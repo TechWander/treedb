@@ -103,9 +103,12 @@ impl ServerConfig {
             sync_ms: 20,
             auto_checkpoint_bytes: 64 * 1024 * 1024,
             backlog: 4096,
-            // auto：按核数给。默认 1 等于把读吞吐锁在一个核上，高并发纯读
-            // 直接输给每连接一进程的 PG（实测 3-8×），理由见
-            // [`crate::net::default_workers`]。
+            // auto：按核数给。默认 1 等于把读吞吐锁在一个核上：64 条连接的
+            // read/exec/write 全排在同一条线程上，而 PG 是每个 backend 一个进程、
+            // 天然摊在几十个核上。这差距是**并行度**不是效率 —— 两边都只给一个核时
+            // 单核档反而领先一个量级（同核口径见 `benches/sc_ops.sh` 的四臂表）。
+            // 理由见 [`crate::net::default_workers`]；旧版这里写的那句「高并发纯读
+            // 直接输给 PG（实测 3-8×）」已作废，见 DESIGN.md §9.1 第 3、4 条。
             workers: crate::net::default_workers(),
         }
     }

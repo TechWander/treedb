@@ -22,10 +22,10 @@
 fsync 删掉了，与 `group` 共用一个提交点，机械盘 64 并发 1 891 → 10 913 ops/s、
 p99 81.5 → 31.1 ms（§7.9 第 3 条，受控 A/B 在 `benches/results/ab_durability.log`）。
 
-test 现在分两档报：默认档（纯引擎）`cargo test --release` = **74 passed**（28 lib +
+test 现在分两档报：默认档（纯引擎）`cargo test --release` = **75 passed**（29 lib +
 20 engine_crud + 9 net_protocol + 7 read_scaling + 6 crash_recovery + 3 independence +
 1 scale_connections，10k 那条仍 `#[ignore]`）；`--features postgres-compat` =
-**105 passed**，多出的 31 条 = 过渡档自己的 30 条单测 + `concurrency.rs` 里那条
+**106 passed**，多出的 31 条 = 过渡档自己的 30 条单测 + `concurrency.rs` 里那条
 不需要 PG 的拨号用例（剩下 6 条要真 PG，默认 `#[ignore]`，不计入 passed）。即 PG 只出现在
 `postgres-compat` 后面的 `src/pool`、`src/store`、
 `src/persist`、`src/schema`、`src/probe.rs` 里，以及性能对照器 `src/bin/pgbench.rs`
@@ -101,8 +101,11 @@ test 现在分两档报：默认档（纯引擎）`cargo test --release` = **74 
 - 「全局定序」这条不变量一点没被稀释：WAL、`stats`、`apply` 仍然只有提交线程碰得到。
 - 唯一新增的共享可变状态是三个原子计数（在册连接数、就地读条数、转交条数）和
   `State` 那把本来就要给 checkpoint 用的 `RwLock`。
-- `workers = 1`（默认）根本不走这条路径，事件循环代码与改造前逐字一致 —— 历史上
-  所有基线数字仍然是同一段代码跑出来的。
+- `workers = 1` 根本不走这条路径，走 [`crate::net::server::serve_single`]。但它**不是**
+  另一份实现：`Conn`、`Slot`、帧编解码、`apply` 这两档共用同一层构件，所以读并行度
+  与 syscall 并行度在 `workers=1` 时就是同一个 1。**因此别把「w=1 那档的代码从未变过」
+  当成事实**：本轮三项逐 op 压榨（§7.5 末）全落在共用构件上，两个档位一起抬 ——
+  与历史 w=1 基线对比时必须重跑同格 A/B，不能拿旧格子直接减。
 
 **B. group commit 的提交点是「一轮 epoll 结束」，不是定时器**
 - 所有落在同一轮里的写共用一次 fsync。客户端一问一答（pipeline=1）时，等待方越多、
@@ -514,8 +517,13 @@ p99 315 ms 是**旧 `always` 实现**（按连接串 fsync）量出来的，该�
   还有 1.6–2.0×，之后进平台期（`lookup` 64/32 那格 3.26 M → 3.30 M）。
   封顶 8 的判据就是这一段：8 → 16 只换来不到 2×，却要把 §8 第 1 条那三个代价
   再摊一倍。
-- **`workers=1` 那一列仍然输给 PG（0.26–0.48×：`ping` 0.26、`readdir` 0.34、`lookup` 0.48），而它才是真实的单核成绩**
-  （独立复跑对得上：0.25–0.49×，见下一小节）。
+- **`workers=1` 那一列「输给 PG 0.26–0.48×」这句已作废**。它是拿 treedb 的一个核去比
+  PG 不限亲和性的 64 个 backend，而那个比值从未同时记下对面吃了几个核。本轮四臂重测
+  （§7.5 末）：同核 `t1/p1` 是 **9.0–86×**，除掉核数的每核 `t1/pf` 是 **13.4–102×**；实际用到的
+  五个 op（`ping`/`lookup`/`readdir`/`create`/`write`）在同核口径下全部碾压，最低的一格也是 9×。
+  只剩「1 核 vs 46–52 核」那个绝对口径还低于 1（`ping` 0.29、`lookup` 0.56、`readdir` 0.60），
+  而单核 `ping` 153 329 已是**同核裸 epoll echo 服务端中位 167 999 的 91.3 %**。这一列到顶了，
+  不是没压榨；它也不是真实使用时的档位（本机默认 `workers=8`）。
   把这一列往上推的是计算侧布局优化（§7.10）：它的收益**只能在受控 A/B 里引**，
   拿两次不同日期的矩阵格子相减会得到完全错误的结论（本轮就这么错了一次，
   §7.10 末条）。
@@ -544,9 +552,10 @@ p99 315 ms 是**旧 `always` 实现**（按连接串 fsync）量出来的，该�
   25–53 %（而 `w=1` 那一列两边只差 ±3 %，见下条）。矩阵里 PG 与 treedb 的格子是
   交替跑的，残留负载对 8 条 worker 的干扰比对单核大。所以上面两张表里的
   **2.9× / 4.0× / 1.8× 要当成下界读**，同格中位是 **4.5× / 5.0× / 1.9×**。
-- **单核那一列是实的**：独立复跑与矩阵逐格咬合（0.99 / 1.02 / 0.97），换算成对 PG
-  的比值是 0.25–0.49×。这不但是同一台机器上的两次测量，还是两个独立跑的
-  脚本 —— “一个核打不过 64 个 PG backend”不是量具问题。
+- **单核那一列是实的**：独立复跑与矩阵逐格咬合（0.99 / 1.02 / 0.97）。但当时把它换算成
+  「对 PG 只有 0.25–0.49×」是一句口径错配的话 —— 那个 PG 格子不限亲和性（本轮实测
+  它摊在 46–52 个核上）。「一个核打不过 64 个 PG backend」确实不是量具问题，可它也不是
+  效率问题：两边都只给一个核时是 9.0–86×，见 §7.5 末的四臂表。
 
 **这笔账的另一半 —— 写档有没有被拖下水**（同轴、同机器、conns=64、`group`、
 WAL 在 `/data`；格式 ops/s（p50 µs））：
@@ -566,6 +575,119 @@ eventfd 递交是 µs 级，在这块机械盘上它没出现在任何一格里�
 另一个测量口径差异，别被表格骗到：treedb 的 `pipeline=32` 是**真的一次往返发 32 个
 请求**；`treedb-pgbench` 的 `pipeline=32` 只能是一个事务里跑 32 条语句（libpq 不做
 请求合并），省的是 commit、不省往返。所以读档上 PG 的 pipeline=32 是**被低估**的。
+
+**四臂口径：把并行度从比值里摘出去**（本轮重测；`benches/sc_ops.sh 3 3`，输出在
+`benches/results/sc_ops.log` 的 `run=final` 段）。上面那句「`workers=1` 输给 PG
+0.26–0.48×」的全部问题在于：treedb 这边钉死一个核，PG 那边 64 个 backend 不限亲和性——
+而这一轮把核数记下来之后，PG 那一臂**真的摊在 46–52 个核上**。一个核对四十几个核，
+比值里装的是并行度，不是效率。四臂各管一件事：
+
+| 臂 | 约束 | 用来回答 |
+|---|---|---|
+| `t1` | treedb `--workers 1`，`taskset` 钉 CPU 1 | 被测对象 |
+| `p1` | PG postmaster 钉**同一个** CPU 1（backend 是 fork 出来的、继承亲和性，脚本读回 `Cpus_allowed_list` 核验） | 同核效率 |
+| `pf` | PG 不限亲和性，但**实测记下它吃了几个核** | 历史严格判据 |
+| `t8` | treedb `--workers 8`，不钉 | 参考上限 |
+
+同一次运行、同一台机器、同一块 `/data` 机械盘、同并发 conns=64/pipe=1，每格 3 s × 3 次取中位：
+
+| op | `t1` | `p1` | `pf`（实测核数） | `t8` | t1/p1 同核 | t1/pf 绝对 | t1/pf 每核 |
+|----|------|------|-----------------|------|-----------|-----------|-----------|
+| `ping` | 153 329 | 17 035 | 528 940（46.3） | 1 124 353 | **9.0×** | 0.29× | **13.4×** |
+| `lookup` | 119 001 | 6 501 | 210 990（49.8） | 1 066 281 | **18.3×** | 0.56× | **28.1×** |
+| `readdir` | 87 075 | 4 486 | 145 937（51.5） | 861 270 | **19.4×** | 0.60× | **30.7×** |
+| `create` | 65 122 | 1 583 | 1 790（1.16） | 95 032 | **41.1×** | 36.4× | **53.4×** |
+| `write` | 71 213 | 828 | 1 117（1.21） | 102 103 | **86.0×** | 63.8× | **101.5×** |
+
+三列得一起给，因为它们各自会骗人：
+
+- `t1/p1` 是**同核绝对吞吐**，这才是「单核配置下 vs PG」的验收口径。p1 那臂 PG 只吃掉
+  了 0.06–0.13 个核（p50 3.6–48 ms），但那不是它省下来的性能，是 64 个进程在同一个核上
+  抢 CFS 时间片抢不动 —— 把整整一个核给它，它就只有 17 035 ops/s。
+- `t1/pf 绝对` 是唯一低于 1 的那列，而它比的是 1 个核对 46–52 个核。treedb 这边的并行度
+  开关就是 `--workers`，拿关掉它的档位去要求赢，等价于要求 1 个核做出 47 个核的事。
+- `t1/pf 每核` 把核数除掉之后是 13.4–102×。
+
+**「一个核的天花板」现在有了仪器读数**：`benches/lb_floor.c` 是一个不碰 treedb 任何代码
+的最小服务端（`epoll_wait` + `recv` + `send`，收到什么回什么，无业务无分配），服务端线程
+钉同一个 CPU 1、客户端每连接一条线程不钉核。同口径 64/1 本次三次实测
+**166 934–168 245 ops/s（中位 167 999，5.95 µs/op）**，原始输出 `benches/results/lb_floor.log`。
+treedb 单核 `ping` 153 329 = 那条中位线的 **91.3 %**。剩下 8.7 % 是协议解码、stats 计数、帧
+编码；而这一列的上限由内核的 loopback 往返决定，不由数据结构决定 —— 换任何实现都不可能超它。
+
+**那一核的时间花在哪儿**（`benches/split_attr.sh`，无 strace 的真实负载下读
+`/proc/<pid>/task/*/stat` 的 utime/stime 差分，8 s 窗口；「改前」那一臂的服务端是把 tag
+`v0.3.2` 用 `git worktree` 重新编译出来的二进制，客户端与口径完全不变 —— 本轮三项优化
+一项都没有；原始输出 `benches/results/split_attr.log`）：
+
+| op | 服务端 | ops/s | user 核 | sys 核 | sys 占比 | user µs/op |
+|----|--------|-------|--------|-------|---------|-----------|
+| `ping` | v0.3.2 | 137 884 | 0.11 | 0.89 | 89 % | 0.80 |
+| `ping` | 本轮 | 158 509 | 0.10 | 0.90 | **90 %** | 0.63 |
+| `lookup` | v0.3.2 | 108 921 | 0.27 | 0.73 | 73 % | 2.48 |
+| `lookup` | 本轮 | 124 039 | 0.26 | 0.74 | **74 %** | 2.10 |
+| `readdir` | v0.3.2 | 51 471 | 0.58 | 0.42 | **42 %** | 11.27 |
+| `readdir` | 本轮 | 90 144 | 0.39 | 0.61 | **61 %** | 4.33 |
+
+两个结论一起读：三个读 op 现在全是系统时间主导，把它们推到 1.0 核以上的唯一办法是少付
+syscall，而不是少算几纳秒 —— 这就是第一项优化为什么动 `epoll_ctl` 而不动 `BTreeMap`。而
+**user 时间真正掉下来的只有 `readdir`（11.27 → 4.33 µs/op）**，那一笔就是分配（下面第 ③ 项）；
+`ping`/`lookup` 的 user 只动了 0.17 / 0.38 µs，它们的吞吐来自同样一个核上多跑了几轮往返。
+
+**不缺索引：把项规模拉散重测**（`treedb-micro`，不经网络不写 WAL，钉 CPU 1；本轮实测，
+原始输出 `benches/results/micro_names.log`）：
+
+| items | `lookup` ns | `readdir`（一页 100 条）ns | `create` ns |
+|---|---|---|---|
+| 32 000 | 365.5 | 1 292.9 | 1 343.6 |
+| 96 000 | 391.4 | 1 256.5 | 1 328.2 |
+| 288 000 | 462.7 | 1 294.5 | 1 371.8 |
+
+项数×9，`lookup` 只涨 26.6 %、`readdir`/`create` 根本不涨 —— 这是 log 形状，不是扫描。
+另有一份**优化前二进制**的同工装对照（`benches/results/micro_names_before.log`，
+`lookup` 367.8 → 398.0），两档的 `lookup` 逐格差在 ±2 % 内 —— 本轮三项优化没动过表结构，
+它们动的全在 syscall 与分配上。形状上它也不需要新索引：`dentries` 是
+`BTreeMap<(view,parent), BTreeMap<name,Dent>>`，`lookup` 两层钻取共 2 次树查找，
+`readdir` 一次定位到 `(view,parent)` 后拿内层表做 range + `skip(offset)`，
+**一页只碰这一棵子树**；`Dent` 里冗余 `kind` 就是为了让 readdir 一页不用回 `nodes` 表下钻
+（那是 100 次 cache miss）。所以「单核输 PG」与索引无关，它只与「一个核能付几次
+syscall」有关。
+
+**本轮三项逐 op 压榨**（同一格受控 A/B，`SKIP_PG=1` 只跑 treedb 两臂；单位 ops/s）：
+
+| op | 改前 | ① `Conn::rearm` | ② `Conn::push_frame` | ③ `Names` 扁平缓冲 | 合计 |
+|----|------|----------------|---------------------|-------------------|------|
+| `ping` | 132 673 | 151 881 | 155 090 | 153 329 | **+16 %** |
+| `lookup` | 105 372 | 116 258 | 121 079 | 119 001 | **+13 %** |
+| `readdir` | 49 943 | 52 875 | 57 751 | 87 075 | **+74 %** |
+| `create` | 61 399 | 64 714 | 64 361 | 65 122 | **+6 %** |
+| `write` | 68 430 | 70 880 | 69 166 | 71 213 | **+4 %** |
+
+最后一列取含 PG 四臂那次（load 更高），与单项跑差 ±2 %（`ping` 155 327、`readdir` 88 597）。
+
+- **① `epoll_ctl` 归零**。`benches/strace_attr.sh` 本次双分实测（同一客户端、同一核、
+  分母取测量窗口 ops；原始输出 `benches/results/strace_attr.log`）：`v0.3.2` 服务端每 op
+  **5.10 次** —— `recvfrom` 2.040（err/op 1.019，即其中一次是注定 EAGAIN 的空转）、
+  `epoll_ctl` 2.040（err/op 1.019，掩码没变也拿 ADD 撞 EEXIST 再 MOD）、`sendto` 1.019；
+  本轮服务端 **2.02 次** —— `recvfrom` 1.010（err 归零）、`sendto` 1.009、`epoll_ctl` 跌到
+  0.001（只剩连接建立那几次）。`Conn` 记住当前真挂的掩码（`ep_out`）、只在变得不一致
+  时才 `epoll_mod`，读循环收到短读就 `break`（电平触发不丢数据）。
+- **② 应答直接编进发送缓冲**。`push_frame` 把 reply 直接编到 `c.tx` 尾部，省掉
+  `reply_frame` 的 2 次分配与 `pump` 里的第三次拷贝；`out` 非空时返回 false 退回原来的
+  插槽路径，以保证同连接应答顺序。
+- **③ readdir 的名字不再每条一次 malloc**。这是三项里唯一只属于单个 op 的。micro 把
+  每条目录项定价定得很死（`micro_names_before.log` vs `micro_names.log`，同机同核同工装）：
+  limit 从 1 扫到 400，改前耗时 220.6 → 482.7 → 2 293.5 → 4 280.5 → 17 038.1 ns，分配数恰好
+  5 → 14 → 54 → 104 → 404，即**每条 ≈42 ns、每条 1 次 malloc**，占一页 100 条成本的 97 %。
+  名字只有十几字节，那 42 ns 几乎全是 glibc 的 malloc/free 对。
+  换成 `Names`（一块扁平 `blob` + 每项起点）后分配固定 **5 次、与 limit 无关**，边际从
+  42 ns/条降到 ≈10.6 ns/条，引擎侧 4 280.5 → 1 268.5 ns（**3.4×**），端到端 `readdir` +53 %，
+  并把这一格从「计算主导」翻回「syscall 主导」（sys 占比 42 % → 61 %，见上面那张
+  `split_attr.log` 表；strace 里也能看到同一个改动的旁证：`brk` 从 0.045 次/op 降到 0.018）。
+  **线协议一个字节未变**，编码仍逐条 `u32 len + 字节`。
+
+三项全部只动 `workers=1` 与多前端**共用**的那层（`Conn` / codec / apply），所以 `t8` 同步受益：
+`readdir` 690 070 → 861 270（+25 %）、`ping` 977 533 → 1 124 353（+15 %）。
 
 ### 7.6 连接轴
 
@@ -611,6 +733,9 @@ eventfd 递交是 µs 级，在这块机械盘上它没出现在任何一格里�
 关键格子的历史值 vs 本次值（**注意：这一段里 `lookup`/`readdir` 的 treedb 侧数字
 全部是 §9.1 第 3 条那个分母修正之前的，虚低 1.6–2×**；表格保留原样是为了记下当时
 确实看到了“PG 反胜 3.6–7.5×”，修正后的同格数字在 §7.5）：
+
+表中 `w=1` 那几行对的是**不限亲和性**的 PG，而那一臂本轮实测吃 46–52 个核 ——
+它们是历史观测记录，不是「单核效率」的判据；同核口径的四臂表在 §7.5 末。
 
 | 格子 | 历史 ops/s | 本次 ops/s | 本次 PG | 判读 |
 |------|-----------|-----------|---------|------|
@@ -835,8 +960,8 @@ O(目录数)）另开了 `Engine::wal_bytes()`（`src/engine/core.rs`）：auto-
 ## 9. 测试清单
 
 ```sh
-cargo test --release                            # 默认档（纯引擎），73 条
-cargo test --release --features postgres-compat # 加上过渡档，104 条
+cargo test --release                            # 默认档（纯引擎），75 条
+cargo test --release --features postgres-compat # 加上过渡档，106 条
 cargo test --release --lib                      # 只看引擎单测
 cargo test --release --test scale_connections -- --ignored   # 万级连接重压（§7.6）
 bash benches/throughput_matrix.sh 3             # 五轴吞吐矩阵（默认只跑 1–4）
@@ -845,6 +970,11 @@ bash benches/ab_layout.sh <基线 rev>            # 受控 A/B：只换服务端
 bash benches/sync_ratio.sh 3                    # 一次 fsync 摊了几次写（§7.9）
 bash benches/ab_durability.sh <基线 rev>        # 写轴 A/B：持久化档的吞吐与尾延迟（§7.9 第 3 条）
 bash benches/probe_srv.sh                       # 服务端吃了几核（/proc 计数，§7.5）
+bash benches/sc_ops.sh 3 3                      # 单核四臂：t1/p1/pf/t8，逐格记实测核数（§7.5 末）
+bash benches/sc_ops.sh 3 1 readdir              # 只跑同一格的受控 A/B（配 SKIP_PG=1 与 RUN=…）
+bash benches/strace_attr.sh ping                # 每 op 几次 syscall（分母取测量窗口 ops）
+bash benches/split_attr.sh readdir 1 8          # 那一核的时间有多少在 sys 里（无 strace）
+gcc -O2 -pthread -o /tmp/lb_floor benches/lb_floor.c && /tmp/lb_floor 1 64 3   # 1 核物理下界
 ./target/release/treedb-micro --items 32000     # 纯计算档 ns/op + allocs/op（§7.10）
 ```
 
@@ -873,7 +1003,7 @@ bash benches/probe_srv.sh                       # 服务端吃了几核（/proc 
 **逻辑末尾**，不是文件 EOF —— 预分配后两者差着一大片零，注错地方就等于什么都没测）、
 `ops_stats_checkpoint_shutdown_over_tcp`（`wal_bytes` 改按逻辑长度断言，checkpoint 后归零）。
 
-### 9.1 三条被作废的测量（记录过程，防止有人复用假数据）
+### 9.1 四条被作废的测量（记录过程，防止有人复用假数据）
 
 1. **`pg op=… pipeline=32 → 14.7 M ops/s`**：对照器里 `ping`/`lookup`/`readdir` 只跑
    1 条语句，外层却按 `pipeline` 计数，虚高 32×。现改成 `one_op` 返回**真正执行掉的
@@ -890,6 +1020,27 @@ bash benches/probe_srv.sh                       # 服务端吃了几核（/proc 
    反胜 3–8×”有一半是量具给的。两个客户端现在都改成「每线程自记窗口、汇总取
    最大窗口当分母」，§7.5 与 §7.10 的数字是修完之后重跑的；§7.2/§7.8 里标了
    “旧口径”的格子仍偏低，只能看量级不能相减。
+   本轮又挖出同一个坑的第二个版本：`benches/strace_attr.sh` 原先拿服务端**生命期**
+   累计 ops 当分母，而预热那 25.6 万条是 `pipeline` 批量发的，于是 `lookup`/`readdir`
+   被量出「每 op 0.2 次 syscall」这种物理上不可能的读数（`ping` 没有文件预热，两种
+   分母同值，所以这个坑只在 lookup/readdir 上暴露）。现在分母改取测量窗口 ops
+   （bench 自报的 rate × over），读数才与 `ping` 那条线对上。
+4. **「`workers=1` 那一列输给 PG 0.26–0.48×」这个比值**（本轮作废）：treedb 那边
+   `taskset` 钉了一个核，PG 那边 64 个 backend 不限亲和性，而比值从来没同时记下两边
+   各用了几个核。`benches/sc_ops.sh` 现在四臂同跑、逐格记录服务端实测核数
+   （`benches/cores.py` 10 Hz 采样 `/proc/<pid>/task/*/stat`），一记就露出来：PG 那一臂
+   实际摊在 **46–52 个核**上。三个口径各自的正确数字见 §7.5 末。
+
+   同一个理由也适用于「本轮三项优化到底抬了多少」：那不能拿历史格子减，只能同格
+   A/B。本轮的改法是先把 tag `v0.3.2` 用 `git worktree` 重新编译一份旧服务端，只换
+   服务端二进制、客户端与口径全不动（`benches/results/strace_attr.log` 与
+   `split_attr.log` 的 before 段就是这么出的，旧版 `benches/ab_layout.sh` 已经用过同
+   一手法）；跑完立即还原二进制并在日志里记下 sha256，避免下一轮把旧二进制当成新的测。
+
+   同一条里还藏着一个**反向陷阱**：p1 臂（PG 钉同一个核）只用掉 0.07 个核，拿它算
+   「每核效率」会把 PG 在单核上抢不到时间片（p50 3.6–48 ms 全在等调度）洗成优势。
+   所以 `benches/sc_sum.py` 里 `t1/p1` 报的是**绝对吞吐**、`t1/pf` 才除核数，两者不能
+   互换 —— 上一版把 `t1/p1` 那列标成了「每核」，就是这个混淆。
 
 ---
 
@@ -921,6 +1072,17 @@ bash benches/probe_srv.sh                       # 服务端吃了几核（/proc 
    `ApiKeyStore`。建议先保留，减少一次性改动面。（spike 现状：保留本地 SQLite。）
    本轮重新定调：`Key*`/`Audit*` 本身形状就是 grovefs 的表，直接接上等于把业务
    语义坐进内核——真正的终态是 §11 第 7 条 T2 的通用表，而不是这两个 op。
+
+**bump tag 前必读的一处 `Dirents` 接口变更**（本轮 `Names` 扁平缓冲带过来的，§7.5 末）。
+`Reply::Dirents.names` 的类型从 `Vec<Vec<u8>>` 变成了 [`Names`](src/engine/model.rs)。
+**线协议一字未改**，所以跨版本连通没问题；断的是**编译期**：
+`grovefs/src/treedb_store.rs` 的 `page()` 里那句 `inos.iter().zip(names)` 要改成
+`zip(&names)`（`&Names` 实现了 `IntoIterator<Item = &[u8]>`，`from_utf8_lossy(&name)`
+那一行不用动）。grovefs 现在锁在 `v0.3.2`，不受影响；但下一次把 tag 往前推时必须
+带上这一行，并按既有做法拿临时 `[patch."https://github.com/TechWander/treedb.git"]`
+跑一次 `cargo check --features treedb` 再拆掉。选这个方案而不是给 `Names` 加一个
+`to_vec()` 兼容层：后者能让 grovefs 一行不改地编过，但它会把刚刚消掉的那 100 次
+`malloc` 原封不动放回客户端侧 —— 用静默的性能回退换编译兼容，不如把断点摆在明处。
 
 ### 阶段 B spike 的实际结果（2026-11-19，`exp/treedb-integration`）
 
@@ -1059,8 +1221,8 @@ spike 明确**没**做、也不在接入面上假装做的事 —— 一律返�
      里非 optional 项只能是 `libc` + `thiserror`；`postgres-compat` 不得进 `default`。
      关键词是拼出来的，文件也不扫 `tests/`，否则门会把自己拦下来。**反向验过**：
      往 `src/engine/` 丢一个含该名字的探针文件，门 1 立刻 FAILED，删掉又绿 —— 门不是装饰。
-     跑法：默认档 `cargo test --release` = **74 passed / 0 failed**（含三把门），
-     `--features postgres-compat` = **105 passed / 0 failed**（数字跟 §9 同步）。
+     跑法：默认档 `cargo test --release` = **75 passed / 0 failed**（含三把门），
+     `--features postgres-compat` = **106 passed / 0 failed**（数字跟 §9 同步）。
 
    接入侧因此得到的约束：第 5 条里“把定义/密钥/账户补进引擎”的正解不是
    `Key*`/`Audit*` 直接给 grovefs 用，而是 grovefs 用 T2 的通用表自己拼语义；

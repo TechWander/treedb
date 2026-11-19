@@ -16,8 +16,8 @@ cargo build --release                                   # 默认档：依赖只�
 ./target/release/treedb-server --dir /var/lib/treedb --listen 127.0.0.1:7777
 ./target/release/treedb-bench --op lookup --conns 64 --pipeline 32 --secs 3
 
-cargo test --release                                    # 默认档 74 passed（引擎本体）
-cargo test --release --features postgres-compat         # 105 passed（含 PG 过渡档）
+cargo test --release                                    # 默认档 75 passed（引擎本体）
+cargo test --release --features postgres-compat         # 106 passed（含 PG 过渡档）
 bash benches/throughput_matrix.sh 3 1 2 3 4 5           # 五轴复现，输出进 benches/results/
 bash benches/sync_ratio.sh 3                           # 写路径机制：一次 fsync 摊了多少写
 bash benches/ab_layout.sh <基线 rev>                     # 受控 A/B：只换服务端二进制比引擎改动
@@ -38,7 +38,7 @@ group commit 不丢。默认按核数给：`min(8, 核数/2)`（1–3 核机器�
 | 连接 | 单进程 10 000 常驻连接：RSS +6 MiB、**0.56 KiB/conn**、`fd/conn = 1.0000` |
 | 写（`dur=group` vs PG `synchronous_commit=on`，WAL 同盘） | 64 并发 `create` **10 386 vs 1 837 ops/s**（**5.7×**，PG 那一格 p50 = 33.6 ms）、`write` **12 753 vs 1 415**（**9.0×**） |
 | 64 并发纯读（默认档 `workers=8`） | `readdir` **427 092 vs 146 203** ops/s（**2.9×**）、`lookup` **847 297 vs 210 868**（**4.0×**）、`ping` **977 771 vs 531 437**（**1.8×**）；p50 62–112 µs vs PG 117–431 µs |
-| 同一格只给一个核（`workers=1`） | `readdir` 50 435、`lookup` 101 098、`ping` 136 496 —— 输给 64 个 PG backend 是**并行度**差异，不是语言差异：`/proc` 计 CPU 显示这一档服务端稳定 100 % 单核（`benches/probe_srv.sh`）；独立复跑 5 次与本行差 ±3 % |
+| 只给一个核（`workers=1`，且 PG 钉在**同一个**核上） | 同核、同并发 64/1：`ping` **153 329 vs 17 035**（**9.0×**）、`lookup` **119 001 vs 6 501**（**18.3×**）、`readdir` **87 075 vs 4 486**（**19.4×**）、`create` **65 122 vs 1 583**（**41.1×**）、`write` **71 213 vs 828**（**86.0×**）。旧版这一行写的「输给 PG 0.26–0.48×」**已作废**：那是拿一个核去比 PG 不限亲和性的 46–52 个核。同一张四臂表里还钉了另两件事：单核 `ping` 153 329 已是**同核裸 epoll echo 服务端（中位 167 999 ops/s，`benches/results/lb_floor.log`）的 91.3 %**，而这一核 90 % 的时间在系统时间里（`benches/results/split_attr.log`）—— 这一列到顶了。详见 [DESIGN.md](DESIGN.md) §7.5 末、`benches/sc_ops.sh` |
 | 零旗标默认档（照上面两行命令起服务，同格跑 5 次取中位） | 服务端 banner 就是 `workers=8`：`readdir` **654 983**（= PG 4.5×）、`lookup` **1 062 564**（**5.0×**）、`ping` **1 016 868**（1.9×）—— 领先不靠调用方传 `--workers`；矩阵连跑的那两行是**下界**（`benches/default_check.sh`） |
 | 为什么快（引擎自己的计数器） | 两个「会 fsync」的档位现在共用同一个提交点：64 并发下一轮只付 1 次 fsync、摊 **≈ 55–58 次写/fsync**（`benches/sync_ratio.sh`） |
 | 每 op 一次 fsync（`dur=always` vs PG `synchronous_commit=on`，WAL 同盘） | 改前 1 891 vs 1 469 ops/s（p99 81.5 ms vs 157 ms）；**改后 10 913 vs 1 469 = 7.4×**，p50 优 17×、p99 优 5×（受控 A/B：`benches/ab_durability.sh v0.3.1`）。旧版这句「刨掉合并 fsync，treedb 对 PG 就没有结构性优势」是当时那个**按连接串 fsync** 的实现留下的错判，已作废：两家都是靠一次 fsync 摊多次写，treedb 在这一格摊得动（≈ 55）而 `always` 档以前自己把它抵消掉了 |
