@@ -12,6 +12,8 @@ path = "src/lib.rs"
 [[bin]]
 name = "treedb-demo"
 path = "src/bin/demo.rs"
+# demo 演示的是过渡档（schema 编码 / 镜像 / 密钥表），引擎本体验收不靠它。
+required-features = ["postgres-compat"]
 
 [[bin]]
 name = "treedb-server"
@@ -25,6 +27,22 @@ path = "src/bin/bench.rs"
 [[bin]]
 name = "treedb-pgbench"
 path = "src/bin/pgbench.rs"
+required-features = ["postgres-compat"]
+
+[features]
+# 默认空：`cargo build` 出来的是纯引擎，依赖只有 libc + thiserror。
+# 过渡档（PG 共享池 + SQLite 镜像 + grovefs_control 表形）全部关在这里，
+# 它服务的是 grovefs 现有的 PostgreSQL 栈，不是元数据引擎本体。
+# 打开它才会把下面标 optional 的 7 个依赖拉进构建图。
+postgres-compat = [
+    "dep:postgres",
+    "dep:rusqlite",
+    "dep:parking_lot",
+    "dep:uuid",
+    "dep:sha2",
+    "dep:chrono",
+    "dep:tracing",
+]
 
 [dependencies]
 # --- engine（自研引擎本体）：只依赖 libc + thiserror + 标准库 ---
@@ -32,17 +50,19 @@ libc = "0.2"
 thiserror = "1"
 
 # --- 过渡档：PG 共享池 + SQLite 镜像（grovefs 现有栈，接入期保留）---
-postgres = { version = "0.19", default-features = false }
-rusqlite = { version = "0.31", features = ["bundled"] }
-parking_lot = "0.12"
-uuid = { version = "1", features = ["v4"] }
-sha2 = { version = "0.11.1" }
-chrono = "0.4"
-tracing = "0.1"
+# 全部 optional，由 `postgres-compat` 拉起（见上）。为什么不能默认开：
+# 一个要被人当依赖引的数据库，不该因为 `pool/store/persist/schema` 这四个
+# 模块就把 PG 客户端和一个编译期 SQLite 塞进下游的构建图。
+postgres = { version = "0.19", default-features = false, optional = true }
+rusqlite = { version = "0.31", features = ["bundled"], optional = true }
+parking_lot = { version = "0.12", optional = true }
+uuid = { version = "1", features = ["v4"], optional = true }
+sha2 = { version = "0.11.1", optional = true }
+chrono = { version = "0.4", optional = true }
+tracing = { version = "0.1", optional = true }
 
 [dev-dependencies]
 tempfile = "3"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [profile.release]
 lto = true

@@ -27,6 +27,15 @@
 //!    + authenticate 全通过；池与 SHA 生成路径都线程安全。
 //! 7. `throughput_ref_reports_percentiles` —— 打印 p50/p95/p99 与
 //!    ops/s；不做阈值断言（避免 CI 抖动）。
+//!
+//! **这些全部是 `postgres-compat` 过渡档的验收，不是元数据引擎本体的。**
+//! 引擎自己的并发证据在 `net_protocol.rs`（同连接流内顺序、连接间不串扰）
+//! 与 `read_scaling.rs`（多 worker 并行读与单线程逐条同答复、混打不插队、
+//! acked 写崩后不丢）。那些不靠 feature，默认 `cargo test` 就跑。
+
+// 没有 `postgres-compat` 时整个文件不参与编译：它 `use` 的 `treedb::pool` /
+// `treedb::store` 在那个档下根本不存在。注意不要把“0 tests”当成“过了”。
+#![cfg(feature = "postgres-compat")]
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;

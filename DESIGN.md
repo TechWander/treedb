@@ -799,18 +799,25 @@ spike 明确**没**做、也不在接入面上假装做的事 —— 一律返�
    |----|------|------------|
    | **L0 命名与注释** | 引擎内核里 21 处 grovefs 提及**全部是注释**（「与 grovefs `node.is_dir` 的 0/1/2 一致」这类对齐声明）；无 `use grovefs::`，无 grovefs 类型 | 无害，但叙述口径要改（见下） |
    | **L1 数据结构与 op 语义** | `KeyRec` 逐列照抄 `grovefs_control.api_keys`（`ro`/`owner`/`note`/`expires_at`/`secret_hint`/`created_by`），`AuditRec` 照抄 `mcp_calls`，`Def*` 就是视图定义，`EADV = 68` 注释写着「借用 grovefs 控制面既有码」，`KeyCheck` 里带 `verb` 授权参数 | **违反**。这是业务形状进了内核 |
-   | **L2 依赖图** | `postgres`/`rusqlite(bundled)`/`sha2`/`uuid`/`chrono`/`tracing`/`parking_lot` 全是**非 optional** 依赖，只为过渡档服务；而 grovefs 实际只用了 `treedb::net::Client` 与 `treedb::engine::model::Op`，**从 `pool/`、`store/`、`persist/`、`schema/` 一行符号都没用** | **违反**。任何消费者都白吃一个 PG 客户端 + 一个编译期 SQLite |
+   | **L2 依赖图** | ~~`postgres`/`rusqlite(bundled)`/`sha2`/`uuid`/`chrono`/`tracing`/`parking_lot` 全是非 optional 依赖~~ **已关进 `postgres-compat`**（T1 完成）：默认档 `cargo tree` 只剩 `libc` + `thiserror`；依据仍是 grovefs 只用 `treedb::net::Client` 与 `engine::model::Op`，`pool/`、`store/`、`persist/`、`schema/` 一行符号都没用 | ~~违反~~ **已修** |
 
    好消息是边界已经天然存在一半：`data_ref` 是不透明字节（引擎不解释内容键），
    引擎**不算哈希**（`sha2` 只出现在 `store/keys.rs` 和 demo 里，`KeyCheck` 只比较
    调用者送来的 hash），错误不做二次翻译，字节区间锁与 `link()` 不做 —— 这些都是
    「通用引擎」该有的形状。要改的是下面四步，**每一步都在本仓**：
 
-   - **T1 过渡档关进 feature**：`pool/`、`store/`、`persist/`、`schema/`、`bin/demo.rs`
-     移到 `postgres-compat`（默认关），`sha2`/`uuid`/`rusqlite`/`postgres`/`chrono` 跟着变
-     optional。先决条件：grovefs 零使用（已核实）+ 本仓 `bin/pgbench.rs` 不依赖它们
-     （对照工具自己开 feature 编）。关完默认 `cargo build` 的依赖应当只剩
-     `libc` + `thiserror`，这才是能被任何项目引用的干净底座。
+   - ~~**T1 过渡档关进 feature**~~ **已完成**：`pool/`、`store/`、`persist/`、`schema/`、
+     `probe.rs` 关进 `postgres-compat`（`default = []`，默认关），`sha2`/`uuid`/
+     `rusqlite`/`postgres`/`chrono`/`tracing`/`parking_lot` 全部转 optional，
+     `treedb-demo`/`treedb-pgbench` 上 `required-features`，`error.rs` 里那两个
+     `From<postgres::Error>`/`From<rusqlite::Error>` 一并关掉（变体保留，免得下游分支
+     突然编不过）。实测：`cargo tree -e no-dev` 默认档**只剩 libc + thiserror**；
+     `cargo test --release` 默认档 68 passed / 0 failed（lib 从 56 降到 26，少的 30 条
+     正是过渡档自己的单测），`--features postgres-compat` 下 99 passed / 0 failed /
+     7 ignored，与开关前逐条相同。顺手删了 `tracing-subscriber` 这个没人在用的
+     dev-dependency（拖 11 个 crate，Cargo.lock 少 105 行全是它）。注意锁文件里
+     `postgres`/`rusqlite` 条目仍在：cargo 对可选依赖做 union 解析，判据是
+     `cargo tree` 与编译日志，不是锁文件行数。
    - **T2 把密钥/审计/定义三张专用表换成通用表能力**：内核只给 `TableCreate` /
      `RowPut` / `RowGet` / `RowList` / `RowDelete`（字段为字节列，可加唯一约束与
      比较条件），具体列名、撤销/过期/只读这些规则全部由客户端定义。协议版本

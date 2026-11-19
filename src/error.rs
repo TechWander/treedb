@@ -40,12 +40,18 @@ pub enum Error {
     Io(String),
 }
 
+// 这两个 `From` 只为过渡档服务：`Error::Pg`/`Error::Mirror` 存的是字面量串，
+// 引擎本体永远不构造它们。把它们跟 `postgres-compat` 绑在一起，而不是
+// 把变体一起关掉 —— 免得下游已经写好的 `Error::Pg(_)` 分支在换 feature 时
+// 突然编译不过。
+#[cfg(feature = "postgres-compat")]
 impl From<postgres::Error> for Error {
     fn from(e: postgres::Error) -> Self {
         Error::Pg(e.to_string())
     }
 }
 
+#[cfg(feature = "postgres-compat")]
 impl From<rusqlite::Error> for Error {
     fn from(e: rusqlite::Error) -> Self {
         Error::Mirror(e.to_string())

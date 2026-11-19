@@ -28,34 +28,51 @@
 //! - **search_path 只在事务内 SET LOCAL**：跨事务不残留会话状态，任何
 //!   借出/归还的中间时刻连接都是干净的。
 //!
-//! ## 与 GroveFS 现有代码的映射
+//! ## 与 GroveFS 现有代码的映射（`postgres-compat` 过渡档）
+//!
+//! 下面这些模块**不属于引擎本体**：它们是 grovefs 现有 PostgreSQL 栈的共享池/
+//! 镜像形状，接入期留在这里，靠 `postgres-compat` feature 关着。feature 关掉
+//! 时这些模块根本不参与编译，链接图里也就没有 PG 客户端和 SQLite：
 //!
 //! | treedb 模块 | grovefs 对应 | 迁移方式 |
 //! |------------|--------------|----------|
-//! | [`pool::SharedInstancePool`] | `pg_store::PgEngine` per-view 池 | 作为 `MetaStore::Pg` 的 sibling variant |
-//! | [`store::keys::KeyStore`] | `apikeys::ApiKeyStore` (Backend::Pg 分支) | 直接替换 PG 分支实现 |
-//! | [`persist::Mirror`] | `apikeys::ApiKeyStore` (Backend::Sqlite 分支) | 从"主存"降级为"备份" |
-//! | [`store::defs::DefStore`] | `mcp::PgControlStore` view_defs 表 | 接口等价 |
-//! | [`schema`] | `pg_store::schema_for` / `control::schema_name_for` | 保持字节一致，双端可解析同名 schema |
+//! | `pool::SharedInstancePool` | `pg_store::PgEngine` per-view 池 | 作为 `MetaStore::Pg` 的 sibling variant |
+//! | `store::keys::KeyStore` | `apikeys::ApiKeyStore` (Backend::Pg 分支) | 直接替换 PG 分支实现 |
+//! | `persist::Mirror` | `apikeys::ApiKeyStore` (Backend::Sqlite 分支) | 从"主存"降级为"备份" |
+//! | `store::defs::DefStore` | `mcp::PgControlStore` view_defs 表 | 接口等价 |
+//! | `schema` | `pg_store::schema_for` / `control::schema_name_for` | 保持字节一致，双端可解析同名 schema
 
 pub mod config;
 pub mod engine;
 pub mod error;
 pub mod net;
+
+// 过渡档：PG 共享池 + SQLite 镜像 + grovefs_control 表形。引擎本体
+// （`engine` + `net`）不引用这里的任何东西，所以关掉 feature 后剩下的是一
+// 个自足的数据库，而不是“少了一半功能的 grovefs 客户端”。
+#[cfg(feature = "postgres-compat")]
 pub mod persist;
+#[cfg(feature = "postgres-compat")]
 pub mod pool;
+#[cfg(feature = "postgres-compat")]
 pub mod probe;
+#[cfg(feature = "postgres-compat")]
 pub mod schema;
+#[cfg(feature = "postgres-compat")]
 pub mod store;
 
 pub use config::{PoolConfig, StoreConfig};
 pub use error::{Error, Result};
+#[cfg(feature = "postgres-compat")]
 pub use persist::Mirror;
+#[cfg(feature = "postgres-compat")]
 pub use pool::{SharedInstancePool, SharedPoolManager, Tx};
+#[cfg(feature = "postgres-compat")]
 pub use store::{AuditWriter, DefStore, KeyRecord, KeyStore, StoredKey};
 
 /// 库内部通用工具：把 view name 编成 PG schema 名（`grovefs_v_<hex>`）。
 /// 与 `grovefs::pg_store::schema_for` 保持字节一致，双端可互解。
+#[cfg(feature = "postgres-compat")]
 pub fn schema_for_view(view: &str) -> Option<String> {
     schema::encode(view)
 }
