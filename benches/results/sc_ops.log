@@ -1,0 +1,616 @@
+=== 单核口径逐 op A/B 2026-11-19 09:21:21 UTC CPU钉=3 SECS=2 REPS=1 ops=ping ===
+机器：Intel(R)Xeon(R)Gold6338CPU@2.00GHz nproc=128 load=7.12 8.07 8.81
+盘：/data 2% 挂载 xfs
+cell arm=t1 op=ping w=1 rep=1 ops=133388 p50=458 p99=600 cores= cpu=
+cell arm=t1 op=lookup w=1 rep=1 ops=103330 p50=605 p99=753 cores= cpu=
+cell arm=t1 op=readdir w=1 rep=1 ops=51365 p50=1191 p99=2510 cores= cpu=
+cell arm=t1 op=create w=1 rep=1 ops=70335 p50=821 p99=2296 cores= cpu=
+cell arm=t1 op=write w=1 rep=1 ops=84830 p50=685 p99=2044 cores= cpu=
+cell arm=t8 op=ping w=8 rep=1 ops=128882 p50=474 p99=629 cores= cpu=
+cell arm=t8 op=lookup w=8 rep=1 ops=100904 p50=618 p99=744 cores= cpu=
+cell arm=t8 op=readdir w=8 rep=1 ops=58558 p50=1030 p99=2236 cores= cpu=
+cell arm=t8 op=create w=8 rep=1 ops=70416 p50=835 p99=2234 cores= cpu=
+cell arm=t8 op=write w=8 rep=1 ops=82947 p50=700 p99=2272 cores= cpu=
+pg 臂=p1 pid=3497464 fsync=on synchronous_commit=on postmaster cpu=3 backend 3497476 cpu=3
+cell arm=p1 op=ping rep=1 ops=16651 p50=3604 p99=9236 cores= cpu=3
+  ! setup 8 个视图 schema 耗时 8.7 ms（每视图 1.1 ms，不进 op QPS）
+pg 臂=pf pid=3497826 fsync=on synchronous_commit=on postmaster cpu=0-127 backend 3497828 cpu=0-127
+cell arm=pf op=ping rep=1 ops=516566 p50=119 p99=196 cores= cpu=0-127
+  ! setup 8 个视图 schema 耗时 11.3 ms（每视图 1.4 ms，不进 op QPS）
+=== 汇总（REPS 次中位；cores = 测量窗口内服务端平均核数）===
+=== 单核口径逐 op A/B 2026-11-19 09:24:48 UTC CPU钉=3 SECS=3 REPS=3 ops=ping lookup readdir create write ===
+机器：Intel(R)Xeon(R)Gold6338CPU@2.00GHz nproc=128 load=8.96 9.51 9.35
+盘：/data 2% 挂载 xfs
+pg 臂=p1 pid=3536573 fsync=on synchronous_commit=on postmaster cpu=3 backend 3536653 cpu=3
+cell arm=p1 op=ping rep=1 ops=16623 p50=3614 p99=8467 cores=0.00 cpu=3
+  ! setup 8 个视图 schema 耗时 5.8 ms（每视图 0.7 ms，不进 op QPS）
+cell arm=p1 op=lookup rep=1 ops=6275 p50=10052 p99=19460 cores=0.00 cpu=3
+  ! setup 8 个视图 schema 耗时 7.1 ms（每视图 0.9 ms，不进 op QPS）
+cell arm=p1 op=readdir rep=1 ops=4258 p50=14131 p99=32255 cores=0.00 cpu=3
+  ! setup 8 个视图 schema 耗时 8.3 ms（每视图 1.0 ms，不进 op QPS）
+cell arm=p1 op=create rep=1 ops=1582 p50=37054 p99=85473 cores=0.00 cpu=3
+  ! setup 8 个视图 schema 耗时 5.6 ms（每视图 0.7 ms，不进 op QPS）
+cell arm=p1 op=write rep=1 ops=793 p50=61631 p99=306393 cores=0.00 cpu=3
+  ! setup 8 个视图 schema 耗时 6.4 ms（每视图 0.8 ms，不进 op QPS）
+pg 臂=pf pid=3542876 fsync=on synchronous_commit=on postmaster cpu=0-127 backend 3543269 cpu=0-127
+cell arm=pf op=ping rep=1 ops=518560 p50=119 p99=192 cores=0.00 cpu=0-127
+  ! setup 8 个视图 schema 耗时 9.2 ms（每视图 1.2 ms，不进 op QPS）
+cell arm=pf op=lookup rep=1 ops=208689 p50=308 p99=418 cores=0.00 cpu=0-127
+  ! setup 8 个视图 schema 耗时 10.4 ms（每视图 1.3 ms，不进 op QPS）
+cell arm=pf op=readdir rep=1 ops=145111 p50=433 p99=621 cores=0.00 cpu=0-127
+  ! setup 8 个视图 schema 耗时 12.0 ms（每视图 1.5 ms，不进 op QPS）
+cell arm=pf op=create rep=1 ops=1678 p50=33638 p99=67080 cores=0.01 cpu=0-127
+  ! setup 8 个视图 schema 耗时 5.2 ms（每视图 0.7 ms，不进 op QPS）
+cell arm=pf op=write rep=1 ops=1230 p50=33680 p99=499746 cores=0.01 cpu=0-127
+  ! setup 8 个视图 schema 耗时 7.1 ms（每视图 0.9 ms，不进 op QPS）
+pg 臂=p1 pid=3547249 fsync=on synchronous_commit=on postmaster cpu=3 backend 3547259 cpu=3
+cell arm=p1 op=ping rep=2 ops=17040 p50=3581 p99=8096 cores=0.00 cpu=3
+  ! setup 8 个视图 schema 耗时 6.9 ms（每视图 0.9 ms，不进 op QPS）
+cell arm=p1 op=lookup rep=2 ops=6246 p50=9863 p99=19879 cores=0.00 cpu=3
+  ! setup 8 个视图 schema 耗时 7.3 ms（每视图 0.9 ms，不进 op QPS）
+cell arm=p1 op=readdir rep=2 ops=4775 p50=13728 p99=29287 cores=0.00 cpu=3
+  ! setup 8 个视图 schema 耗时 8.6 ms（每视图 1.1 ms，不进 op QPS）
+cell arm=p1 op=create rep=2 ops=1605 p50=36088 p99=96041 cores=0.00 cpu=3
+  ! setup 8 个视图 schema 耗时 8.1 ms（每视图 1.0 ms，不进 op QPS）
+cell arm=p1 op=write rep=2 ops=953 p50=43799 p99=288079 cores=0.00 cpu=3
+  ! setup 8 个视图 schema 耗时 6.5 ms（每视图 0.8 ms，不进 op QPS）
+pg 臂=pf pid=3548501 fsync=on synchronous_commit=on postmaster cpu=0-127 backend 3548503 cpu=0-127
+cell arm=pf op=ping rep=2 ops=523903 p50=118 p99=185 cores=0.00 cpu=0-127
+  ! setup 8 个视图 schema 耗时 8.4 ms（每视图 1.0 ms，不进 op QPS）
+cell arm=pf op=lookup rep=2 ops=205224 p50=312 p99=423 cores=0.00 cpu=0-127
+  ! setup 8 个视图 schema 耗时 7.3 ms（每视图 0.9 ms，不进 op QPS）
+cell arm=pf op=readdir rep=2 ops=144375 p50=436 p99=601 cores=0.00 cpu=0-127
+  ! setup 8 个视图 schema 耗时 10.6 ms（每视图 1.3 ms，不进 op QPS）
+cell arm=pf op=create rep=2 ops=1712 p50=33592 p99=76739 cores=0.01 cpu=0-127
+  ! setup 8 个视图 schema 耗时 8.8 ms（每视图 1.1 ms，不进 op QPS）
+cell arm=pf op=write rep=2 ops=1039 p50=36104 p99=760795 cores=0.01 cpu=0-127
+  ! setup 8 个视图 schema 耗时 6.1 ms（每视图 0.8 ms，不进 op QPS）
+pg 臂=p1 pid=3549699 fsync=on synchronous_commit=on postmaster cpu=3 backend 3549722 cpu=3
+cell arm=p1 op=ping rep=3 ops=16598 p50=3605 p99=8730 cores=0.00 cpu=3
+  ! setup 8 个视图 schema 耗时 8.6 ms（每视图 1.1 ms，不进 op QPS）
+cell arm=p1 op=lookup rep=3 ops=6283 p50=9870 p99=19222 cores=0.00 cpu=3
+  ! setup 8 个视图 schema 耗时 6.5 ms（每视图 0.8 ms，不进 op QPS）
+cell arm=p1 op=readdir rep=3 ops=4472 p50=13975 p99=27136 cores=0.00 cpu=3
+  ! setup 8 个视图 schema 耗时 4.3 ms（每视图 0.5 ms，不进 op QPS）
+cell arm=p1 op=create rep=3 ops=1330 p50=38237 p99=127162 cores=0.00 cpu=3
+  ! setup 8 个视图 schema 耗时 4.9 ms（每视图 0.6 ms，不进 op QPS）
+cell arm=p1 op=write rep=3 ops=903 p50=44801 p99=339706 cores=0.00 cpu=3
+  ! setup 8 个视图 schema 耗时 6.1 ms（每视图 0.8 ms，不进 op QPS）
+pg 臂=pf pid=3551021 fsync=on synchronous_commit=on postmaster cpu=0-127 backend 3551034 cpu=0-127
+cell arm=pf op=ping rep=3 ops=522664 p50=118 p99=188 cores=0.00 cpu=0-127
+  ! setup 8 个视图 schema 耗时 9.6 ms（每视图 1.2 ms，不进 op QPS）
+cell arm=pf op=lookup rep=3 ops=207530 p50=310 p99=411 cores=0.00 cpu=0-127
+  ! setup 8 个视图 schema 耗时 8.7 ms（每视图 1.1 ms，不进 op QPS）
+cell arm=pf op=readdir rep=3 ops=136202 p50=467 p99=661 cores=0.00 cpu=0-127
+  ! setup 8 个视图 schema 耗时 9.8 ms（每视图 1.2 ms，不进 op QPS）
+cell arm=pf op=create rep=3 ops=1766 p50=33566 p99=87419 cores=0.01 cpu=0-127
+  ! setup 8 个视图 schema 耗时 9.4 ms（每视图 1.2 ms，不进 op QPS）
+cell arm=pf op=write rep=3 ops=1006 p50=34058 p99=964268 cores=0.00 cpu=0-127
+  ! setup 8 个视图 schema 耗时 6.2 ms（每视图 0.8 ms，不进 op QPS）
+=== 汇总（REPS 次中位；cores = 测量窗口内服务端平均核数）===
+=== 单核口径逐 op A/B 2026-11-19 09:27:16 UTC CPU钉=3 SECS=2 REPS=1 ops=ping ===
+机器：Intel(R)Xeon(R)Gold6338CPU@2.00GHz nproc=128 load=27.32 19.59 13.31
+盘：/data 2% 挂载 xfs
+pg 臂=p1 pid=3553235 fsync=on synchronous_commit=on postmaster cpu=3 backend 3553240 cpu=3
+cell arm=p1 op=ping rep=1 ops=16398 p50=3620 p99=10148 cores=0.00 cpu=3
+  ! setup 8 个视图 schema 耗时 8.0 ms（每视图 1.0 ms，不进 op QPS）
+pg 臂=pf pid=3553647 fsync=on synchronous_commit=on postmaster cpu=0-127 backend 3553666 cpu=0-127
+cell arm=pf op=ping rep=1 ops=533065 p50=116 p99=180 cores=0.00 cpu=0-127
+  ! setup 8 个视图 schema 耗时 8.9 ms（每视图 1.1 ms，不进 op QPS）
+=== 汇总（REPS 次中位；cores = 测量窗口内服务端平均核数）===
+=== 单核口径逐 op A/B 2026-11-19 09:31:45 UTC CPU钉=3 SECS=3 REPS=3 ops=ping lookup readdir create write run=r3598726 ===
+机器：Intel(R)Xeon(R)Gold6338CPU@2.00GHz nproc=128 load=17.20 16.38 13.41
+盘：/data 2% 挂载 xfs
+pg 臂=p1 pid=3599180 fsync=on synchronous_commit=on postmaster cpu=3 backend 3599182 cpu=3
+cell arm=p1 op=ping rep=1 ops=17229 p50=3584 p99=8012 cores=0.00 cpu=3 load=21.06
+  ! setup 8 个视图 schema 耗时 5.7 ms（每视图 0.7 ms，不进 op QPS）
+cell arm=p1 op=lookup rep=1 ops=6348 p50=9775 p99=20777 cores=0.00 cpu=3 load=21.06
+  ! setup 8 个视图 schema 耗时 5.7 ms（每视图 0.7 ms，不进 op QPS）
+cell arm=p1 op=readdir rep=1 ops=4677 p50=13867 p99=25905 cores=0.00 cpu=3 load=20.26
+  ! setup 8 个视图 schema 耗时 6.3 ms（每视图 0.8 ms，不进 op QPS）
+cell arm=p1 op=create rep=1 ops=1625 p50=36530 p99=83512 cores=0.00 cpu=3 load=23.44
+  ! setup 8 个视图 schema 耗时 7.8 ms（每视图 1.0 ms，不进 op QPS）
+cell arm=p1 op=write rep=1 ops=951 p50=44393 p99=346555 cores=0.01 cpu=3 load=25.33
+  ! setup 8 个视图 schema 耗时 5.1 ms（每视图 0.6 ms，不进 op QPS）
+pg 臂=pf pid=3600441 fsync=on synchronous_commit=on postmaster cpu=0-127 backend 3600444 cpu=0-127
+cell arm=pf op=ping rep=1 ops=520217 p50=118 p99=192 cores=0.00 cpu=0-127 load=30.51
+  ! setup 8 个视图 schema 耗时 9.2 ms（每视图 1.1 ms，不进 op QPS）
+cell arm=pf op=lookup rep=1 ops=205694 p50=313 p99=417 cores=0.00 cpu=0-127 load=30.51
+  ! setup 8 个视图 schema 耗时 7.7 ms（每视图 1.0 ms，不进 op QPS）
+cell arm=pf op=readdir rep=1 ops=142425 p50=442 p99=609 cores=0.00 cpu=0-127 load=34.87
+  ! setup 8 个视图 schema 耗时 8.7 ms（每视图 1.1 ms，不进 op QPS）
+cell arm=pf op=create rep=1 ops=1566 p50=33656 p99=104087 cores=0.01 cpu=0-127 load=32.88
+  ! setup 8 个视图 schema 耗时 8.8 ms（每视图 1.1 ms，不进 op QPS）
+cell arm=pf op=write rep=1 ops=1257 p50=33664 p99=528200 cores=0.01 cpu=0-127 load=32.88
+  ! setup 8 个视图 schema 耗时 10.4 ms（每视图 1.3 ms，不进 op QPS）
+pg 臂=p1 pid=3601542 fsync=on synchronous_commit=on postmaster cpu=3 backend 3601544 cpu=3
+cell arm=p1 op=ping rep=2 ops=16758 p50=3577 p99=7831 cores=0.00 cpu=3 load=31.05
+  ! setup 8 个视图 schema 耗时 7.1 ms（每视图 0.9 ms，不进 op QPS）
+cell arm=p1 op=lookup rep=2 ops=6421 p50=9721 p99=21262 cores=0.00 cpu=3 load=34.49
+  ! setup 8 个视图 schema 耗时 6.8 ms（每视图 0.8 ms，不进 op QPS）
+cell arm=p1 op=readdir rep=2 ops=4520 p50=13835 p99=26185 cores=0.00 cpu=3 load=37.65
+  ! setup 8 个视图 schema 耗时 6.9 ms（每视图 0.9 ms，不进 op QPS）
+cell arm=p1 op=create rep=2 ops=1428 p50=35409 p99=101895 cores=0.00 cpu=3 load=37.65
+  ! setup 8 个视图 schema 耗时 8.3 ms（每视图 1.0 ms，不进 op QPS）
+cell arm=p1 op=write rep=2 ops=740 p50=57869 p99=434932 cores=0.01 cpu=3 load=37.20
+  ! setup 8 个视图 schema 耗时 6.1 ms（每视图 0.8 ms，不进 op QPS）
+pg 臂=pf pid=3603082 fsync=on synchronous_commit=on postmaster cpu=0-127 backend 3603125 cpu=0-127
+cell arm=pf op=ping rep=2 ops=510809 p50=120 p99=200 cores=0.00 cpu=0-127 load=41.51
+  ! setup 8 个视图 schema 耗时 9.0 ms（每视图 1.1 ms，不进 op QPS）
+cell arm=pf op=lookup rep=2 ops=202749 p50=317 p99=433 cores=0.00 cpu=0-127 load=44.75
+  ! setup 8 个视图 schema 耗时 10.1 ms（每视图 1.3 ms，不进 op QPS）
+cell arm=pf op=readdir rep=2 ops=140102 p50=450 p99=620 cores=0.00 cpu=0-127 load=44.75
+  ! setup 8 个视图 schema 耗时 8.5 ms（每视图 1.1 ms，不进 op QPS）
+cell arm=pf op=create rep=2 ops=1855 p50=33581 p99=75356 cores=0.01 cpu=0-127 load=41.97
+  ! setup 8 个视图 schema 耗时 6.1 ms（每视图 0.8 ms，不进 op QPS）
+cell arm=pf op=write rep=2 ops=1093 p50=41574 p99=656565 cores=0.01 cpu=0-127 load=39.41
+  ! setup 8 个视图 schema 耗时 9.3 ms（每视图 1.2 ms，不进 op QPS）
+pg 臂=p1 pid=3604452 fsync=on synchronous_commit=on postmaster cpu=3 backend 3604466 cpu=3
+cell arm=p1 op=ping rep=3 ops=16250 p50=3745 p99=8845 cores=0.00 cpu=3 load=42.58
+  ! setup 8 个视图 schema 耗时 8.3 ms（每视图 1.0 ms，不进 op QPS）
+cell arm=p1 op=lookup rep=3 ops=6819 p50=9764 p99=17336 cores=0.00 cpu=3 load=41.89
+  ! setup 8 个视图 schema 耗时 5.8 ms（每视图 0.7 ms，不进 op QPS）
+cell arm=p1 op=readdir rep=3 ops=4722 p50=13910 p99=23561 cores=0.00 cpu=3 load=41.89
+  ! setup 8 个视图 schema 耗时 6.8 ms（每视图 0.8 ms，不进 op QPS）
+cell arm=p1 op=create rep=3 ops=1638 p50=34945 p99=74786 cores=0.00 cpu=3 load=40.06
+  ! setup 8 个视图 schema 耗时 8.1 ms（每视图 1.0 ms，不进 op QPS）
+cell arm=p1 op=write rep=3 ops=922 p50=45812 p99=367338 cores=0.00 cpu=3 load=43.02
+  ! setup 8 个视图 schema 耗时 7.5 ms（每视图 0.9 ms，不进 op QPS）
+pg 臂=pf pid=3605904 fsync=on synchronous_commit=on postmaster cpu=0-127 backend 3605906 cpu=0-127
+cell arm=pf op=ping rep=3 ops=506055 p50=120 p99=207 cores=0.00 cpu=0-127 load=46.94
+  ! setup 8 个视图 schema 耗时 8.6 ms（每视图 1.1 ms，不进 op QPS）
+cell arm=pf op=lookup rep=3 ops=199904 p50=320 p99=447 cores=0.00 cpu=0-127 load=46.94
+  ! setup 8 个视图 schema 耗时 6.9 ms（每视图 0.9 ms，不进 op QPS）
+cell arm=pf op=readdir rep=3 ops=139541 p50=452 p99=625 cores=0.00 cpu= load=49.91
+  ! setup 8 个视图 schema 耗时 6.6 ms（每视图 0.8 ms，不进 op QPS）
+cell arm=pf op=create rep=3 ops= p50= p99= cores= cpu= load=49.91
+  ! connect postgresql://postgres@127.0.0.1:54390/postgres: error connecting to server
+  ! note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+cell arm=pf op=write rep=3 ops= p50= p99= cores= cpu= load=49.91
+  ! connect postgresql://postgres@127.0.0.1:54390/postgres: error connecting to server
+  ! note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+=== 汇总（REPS 次中位；cores = 测量窗口内服务端平均核数）===
+=== 单核口径逐 op A/B 2026-11-19 09:37:28 UTC CPU钉=1 SECS=2 REPS=1 ops=ping lookup readdir create write run=smoke1 ===
+机器：Intel(R)Xeon(R)Gold6338CPU@2.00GHz nproc=128 load=12.94 20.19 16.92
+盘：/data 2% 挂载 xfs
+cell arm=t1 op=ping w=1 rep=1 ops=129174 p50=475 p99=635 cores=1.00 cpu=1 load=12.94
+cell arm=t1 op=lookup w=1 rep=1 ops=103051 p50=597 p99=776 cores=1.00 cpu=1 load=12.63
+cell arm=t1 op=readdir w=1 rep=1 ops=49304 p50=1207 p99=2692 cores=1.00 cpu=1 load=12.26
+cell arm=t1 op=create w=1 rep=1 ops=55067 p50=1076 p99=5132 cores=0.74 cpu=1 load=12.26
+cell arm=t1 op=write w=1 rep=1 ops=68835 p50=909 p99=1136 cores=0.78 cpu=1 load=12.08
+cell arm=t8 op=ping w=8 rep=1 ops=989110 p50=57 p99=163 cores=8.00 cpu=0-127 load=12.08
+cell arm=t8 op=lookup w=8 rep=1 ops=1012724 p50=54 p99=195 cores=7.81 cpu=0-127 load=13.03
+cell arm=t8 op=readdir w=8 rep=1 ops=717043 p50=74 p99=269 cores=7.80 cpu=0-127 load=13.99
+cell arm=t8 op=create w=8 rep=1 ops=92781 p50=622 p99=1325 cores=8.58 cpu=0-127 load=13.99
+cell arm=t8 op=write w=8 rep=1 ops=98386 p50=548 p99=1599 cores=8.53 cpu=0-127 load=14.55
+pg 臂=p1 pid=3640127 fsync=on synchronous_commit=on postmaster cpu=1 backend 3640132 cpu=1
+cell arm=p1 op=ping rep=1 ops=17071 p50=3611 p99=9819 cores=0.00 cpu=1 load=18.99
+  ! setup 8 个视图 schema 耗时 7.2 ms（每视图 0.9 ms，不进 op QPS）
+cell arm=p1 op=lookup rep=1 ops=6617 p50=9972 p99=25157 cores=0.00 cpu=1 load=18.99
+  ! setup 8 个视图 schema 耗时 8.5 ms（每视图 1.1 ms，不进 op QPS）
+cell arm=p1 op=readdir rep=1 ops=4462 p50=13914 p99=37207 cores=0.00 cpu=1 load=23.56
+  ! setup 8 个视图 schema 耗时 9.4 ms（每视图 1.2 ms，不进 op QPS）
+cell arm=p1 op=create rep=1 ops=1536 p50=37842 p99=89705 cores=0.00 cpu=1 load=23.56
+  ! setup 8 个视图 schema 耗时 8.4 ms（每视图 1.1 ms，不进 op QPS）
+cell arm=p1 op=write rep=1 ops=710 p50=50137 p99=509434 cores=0.00 cpu=1 load=27.12
+  ! setup 8 个视图 schema 耗时 5.2 ms（每视图 0.7 ms，不进 op QPS）
+pg 臂=pf pid=3641335 fsync=on synchronous_commit=on postmaster cpu=0-127 backend 3641340 cpu=0-127
+cell arm=pf op=ping rep=1 ops=521422 p50=118 p99=193 cores=0.00 cpu=0-127 load=31.03
+  ! setup 8 个视图 schema 耗时 8.7 ms（每视图 1.1 ms，不进 op QPS）
+cell arm=pf op=lookup rep=1 ops=209147 p50=306 p99=403 cores=0.00 cpu=0-127 load=31.03
+  ! setup 8 个视图 schema 耗时 11.0 ms（每视图 1.4 ms，不进 op QPS）
+cell arm=pf op=readdir rep=1 ops=144172 p50=435 p99=637 cores=0.00 cpu=0-127 load=30.15
+  ! setup 8 个视图 schema 耗时 8.9 ms（每视图 1.1 ms，不进 op QPS）
+cell arm=pf op=create rep=1 ops=1716 p50=33597 p99=98927 cores=0.01 cpu=0-127 load=30.15
+  ! setup 8 个视图 schema 耗时 8.5 ms（每视图 1.1 ms，不进 op QPS）
+cell arm=pf op=write rep=1 ops=1039 p50=34141 p99=886788 cores=0.00 cpu=0-127 load=30.15
+  ! setup 8 个视图 schema 耗时 11.0 ms（每视图 1.4 ms，不进 op QPS）
+=== 汇总（REPS 次中位；cores = 测量窗口内服务端平均核数）===
+=== 单核口径逐 op A/B 2026-11-19 09:46:36 UTC CPU钉=1 SECS=3 REPS=3 ops=ping lookup readdir create write run=base1 ===
+机器：Intel(R)Xeon(R)Gold6338CPU@2.00GHz nproc=128 load=11.28 14.58 15.80
+盘：/data 2% 挂载 xfs
+cell arm=t1 op=ping w=1 rep=1 ops=135365 p50=451 p99=632 cores=1.00 cpu=1 load=11.50
+cell arm=t1 op=lookup w=1 rep=1 ops=104537 p50=586 p99=905 cores=1.00 cpu=1 load=11.86
+cell arm=t1 op=readdir w=1 rep=1 ops=49943 p50=1219 p99=2548 cores=1.00 cpu=1 load=12.43
+cell arm=t1 op=create w=1 rep=1 ops=60504 p50=1021 p99=1444 cores=0.79 cpu=1 load=12.43
+cell arm=t1 op=write w=1 rep=1 ops=60228 p50=974 p99=1128 cores=0.72 cpu=1 load=12.32
+cell arm=t8 op=ping w=8 rep=1 ops=993522 p50=56 p99=189 cores=7.89 cpu=0-127 load=13.01
+cell arm=t8 op=lookup w=8 rep=1 ops=1000742 p50=56 p99=170 cores=8.00 cpu=0-127 load=14.77
+cell arm=t8 op=readdir w=8 rep=1 ops=687164 p50=76 p99=263 cores=7.62 cpu=0-127 load=16.23
+cell arm=t8 op=create w=8 rep=1 ops=89739 p50=673 p99=1389 cores=8.63 cpu=0-127 load=16.54
+cell arm=t8 op=write w=8 rep=1 ops=105340 p50=555 p99=1083 cores=8.55 cpu=0-127 load=16.54
+cell arm=t1 op=ping w=1 rep=2 ops=132673 p50=459 p99=705 cores=1.00 cpu=1 load=16.33
+cell arm=t1 op=lookup w=1 rep=2 ops=105911 p50=577 p99=791 cores=1.00 cpu=1 load=16.63
+cell arm=t1 op=readdir w=1 rep=2 ops=48443 p50=1257 p99=2607 cores=1.00 cpu=1 load=16.10
+cell arm=t1 op=create w=1 rep=2 ops=61399 p50=1025 p99=1210 cores=0.79 cpu=1 load=15.61
+cell arm=t1 op=write w=1 rep=2 ops=68430 p50=879 p99=1214 cores=0.76 cpu=1 load=15.61
+cell arm=t8 op=ping w=8 rep=2 ops=977533 p50=61 p99=168 cores=7.88 cpu=0-127 load=16.52
+cell arm=t8 op=lookup w=8 rep=2 ops=983797 p50=54 p99=205 cores=7.92 cpu=0-127 load=17.28
+cell arm=t8 op=readdir w=8 rep=2 ops=690070 p50=80 p99=209 cores=7.89 cpu=0-127 load=17.74
+cell arm=t8 op=create w=8 rep=2 ops=92802 p50=634 p99=1346 cores=8.63 cpu=0-127 load=17.04
+cell arm=t8 op=write w=8 rep=2 ops=101687 p50=566 p99=1157 cores=8.53 cpu=0-127 load=17.35
+cell arm=t1 op=ping w=1 rep=3 ops=131554 p50=467 p99=636 cores=1.00 cpu=1 load=16.69
+cell arm=t1 op=lookup w=1 rep=3 ops=105372 p50=588 p99=765 cores=1.00 cpu=1 load=16.69
+cell arm=t1 op=readdir w=1 rep=3 ops=50003 p50=1215 p99=2514 cores=1.00 cpu=1 load=16.15
+cell arm=t1 op=create w=1 rep=3 ops=62549 p50=1003 p99=1174 cores=0.79 cpu=1 load=15.90
+cell arm=t1 op=write w=1 rep=3 ops=69276 p50=895 p99=1099 cores=0.78 cpu=1 load=15.42
+cell arm=t8 op=ping w=8 rep=3 ops=976797 p50=56 p99=152 cores=7.92 cpu=0-127 load=15.42
+cell arm=t8 op=lookup w=8 rep=3 ops=946224 p50=53 p99=201 cores=7.77 cpu=0-127 load=15.63
+cell arm=t8 op=readdir w=8 rep=3 ops=723553 p50=75 p99=182 cores=7.80 cpu=0-127 load=15.92
+cell arm=t8 op=create w=8 rep=3 ops=91625 p50=637 p99=1339 cores=8.60 cpu=0-127 load=15.92
+cell arm=t8 op=write w=8 rep=3 ops=95919 p50=630 p99=1235 cores=8.47 cpu=0-127 load=15.77
+pg 臂=p1 pid=3685638 fsync=on synchronous_commit=on postmaster cpu=1 backends=6
+cell arm=p1 op=ping rep=1 ops=16502 p50=3656 p99=8511 cores=0.19 cpu=1 load=15.47
+  ! setup 8 个视图 schema 耗时 6.7 ms（每视图 0.8 ms，不进 op QPS）
+cell arm=p1 op=lookup rep=1 ops=6228 p50=9926 p99=19659 cores=0.04 cpu=1 load=20.87
+  ! setup 8 个视图 schema 耗时 8.2 ms（每视图 1.0 ms，不进 op QPS）
+cell arm=p1 op=readdir rep=1 ops=4718 p50=13751 p99=24287 cores=0.04 cpu=1 load=25.37
+  ! setup 8 个视图 schema 耗时 8.2 ms（每视图 1.0 ms，不进 op QPS）
+cell arm=p1 op=create rep=1 ops=1558 p50=37997 p99=96339 cores=0.11 cpu=1 load=25.37
+  ! setup 8 个视图 schema 耗时 7.2 ms（每视图 0.9 ms，不进 op QPS）
+cell arm=p1 op=write rep=1 ops=816 p50=49755 p99=311598 cores=0.07 cpu=1 load=24.38
+  ! setup 8 个视图 schema 耗时 6.3 ms（每视图 0.8 ms，不进 op QPS）
+pg 臂=pf pid=3688047 fsync=on synchronous_commit=on postmaster cpu=0-127 backends=6
+cell arm=pf op=ping rep=1 ops=514077 p50=119 p99=197 cores=45.52 cpu=0-127 load=24.67
+  ! setup 8 个视图 schema 耗时 9.2 ms（每视图 1.2 ms，不进 op QPS）
+cell arm=pf op=lookup rep=1 ops=208621 p50=308 p99=408 cores=1.61 cpu=0-127 load=29.26
+  ! setup 8 个视图 schema 耗时 8.8 ms（每视图 1.1 ms，不进 op QPS）
+cell arm=pf op=readdir rep=1 ops=144122 p50=437 p99=600 cores=NA cpu=0-127 load=29.26
+  ! setup 8 个视图 schema 耗时 6.5 ms（每视图 0.8 ms，不进 op QPS）
+cell arm=pf op=create rep=1 ops=1736 p50=33629 p99=66641 cores=1.14 cpu=0-127 load=27.88
+  ! setup 8 个视图 schema 耗时 8.7 ms（每视图 1.1 ms，不进 op QPS）
+cell arm=pf op=write rep=1 ops=1185 p50=34019 p99=681071 cores=1.31 cpu=0-127 load=31.73
+  ! setup 8 个视图 schema 耗时 8.4 ms（每视图 1.1 ms，不进 op QPS）
+pg 臂=p1 pid=3696030 fsync=on synchronous_commit=on postmaster cpu=1 backends=6
+cell arm=p1 op=ping rep=2 ops=17336 p50=3595 p99=8780 cores=0.11 cpu=1 load=36.80
+  ! setup 8 个视图 schema 耗时 7.3 ms（每视图 0.9 ms，不进 op QPS）
+cell arm=p1 op=lookup rep=2 ops=6330 p50=9900 p99=19301 cores=0.08 cpu=1 load=39.78
+  ! setup 8 个视图 schema 耗时 4.3 ms（每视图 0.5 ms，不进 op QPS）
+cell arm=p1 op=readdir rep=2 ops=4526 p50=13955 p99=26649 cores=0.15 cpu=1 load=39.78
+  ! setup 8 个视图 schema 耗时 7.8 ms（每视图 1.0 ms，不进 op QPS）
+cell arm=p1 op=create rep=2 ops=1634 p50=34050 p99=89282 cores=0.10 cpu=1 load=43.00
+  ! setup 8 个视图 schema 耗时 6.0 ms（每视图 0.8 ms，不进 op QPS）
+cell arm=p1 op=write rep=2 ops=904 p50=48289 p99=344694 cores=0.14 cpu=1 load=40.20
+  ! setup 8 个视图 schema 耗时 8.3 ms（每视图 1.0 ms，不进 op QPS）
+pg 臂=pf pid=3704437 fsync=on synchronous_commit=on postmaster cpu=0-127 backends=6
+cell arm=pf op=ping rep=2 ops=508903 p50=119 p99=206 cores=NA cpu=0-127 load=44.02
+  ! setup 8 个视图 schema 耗时 10.5 ms（每视图 1.3 ms，不进 op QPS）
+cell arm=pf op=lookup rep=2 ops=197397 p50=321 p99=483 cores=0.11 cpu=0-127 load=47.47
+  ! setup 8 个视图 schema 耗时 10.4 ms（每视图 1.3 ms，不进 op QPS）
+cell arm=pf op=readdir rep=2 ops=142458 p50=442 p99=611 cores=51.63 cpu=0-127 load=47.47
+  ! setup 8 个视图 schema 耗时 6.7 ms（每视图 0.8 ms，不进 op QPS）
+cell arm=pf op=create rep=2 ops=1683 p50=33594 p99=88792 cores=1.13 cpu=0-127 load=44.87
+  ! setup 8 个视图 schema 耗时 8.4 ms（每视图 1.1 ms，不进 op QPS）
+cell arm=pf op=write rep=2 ops=1192 p50=34507 p99=507361 cores=1.28 cpu=0-127 load=42.23
+  ! setup 8 个视图 schema 耗时 5.9 ms（每视图 0.7 ms，不进 op QPS）
+pg 臂=p1 pid=3711535 fsync=on synchronous_commit=on postmaster cpu=1 backends=6
+cell arm=p1 op=ping rep=3 ops=16161 p50=3684 p99=9186 cores=0.03 cpu=1 load=44.94
+  ! setup 8 个视图 schema 耗时 6.3 ms（每视图 0.8 ms，不进 op QPS）
+cell arm=p1 op=lookup rep=3 ops=6471 p50=9846 p99=18029 cores=0.06 cpu=1 load=44.94
+  ! setup 8 个视图 schema 耗时 6.7 ms（每视图 0.8 ms，不进 op QPS）
+cell arm=p1 op=readdir rep=3 ops=4431 p50=14062 p99=27148 cores=0.03 cpu=1 load=42.46
+  ! setup 8 个视图 schema 耗时 8.6 ms（每视图 1.1 ms，不进 op QPS）
+cell arm=p1 op=create rep=3 ops=1621 p50=34604 p99=89396 cores=0.07 cpu=1 load=39.86
+  ! setup 8 个视图 schema 耗时 4.1 ms（每视图 0.5 ms，不进 op QPS）
+cell arm=p1 op=write rep=3 ops=904 p50=47010 p99=307163 cores=0.09 cpu=1 load=39.71
+  ! setup 8 个视图 schema 耗时 6.1 ms（每视图 0.8 ms，不进 op QPS）
+pg 臂=pf pid=3719118 fsync=on synchronous_commit=on postmaster cpu=0-127 backends=6
+cell arm=pf op=ping rep=3 ops=514456 p50=119 p99=200 cores=8.18 cpu=0-127 load=42.94
+  ! setup 8 个视图 schema 耗时 5.8 ms（每视图 0.7 ms，不进 op QPS）
+cell arm=pf op=lookup rep=3 ops=204254 p50=315 p99=428 cores=49.44 cpu=0-127 load=42.94
+  ! setup 8 个视图 schema 耗时 8.6 ms（每视图 1.1 ms，不进 op QPS）
+cell arm=pf op=readdir rep=3 ops=144524 p50=434 p99=601 cores=9.13 cpu=0-127 load=45.67
+  ! setup 8 个视图 schema 耗时 10.8 ms（每视图 1.3 ms，不进 op QPS）
+cell arm=pf op=create rep=3 ops=1783 p50=33574 p99=68225 cores=1.18 cpu=0-127 load=42.73
+  ! setup 8 个视图 schema 耗时 10.4 ms（每视图 1.3 ms，不进 op QPS）
+cell arm=pf op=write rep=3 ops=824 p50=44847 p99=1025478 cores=0.85 cpu=0-127 load=42.73
+  ! setup 8 个视图 schema 耗时 9.2 ms（每视图 1.1 ms，不进 op QPS）
+=== 汇总（REPS 次中位；cores = 测量窗口内服务端平均核数）===
+=== 单核口径逐 op A/B 2026-11-19 10:05:28 UTC CPU钉=1 SECS=3 REPS=3 ops=ping lookup readdir create write run=opt1 ===
+机器：Intel(R)Xeon(R)Gold6338CPU@2.00GHz nproc=128 load=7.17 8.47 12.56
+盘：/data 2% 挂载 xfs
+cell arm=t1 op=ping w=1 rep=1 ops=150319 p50=401 p99=643 cores=1.00 cpu=1 load=7.17
+cell arm=t1 op=lookup w=1 rep=1 ops=116115 p50=534 p99=729 cores=1.00 cpu=1 load=7.15
+cell arm=t1 op=readdir w=1 rep=1 ops=52685 p50=1150 p99=2379 cores=1.00 cpu=1 load=7.54
+cell arm=t1 op=create w=1 rep=1 ops=64611 p50=973 p99=1146 cores=0.78 cpu=1 load=7.42
+cell arm=t1 op=write w=1 rep=1 ops=70044 p50=892 p99=1203 cores=0.76 cpu=1 load=7.42
+cell arm=t8 op=ping w=8 rep=1 ops=1123469 p50=53 p99=135 cores=7.89 cpu=0-127 load=8.99
+cell arm=t8 op=lookup w=8 rep=1 ops=1074133 p50=51 p99=173 cores=7.99 cpu=0-127 load=10.19
+cell arm=t8 op=readdir w=8 rep=1 ops=697922 p50=78 p99=227 cores=7.56 cpu=0-127 load=10.41
+cell arm=t8 op=create w=8 rep=1 ops=97821 p50=569 p99=1248 cores=8.62 cpu=0-127 load=10.86
+cell arm=t8 op=write w=8 rep=1 ops=104817 p50=546 p99=1080 cores=8.55 cpu=0-127 load=11.51
+cell arm=t1 op=ping w=1 rep=2 ops=151881 p50=403 p99=555 cores=1.00 cpu=1 load=11.51
+cell arm=t1 op=lookup w=1 rep=2 ops=119174 p50=516 p99=724 cores=1.00 cpu=1 load=11.55
+cell arm=t1 op=readdir w=1 rep=2 ops=53342 p50=1133 p99=2377 cores=1.00 cpu=1 load=11.19
+cell arm=t1 op=create w=1 rep=2 ops=64714 p50=950 p99=1423 cores=0.78 cpu=1 load=10.77
+cell arm=t1 op=write w=1 rep=2 ops=70880 p50=888 p99=1100 cores=0.76 cpu=1 load=10.77
+cell arm=t8 op=ping w=8 rep=2 ops=1064568 p50=54 p99=128 cores=7.91 cpu=0-127 load=12.23
+cell arm=t8 op=lookup w=8 rep=2 ops=1073201 p50=54 p99=144 cores=7.95 cpu=0-127 load=13.41
+cell arm=t8 op=readdir w=8 rep=2 ops=771037 p50=66 p99=196 cores=7.85 cpu=0-127 load=13.62
+cell arm=t8 op=create w=8 rep=2 ops=77229 p50=758 p99=1865 cores=8.55 cpu=0-127 load=13.97
+cell arm=t8 op=write w=8 rep=2 ops=99364 p50=596 p99=1251 cores=8.51 cpu=0-127 load=14.46
+cell arm=t1 op=ping w=1 rep=3 ops=155191 p50=397 p99=568 cores=1.00 cpu=1 load=14.46
+cell arm=t1 op=lookup w=1 rep=3 ops=116258 p50=525 p99=717 cores=1.00 cpu=1 load=14.18
+cell arm=t1 op=readdir w=1 rep=3 ops=52875 p50=1140 p99=2378 cores=1.00 cpu=1 load=13.60
+cell arm=t1 op=create w=1 rep=3 ops=66757 p50=941 p99=1112 cores=0.78 cpu=1 load=13.15
+cell arm=t1 op=write w=1 rep=3 ops=72094 p50=861 p99=1069 cores=0.77 cpu=1 load=13.15
+cell arm=t8 op=ping w=8 rep=3 ops=1115496 p50=53 p99=142 cores=7.88 cpu=0-127 load=14.82
+cell arm=t8 op=lookup w=8 rep=3 ops=1039225 p50=56 p99=161 cores=7.87 cpu=0-127 load=15.48
+cell arm=t8 op=readdir w=8 rep=3 ops=668913 p50=69 p99=319 cores=7.98 cpu=0-127 load=16.08
+cell arm=t8 op=create w=8 rep=3 ops=98032 p50=596 p99=1233 cores=8.64 cpu=0-127 load=16.32
+cell arm=t8 op=write w=8 rep=3 ops=104032 p50=539 p99=1078 cores=8.57 cpu=0-127 load=17.01
+=== 汇总（REPS 次中位；cores = 测量窗口内服务端平均核数）===
+
+## 本次运行汇总（opt1）
+op           t1 ops/s    t1核    p1 ops/s    p1核    pf ops/s    pf核    t8 ops/s    t8核
+-------------------------------------------------------------------------------------
+ping           151881   1.00           -      -           -      -     1115496   7.89
+         t1 [150319~155191] p50=401us p99=568us 每核=151881 ops/core
+lookup         116258   1.00           -      -           -      -     1073201   7.95
+         t1 [116115~119174] p50=525us p99=724us 每核=116258 ops/core
+readdir         52875   1.00           -      -           -      -      697922   7.85
+         t1 [52685~53342] p50=1140us p99=2378us 每核=52875 ops/core
+create          64714   0.78           -      -           -      -       97821   8.62
+         t1 [64611~66757] p50=950us p99=1146us 每核=82967 ops/core
+write           70880   0.76           -      -           -      -      104032   8.55
+         t1 [70044~72094] p50=888us p99=1100us 每核=93263 ops/core
+=== 单核口径逐 op A/B 2026-11-19 10:16:39 UTC CPU钉=2 SECS=3 REPS=3 ops=ping lookup readdir create write run=opt2 ===
+机器：Intel(R)Xeon(R)Gold6338CPU@2.00GHz nproc=128 load=8.71 9.57 11.40
+盘：/data 2% 挂载 xfs
+cell arm=t1 op=ping w=1 rep=1 ops=152267 p50=402 p99=566 cores=1.00 cpu=2 load=8.71
+cell arm=t1 op=lookup w=1 rep=1 ops=122553 p50=500 p99=694 cores=1.00 cpu=2 load=8.66
+cell arm=t1 op=readdir w=1 rep=1 ops=57751 p50=1041 p99=2160 cores=1.00 cpu=2 load=8.52
+cell arm=t1 op=create w=1 rep=1 ops=64361 p50=933 p99=1637 cores=0.77 cpu=2 load=8.80
+cell arm=t1 op=write w=1 rep=1 ops=67887 p50=915 p99=1386 cores=0.75 cpu=2 load=8.98
+cell arm=t8 op=ping w=8 rep=1 ops=1132323 p50=53 p99=133 cores=7.88 cpu=0-127 load=8.98
+cell arm=t8 op=lookup w=8 rep=1 ops=1094813 p50=49 p99=189 cores=7.97 cpu=0-127 load=10.18
+cell arm=t8 op=readdir w=8 rep=1 ops=745844 p50=77 p99=204 cores=7.78 cpu=0-127 load=10.81
+cell arm=t8 op=create w=8 rep=1 ops=97751 p50=621 p99=1241 cores=8.60 cpu=0-127 load=10.42
+cell arm=t8 op=write w=8 rep=1 ops=101382 p50=574 p99=1204 cores=8.53 cpu=0-127 load=10.79
+cell arm=t1 op=ping w=1 rep=2 ops=155090 p50=395 p99=561 cores=1.00 cpu=2 load=10.41
+cell arm=t1 op=lookup w=1 rep=2 ops=120590 p50=515 p99=688 cores=1.00 cpu=2 load=10.41
+cell arm=t1 op=readdir w=1 rep=2 ops=57105 p50=1055 p99=2192 cores=1.00 cpu=2 load=10.37
+cell arm=t1 op=create w=1 rep=2 ops=64494 p50=967 p99=1369 cores=0.78 cpu=2 load=10.26
+cell arm=t1 op=write w=1 rep=2 ops=71696 p50=864 p99=1024 cores=0.77 cpu=2 load=10.00
+cell arm=t8 op=ping w=8 rep=2 ops=1094390 p50=49 p99=129 cores=7.98 cpu=0-127 load=10.00
+cell arm=t8 op=lookup w=8 rep=2 ops=1099258 p50=52 p99=154 cores=7.86 cpu=0-127 load=10.80
+cell arm=t8 op=readdir w=8 rep=2 ops=723951 p50=74 p99=221 cores=7.64 cpu=0-127 load=11.46
+cell arm=t8 op=create w=8 rep=2 ops=95930 p50=604 p99=1234 cores=8.62 cpu=0-127 load=11.18
+cell arm=t8 op=write w=8 rep=2 ops=107620 p50=518 p99=1073 cores=8.58 cpu=0-127 load=13.57
+cell arm=t1 op=ping w=1 rep=3 ops=156143 p50=396 p99=544 cores=1.00 cpu=2 load=13.57
+cell arm=t1 op=lookup w=1 rep=3 ops=121079 p50=506 p99=692 cores=1.00 cpu=2 load=12.96
+cell arm=t1 op=readdir w=1 rep=3 ops=58371 p50=1023 p99=2145 cores=1.00 cpu=2 load=12.41
+cell arm=t1 op=create w=1 rep=3 ops=63460 p50=945 p99=1389 cores=0.79 cpu=2 load=12.37
+cell arm=t1 op=write w=1 rep=3 ops=69166 p50=866 p99=1368 cores=0.78 cpu=2 load=11.94
+cell arm=t8 op=ping w=8 rep=3 ops=1153951 p50=44 p99=152 cores=7.90 cpu=0-127 load=11.94
+cell arm=t8 op=lookup w=8 rep=3 ops=1092765 p50=51 p99=146 cores=7.91 cpu=0-127 load=12.99
+cell arm=t8 op=readdir w=8 rep=3 ops=809926 p50=62 p99=245 cores=7.97 cpu=0-127 load=12.21
+cell arm=t8 op=create w=8 rep=3 ops=93910 p50=601 p99=1286 cores=8.60 cpu=0-127 load=12.21
+cell arm=t8 op=write w=8 rep=3 ops=105251 p50=580 p99=1112 cores=8.51 cpu=0-127 load=12.67
+=== 汇总（REPS 次中位；cores = 测量窗口内服务端平均核数）===
+
+## 本次运行汇总（opt2）
+op           t1 ops/s    t1核    p1 ops/s    p1核    pf ops/s    pf核    t8 ops/s    t8核
+-------------------------------------------------------------------------------------
+ping           155090   1.00           -      -           -      -     1132323   7.90
+         t1 [152267~156143] p50=396us p99=561us 每核=155090 ops/core
+lookup         121079   1.00           -      -           -      -     1094813   7.91
+         t1 [120590~122553] p50=506us p99=692us 每核=121079 ops/core
+readdir         57751   1.00           -      -           -      -      745844   7.78
+         t1 [57105~58371] p50=1041us p99=2160us 每核=57751 ops/core
+create          64361   0.78           -      -           -      -       95930   8.60
+         t1 [63460~64494] p50=945us p99=1389us 每核=82514 ops/core
+write           69166   0.77           -      -           -      -      105251   8.53
+         t1 [67887~71696] p50=866us p99=1368us 每核=89826 ops/core
+=== 单核口径逐 op A/B 2026-11-19 10:36:18 UTC CPU钉=2 SECS=3 REPS=3 ops=ping lookup readdir create write run=opt3 ===
+机器：Intel(R)Xeon(R)Gold6338CPU@2.00GHz nproc=128 load=10.91 9.39 9.66
+盘：/data 2% 挂载 xfs
+cell arm=t1 op=ping w=1 rep=1 ops=155376 p50=388 p99=713 cores=1.00 cpu=2 load=10.67
+cell arm=t1 op=lookup w=1 rep=1 ops=120778 p50=509 p99=690 cores=1.00 cpu=2 load=10.46
+cell arm=t1 op=readdir w=1 rep=1 ops=90711 p50=674 p99=1332 cores=1.00 cpu=2 load=10.42
+cell arm=t1 op=create w=1 rep=1 ops=66521 p50=943 p99=1103 cores=0.78 cpu=2 load=10.42
+cell arm=t1 op=write w=1 rep=1 ops=70606 p50=899 p99=1193 cores=0.77 cpu=2 load=10.39
+cell arm=t8 op=ping w=8 rep=1 ops=1135265 p50=52 p99=138 cores=7.90 cpu=0-127 load=12.60
+cell arm=t8 op=lookup w=8 rep=1 ops=1075042 p50=53 p99=169 cores=7.94 cpu=0-127 load=13.51
+cell arm=t8 op=readdir w=8 rep=1 ops=937728 p50=57 p99=220 cores=7.86 cpu=0-127 load=14.27
+cell arm=t8 op=create w=8 rep=1 ops=93494 p50=603 p99=1294 cores=8.49 cpu=0-127 load=14.27
+cell arm=t8 op=write w=8 rep=1 ops=102152 p50=574 p99=1196 cores=8.55 cpu=0-127 load=14.57
+cell arm=t1 op=ping w=1 rep=2 ops=155327 p50=393 p99=569 cores=1.00 cpu=2 load=14.04
+cell arm=t1 op=lookup w=1 rep=2 ops=120432 p50=510 p99=681 cores=1.00 cpu=2 load=14.04
+cell arm=t1 op=readdir w=1 rep=2 ops=88597 p50=694 p99=1378 cores=1.00 cpu=2 load=13.48
+cell arm=t1 op=create w=1 rep=2 ops=66003 p50=952 p99=1101 cores=0.78 cpu=2 load=13.12
+cell arm=t1 op=write w=1 rep=2 ops=71353 p50=881 p99=1095 cores=0.76 cpu=2 load=13.35
+cell arm=t8 op=ping w=8 rep=2 ops=1122371 p50=50 p99=145 cores=7.89 cpu=0-127 load=13.35
+cell arm=t8 op=lookup w=8 rep=2 ops=1078058 p50=52 p99=176 cores=8.00 cpu=0-127 load=13.64
+cell arm=t8 op=readdir w=8 rep=2 ops=887690 p50=59 p99=259 cores=7.98 cpu=0-127 load=13.83
+cell arm=t8 op=create w=8 rep=2 ops=92937 p50=622 p99=1327 cores=8.60 cpu=0-127 load=13.29
+cell arm=t8 op=write w=8 rep=2 ops=102615 p50=555 p99=1158 cores=8.54 cpu=0-127 load=13.34
+cell arm=t1 op=ping w=1 rep=3 ops=152400 p50=404 p99=560 cores=1.00 cpu=2 load=13.34
+cell arm=t1 op=lookup w=1 rep=3 ops=119907 p50=516 p99=709 cores=1.00 cpu=2 load=12.68
+cell arm=t1 op=readdir w=1 rep=3 ops=87386 p50=702 p99=1400 cores=1.00 cpu=2 load=12.30
+cell arm=t1 op=create w=1 rep=3 ops=66844 p50=934 p99=1114 cores=0.78 cpu=2 load=11.96
+cell arm=t1 op=write w=1 rep=3 ops=72887 p50=847 p99=1065 cores=0.77 cpu=2 load=11.56
+cell arm=t8 op=ping w=8 rep=3 ops=1104414 p50=54 p99=136 cores=7.98 cpu=0-127 load=11.56
+cell arm=t8 op=lookup w=8 rep=3 ops=1090894 p50=51 p99=156 cores=8.00 cpu=0-127 load=12.16
+cell arm=t8 op=readdir w=8 rep=3 ops=840074 p50=62 p99=215 cores=7.99 cpu=0-127 load=12.94
+cell arm=t8 op=create w=8 rep=3 ops=96936 p50=594 p99=1271 cores=8.61 cpu=0-127 load=13.03
+cell arm=t8 op=write w=8 rep=3 ops=94723 p50=660 p99=1241 cores=8.41 cpu=0-127 load=13.11
+=== 汇总（REPS 次中位；cores = 测量窗口内服务端平均核数）===
+
+## 本次运行汇总（opt3）
+op           t1 ops/s    t1核    p1 ops/s    p1核    pf ops/s    pf核    t8 ops/s    t8核
+-------------------------------------------------------------------------------------
+ping           155327   1.00           -      -           -      -     1122371   7.90
+         t1 [152400~155376] p50=393us p99=569us 每核=155327 ops/core
+lookup         120432   1.00           -      -           -      -     1078058   8.00
+         t1 [119907~120778] p50=510us p99=690us 每核=120432 ops/core
+readdir         88597   1.00           -      -           -      -      887690   7.98
+         t1 [87386~90711] p50=694us p99=1378us 每核=88597 ops/core
+create          66521   0.78           -      -           -      -       93494   8.60
+         t1 [66003~66844] p50=943us p99=1103us 每核=85283 ops/core
+write           71353   0.77           -      -           -      -      102152   8.54
+         t1 [70606~72887] p50=881us p99=1095us 每核=92666 ops/core
+=== 单核口径逐 op A/B 2026-11-19 10:38:28 UTC CPU钉=1 SECS=3 REPS=3 ops=ping lookup readdir create write run=final ===
+机器：Intel(R)Xeon(R)Gold6338CPU@2.00GHz nproc=128 load=12.01 10.65 10.11
+盘：/data 2% 挂载 xfs
+cell arm=t1 op=ping w=1 rep=1 ops=152077 p50=405 p99=570 cores=1.00 cpu=1 load=11.77
+cell arm=t1 op=lookup w=1 rep=1 ops=118651 p50=519 p99=694 cores=1.00 cpu=1 load=11.63
+cell arm=t1 op=readdir w=1 rep=1 ops=85090 p50=722 p99=1441 cores=1.00 cpu=1 load=11.42
+cell arm=t1 op=create w=1 rep=1 ops=65122 p50=962 p99=1151 cores=0.79 cpu=1 load=11.42
+cell arm=t1 op=write w=1 rep=1 ops=72244 p50=850 p99=1082 cores=0.77 cpu=1 load=11.06
+cell arm=t8 op=ping w=8 rep=1 ops=1124353 p50=51 p99=152 cores=7.88 cpu=0-127 load=12.42
+cell arm=t8 op=lookup w=8 rep=1 ops=1066281 p50=54 p99=146 cores=7.99 cpu=0-127 load=13.59
+cell arm=t8 op=readdir w=8 rep=1 ops=857561 p50=63 p99=216 cores=7.59 cpu=0-127 load=14.82
+cell arm=t8 op=create w=8 rep=1 ops=92902 p50=659 p99=1254 cores=8.63 cpu=0-127 load=14.82
+cell arm=t8 op=write w=8 rep=1 ops=102103 p50=544 p99=1137 cores=8.59 cpu=0-127 load=14.20
+cell arm=t1 op=ping w=1 rep=2 ops=155251 p50=393 p99=551 cores=1.00 cpu=1 load=13.70
+cell arm=t1 op=lookup w=1 rep=2 ops=119001 p50=521 p99=693 cores=1.00 cpu=1 load=13.40
+cell arm=t1 op=readdir w=1 rep=2 ops=89050 p50=689 p99=1365 cores=1.00 cpu=1 load=13.05
+cell arm=t1 op=create w=1 rep=2 ops=65646 p50=954 p99=1368 cores=0.79 cpu=1 load=13.05
+cell arm=t1 op=write w=1 rep=2 ops=71213 p50=875 p99=1050 cores=0.76 cpu=1 load=12.81
+cell arm=t8 op=ping w=8 rep=2 ops=1104965 p50=47 p99=153 cores=7.87 cpu=0-127 load=12.26
+cell arm=t8 op=lookup w=8 rep=2 ops=1005078 p50=61 p99=143 cores=7.64 cpu=0-127 load=12.26
+cell arm=t8 op=readdir w=8 rep=2 ops=890893 p50=58 p99=230 cores=7.77 cpu=0-127 load=12.00
+cell arm=t8 op=create w=8 rep=2 ops=95032 p50=587 p99=1314 cores=8.62 cpu=0-127 load=11.52
+cell arm=t8 op=write w=8 rep=2 ops=94546 p50=638 p99=1223 cores=8.44 cpu=0-127 load=12.04
+cell arm=t1 op=ping w=1 rep=3 ops=153329 p50=397 p99=566 cores=1.00 cpu=1 load=12.04
+cell arm=t1 op=lookup w=1 rep=3 ops=119727 p50=514 p99=695 cores=1.00 cpu=1 load=12.11
+cell arm=t1 op=readdir w=1 rep=3 ops=87075 p50=707 p99=1404 cores=1.00 cpu=1 load=11.87
+cell arm=t1 op=create w=1 rep=3 ops=65021 p50=960 p99=1226 cores=0.78 cpu=1 load=11.48
+cell arm=t1 op=write w=1 rep=3 ops=71018 p50=874 p99=1391 cores=0.76 cpu=1 load=11.04
+cell arm=t8 op=ping w=8 rep=3 ops=1150946 p50=52 p99=136 cores=7.87 cpu=0-127 load=11.04
+cell arm=t8 op=lookup w=8 rep=3 ops=1073049 p50=52 p99=157 cores=7.97 cpu=0-127 load=11.59
+cell arm=t8 op=readdir w=8 rep=3 ops=861270 p50=68 p99=197 cores=7.92 cpu=0-127 load=12.11
+cell arm=t8 op=create w=8 rep=3 ops=96543 p50=615 p99=1252 cores=8.63 cpu=0-127 load=12.50
+cell arm=t8 op=write w=8 rep=3 ops=108789 p50=526 p99=1061 cores=8.58 cpu=0-127 load=13.34
+pg 臂=p1 pid=3918646 fsync=on synchronous_commit=on postmaster cpu=1 backends=6
+cell arm=p1 op=ping rep=1 ops=16562 p50=3629 p99=8160 cores=0.06 cpu=1 load=17.88
+  ! setup 8 个视图 schema 耗时 5.7 ms（每视图 0.7 ms，不进 op QPS）
+cell arm=p1 op=lookup rep=1 ops=6744 p50=9728 p99=18723 cores=0.08 cpu=1 load=17.01
+  ! setup 8 个视图 schema 耗时 7.1 ms（每视图 0.9 ms，不进 op QPS）
+cell arm=p1 op=readdir rep=1 ops=4450 p50=13845 p99=26438 cores=0.20 cpu=1 load=17.01
+  ! setup 8 个视图 schema 耗时 5.9 ms（每视图 0.7 ms，不进 op QPS）
+cell arm=p1 op=create rep=1 ops=1601 p50=37702 p99=73625 cores=0.17 cpu=1 load=16.20
+  ! setup 8 个视图 schema 耗时 8.1 ms（每视图 1.0 ms，不进 op QPS）
+cell arm=p1 op=write rep=1 ops=917 p50=45516 p99=278439 cores=0.13 cpu=1 load=15.63
+  ! setup 8 个视图 schema 耗时 7.3 ms（每视图 0.9 ms，不进 op QPS）
+pg 臂=pf pid=3919648 fsync=on synchronous_commit=on postmaster cpu=0-127 backends=6
+cell arm=pf op=ping rep=1 ops=528801 p50=117 p99=184 cores=46.24 cpu=0-127 load=20.70
+  ! setup 8 个视图 schema 耗时 8.4 ms（每视图 1.1 ms，不进 op QPS）
+cell arm=pf op=lookup rep=1 ops=212082 p50=301 p99=398 cores=49.93 cpu=0-127 load=20.70
+  ! setup 8 个视图 schema 耗时 8.4 ms（每视图 1.0 ms，不进 op QPS）
+cell arm=pf op=readdir rep=1 ops=145937 p50=431 p99=597 cores=51.60 cpu=0-127 load=25.13
+  ! setup 8 个视图 schema 耗时 7.3 ms（每视图 0.9 ms，不进 op QPS）
+cell arm=pf op=create rep=1 ops=1797 p50=33563 p99=57307 cores=1.05 cpu=0-127 load=23.68
+  ! setup 8 个视图 schema 耗时 10.5 ms（每视图 1.3 ms，不进 op QPS）
+cell arm=pf op=write rep=1 ops=929 p50=35228 p99=1006456 cores=0.96 cpu=0-127 load=23.68
+  ! setup 8 个视图 schema 耗时 10.0 ms（每视图 1.2 ms，不进 op QPS）
+pg 臂=p1 pid=3920672 fsync=on synchronous_commit=on postmaster cpu=1 backends=6
+cell arm=p1 op=ping rep=2 ops=17612 p50=3564 p99=8392 cores=0.12 cpu=1 load=22.09
+  ! setup 8 个视图 schema 耗时 5.5 ms（每视图 0.7 ms，不进 op QPS）
+cell arm=p1 op=lookup rep=2 ops=6501 p50=9775 p99=18148 cores=0.05 cpu=1 load=22.09
+  ! setup 8 个视图 schema 耗时 8.2 ms（每视图 1.0 ms，不进 op QPS）
+cell arm=p1 op=readdir rep=2 ops=4486 p50=13912 p99=26558 cores=0.03 cpu=1 load=25.84
+  ! setup 8 个视图 schema 耗时 6.5 ms（每视图 0.8 ms，不进 op QPS）
+cell arm=p1 op=create rep=2 ops=1569 p50=35678 p99=101932 cores=0.13 cpu=1 load=26.90
+  ! setup 8 个视图 schema 耗时 5.6 ms（每视图 0.7 ms，不进 op QPS）
+cell arm=p1 op=write rep=2 ops=797 p50=49276 p99=318954 cores=0.08 cpu=1 load=26.90
+  ! setup 8 个视图 schema 耗时 5.8 ms（每视图 0.7 ms，不进 op QPS）
+pg 臂=pf pid=3921684 fsync=on synchronous_commit=on postmaster cpu=0-127 backends=6
+cell arm=pf op=ping rep=2 ops=524642 p50=118 p99=183 cores=NA cpu=0-127 load=25.14
+  ! setup 8 个视图 schema 耗时 10.7 ms（每视图 1.3 ms，不进 op QPS）
+cell arm=pf op=lookup rep=2 ops=210898 p50=304 p99=402 cores=5.42 cpu=0-127 load=23.69
+  ! setup 8 个视图 schema 耗时 8.9 ms（每视图 1.1 ms，不进 op QPS）
+cell arm=pf op=readdir rep=2 ops=145849 p50=431 p99=601 cores=51.53 cpu=0-127 load=27.72
+  ! setup 8 个视图 schema 耗时 7.8 ms（每视图 1.0 ms，不进 op QPS）
+cell arm=pf op=create rep=2 ops=1790 p50=33592 p99=75187 cores=1.21 cpu=0-127 load=27.72
+  ! setup 8 个视图 schema 耗时 5.2 ms（每视图 0.6 ms，不进 op QPS）
+cell arm=pf op=write rep=2 ops=1117 p50=34128 p99=691679 cores=1.21 cpu=0-127 load=26.06
+  ! setup 8 个视图 schema 耗时 8.7 ms（每视图 1.1 ms，不进 op QPS）
+pg 臂=p1 pid=3922674 fsync=on synchronous_commit=on postmaster cpu=1 backends=6
+cell arm=p1 op=ping rep=3 ops=17035 p50=3608 p99=7990 cores=0.07 cpu=1 load=24.77
+  ! setup 8 个视图 schema 耗时 6.4 ms（每视图 0.8 ms，不进 op QPS）
+cell arm=p1 op=lookup rep=3 ops=6406 p50=9803 p99=18629 cores=0.06 cpu=1 load=28.40
+  ! setup 8 个视图 schema 耗时 8.6 ms（每视图 1.1 ms，不进 op QPS）
+cell arm=p1 op=readdir rep=3 ops=4660 p50=13801 p99=26563 cores=0.06 cpu=1 load=31.73
+  ! setup 8 个视图 schema 耗时 7.6 ms（每视图 1.0 ms，不进 op QPS）
+cell arm=p1 op=create rep=3 ops=1583 p50=37279 p99=83076 cores=0.11 cpu=1 load=31.73
+  ! setup 8 个视图 schema 耗时 7.7 ms（每视图 1.0 ms，不进 op QPS）
+cell arm=p1 op=write rep=3 ops=828 p50=47937 p99=346368 cores=0.10 cpu=1 load=29.67
+  ! setup 8 个视图 schema 耗时 6.4 ms（每视图 0.8 ms，不进 op QPS）
+pg 臂=pf pid=3923672 fsync=on synchronous_commit=on postmaster cpu=0-127 backends=6
+cell arm=pf op=ping rep=3 ops=529078 p50=117 p99=181 cores=46.36 cpu=0-127 load=27.85
+  ! setup 8 个视图 schema 耗时 8.9 ms（每视图 1.1 ms，不进 op QPS）
+cell arm=pf op=lookup rep=3 ops=210990 p50=303 p99=402 cores=49.77 cpu=0-127 load=31.31
+  ! setup 8 个视图 schema 耗时 9.6 ms（每视图 1.2 ms，不进 op QPS）
+cell arm=pf op=readdir rep=3 ops=145943 p50=430 p99=604 cores=1.64 cpu=0-127 load=35.05
+  ! setup 8 个视图 schema 耗时 10.4 ms（每视图 1.3 ms，不进 op QPS）
+cell arm=pf op=create rep=3 ops=1786 p50=33581 p99=73049 cores=1.16 cpu=0-127 load=35.05
+  ! setup 8 个视图 schema 耗时 8.2 ms（每视图 1.0 ms，不进 op QPS）
+cell arm=pf op=write rep=3 ops=1161 p50=34020 p99=592179 cores=1.24 cpu=0-127 load=32.72
+  ! setup 8 个视图 schema 耗时 5.5 ms（每视图 0.7 ms，不进 op QPS）
+=== 汇总（REPS 次中位；cores = 测量窗口内服务端平均核数）===
+
+## 本次运行汇总（final）
+op           t1 ops/s    t1核    p1 ops/s    p1核    pf ops/s    pf核    t8 ops/s    t8核
+-------------------------------------------------------------------------------------
+ping           153329   1.00       17035   0.07      528940  46.30     1124353   7.87
+         t1 [152077~155251] p50=397us p99=566us 每核=153329 ops/core
+         p1 [16562~17612] p50=3608us p99=8160us 每核=243357 ops/core
+lookup         119001   1.00        6501   0.06      210990  49.77     1066281   7.97
+         t1 [118651~119727] p50=519us p99=694us 每核=119001 ops/core
+         p1 [6406~6744] p50=9775us p99=18629us 每核=108350 ops/core
+readdir         87075   1.00        4486   0.06      145937  51.53      861270   7.77
+         t1 [85090~89050] p50=707us p99=1404us 每核=87075 ops/core
+         p1 [4450~4660] p50=13845us p99=26558us 每核=74767 ops/core
+create          65122   0.79        1583   0.13        1790   1.16       95032   8.63
+         t1 [65021~65646] p50=960us p99=1226us 每核=82433 ops/core
+         p1 [1569~1601] p50=37279us p99=83076us 每核=12177 ops/core
+write           71213   0.76         828   0.10        1117   1.21      102103   8.58
+         t1 [71018~72244] p50=874us p99=1082us 每核=93701 ops/core
+         p1 [797~917] p50=47937us p99=318954us 每核=8280 ops/core
+
+op           t1/p1 每核    t1/pf 绝对    t8/t1 扩展
+ping            9.00x       0.29x       7.33x
+lookup         18.31x       0.56x       8.96x
+readdir        19.41x       0.60x       9.89x
+create         41.14x      36.38x       1.46x
+write          86.01x      63.75x       1.43x
+
+   [勘误 2026-11-19，本次会话] 这张表是修正前的 sc_sum.py 打出来的：表头
+   `t1/p1 每核` 标错了，那三列数字实际是**同核绝对吞吐比**（两臂被钉在同一个
+   CPU 1 上），现在改叫 `t1/p1 同核`；它同时缺 `t1/pf 每核` 那一列。数字本身
+   不受影响，用当前 sc_sum.py 从上面的 raw cell 重算即得三列：
+     同核 9.00 / 18.31 / 19.41 / 41.14 / 86.01×，绝对 0.29 / 0.56 / 0.60 /
+     36.38 / 63.75×，每核 13.4 / 28.1 / 30.7 / 53.4 / 101.5×。
+   为什么必须分清：p1 那臂 PG 只用掉 0.03~0.13 个核（64 个 backend 在同一个核上
+   抢 CFS 时间片，p50 3.6~48 ms 全在等调度），拿它自己的每核数去除会把「PG 在等」
+   洗成「PG 很快」。口径与推导见 DESIGN.md §7.5 末与 §9.1 第 4 条。
+=== 单核口径逐 op A/B 2026-11-19 10:58:37 UTC CPU钉=1 SECS=2 REPS=1 ops=readdir run=vfy ===
+机器：Intel(R)Xeon(R)Gold6338CPU@2.00GHz nproc=128 load=8.66 8.70 9.79
+盘：/data 2% 挂载 xfs
+cell arm=t1 op=ping w=1 rep=1 ops=146136 p50=419 p99=571 cores=1.00 cpu=1 load=8.66
+cell arm=t1 op=lookup w=1 rep=1 ops=116441 p50=526 p99=709 cores=1.00 cpu=1 load=8.45
+cell arm=t1 op=readdir w=1 rep=1 ops=85837 p50=712 p99=1413 cores=1.00 cpu=1 load=8.41
+cell arm=t1 op=create w=1 rep=1 ops=63611 p50=992 p99=1147 cores=0.80 cpu=1 load=8.41
+cell arm=t1 op=write w=1 rep=1 ops=69978 p50=899 p99=1218 cores=0.77 cpu=1 load=8.30
+cell arm=t8 op=ping w=8 rep=1 ops=1145495 p50=47 p99=151 cores=7.97 cpu=0-127 load=8.30
+cell arm=t8 op=lookup w=8 rep=1 ops=1153750 p50=47 p99=166 cores=7.91 cpu=0-127 load=10.04
+cell arm=t8 op=readdir w=8 rep=1 ops=951724 p50=59 p99=185 cores=7.82 cpu=0-127 load=11.31
+cell arm=t8 op=create w=8 rep=1 ops=91474 p50=618 p99=1343 cores=8.63 cpu=0-127 load=11.31
+cell arm=t8 op=write w=8 rep=1 ops=99258 p50=598 p99=1238 cores=8.48 cpu=0-127 load=11.61
+=== 汇总（REPS 次中位；cores = 测量窗口内服务端平均核数）===
+
+## 本次运行汇总（vfy）
+op           t1 ops/s    t1核    p1 ops/s    p1核    pf ops/s    pf核    t8 ops/s    t8核
+-------------------------------------------------------------------------------------
+ping           146136   1.00           -      -           -      -     1145495   7.97
+         t1  p50=419us p99=571us 每核=146136 ops/core
+lookup         116441   1.00           -      -           -      -     1153750   7.91
+         t1  p50=526us p99=709us 每核=116441 ops/core
+readdir         85837   1.00           -      -           -      -      951724   7.82
+         t1  p50=712us p99=1413us 每核=85837 ops/core
+create          63611   0.80           -      -           -      -       91474   8.63
+         t1  p50=992us p99=1147us 每核=79514 ops/core
+write           69978   0.77           -      -           -      -       99258   8.48
+         t1  p50=899us p99=1218us 每核=90881 ops/core

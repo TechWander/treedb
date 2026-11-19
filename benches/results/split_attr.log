@@ -1,0 +1,24 @@
+# split_attr.sh 本次复跑 2026-11-19 11:08:46 UTC CPU钉=1 workers=1 conns=64 pipe=1 secs=8
+# 字段：user/sys 核数占比 + 每 op 的 user/sys µs（无 strace 真实负载，/proc utime/stime 差分）
+## op=ping
+cores_user=0.10 cores_sys=0.90 cores_total=1.00 sys占比=90% 窗口=4.00s
+→ 158509 ops/s over 8.00s | lat us: p50=394 p90=423 p99=555 max=2189 | errors=0
+## op=lookup
+cores_user=0.26 cores_sys=0.74 cores_total=1.00 sys占比=74% 窗口=4.00s
+→ 124039 ops/s over 8.00s | lat us: p50=502 p90=538 p99=698 max=66639 | errors=0
+## op=readdir
+cores_user=0.39 cores_sys=0.61 cores_total=1.00 sys占比=61% 窗口=4.00s
+→ 90144 ops/s over 8.00s | lat us: p50=689 p90=732 p99=1364 max=75013 | errors=0
+
+## ===== 以下三格服务端 = tag v0.3.2 重新编译的二进制（本轮三项优化都没有）=====
+# 同一脚本、同一客户端、同一核、同 secs=8；服务端二进制跑完即还原（sha256 见文末）
+## op=ping before(v0.3.2)
+cores_user=0.11 cores_sys=0.89 cores_total=1.00 sys占比=89% 窗口=4.00s
+→ 137884 ops/s over 8.00s | lat us: p50=453 p90=486 p99=612 max=2670 | errors=0
+## op=lookup before(v0.3.2)
+cores_user=0.27 cores_sys=0.73 cores_total=1.00 sys占比=73% 窗口=4.00s
+→ 108921 ops/s over 8.00s | lat us: p50=572 p90=617 p99=773 max=65172 | errors=0
+## op=readdir before(v0.3.2)
+cores_user=0.58 cores_sys=0.42 cores_total=1.00 sys占比=42% 窗口=4.00s
+→ 51471 ops/s over 8.00s | lat us: p50=1203 p90=1299 p99=2399 max=71366 | errors=0
+# 还原后 treedb-server sha256 前16 = 676d2730e90163ae

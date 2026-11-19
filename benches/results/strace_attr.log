@@ -1,0 +1,52 @@
+# 单核 syscall 账的本次复跑 2026-11-19 11:13:20 UTC CPU钉=1 workers=1 conns=64 pipe=1 secs=4
+# before 段的服务端 = tag v0.3.2 重新编译的二进制（git worktree /tmp/tv032），客户端仍是当前 treedb-bench ——
+#   线协议本轮没改过，这样换服务端二进制做 A/B 是合法的；after 段 = 当前工作区二进制。
+# strace 在场吞吐拖 5–10 倍，本文件只作 syscall 计数，绝不作性能数（性能数看 sc_ops.log）。
+
+## ===== after：当前二进制（rearm + 短读 + push_frame + Names）=====
+--- op=ping after ---
+bench（strace 在场，只作参考不作性能数）: op=ping conns=64 threads=64 pipeline=1 → 16480 ops/s over 4.00s | lat us: p50=3817 p90=4425 p99=4988 max=12481 | errors=0
+服务端累计 ops=66496；测量窗口 ops=65920（分母用它）
+--- 每 op syscall 数（分子 strace -c 计数 / 分母测量窗口 ops；列序 %time seconds usecs/call calls [errors] syscall，errors 只在非零时打印所以列数不一，名字取 $NF）---
+recvfrom       calls/op=  1.010  err/op= 0.000    41.5% 系统时间      8.41 us/op
+sendto         calls/op=  1.009  err/op= 0.000    56.5% 系统时间     11.46 us/op
+epoll_wait     calls/op=  0.016  err/op= 0.000     1.7% 系统时间      0.34 us/op
+setsockopt     calls/op=  0.005  err/op= 0.000     0.1% 系统时间      0.03 us/op
+write          calls/op=  0.001  err/op= 0.000     0.0% 系统时间      0.00 us/op
+ioctl          calls/op=  0.001  err/op= 0.000     0.0% 系统时间      0.01 us/op
+
+--- op=readdir after ---
+bench（strace 在场，只作参考不作性能数）: op=readdir conns=64 threads=64 pipeline=1 → 14887 ops/s over 4.00s | lat us: p50=4228 p90=4613 p99=5707 max=47191 | errors=0
+服务端累计 ops=316101；测量窗口 ops=59548（分母用它）
+--- 每 op syscall 数（分子 strace -c 计数 / 分母测量窗口 ops；列序 %time seconds usecs/call calls [errors] syscall，errors 只在非零时打印所以列数不一，名字取 $NF）---
+recvfrom       calls/op=  1.028  err/op= 0.000    36.5% 系统时间      6.21 us/op
+sendto         calls/op=  1.026  err/op= 0.000    54.1% 系统时间      9.19 us/op
+brk            calls/op=  0.018  err/op= 0.000     0.4% 系统时间      0.07 us/op
+epoll_wait     calls/op=  0.017  err/op= 0.000     1.7% 系统时间      0.28 us/op
+setsockopt     calls/op=  0.006  err/op= 0.000     0.1% 系统时间      0.02 us/op
+write          calls/op=  0.001  err/op= 0.000     3.5% 系统时间      0.60 us/op
+
+## ===== before：v0.3.2 服务端（本轮三项优化都没有）=====
+--- op=ping before ---
+bench（strace 在场，只作参考不作性能数）: op=ping conns=64 threads=64 pipeline=1 → 7020 ops/s over 4.00s | lat us: p50=8725 p90=11093 p99=12661 max=14857 | errors=0
+服务端累计 ops=28609；测量窗口 ops=28080（分母用它）
+--- 每 op syscall 数（分子 strace -c 计数 / 分母测量窗口 ops；列序 %time seconds usecs/call calls [errors] syscall，errors 只在非零时打印所以列数不一，名字取 $NF）---
+recvfrom       calls/op=  2.040  err/op= 1.019    38.3% 系统时间     16.42 us/op
+epoll_ctl      calls/op=  2.040  err/op= 1.019    31.3% 系统时间     13.41 us/op
+sendto         calls/op=  1.019  err/op= 0.000    29.1% 系统时间     12.47 us/op
+epoll_wait     calls/op=  0.016  err/op= 0.000     0.5% 系统时间      0.22 us/op
+setsockopt     calls/op=  0.012  err/op= 0.000     0.2% 系统时间      0.09 us/op
+close          calls/op=  0.003  err/op= 0.000     0.1% 系统时间      0.05 us/op
+
+--- op=readdir before ---
+bench（strace 在场，只作参考不作性能数）: op=readdir conns=64 threads=64 pipeline=1 → 6202 ops/s over 4.01s | lat us: p50=10221 p90=11180 p99=12428 max=27757 | errors=0
+服务端累计 ops=281374；测量窗口 ops=24870（分母用它）
+--- 每 op syscall 数（分子 strace -c 计数 / 分母测量窗口 ops；列序 %time seconds usecs/call calls [errors] syscall，errors 只在非零时打印所以列数不一，名字取 $NF）---
+recvfrom       calls/op=  2.126  err/op= 1.061    34.2% 系统时间     11.47 us/op
+epoll_ctl      calls/op=  2.126  err/op= 1.061    28.9% 系统时间      9.70 us/op
+sendto         calls/op=  1.061  err/op= 0.000    28.6% 系统时间      9.58 us/op
+brk            calls/op=  0.045  err/op= 0.000     0.4% 系统时间      0.14 us/op
+epoll_wait     calls/op=  0.019  err/op= 0.000     0.6% 系统时间      0.19 us/op
+setsockopt     calls/op=  0.013  err/op= 0.000     0.3% 系统时间      0.11 us/op
+
+恢复后服务端二进制 sha256：676d2730e90163ae …（应为 676d2730e90163ae）

@@ -42,10 +42,16 @@ SRV=$(pgrep -nx treedb-server)
 kill "$ST" 2>/dev/null; wait 2>/dev/null
 echo "bench（strace 在场，只作参考不作性能数）: $(cat "$D/bench.txt")"
 SRVOPS=$(grep -oE 'ops [0-9]+' "$D/srv.log" | tail -1 | grep -oE '[0-9]+')
-echo "服务端累计 ops=$SRVOPS"
-echo "--- 每 op syscall 数（strace -c 列序：%time seconds usecs/call calls errors syscall； calls 是第 4 列不是第 5 列）---"
-awk -v n="$SRVOPS" 'NR>2 && NF>=6 && $1 ~ /^[0-9.]+$/ {
-    c=$4+0; e=$5+0;
-    printf "%-14s calls/op=%7.3f  err/op=%6.3f  %6.1f%% 系统时间  %8.2f us/op\n", $7, c/n, e/n, $1, $2*1e6/n
+# 分母必须取**测量窗口内**的 ops，不能用服务端生命期累计 ops。后者把预热也算进去了，
+# 而预热是 `pipeline` 批量发的（lookup/readdir 那两格 8 视图 × 500 文件 × 64 线程 =
+# 25.6 万条只付几万条 syscall），于是真实每 op 数被摊薄到 0.2 上下 —— 症状是
+# 「每 op 不到 0.3 次 syscall」这种物理上不可能的读数。ping 没有文件预热，两种
+# 分母同值，所以这个坑只在 lookup/readdir 上暴露。
+MOPS=$(sed -E 's/.*→ ([0-9]+) ops\/s over ([0-9.]+)s.*/\1 \2/' "$D/bench.txt" | awk '{printf "%d", $1 * $2}')
+echo "服务端累计 ops=$SRVOPS；测量窗口 ops=$MOPS（分母用它）"
+echo "--- 每 op syscall 数（分子 strace -c 计数 / 分母测量窗口 ops；列序 %time seconds usecs/call calls [errors] syscall，errors 只在非零时打印所以列数不一，名字取 \$NF）---"
+awk -v n="$MOPS" 'NF>=5 && $1 ~ /^[0-9.]+$/ && $NF != "total" {
+    c=$4+0; e=($5 ~ /^[0-9]+$/ ? $5+0 : 0);
+    printf "%-14s calls/op=%7.3f  err/op=%6.3f  %6.1f%% 系统时间  %8.2f us/op\n", $NF, c/n, e/n, $1, $2*1e6/n
 }' "$D/sum" | sort -t= -k2 -rn | head -12
 grep -E 'rounds|worst' "$D/srv.log" | tail -1

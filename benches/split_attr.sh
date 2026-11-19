@@ -5,6 +5,12 @@
 # 读 /proc/<pid>/task/*/stat 的 utime/stime 差分，这是没 perf 时最干净的拆法。
 #
 # 用法：split_attr.sh <op> [workers=1] [秒数=8] [durability=never]
+#
+# 想拿它做「改前 vs 改后」：把 tag 或基线 rev 用 `git worktree` 开出来、在里头
+# `cargo build --release --bin treedb-server`，再把那个二进制临时放到
+# ./target/release/treedb-server 上过一遍本脚本，跑完立即还原（`benches/ab_layout.sh`
+# 就是这套手法；线协议未变时客户端不需要跟着换）。落盘的
+# `benches/results/split_attr.log` 里 before 段就是这么出的，末尾记了还原后的 sha256。
 cd /data/grovefs/treedb || exit 1
 OP=${1:-ping}
 PREROLL=${PREROLL:-2}

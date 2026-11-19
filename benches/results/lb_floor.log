@@ -1,0 +1,8 @@
+# 单核 loopback 物理下界 本次复跑 2026-11-19 11:13:54 UTC
+# benches/lb_floor.c：不碰 treedb 任何代码的最小服务端（epoll_wait + recv + send，原样回字节，无业务无分配）
+# 服务端线程钉 CPU 1；客户端每连接一条线程、不钉核、各自独立计数槽；conns=64 与 sc_ops.sh 同口径
+# 用途：给「treedb 单核 ping 到没到顶」提供一条与实现无关的线
+11.10 8.74 8.55
+lb_floor cpu=1 conns=64 secs=3.00 ops=504188 -> 167999 ops/s  (5.95 us/op)
+lb_floor cpu=1 conns=64 secs=3.00 ops=504941 -> 168245 ops/s  (5.94 us/op)
+lb_floor cpu=1 conns=64 secs=3.00 ops=500995 -> 166934 ops/s  (5.99 us/op)
