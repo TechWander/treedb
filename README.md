@@ -19,6 +19,7 @@ cargo build --release                                   # 默认档：依赖只�
 cargo test --release                                    # 默认档 71 passed（引擎本体）
 cargo test --release --features postgres-compat         # 102 passed（含 PG 过渡档）
 bash benches/throughput_matrix.sh 3 1 2 3 4 5           # 五轴复现，输出进 benches/results/
+bash benches/sync_ratio.sh 3                           # 写路径机制：一次 fsync 摊了多少写
 ```
 
 `--workers N`（N > 1）把只读 op 摊到 N 条前端线程上并行；写永远由唯一提交线程定序，
@@ -30,7 +31,8 @@ group commit 不丢。默认 `--workers 1`，历史基线数字都在这一档�
 |----|------|
 | 连接 | 单进程 10 000 常驻连接：RSS +6 MiB、**0.56 KiB/conn**、`fd/conn = 1.0000` |
 | 写（`dur=group` vs PG `synchronous_commit=on`，WAL 同盘） | 64 并发 `create` **7 844 vs 1 441 ops/s**（PG 那一格 p50 = 33.6 ms） |
-| 每 op 一次 fsync（`dur=always`） | 1 586 vs 1 441 ops/s = **1.1×** —— 领先全部来自跨连接合并 fsync，不是来自语言或内存布局 |
+| 为什么快（引擎自己的计数器） | `group` 档 64 并发下一轮只付 1 次 fsync、摊 **≈ 60 次写/fsync**；`always` 档永远是 1.00，代价是 5.1–6.0× 吞吐（`benches/sync_ratio.sh`） |
+| 每 op 一次 fsync（`dur=always`） | 1 586 vs 1 441 ops/s = **1.1×** —— 刨掉合并 fsync，treedb 对 PG 就没有结构性优势（领先不来自语言或内存布局） |
 | 64 并发纯读 | `workers=1` 被 PG 反胜 3.6–7.5×；`workers=16` 反超 2.0–3.8×（`lookup` 792 k vs 207 k ops/s，p50 37 µs） |
 | 持久性 | `kill -9` 六个崩溃用例零丢失（含 checkpoint 瞬间崩、连崩 3 轮） |
 

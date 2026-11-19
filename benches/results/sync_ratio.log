@@ -1,0 +1,23 @@
+=== sync_ratio @ 2026-11-19T06:16:08+00:00 (op=write conns=64 pipeline=1, 3s/格) ===
+group  wal=sr_group 11288 | writes=35328 syncs=571 → 61.87 写/fsync
+       ops        = 35330 (writes 35328, syncs 571, avg fsync 4287 us)
+always wal=sr_always 1716 | writes=6354 syncs=6354 → 1.00 写/fsync
+       ops        = 6356 (writes 6354, syncs 6354, avg fsync 507 us)
+group  wal=treedb-sr-group 68249 | writes=208029 syncs=3326 → 62.55 写/fsync
+       ops        = 208031 (writes 208029, syncs 3326, avg fsync 281 us)
+always wal=treedb-sr-always 13854 | writes=43425 syncs=43425 → 1.00 写/fsync
+       ops        = 43427 (writes 43425, syncs 43425, avg fsync 59 us)
+=== sync_ratio @ 2026-11-19T06:16:54+00:00 (op=write conns=64 pipeline=1, 3s/格) ===
+group  wal=sr_group op=write conns=64 threads=64 pipeline=1 → 9888 ops/s over 3.07s | lat us: p50=2908 p90=16553 p99=25374 max=47284 | errors=0
+group  wal=sr_group   writes=30918 syncs=501 → 61.71 写/fsync
+always wal=sr_always op=write conns=64 threads=64 pipeline=1 → 1722 ops/s over 3.50s | lat us: p50=29883 p90=45068 p99=83619 max=110766 | errors=0
+always wal=sr_always   writes=6532 syncs=6532 → 1.00 写/fsync
+=== sync_ratio @ 2026-11-19T06:17:12+00:00 (op=write conns=64 pipeline=1, 3s/格) ===
+group  wal=sr_group op=write conns=64 threads=64 pipeline=1 → 10322 ops/s over 3.08s | lat us: p50=2767 p90=15175 p99=28310 max=36954 | errors=0
+group  wal=sr_group   writes=32313 syncs=549 → 58.86 写/fsync
+always wal=sr_always op=write conns=64 threads=64 pipeline=1 → 1716 ops/s over 3.31s | lat us: p50=30521 p90=47474 p99=65132 max=110344 | errors=0
+always wal=sr_always   writes=6199 syncs=6199 → 1.00 写/fsync
+group  wal=treedb-sr-group op=write conns=64 threads=64 pipeline=1 → 68758 ops/s over 3.07s | lat us: p50=877 p90=1020 p99=1441 max=7541 | errors=0
+group  wal=treedb-sr-group   writes=211794 syncs=3445 → 61.48 写/fsync
+always wal=treedb-sr-always op=write conns=64 threads=64 pipeline=1 → 13600 ops/s over 3.10s | lat us: p50=4567 p90=4685 p99=6704 max=12528 | errors=0
+always wal=treedb-sr-always   writes=42604 syncs=42604 → 1.00 写/fsync

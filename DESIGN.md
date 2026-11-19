@@ -441,7 +441,8 @@ checkpoint 之后 WAL 被 `reset` 成空文件，`fast_forward(snap_seq)` 把发
 
 同一份代码、同一个 op，**换盘就是 8×**。结论：`always` 档在机械盘上上限约 1.6k ops/s，
 和连接数无关（盘被打满了）；这类格子只能用来比较引擎，不能用来宣称引擎快慢。
-GroveFS 生产默认应该是 `group`，`always` 留给「每个 op 独立可恢复」的强需求。
+生产默认应该是 `group`，`always` 留给「每个 op 独立可恢复」的强需求 —— 但要看
+§7.9：`always` 在 64 并发下把 fsync 串成一条队，尾延迟会跑飞（§8 第 11 条）。
 
 ### 7.5 读路径：单线程时 PG 赢了 —— 补上前端 worker 之后反过来
 
@@ -600,11 +601,43 @@ PG 2.2–4.1×（§7.5）。默认档仍是 `workers=1`：不显式开就没有�
 
 - **`tests/concurrency.rs` 不是引擎并发的证据**。它 7 条里有 6 条 `#[ignore]`，
   且测的是 PG 过渡档的 `SharedInstancePool`（池上限、排队、reap、KeyStore 并发）。
-  默认 `cargo test` 只会跑到其中 1 条 `dial_failures_do_not_leak_live`。引擎自身的
-  并发证据是上面那两张表里的 `net_protocol` + `read_scaling` + 56 条 lib 单测。
+  T1 之后整个文件已在 `postgres-compat` 后面，默认档一条也不跑。引擎自身的
+  并发证据是上面那两张表里的 `net_protocol`（9）+ `read_scaling`（7）+ lib 单测。
 - 会话里曾经口传过一个「单进程 `max_conn = 4382`」的上限数字，**仓内查无出处**
   （`grep -rn 4382 DESIGN.md benches/ tests/` 为空），本轮撤回，不再引用。真实
   约束是 `net.core.somaxconn = 4096` 与临时端口区间，与引擎无关（§7.6 末句）。
+  引擎侧只有 `ServerConfig::backlog`（默认 4096）这一个旋钮，没有连接数上限。
+
+### 7.9 合并 fsync 是量出来的，不是推断的（2026-11-19）
+
+§7.3 那句「treedb 写路径的领先全部来自跨连接合并 fsync」以前只有两个档位之间的
+吞吐差做支撑。本轮直接读引擎自己的计数器（`--stats` 的 `writes` / `syncs`），算出
+「一次 fsync 摊了多少次写」。固定同一格 `op=write conns=64 pipeline=1`，只换盘与
+持久化档，复现命令：`benches/sync_ratio.sh 3`（原始输出追加在
+`benches/results/sync_ratio.log`，下表是最后四轮）：
+
+| WAL 位置 | 档位 | ops/s（p50 / p99 µs） | writes | syncs | **写/fsync** |
+|----------|------|--------------------|--------|-------|---------|
+| 机械盘 XFS | `group` | 10 322（2 767 / 28 310） | 32 313 | 549 | **58.9** |
+| 机械盘 XFS | `always` | 1 716（30 521 / 65 132） | 6 199 | 6 199 | **1.00** |
+| 根盘 ext4 | `group` | 68 758（877 / 1 441） | 211 794 | 3 445 | **61.5** |
+| 根盘 ext4 | `always` | 13 600（4 567 / 6 704） | 42 604 | 42 604 | **1.00** |
+
+同一轮独立复跑给的是 61.87 / 1.00（机械盘）与 62.55 / 1.00（根盘），即这个比值本身
+很稳。两条结论：
+
+1. **`group` 档一轮把 ≈ 60 次 fsync 合成了 1 次**（conns=64 几乎全部排上了同一个
+   回合），换回 5.1–6.0× 吞吐。这就是 §7.3 那张倍率表的机制本身，现在它在计数器
+   上看得见，不用靠吞吐差反推。
+2. **`always` 档在高并发下不领先，尾延迟差于 PG**：同一格 PG（`synchronous_commit=on`、
+   WAL 同在机械盘）是 1 469 ops/s（p50 33.5 ms / p99 157 ms），treedb 三次独立量到
+   1 306（p99 **556 ms**）、1 722/1 716（p99 84 / 65 ms）—— 吞吐在噪声里持平，尾部
+   不可预测。原因在 `commit_batch`：`Always` 分支按组循环 `wal.commit()`，即**单提交
+   线程在一回合里串行发 N 次 fsync**，第 k 条连接要等 k × fsync 延迟；而 PG 的
+   `XLogFlush` 把后到的等待者挂在一个已在飞的 flush 上，同一个 fsync 能顺手 ack
+   一批（对 PG 侧这是其既有语义，本仓未量它内部，仅作机制解释）。
+   → 已记进 §8 第 11 条与 §11 第 8 条（P1）。选 `always` 必须知道这个代价；
+   默认档 `group` 不受影响。
 
 ---
 
@@ -638,6 +671,11 @@ PG 2.2–4.1×（§7.5）。默认档仍是 `workers=1`：不显式开就没有�
    `Stats.wal_bytes` 报的是**逻辑长度**（checkpoint 阈值按它算），磁盘长度只会 ≥ 它。
 10. **`--bench`/`--pgbench` 是本机同盘对照，不是云端结论**：换 SSD/NVMe、换 PG 大版本、
     换 `wal_compression`/`full_page_writes` 配置，绝对数字都会变，倍数关系才可信。
+11. **`always` 档在高并发下没有优势，尾延迟还会跑飞**（§7.9）：它是每 op 一次
+    fsync，而且这些 fsync 由单提交线程**在一回合里串行**发出，第 k 条连接的 ack
+    要等在前面 k−1 次 fsync 后面；64 并发机械盘上量到 p99 65–556 ms，而同一格
+    PG 是 157 ms。要「每个 op 独立可恢复」又要尾巴好看，得先把 flush 改成流水线
+    （多个 in-flight flush，按区间完成逐个 ack），见 §11 第 8 条。
 
 ---
 
@@ -852,3 +890,9 @@ spike 明确**没**做、也不在接入面上假装做的事 —— 一律返�
    接入侧因此得到的约束：第 5 条里“把定义/密钥/账户补进引擎”的正解不是
    `Key*`/`Audit*` 直接给 grovefs 用，而是 grovefs 用 T2 的通用表自己拼语义；
    §10 阶段 B 第 4 步那句“走 treedb 的 `Key*`/`Audit*`”作废。
+8. **`always` 档的 flush 流水线**（P1，本轮新发现，§7.9 / §8 第 11 条）：把
+   `commit_batch` 的 `Always` 分支从「串行 N 次 fsync」改成「多个 in-flight
+   flush，哪一段先落盘先 ack 哪一段的等待者」。语义不变（ack 即 durable），
+   但不再把第 k 条连接排在前面 k−1 次盘等待之后。验收判据就用本轮那张表：
+   64 并发 `write` `always` 档 p99 从 65–556 ms 降到与 `group` 同量级（≤30 ms），
+   而崩溃用例六条仍全绿 —— 不然只是把耐久度换成了延迟数字。
