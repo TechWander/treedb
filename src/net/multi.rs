@@ -699,8 +699,11 @@ fn committer(
             last_sync = Instant::now();
         }
         if cfg.auto_checkpoint_bytes > 0 {
-            let s = engine.snapshot_stats();
-            if s.wal_bytes > cfg.auto_checkpoint_bytes {
+            // 只要 WAL 尺寸。这里不能走 `snapshot_stats()`：它除了判尺寸还会
+            // 顺手折一次 worker 的 op 计数，而折计数只在有人真问数时才值钱
+            // （`Op::Stats` 与退出收口两处），每轮折一次等于白拿一次读锁，
+            // 而且 dentry 条数在两层表下是 O(目录数)。
+            if engine.wal_bytes() > cfg.auto_checkpoint_bytes {
                 engine.checkpoint()?;
             }
         }

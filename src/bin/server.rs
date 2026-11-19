@@ -65,7 +65,7 @@ fn main() {
     let mut sync_ms: i32 = 20;
     let mut auto_ckpt_mb: u64 = 64;
     let mut backlog: i32 = 4096;
-    let mut workers: usize = 1;
+    let mut workers: usize = 0;
     let mut stats_only = false;
     let mut shutdown_only = false;
     let mut pid_file: Option<PathBuf> = None;
@@ -83,7 +83,7 @@ fn main() {
             "--sync-ms" => sync_ms = next(&mut i).parse().unwrap_or(20),
             "--auto-checkpoint-mb" => auto_ckpt_mb = next(&mut i).parse().unwrap_or(64),
             "--backlog" => backlog = next(&mut i).parse().unwrap_or(4096),
-            "--workers" => workers = next(&mut i).parse().unwrap_or(1).max(1),
+            "--workers" => workers = next(&mut i).parse().unwrap_or(0),
             "--pid-file" => pid_file = Some(PathBuf::from(next(&mut i))),
             "--stats" => stats_only = true,
             "--shutdown" => shutdown_only = true,
@@ -97,6 +97,12 @@ fn main() {
             }
         }
         i += 1;
+    }
+
+    // 0 = auto，与 [`ServerConfig::new`] 同一个解析函数：两处各写一套
+    // 默认值的话，嵌入式用法与两行命令拉起的实例性能特征就会不一。
+    if workers == 0 {
+        workers = treedb::net::default_workers();
     }
 
     if stats_only {
@@ -186,11 +192,13 @@ treedb-server — 元数据引擎服务端（POSIX 元数据语义，客户端�
   --listen HOST:PORT         监听地址，默认 127.0.0.1:7777
   --durability NAME          group（默认，每轮一次 fsync）| always | never
   --backlog N                listen 接受队列长度，默认 4096（受 somaxconn 截断）
-  --workers N                前端 worker 线程数，默认 1（= 单线程事件循环，
-                             全部基线数字的档）。>1 时每条线程自己 accept、
-                             自己收发，只读 op 就地并行算；写永远由唯一提交
-                             线程定序，group commit 仍然跨连接合并成一次 fsync。
-                             写多读少的负载不要开：并行只偷得到读。
+  --workers N                前端 worker 线程数，默认 0 = auto（按核数取
+                             min(8, 核数/2)，至少 1）。=1 就是单线程事件
+                             循环，也是全部历史基线数字的档。>1 时每条线程
+                             自己 accept、自己收发，只读 op 就地并行算；写永远
+                             由唯一提交线程定序，group commit 仍然跨连接合并成
+                             一次 fsync。写多读少的负载可以显式收到 1：并行
+                             只偷得到读，且每个 worker 要多占 3 个 fd。
   --sync-ms N                事件循环空闲唤醒间隔，默认 20
   --auto-checkpoint-mb N     WAL 超此大小自动快照，默认 64（0 = 关闭）
   --pid-file PATH            启动后写入 pid，便于测试脚本 kill -9

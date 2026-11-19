@@ -45,7 +45,7 @@
 //! 应用的写（凭空提前生效），反过来延后执行的读又看不到它前面的写。混打负载
 //! 因此退回串行 —— 不拿语义换数字。
 //!
-//! `workers = 1`（默认）走的是本文件里那条循环，代码路径与多 worker 改造之前
+//! `workers = 1` 走的是本文件里那条循环，代码路径与多 worker 改造之前
 //! 逐字一致，所以历次基线数字仍然可以直接对比。
 //!
 //! [`crate::net::multi`]: crate::net::multi
@@ -86,10 +86,11 @@ pub struct ServerConfig {
     /// 引擎的连接容量不够，是监听参数不够，所以这里显式可调。
     /// 实际值还会被 `net.core.somaxconn` 截断（本机 4096）。
     pub backlog: i32,
-    /// 前端 worker 线程数。1 = 单线程事件循环（默认，也是全部基线数字的档）。
+    /// 前端 worker 线程数。只扩展读：写永远由唯一提交线程定序。
     ///
-    /// 只扩展读：写永远由唯一提交线程定序。超过核数没有意义，超过并发连接数
-    /// 也没有意义（内核按四元组哈希分流，多出来的线程只会空转）。
+    /// `ServerConfig::new` 把它填成 [`crate::net::default_workers`]（按核数），
+    /// `--workers 1` 是旧默认，也是全部历史基线数字的档。超过核数没有意义，
+    /// 超过并发连接数也没有意义（内核按四元组哈希分流，多出来的线程只会空转）。
     pub workers: usize,
 }
 
@@ -102,7 +103,10 @@ impl ServerConfig {
             sync_ms: 20,
             auto_checkpoint_bytes: 64 * 1024 * 1024,
             backlog: 4096,
-            workers: 1,
+            // auto：按核数给。默认 1 等于把读吞吐锁在一个核上，高并发纯读
+            // 直接输给每连接一进程的 PG（实测 3-8×），理由见
+            // [`crate::net::default_workers`]。
+            workers: crate::net::default_workers(),
         }
     }
 }
@@ -536,8 +540,8 @@ pub(crate) fn serve_single(cfg: &ServerConfig, stop: &AtomicBool, live: &AtomicU
             last_sync = Instant::now();
         }
         if cfg.auto_checkpoint_bytes > 0 {
-            let s = engine.snapshot_stats();
-            if s.wal_bytes > cfg.auto_checkpoint_bytes {
+            // 只要 WAL 尺寸：走 snapshot_stats() 会变成每轮数一遍七张表。
+            if engine.wal_bytes() > cfg.auto_checkpoint_bytes {
                 engine.checkpoint()?;
             }
         }
