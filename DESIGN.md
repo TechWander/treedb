@@ -18,7 +18,7 @@
 阶段 B 末节：31 条 e2e 断言全过，grovefs 默认档逐字节不变；treedb 在 grovefs 里是
 **按 tag 的 git 依赖**，不再依赖同级克隆）。
 
-`v0.3.1` 之后又落了一笔**写轴**改动（下一轮定版收入）：`always` 档的按连接串行
+`v0.3.1` 之后落了一笔**写轴**改动并单独定版为 `v0.3.2`：`always` 档的按连接串行
 fsync 删掉了，与 `group` 共用一个提交点，机械盘 64 并发 1 891 → 10 913 ops/s、
 p99 81.5 → 31.1 ms（§7.9 第 3 条，受控 A/B 在 `benches/results/ab_durability.log`）。
 
@@ -903,8 +903,8 @@ bash benches/probe_srv.sh                       # 服务端吃了几核（/proc 
    后端并列）。落地时先写成 `path = "../treedb"`，实测扛不住：**可选的 path 依赖
    即使 feature 关掉也要解析**，旁边没有同级克隆的 checkout 任何 feature 组合都
    编不过。最终形态是按 tag 的 git 依赖
-   `treedb = { git = "https://github.com/TechWander/treedb.git", tag = "v0.3.1" }`
-   （tag 跟着定版前移，本轮从 `v0.3.0` 升到 `v0.3.1`，格式兼容所以升级只是改行）
+   `treedb = { git = "https://github.com/TechWander/treedb.git", tag = "v0.3.2" }`
+   （tag 跟着定版前移：`v0.3.0` → `v0.3.1` → `v0.3.2`，格式兼容所以升级只是改行）
    —— 故意用匿名 https，没有 SSH key 也 `cargo fetch` 得动。已拿一个**旁边没有
    treedb 的干净克隆**验证默认档与 `--features treedb` 都能编过。
 2. `remote/meta/server_ext.rs::StoreKind` 新增 `Treedb` variant，实现
@@ -977,7 +977,7 @@ spike 明确**没**做、也不在接入面上假装做的事 —— 一律返�
 | readdir 的属性 | N/64 次往返 | 协议该补 `ReadDirPlus`，见 §11 第 6 条 |
 | `view list` 的物理树 | 列不出来 | 控制面枚举器只看本地 db 文件 |
 | HA / 快照传送 | 启动即拒绝 | §8「无复制」这条限制本身 |
-| ~~path 依赖的分发方式~~ | 已定：按 tag 的 git 依赖 | 钉 `v0.3.1`（随定版前移），无同级克隆也能构建（实测） |
+| ~~path 依赖的分发方式~~ | 已定：按 tag 的 git 依赖 | 钉 `v0.3.2`（随定版前移），无同级克隆也能构建（实测） |
 
 ### 阶段 C（回归与灰度）
 1. ~~`test_pg.sh` 那套断言在 treedb 后端重跑~~ 已起头：新增 `.build-bin/test_treedb.sh`
