@@ -1,0 +1,55 @@
+=== 默认档复测 2026-11-19 08:15:00 UTC  核数=128  REPS=5 ===
+srv[默认]: treedb-server pid=3281973 listen=127.0.0.1:17841 dir=/data/grovefs/treedb/.matrix/dc-readdir-1 durability=group backlog=4096 workers=8
+默认   readdir  run1 → 654983 ops/s over 3.00s | p50=86 max=2992 us
+默认   readdir  run2 → 599833 ops/s over 3.00s | p50=86 max=6905 us
+默认   readdir  run3 → 792903 ops/s over 3.00s | p50=69 max=5409 us
+默认   readdir  run4 → 490714 ops/s over 3.00s | p50=116 max=4928 us
+默认   readdir  run5 → 761635 ops/s over 3.00s | p50=74 max=3205 us
+srv[默认]: treedb-server pid=3283096 listen=127.0.0.1:17841 dir=/data/grovefs/treedb/.matrix/dc-lookup-1 durability=group backlog=4096 workers=8
+默认   lookup   run1 → 1050578 ops/s over 3.00s | p50=50 max=3995 us
+默认   lookup   run2 → 1021964 ops/s over 3.00s | p50=52 max=3240 us
+默认   lookup   run3 → 1062564 ops/s over 3.00s | p50=51 max=3869 us
+默认   lookup   run4 → 1088283 ops/s over 3.00s | p50=51 max=3351 us
+默认   lookup   run5 → 1103529 ops/s over 3.00s | p50=51 max=3537 us
+srv[默认]: treedb-server pid=3284042 listen=127.0.0.1:17841 dir=/data/grovefs/treedb/.matrix/dc-ping-1 durability=group backlog=4096 workers=8
+默认   ping     run1 → 1039153 ops/s over 3.00s | p50=59 max=3120 us
+默认   ping     run2 → 991711 ops/s over 3.00s | p50=57 max=6863 us
+默认   ping     run3 → 1016868 ops/s over 3.00s | p50=55 max=3214 us
+默认   ping     run4 → 1018013 ops/s over 3.00s | p50=55 max=611 us
+默认   ping     run5 → 1001808 ops/s over 3.00s | p50=61 max=3358 us
+srv[w8显式]: treedb-server pid=3284693 listen=127.0.0.1:17841 dir=/data/grovefs/treedb/.matrix/dc-readdir-1 durability=group backlog=4096 workers=8
+w8显式 readdir  run1 → 501893 ops/s over 3.00s | p50=107 max=5878 us
+w8显式 readdir  run2 → 572638 ops/s over 3.00s | p50=87 max=7990 us
+w8显式 readdir  run3 → 720462 ops/s over 3.00s | p50=78 max=3540 us
+w8显式 readdir  run4 → 570586 ops/s over 3.00s | p50=79 max=4045 us
+w8显式 readdir  run5 → 665451 ops/s over 3.00s | p50=84 max=3906 us
+srv[w8显式]: treedb-server pid=3285496 listen=127.0.0.1:17841 dir=/data/grovefs/treedb/.matrix/dc-lookup-1 durability=group backlog=4096 workers=8
+w8显式 lookup   run1 → 874370 ops/s over 3.00s | p50=64 max=4198 us
+w8显式 lookup   run2 → 1061772 ops/s over 3.00s | p50=53 max=3906 us
+w8显式 lookup   run3 → 1115528 ops/s over 3.00s | p50=47 max=12229 us
+w8显式 lookup   run4 → 1057844 ops/s over 3.00s | p50=52 max=2928 us
+w8显式 lookup   run5 → 981268 ops/s over 3.00s | p50=52 max=2570 us
+srv[w8显式]: treedb-server pid=3286431 listen=127.0.0.1:17841 dir=/data/grovefs/treedb/.matrix/dc-ping-1 durability=group backlog=4096 workers=8
+w8显式 ping     run1 → 1007756 ops/s over 3.00s | p50=59 max=3079 us
+w8显式 ping     run2 → 1002420 ops/s over 3.00s | p50=54 max=2886 us
+w8显式 ping     run3 → 1013921 ops/s over 3.00s | p50=55 max=3453 us
+w8显式 ping     run4 → 985636 ops/s over 3.00s | p50=62 max=682 us
+w8显式 ping     run5 → 1013432 ops/s over 3.00s | p50=58 max=2040 us
+srv[w1单核]: treedb-server pid=3287117 listen=127.0.0.1:17841 dir=/data/grovefs/treedb/.matrix/dc-readdir-1 durability=group backlog=4096 workers=1
+w1单核 readdir  run1 → 51436 ops/s over 3.00s | p50=1149 max=139917 us
+w1单核 readdir  run2 → 50156 ops/s over 3.00s | p50=1201 max=112308 us
+w1单核 readdir  run3 → 50243 ops/s over 3.00s | p50=1175 max=108612 us
+w1单核 readdir  run4 → 49983 ops/s over 3.00s | p50=1204 max=151528 us
+w1单核 readdir  run5 → 49470 ops/s over 3.00s | p50=1202 max=120772 us
+srv[w1单核]: treedb-server pid=3287893 listen=127.0.0.1:17841 dir=/data/grovefs/treedb/.matrix/dc-lookup-1 durability=group backlog=4096 workers=1
+w1单核 lookup   run1 → 102728 ops/s over 3.00s | p50=594 max=132106 us
+w1单核 lookup   run2 → 101198 ops/s over 3.00s | p50=597 max=127759 us
+w1单核 lookup   run3 → 104284 ops/s over 3.00s | p50=592 max=108716 us
+w1单核 lookup   run4 → 103507 ops/s over 3.00s | p50=584 max=93037 us
+w1单核 lookup   run5 → 104988 ops/s over 3.00s | p50=587 max=124751 us
+srv[w1单核]: treedb-server pid=3288726 listen=127.0.0.1:17841 dir=/data/grovefs/treedb/.matrix/dc-ping-1 durability=group backlog=4096 workers=1
+w1单核 ping     run1 → 131741 ops/s over 3.00s | p50=468 max=21796 us
+w1单核 ping     run2 → 131201 ops/s over 3.00s | p50=470 max=19342 us
+w1单核 ping     run3 → 132340 ops/s over 3.00s | p50=467 max=12683 us
+w1单核 ping     run4 → 136097 ops/s over 3.00s | p50=448 max=23927 us
+w1单核 ping     run5 → 132878 ops/s over 3.00s | p50=459 max=2852 us
