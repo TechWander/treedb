@@ -9,11 +9,11 @@
 自己的仓里；本仓唯一与 PostgreSQL 有关的东西是默认关掉的 `postgres-compat` 脚手架，
 而这条约束有测试守着（`tests/independence.rs`，详见 §11 第 7 条）。
 
-**状态**：v0.3.1。引擎本体已落地并跑完五轴验收（§7.8 是 2026-11-19 的全轴复跑）；
+**状态**：v0.3.3。引擎本体已落地并跑完五轴验收（§7.8 是 2026-11-19 的全轴复跑）；
 已建 git 仓推 `origin`(gitee) + `github` 两远端。0.3.0 之后的一批全在**读轴**上：
 量具口径对称化（§9.1 第 3 条）、默认前端 worker 按核数（§8 第 1 条）、目录项两层表
-+ kind 冗余（§7.10）；**线协议、WAL 与快照的字节格式一个字节没动**（`SNAP_VERSION`
-仍是 2，本轮没升），旧数据目录直接升级。tag：`v0.3.0` 是引擎首版（e2bb51d），`v0.3.1` 是本轮
++ kind 冗余（§7.10）；那一批**线协议、WAL 与快照的字节格式一个字节没动**（当时
+`SNAP_VERSION` 仍是 2），旧数据目录直接升级。tag：`v0.3.0` 是引擎首版（e2bb51d），`v0.3.1` 是本轮
 定版。接入 spike 已在 grovefs 实验分支 `exp/treedb-integration` 上**端到端跑通**（§10
 阶段 B 末节：31 条 e2e 断言全过，grovefs 默认档逐字节不变；treedb 在 grovefs 里是
 **按 tag 的 git 依赖**，不再依赖同级克隆）。
@@ -22,10 +22,18 @@
 fsync 删掉了，与 `group` 共用一个提交点，机械盘 64 并发 1 891 → 10 913 ops/s、
 p99 81.5 → 31.1 ms（§7.9 第 3 条，受控 A/B 在 `benches/results/ab_durability.log`）。
 
-test 现在分两档报：默认档（纯引擎）`cargo test --release` = **75 passed**（29 lib +
-20 engine_crud + 9 net_protocol + 7 read_scaling + 6 crash_recovery + 3 independence +
+`v0.3.2` 之后是**能力面**一轮，把 §11 第 3、6、7（T2）三条一次收口：引擎有了通用表
+（`Table*` 四条 + `Row*` 五条，字节列 + 唯一约束 + 条件写/CAS），`ReadDirPlus` 让一页
+dirents 直接带属性，`Stats` 补上 WAL 磁盘长度、快照长度与协议版本。**这一轮字节格式
+真的变了**：op 与 reply 各加了一批 tag（47 op / 26 reply），`PROTOCOL_VERSION` 2 → 3，
+且帧里没有版本位可升（§4.1）；快照尾部多了 tables/rows 两段，`SNAP_VERSION` 2 → 3，
+旧快照被版本号闸门拒收而不是静默解错。定版 `v0.3.3`；grovefs 侧仍钉 `v0.3.2`，升级
+面见 §10。
+
+test 现在分两档报：默认档（纯引擎）`cargo test --release` = **83 passed**（30 lib +
+26 engine_crud + 10 net_protocol + 7 read_scaling + 6 crash_recovery + 3 independence +
 1 scale_connections，10k 那条仍 `#[ignore]`）；`--features postgres-compat` =
-**106 passed**，多出的 31 条 = 过渡档自己的 30 条单测 + `concurrency.rs` 里那条
+**114 passed**，多出的 31 条 = 过渡档自己的 30 条单测 + `concurrency.rs` 里那条
 不需要 PG 的拨号用例（剩下 6 条要真 PG，默认 `#[ignore]`，不计入 passed）。即 PG 只出现在
 `postgres-compat` 后面的 `src/pool`、`src/store`、
 `src/persist`、`src/schema`、`src/probe.rs` 里，以及性能对照器 `src/bin/pgbench.rs`
@@ -47,7 +55,7 @@ test 现在分两档报：默认档（纯引擎）`cargo test --release` = **75 
 | # | 验收项 | 判据 | 实测结果 | 结论 |
 |---|--------|------|----------|------|
 | 1 | 连接轴 | 单进程 ≥10 000 并发连接，且 1 fd/conn | 10 000 连接：RSS +5 MiB、**0.53 KiB/conn**、`fd/conn = 1.0000`；25 000 连接：0.39 KiB/conn（2026-11-19 复跑：+6 MiB、0.56 KiB/conn，见 §7.8） | **达成** |
-| 2 | 持久性轴 | `kill -9` 后已 ack 的写零丢失 | 6 个崩溃用例全绿（`always`/`group` 两档、6 线程混打中途崩、checkpoint 瞬间崩、连崩 3 轮） | **达成** |
+| 2 | 持久性轴 | `kill -9` 后已 ack 的写零丢失 | 6 个崩溃用例全绿（`always`/`group` 两档、6 线程混打中途崩、checkpoint 瞬间崩、连崩 3 轮），另有 `workers=8` 下同语义的一条；覆盖面已扩到通用表（行、索引重推、级联删表，§6.4） | **达成** |
 | 3 | 吞吐轴 | op QPS/p99 与 PG 同语义对照 | **默认档（本机 `workers=8`）逐格领先**：64 并发纯读 `readdir` 427 092 vs PG 146 203（**2.9×**）、`lookup` 847 297 vs 210 868（**4.0×**）、`ping` 977 771 vs 531 437（**1.8×**）、`create` 10 386 vs 1 837（**5.7×**）、`write` 12 753 vs 1 415（**9.0×**）；p50 62–112 µs vs PG 117–431 µs（写档 PG 33.6 ms）；零旗标默认档独立复跑 5 次的中位更高（`readdir` 4.5×、`lookup` 5.0×、`ping` 1.9×），所以上面这组倍率是下界。本行旧版那句“默认 `workers=1` 下被 PG 反胜 3–8×”**作废**：它是量具分母不对称与显式单前端两件事叠出来的（§9.1 第 3 条、§7.5） | **达成**（默认即领先，代价见 §8 第 1 条） |
 | 4 | 设计文档 | 选型判据 + 协议 + 语义边界 + 数据成文 | 本文档 | 达成 |
 
@@ -154,12 +162,12 @@ test 现在分两档报：默认档（纯引擎）`cargo test --release` = **75 
                                   │            src/net/mail.rs     纯读批次就地算完直接回；
                                   │           （eventfd 信箱）     含写批次整批 ──► 唯一提交线程
                                   │                                 （只有它持 Engine/WAL/stats）
-                                  │  Op/Reply（src/engine/model.rs，37 op / 20 reply）
+                                  │  Op/Reply（src/engine/model.rs，47 op / 26 reply）
                                   ▼
                                   src/engine/core.rs   Engine：apply → WAL → 持久化 → 回包
-                                  │  src/engine/apply.rs  语义实现（rename/锁/账本/分页）
+                                  │  src/engine/apply.rs  语义实现（rename/锁/账本/分页/表约束）
                                   │  src/engine/wal.rs    WAL：帧/CRC/预分配/group commit
-                                  │  src/engine/mem.rs    State：HashMap 状态机 + Log
+                                  │  src/engine/mem.rs    State：BTreeMap 状态机 + Log（含表与行）
                                   ▼
                             /data/…/treedb.wal + state.snap
 
@@ -172,17 +180,20 @@ test 现在分两档报：默认档（纯引擎）`cargo test --release` = **75 
 
 | 文件 | 行 | 职责 |
 |------|----|------|
-| `src/engine/wal.rs` | 656 | WAL 帧格式、CRC32、预分配、group commit、扫描/重放、`reset` |
-| `src/engine/core.rs` | 469 | `Engine`：op 入口、durability 分档、checkpoint、`Stats`、只读入口 `exec_read` |
-| `src/engine/mem.rs` | 912 | `State`（views/nodes/dentries/locks/refs/keys/audit/defs/place）+ `Log` |
-| `src/engine/apply.rs` | 854 | 37 个 op 的具体语义：环检测、nlink、租约过滤、分页游标 |
-| `src/engine/model.rs` | 1488 | `Op`/`Reply` 定义与 codec 实现 |
-| `src/net/server.rs` | 672 | `workers=1` 的 epoll 循环、连接生命周期、写回背压、周期任务；兼作两条路径共用的 `Conn`/`Slot` 构件 |
-| `src/net/multi.rs` | 819 | `workers>1`：N 条前端 worker + 唯一提交线程（路由闸门、按连接号回程、停机收尾） |
+| `src/engine/wal.rs` | 682 | WAL 帧格式、CRC32、预分配、group commit、扫描/重放、`reset` |
+| `src/engine/core.rs` | 505 | `Engine`：op 入口、durability 分档、checkpoint、`Stats`、只读入口 `exec_read` |
+| `src/engine/mem.rs` | 1428 | `State`（views/nodes/dentries/locks/refs/keys/audit/defs/place/tables/rows/row_index）+ `Log` |
+| `src/engine/apply.rs` | 1287 | 47 个 op 的具体语义：环检测、nlink、租约过滤、分页游标、表形状校验与约束 |
+| `src/engine/model.rs` | 2310 | `Op`/`Reply` 定义与 codec 实现 |
+| `src/net/server.rs` | 758 | `workers=1` 的 epoll 循环、连接生命周期、写回背压、周期任务；兼作两条路径共用的 `Conn`/`Slot` 构件 |
+| `src/net/multi.rs` | 834 | `workers>1`：N 条前端 worker + 唯一提交线程（路由闸门、按连接号回程、停机收尾） |
 | `src/net/mail.rs` | 114 | 两者之间那条能被 `epoll` 唤醒的信箱（`Mutex<VecDeque>` + eventfd） |
 | `src/net/client.rs` | 115 | 同步客户端 + pipeline |
-| `src/bin/{server,bench,pgbench,demo}.rs` | 1151 | 可执行入口；`pgbench` 是 PG 对照器 |
+| `src/bin/{server,bench,pgbench,demo}.rs` | 1200 | 可执行入口；`pgbench` 是 PG 对照器 |
 | `benches/throughput_matrix.sh` | 188 | 五轴吞吐矩阵（§7 的数据来源） |
+
+行是 `wc -l`，含各文件自己的 `mod tests`（旧版这张表是历史快照，已与代码脱开的
+那几个文件本轮按实测回填）。
 
 引擎本体（`src/engine` + `src/net`）的依赖只有 `libc` + `thiserror`。
 
@@ -202,29 +213,39 @@ payload = tag: u16 | 字段…            （Op / Reply 各自的 tag 空间，R
 - 半帧等待：`partial_frame_waits_for_more`，碎帧跨多次 `read` 也要拼完整
   （`fragmented_request_is_reassembled`）。
 - 错误：`Reply::Err { code: u16, msg }`，`code` 就是 POSIX `errno`。
+- **帧里没有版本位**（v1 定形时就没给，现在也不能塞 —— 塞进去就把旧客户端的
+  整个 payload 偏移挪了两位）。版本只能靠 `Stats.proto_version` 在第一次握手后
+  查到，当前 `PROTOCOL_VERSION = 3`。升级顺序因此是硬约束：**先升服务端，后升客户端**。
+  新客户端解旧服务端的帧会短读报错（能看见），旧客户端解新服务端的帧会**静默丢掉
+  尾部字段**（看不见）—— 后者正是 `SNAP_VERSION` 那道闸门在磁盘上防的事，线上没有
+  等价物，只能靠顺序。
 
-### 4.2 op 分组（37 个）
+### 4.2 op 分组（47 个）
 
 | 组 | op |
 |----|----|
 | 运维 | `Ping` `Stats` `Checkpoint` `Shutdown` |
 | 视图 | `CreateView` `DropView` `ListViews` |
-| 名字/属性 | `Lookup` `Getattr` `Setattr` `ReadDir` |
+| 名字/属性 | `Lookup` `Getattr` `Setattr` `ReadDir` `ReadDirPlus` |
 | 增删 | `Create` `Mkdir` `Symlink` `Readlink` `Unlink` `Rmdir` `Rename` |
 | 数据账本 | `RefLookup` `RefUp` `RefDown` |
 | 锁 | `LockQuery` `LockSet` |
 | 密钥 | `KeyCreate` `KeyGet` `KeyList` `KeyUpdate` `KeyCheck` |
 | 审计 | `AuditAppend` `AuditList` |
 | 定义/放置 | `DefPut` `DefGet` `DefList` `DefDel` `PlaceSet` `PlaceGet` `PlaceList` |
+| 通用表 | `TableCreate` `TableDrop` `TableGet` `TableList` `RowPut` `RowGet` `RowList` `RowDelete` `RowCount` |
 
-**只读集（16 个）= worker 可就地执行集**：`Ping` `ListViews` `Lookup` `Getattr`
-`Readlink` `ReadDir` `RefLookup` `LockQuery` `KeyGet` `KeyList` `KeyCheck`
-`AuditList` `DefGet` `DefList` `PlaceGet` `PlaceList`；剩下的 21 个全部要过 WAL。
+**只读集（22 个）= worker 可就地执行集**：`Ping` `ListViews` `Lookup` `Getattr`
+`Readlink` `ReadDir` `ReadDirPlus` `RefLookup` `LockQuery` `KeyGet` `KeyList` `KeyCheck`
+`AuditList` `DefGet` `DefList` `PlaceGet` `PlaceList` `TableGet` `TableList` `RowGet`
+`RowList` `RowCount`；剩下的 25 个全部要过 WAL。
 
 - 这份划分不只是优化提示，**它是语义地基**：`Op::is_readonly()` 判错一条，就是把
   一次应当被确认的写丢在 worker 手里。`readonly_classification_matches_translate`
-  拿 37 个 op 的语料逐条跑 `translate`，断言「判为只读 ⇒ logs 必空」，同时钉住
-  16/21 这两个数 —— 加 op、改分派表，这里和测试必须一起动。
+  拿 47 个 op 的语料逐条跑 `translate`，断言「判为只读 ⇒ logs 必空」，同时钉住
+  22/25 这两个数 —— 加 op、改分派表，这里和测试必须一起动。语料里每条只读 op 都要
+  真查到东西（`seed` 因此也建表灌行），否则「不产 logs」这句只在测「查不存在的表
+  不产 logs」那种废话。
 - `Stats` 刻意**不在**只读集里：它不写 WAL，但它读的是 `Engine` 手里的计数器，而那些
   计数器只有提交线程碰得到。worker 就地算的 op 数走一个 `AtomicU64` 折回
   `ops_total`（`Engine::attach_external_ops`），否则运维看到的 QPS 会少一大截
@@ -252,8 +273,8 @@ pipeline=32 看起来像 1 ms 级，那是骗人。
 
 ### 5.1 状态
 
-`State` 是 9 张内存表：`views` / `nodes`（ino 为中心）/ `dentries`（parent+name → ino）/
-`locks` / `refs` / `keys` / `audit` / `defs` / `place`。
+`State` 是 12 张内存表：`views` / `nodes`（ino 为中心）/ `dentries`（parent+name → ino）/
+`locks` / `refs` / `keys` / `audit` / `defs` / `place` / `tables` / `rows` / `row_index`。
 `data_ref` 是一串**不透明字节**（`DataRef = Vec<u8>`，空串 = 没有内容），引擎不存数据块
 也不解释它；`refs` 表只记「持有者数 + 字节总量」，不变量是 `bytes == Σ 持有者 size`，
 GC 拿它当唯一依据。
@@ -262,6 +283,26 @@ GC 拿它当唯一依据。
 字节互相顶掉）或在 provider 里养一张 `String ↔ u64` 映射表（表本身得持久化，崩溃后
 查不到映射就读不到数据）。字节作键零碰撞、零映射表，且与 PG 后端同形。磁盘格式跟
 着变了，所以 `SNAP_VERSION` 1 → 2，旧快照会被版本号闸门拒收而不是静默解错。）
+
+**通用表（§11 T2）**。引擎不再只有那四张照搬某个客户端表形的专用表
+（`keys`/`audit`/`defs`/`place`）：`tables` 存形状（名字 + 列定义），
+`rows` 是 `表 id → (主键字节 → 列值字节)` 两层表，`row_index` 是
+`(表, 列, 值, 主键)` 一张扁平二级索引。四条定型：
+
+- **列没有类型**。值全是不透明字节，比较只有字节相等，排序只有主键字节序。类型一进
+  内核，客户端的语义就会顺着类型名漏进来，而引擎没法替所有人定义「什么是一个合法
+  的过期时间」。
+- **`row_index` 不进 WAL 也不进快照**，与 `Dent::kind`（§7.10）同一个取舍（冗余可推字段不动
+  磁盘格式）：它完全由 `rows` + def 推出。代价是把「重开后索引必须被重建得一模一样」
+  这条承诺压给了恢复路径，所以它有两个专门的断言顶着：崩溃重开后重复唯一值仍
+  `EEXIST`（`control_plane_survives_sigkill`），checkpoint + 重开后整个 `State`
+  逐字段相等（`generic_tables_keep_rows_and_rebuild_indexes`、`table_state_survives_checkpoint_and_reopen`）。
+- **两层 `rows` + 分层的索引**。与 `dentries` 同一套理由：`Vec<u8>: Borrow<[u8]>` 只在
+  内层那一维成立，分两层后主键查不用先复制一个 `Vec`；而索引必须扁平，因为等值列举要
+  的就是「`(表,列,值)` 前缀下按主键有序的一段」，一层 `range` 直接命中。
+- **id 在 `translate` 里分配，不在 `State::apply` 里**（与 view id 同构）：应答与日志必须
+  拿到同一个 id，而 translate 对状态只读 —— 那正是单写者流水线能成立的前提。id 单调
+  不回收：`TableDrop` 后重建同名表得到新 id，旧行不可能被误认成新表的数据。
 
 ### 5.2 已经锁进测试的语义
 
@@ -279,6 +320,16 @@ GC 拿它当唯一依据。
 | 密钥 create/auth/revoke/rotate/expire 全生命周期 | `key_lifecycle_auth_revoke_rotate_expire` |
 | 缺失 inode 上 `setattr` → errno；目录 size 规则 | `setattr_on_missing_inode_and_dir_size` |
 | 视图 id 单调，drop + checkpoint 后不回绕复用 | `dropped_view_id_is_never_reused_across_reopen` |
+| `readdirplus` 与 `readdir` 给**同一页**（四个平行数组 + `next`/`end` 逐字段相等），每条属性与单独 `Getattr` 相等；错误面同源（`ENOTDIR`/`ENODEV`）。存在理由：不带属性时客户端一页 N 条要回头逐条 `Getattr`，往返从 1 变 N | `readdir_plus_answers_the_same_page_as_readdir_plus_getattr`、`generic_table_and_readdir_plus_over_tcp` |
+| 建表只校形状（名字非空有上界、1..=64 列、列名不重）；重名 `EEXIST` 而不是覆盖；查不存在的表 `TableGet` 回 `Table(None)`（不是错误），写侧回 `ENOENT` | `table_shape_is_validated_and_names_can_be_reclaimed` |
+| 行写校验链：主键 1..=4096、列数与 def 严格相等、两个互斥 flag 同给 `EINVAL`、条件列越界 `EINVAL` | `row_writes_respect_bounds_constraints_and_conditions` |
+| 唯一约束只按字节相等判撞，**空串也是一列的合法值**；同主键覆盖写不算撞。`RowPut` 是整行覆盖（不给列 = 该列清成空字节） | 同上 |
+| `PUT_IF_ABSENT`/`PUT_IF_EXISTS` 与 CAS（`cond_col`/`cond_val`）；条件不命中一律 `EAGAIN`，**行不存在也算不命中**（回 `ENOENT` 还是 `EAGAIN` 会误导重试策略） | 同上 |
+| `RowDelete` 默认幂等（重发一个已成功的删除不该看到错误），`DEL_IF_EXISTS` 才回 `ENOENT` | 同上 |
+| 翻页游标 = 「上一页最后一行的主键」（不含本身），与 `readdir` 同语义；不用「已返回若干条」那种序号游标（BTreeMap 的 `skip(n)` 是 O(n)，翻到第 k 页就把前 k 页重走一遍） | `row_scans_page_by_key_cursor_without_gaps_or_repeats` |
+| 只能按主键或有索引的列列举（否则 `EINVAL`，不静默扫全表）；`limit = 0` 走默认页宽而不是「不限」 | 同上 |
+| `TableDrop` 级联掉行与二级索引，一条不剩；空内层表不留；`next_table_id` 不回收 | `generic_tables_keep_rows_and_rebuild_indexes`、`table_state_survives_checkpoint_and_reopen` |
+| 表与行走完全部四条持久化路径：WAL 重放、checkpoint 截断、`kill -9`、TCP 端到端 | `reopen_replays_wal_into_identical_state`、`control_plane_survives_sigkill`、`generic_table_and_readdir_plus_over_tcp` |
 
 ### 5.3 明确**不**提供的东西
 
@@ -294,6 +345,14 @@ GC 拿它当唯一依据。
   活动（2 + 子目录数）。grovefs `MetaProvider::link_node` 接过来只能回 `EPERM`。
 - **字节区间锁**：锁的 key 是 `(view, ino, owner)`，没有 `(start, end, pid)`。POSIX 记录锁
   要的是按区间合并/拆分的那套语义，这里给不了 —— provider 只能拒，不能假装支持。
+- **通用表只给 §4.2 那九条 op 的形状**（状态与定型见 §5.1）：没有类型、没有 JOIN 与跨表条件、没有范围/前缀
+  谓词（`RowList` 只能按主键字节序、或按某个已建索引列的**等值**翻页）、没有排序与
+  聚合（只有 `RowCount`）、除唯一列外没有其他约束（没 NULL 概念、没外键、没 CHECK）。
+  每一条都是把「查询能力」换回「可推的索引 + 不解释的字节」：内核一旦开始解释列值，
+  客户端语义就顺着类型漏进来（§11 第 7 条的约束）。
+- **表没有命名空间与权限**：`tables` 是全引擎一张平表，不像 `views` 那样按视图隔离
+  命名空间。接入方如果需要多租户，表名得自己带前缀 —— 引擎只保证名字唯一，
+  不保证两个客户端不撞名。
 - xattr、ACL、quota、mtime 之外的时间戳精度增强。
 
 ---
@@ -308,6 +367,12 @@ seq: u64 | crc: u32 | len: u32 | reserved: u32   (HDR = 20) | payload(len)
 
 - `crc32` 是自带查表的 IEEE CRC32，只覆盖 payload（`crc32_matches_known_vector`）。
 - 一次提交可以打包多条 `Log`（一个 op 改多处 = 一个原子批次）。
+- `Log` 现在 22 个变体（`LOG_*` 字节码 1..=22）：本轮给通用表加了
+  `PutTable`/`DelTable`/`PutRow`/`DelRow` 四条。只记**权威事实**（表定义、行全值），
+  其余一律不记：`row_index` 由 `rows` + def 重推，`table_by_id` 由 `tables` 同批维护 ——
+  与 §5.1 「冗余可推字段不进磁盘格式」同一条规矩。`DelTable` 的一条日志在恢复时
+  负责级联掉整张表的行与索引。未知 tag 硬错拒启（`unknown log tag`），不能静默跳过 ——
+  跳过就是丢一次已 ack 的写。
 
 ### 6.2 恢复规则（`scan` / `replay`）
 
@@ -370,12 +435,24 @@ checkpoint 之后 WAL 被 `reset` 成空文件，`fast_forward(snap_seq)` 把发
 | `acked_writes_survive_sigkill_group` | `group` 档同上 |
 | `kill_mid_flight_keeps_every_acked_write` | 6 线程 × 200 条混打中途 `kill -9` |
 | `crash_right_after_checkpoint` | 快照刚落盘、WAL 刚 `reset` 时崩 |
-| `control_plane_survives_sigkill` | 密钥/审计/定义/放置/锁这类无本地缓存兜底的数据 |
+| `control_plane_survives_sigkill` | 密钥/审计/定义/放置/锁这类无本地缓存兜底的数据，本轮起同一口径覆盖通用表（形状见表下） |
 | `repeated_kill_cycles_do_not_erode_state` | 连崩 3 轮，状态不腐蚀 |
+
+`control_plane_survives_sigkill` 里的表负载形状：崩前建表灌 20 行、覆盖写一行、
+再建一张表随后删掉；崩后要求行全在、被覆盖的列读到新值、按索引列能枚举、重复的
+唯一值仍 `EEXIST`（这一条才是「索引真被重推出来」的判据）、删掉的表不留残留行。
+
+这六条在 `tests/crash_recovery.rs`（单前端），另有一条同语义的并行档用例
+`acked_writes_survive_crash_with_workers_on`（`tests/read_scaling.rs`，`workers=8`）：
+300 次目录写与 300 次表写逐条交错，每几条夹一批纯读逼 worker 与提交 fsync 重叠，
+崩后行数与索引重推都要对上。「已 ack 的写一条不丢」这句承诺不因为开并行而缩面。
 
 ---
 
 ## 7. 性能实测（五轴）
+
+口径提醒：本节各节里的「本轮」指**它所记录的那一轮**（v0.3.1 读轴、v0.3.2 写轴），
+不是本文开头那句 v0.3.3 —— 能力面那一轮没动性能，所以本节数字一个没重跑。
 
 复现：`benches/throughput_matrix.sh [每格秒数=3] [轴…]`，原始逐格输出在
 `benches/results/matrix.log`。下面只报表格化的结论。注意脚本默认只跑轴 1–4，
@@ -928,8 +1005,10 @@ O(目录数)）另开了 `Engine::wal_bytes()`（`src/engine/core.rs`）：auto-
    `worst_round_us`（`Report`）而不是继续加 worker。核数自适应只到“起步值”这一层：
    换机器要重测 §7.5 那张表，别把 8 当常数。
 2. **状态全内存**：恢复时间 = 快照读入 + 尾日志重放。状态规模上限就是内存上限；
-   快照多大、重启多少秒**本轮没实测**（现有测试都在 MB 量级以下），真到
-   百 MB / 亿级 inode 前要先量，并另设计分层。
+   本轮之后这个规模不再只算 inode —— 通用表的每一行都全量住在 `rows` 里
+   （`row_index` 额外占一份，它不进快照但占内存）。快照多大、重启多少秒
+   **本轮没实测**（现有测试都在 MB 量级以下），真到百 MB / 亿级 inode 或千万级行
+   前要先量，并另设计分层。
 3. **`never` 档会丢数据**：它只是把 fsync 从提交路径挪走，崩溃丢最近 `sync_ms` 窗口。
    选它必须是有外部冗余的场景。
 4. **无数据面 / 无 fd 语义**（§5.3）：`O_TRUNC`、POSIX 记录锁的 `(pid,fd)` 所有权这类
@@ -943,8 +1022,12 @@ O(目录数)）另开了 `Engine::wal_bytes()`（`src/engine/core.rs`）：auto-
    （`auto_checkpoint_bytes` 只是把触发频率压住）。
 8. **视图名 25 字节上限**：与 grovefs `pg_store::schema_for` 对齐；突破要同步改
    `VIEW_NAME_MAX`。
-9. **预分配的空间代价**：WAL 文件至少 4 MiB 且倍增，`du` 看到的比逻辑长度大。
-   `Stats.wal_bytes` 报的是**逻辑长度**（checkpoint 阈值按它算），磁盘长度只会 ≥ 它。
+9. **预分配的空间代价**：WAL 文件至少 4 MiB 且倍增，`du` 看到的比逻辑长度大。现在
+   两个数都在 `Stats` 里且各说一件事：`wal_bytes` 是**逻辑长度**（checkpoint 阈值按它
+   算），`wal_disk_bytes` 是文件实际长度（容量规划按它算，只会 ≥ 前者）；`snap_bytes`
+   是上一代快照的字节数（未 checkpoint 时为 0）。`treedb-server --stats` 直接把这三个
+   数并列打出来。注意 `snap_bytes` 滞后一代：它反映的是上一次落盘的快照，不是当前
+   状态的编码长度。
 10. **`--bench`/`--pgbench` 是本机同盘对照，不是云端结论**：换 SSD/NVMe、换 PG 大版本、
     换 `wal_compression`/`full_page_writes` 配置，绝对数字都会变，倍数关系才可信。
 11. ~~`always` 档在高并发下没有优势，尾延迟还会跑飞~~ **已修**（§7.9 第 3 条）：
@@ -960,8 +1043,8 @@ O(目录数)）另开了 `Engine::wal_bytes()`（`src/engine/core.rs`）：auto-
 ## 9. 测试清单
 
 ```sh
-cargo test --release                            # 默认档（纯引擎），75 条
-cargo test --release --features postgres-compat # 加上过渡档，106 条
+cargo test --release                            # 默认档（纯引擎），83 条
+cargo test --release --features postgres-compat # 加上过渡档，114 条
 cargo test --release --lib                      # 只看引擎单测
 cargo test --release --test scale_connections -- --ignored   # 万级连接重压（§7.6）
 bash benches/throughput_matrix.sh 3             # 五轴吞吐矩阵（默认只跑 1–4）
@@ -986,22 +1069,46 @@ gcc -O2 -pthread -o /tmp/lb_floor benches/lb_floor.c && /tmp/lb_floor 1 64 3   #
 
 | 目标 | 数量 | 覆盖 |
 |------|------|------|
-| `--lib` | **28**（+30 属 `postgres-compat`） | codec round-trip（全 tag）、CRC 已知向量、碎帧/超长帧、WAL 帧与截断重放、**预分配空洞重开**（`prealloc_padding_reopens_cleanly`）、**大批次不跳写**（`huge_batch_writes_every_record`）、**seq 跳号硬错**、状态快照保留 node key、**两层 dentry 与 kind 冗余过快照不坏**（`dentries_are_two_level_and_kind_survives_snapshot`，§7.10）、缓冲压缩、租约过期边界、`default_workers` 上下界 |
-| `tests/engine_crud.rs` | **19** | §5.2 全部 POSIX 语义（含 GC 线索与 NOREPLACE）+ 控制面（密钥/审计/定义/放置）+ checkpoint 后重开 + 坏尾截断 |
-| `tests/net_protocol.rs` | **9** | TCP 端到端：CRUD、碎帧、pipeline 保序、并发连接不串扰、超长帧只杀违规者、大回包流式读完、`--stats`/`--checkpoint`/`--shutdown`、优雅停服后同地址立刻重绑 |
+| `--lib` | **30**（+30 属 `postgres-compat`） | codec round-trip（全 tag：47 op / 26 reply）、**`Log` 全变体 round-trip**（含本轮四条表日志）、CRC 已知向量、碎帧/超长帧、WAL 帧与截断重放、**预分配空洞重开**（`prealloc_padding_reopens_cleanly`）、**大批次不跳写**（`huge_batch_writes_every_record`）、**seq 跳号硬错**、状态快照保留 node key、**两层 dentry 与 kind 冗余过快照不坏**（`dentries_are_two_level_and_kind_survives_snapshot`，§7.10）、**通用表行与索引过快照不坏**（`generic_tables_keep_rows_and_rebuild_indexes`，§5.1）、缓冲压缩、租约过期边界、`default_workers` 上下界 |
+| `tests/engine_crud.rs` | **26** | §5.2 全部 POSIX 语义（含 GC 线索与 NOREPLACE）+ 控制面（密钥/审计/定义/放置）+ checkpoint 后重开 + 坏尾截断；本轮新增 6 条：4 条盖通用表（表形状校验与表名回收、行写边界/约束/CAS/flags、主键与索引列游标翻页、表状态过 checkpoint+重开），1 条盖 `ReadDirPlus` 与 `ReadDir`+`Getattr` 逐字段对齐，1 条盖 `Stats` 新字段 |
+| `tests/net_protocol.rs` | **10** | TCP 端到端：CRUD、碎帧、pipeline 保序、并发连接不串扰、超长帧只杀违规者、大回包流式读完、`--stats`/`--checkpoint`/`--shutdown`（含两个磁盘长度与协议版本）、优雅停服后同地址立刻重绑、**通用表 + readdirplus 走 TCP**（1000 行 pipeline、错误帧经网络回真实 errno、8 KiB 收缓冲下大应答完整接回） |
 | `tests/crash_recovery.rs` | **6** | §6.4 |
-| `tests/read_scaling.rs` | **7** | 只读分派表逐条对 `translate`（判错一条就是丢写）、`workers=1/8` 答复逐条相同、每连接流内顺序、一写多读不读到半截状态、`ops_total` 记上 worker 就地算的读、并行档下 `kill -9` 已 ack 的写全在、**fd 复用不会把上一任的应答塞给新任** |
+| `tests/read_scaling.rs` | **7** | 只读分派表逐条对 `translate`（判错一条就是丢写；语料 47 条全变体，钉住 47/22/25 三个数）、`workers=1/8` 答复逐条相同（负载含表读与 `ReadDirPlus`，混合批里把 CAS 写夹在读之间）、每连接流内顺序、一写多读不读到半截状态、`ops_total` 记上 worker 就地算的读、并行档下 `kill -9` 已 ack 的写全在（目录写与表写逐条交错）、**fd 复用不会把上一任的应答塞给新任** |
 | `tests/concurrency.rs` | 0（+7，整文件 feature 门控） | T1 之后整个文件在 `postgres-compat` 后面：无 PG 时跑「拨号失败不漏 live」（1 条，要 feature），其余 6 条 `#[ignore]` 需真实 PG。**它测的是共享池，不是引擎并发**（§7.8）|
 | `tests/scale_connections.rs` | 1（+1 ignored） | 1 000 连接 fd/RSS 断言每次跑；万级（`TREEDB_CONNS`，含 25 000）手动 |
 | `tests/independence.rs` | **3** | 独立性三把门：内核目录（`src/engine`、`src/net`）不出现客户端名字；`[dependencies]` 非 optional 项只能是 `libc` + `thiserror`；`postgres-compat` 不得进 `default`（§11 第 7 条） |
 
-本轮新加/改写的回归锁：
+上一轮（读轴/写轴）新加或改写的回归锁，本轮仍然全绿：
 `dentries_are_two_level_and_kind_survives_snapshot`（两层表形状 + kind 冷启动后
 仍在 + 快照字节序列不变，§7.10）、
 `prealloc_padding_reopens_cleanly`（预分配空洞不能被当记录）、
 `torn_wal_tail_is_discarded_not_fatal` 与 `replay_skips_torn_tail`（坏尾必须注入到
-**逻辑末尾**，不是文件 EOF —— 预分配后两者差着一大片零，注错地方就等于什么都没测）、
-`ops_stats_checkpoint_shutdown_over_tcp`（`wal_bytes` 改按逻辑长度断言，checkpoint 后归零）。
+**逻辑末尾**，不是文件 EOF —— 预分配后两者差着一大片零，注错地方就等于什么都没测）。
+
+本轮（能力面）新加的回归锁：
+`generic_tables_keep_rows_and_rebuild_indexes`（lib：`row_index` 不进快照，必须由
+`rows` + def 重推得逐字相等；`row_page`/`index_page` 游标不重不漏；`DelTable` 后
+`row_index.is_empty()`）、
+`table_shape_is_validated_and_names_can_be_reclaimed`（表名/列数/重名列的校验顺序，
+以及删表后 id 不重新发票）、
+`row_writes_respect_bounds_constraints_and_conditions`（key 与列数边界、`flags` 互斥、
+唯一碰撞、条件写不命中一律 `EAGAIN`、幂等删）、
+`row_scans_page_by_key_cursor_without_gaps_or_repeats`（主键游标与索引列游标翻页、
+不索引列 `EINVAL`、`limit=0` 走默认页宽）、
+`table_state_survives_checkpoint_and_reopen`、
+`readdir_plus_answers_the_same_page_as_readdir_plus_getattr`（同一页、同一分页边界、
+逐字段对齐 —— 属性必须是算出来的而不是另一套真相）、
+`stats_reports_table_counts_and_both_disk_sizes`（两个 WAL 长度与 `snap_bytes` 的
+「没 checkpoint 就是 0」口径）、
+`generic_table_and_readdir_plus_over_tcp`、
+`ops_stats_checkpoint_shutdown_over_tcp`（本轮补：`wal_disk_bytes == st_size`、
+checkpoint 前 `snap_bytes == 0`、`proto_version == PROTOCOL_VERSION`）。
+
+同一轮里被「改写」而不只是「新增」的两条：`readonly_classification_matches_translate`
+的语料从 37 条扩到 47 条、计数断言改钉 22/25；`control_plane_survives_sigkill` 与
+`acked_writes_survive_crash_with_workers_on` 把通用表纳入「已 ack 的写一条不丢」与
+「索引必须被重推」的验收面。`seed` 现在也建表灌行 —— 不然五条只读表 op 的
+「不产 logs」只在测「查不存在的表」那种废话（§4.2）。
 
 ### 9.1 四条被作废的测量（记录过程，防止有人复用假数据）
 
@@ -1055,7 +1162,8 @@ gcc -O2 -pthread -o /tmp/lb_floor benches/lb_floor.c && /tmp/lb_floor 1 64 3   #
    即使 feature 关掉也要解析**，旁边没有同级克隆的 checkout 任何 feature 组合都
    编不过。最终形态是按 tag 的 git 依赖
    `treedb = { git = "https://github.com/TechWander/treedb.git", tag = "v0.3.2" }`
-   （tag 跟着定版前移：`v0.3.0` → `v0.3.1` → `v0.3.2`，格式兼容所以升级只是改行）
+   （tag 跟着定版前移：`v0.3.0` → `v0.3.1` → `v0.3.2`，那三步磁盘与线协议格式都兼容，
+   升级就是改行；`v0.3.3` 不再兼容，见下面「bump tag 前必读的两处破坏面」）
    —— 故意用匿名 https，没有 SSH key 也 `cargo fetch` 得动。已拿一个**旁边没有
    treedb 的干净克隆**验证默认档与 `--features treedb` 都能编过。
 2. `remote/meta/server_ext.rs::StoreKind` 新增 `Treedb` variant，实现
@@ -1070,19 +1178,33 @@ gcc -O2 -pthread -o /tmp/lb_floor benches/lb_floor.c && /tmp/lb_floor 1 64 3   #
    （长连接 + pipeline 复用，这才是协议设计的目标用法）。
 4. 控制面（密钥/审计）二选一：走 treedb 的 `Key*`/`Audit*`，或保留过渡档的
    `ApiKeyStore`。建议先保留，减少一次性改动面。（spike 现状：保留本地 SQLite。）
-   本轮重新定调：`Key*`/`Audit*` 本身形状就是 grovefs 的表，直接接上等于把业务
-   语义坐进内核——真正的终态是 §11 第 7 条 T2 的通用表，而不是这两个 op。
+   定调已经落地：`Key*`/`Audit*` 本身形状就是某个客户端的表，直接接上等于把业务
+   语义坐进内核——真正的终态是 §11 第 7 条 T2 的通用表，**它本轮已进引擎**。
+   所以下一步不是「把 `Key*` 接给 grovefs 用」，而是 grovefs 拿 `TableCreate` +
+   `Row*` 自己拼 `api_keys`/`mcp_calls`/视图定义的列与条件（§11 第 7 条末）。
 
-**bump tag 前必读的一处 `Dirents` 接口变更**（本轮 `Names` 扁平缓冲带过来的，§7.5 末）。
+**bump tag 前必读的两处破坏面**
+
+① **`Dirents` 的 Rust 接口变更**（§7.5 末那轮 `Names` 扁平缓冲带过来的）。
 `Reply::Dirents.names` 的类型从 `Vec<Vec<u8>>` 变成了 [`Names`](src/engine/model.rs)。
 **线协议一字未改**，所以跨版本连通没问题；断的是**编译期**：
 `grovefs/src/treedb_store.rs` 的 `page()` 里那句 `inos.iter().zip(names)` 要改成
 `zip(&names)`（`&Names` 实现了 `IntoIterator<Item = &[u8]>`，`from_utf8_lossy(&name)`
-那一行不用动）。grovefs 现在锁在 `v0.3.2`，不受影响；但下一次把 tag 往前推时必须
-带上这一行，并按既有做法拿临时 `[patch."https://github.com/TechWander/treedb.git"]`
-跑一次 `cargo check --features treedb` 再拆掉。选这个方案而不是给 `Names` 加一个
+那一行不用动）。选这个方案而不是给 `Names` 加一个
 `to_vec()` 兼容层：后者能让 grovefs 一行不改地编过，但它会把刚刚消掉的那 100 次
 `malloc` 原封不动放回客户端侧 —— 用静默的性能回退换编译兼容，不如把断点摆在明处。
+
+② **本轮（`v0.3.3`）同时动了磁盘格式与线协议 tag**，这一处不是编译期能兼容的：
+`SNAP_VERSION` 2 → 3，旧 `state.snap` 会被版本号闸门**拒收而不是静默解错**（与
+`data_ref` 改字节键那次同一个选择）。后果：任何已经在用 treedb 跑过元数据的
+数据目录，升级到 `v0.3.3` 二进制后**起不来**，而引擎目前没有快照迁移工具
+（grovefs 侧的 `view export`/`import` 在 treedb 档仍是拒绝的，§10 缺口表）。灰度前
+必须先定这一条：要么保留旧二进制直到有迁移工具（§11 第 10 条），要么接受元数据
+重建。`PROTOCOL_VERSION` 2 → 3 叠加了升级顺序硬约束（§4.1）：**先升服务端、后升
+客户端**，反过来旧客户端会静默丢掉新应答的尾部字段。grovefs 现在钉 `v0.3.2`，两端
+一起动才涉及这两条，按既有做法拿临时
+`[patch."https://github.com/TechWander/treedb.git"]` 跑一次
+`cargo check --features treedb` 再拆掉。
 
 ### 阶段 B spike 的实际结果（2026-11-19，`exp/treedb-integration`）
 
@@ -1136,7 +1258,8 @@ spike 明确**没**做、也不在接入面上假装做的事 —— 一律返�
 | `view export` / `view import` | 拒绝 | dump reader 是 SQL 形状的，treedb 无等价物 |
 | `refs rebuild` | 拒绝 | 持有者计数在引擎内同 op 维护，没有独立账本可重算 |
 | `gc` 审计 | 拒绝 | 没有聚合的 ledger 视图，回空集等于判所有对象为孤儿 |
-| readdir 的属性 | N/64 次往返 | 协议该补 `ReadDirPlus`，见 §11 第 6 条 |
+| readdir 的属性 | 仍是 N/64 次往返 | **协议面已闭合**（`ReadDirPlus` 进了 `v0.3.3`，§11 第 6 条），断的是接入侧：provider 还没改用它，而且 grovefs 钉的是 `v0.3.2`。改造前这个缺口真实存在，不能因为 op 进了协议就算完成 |
+| 定义/密钥/账户 | 还在本地 SQLite | 引擎侧的通用表本轮已可用（§11 第 7 条 T2），但 grovefs 未拿它拼过语义；`Key*`/`Audit*` 那三个专用 op 仍是业务形状，不能当接入面（上文第 4 步） |
 | `view list` 的物理树 | 列不出来 | 控制面枚举器只看本地 db 文件 |
 | HA / 快照传送 | 启动即拒绝 | §8「无复制」这条限制本身 |
 | ~~path 依赖的分发方式~~ | 已定：按 tag 的 git 依赖 | 钉 `v0.3.2`（随定版前移），无同级克隆也能构建（实测） |
@@ -1144,7 +1267,7 @@ spike 明确**没**做、也不在接入面上假装做的事 —— 一律返�
 ### 阶段 C（回归与灰度）
 1. ~~`test_pg.sh` 那套断言在 treedb 后端重跑~~ 已起头：新增 `.build-bin/test_treedb.sh`
    一节 treedb 专属断言（31 条），默认档不变。它钉的是**形状**而不是面积：
-   `posix`/`e2e` 那种全量断言矩阵还没在 treedb 上跑过，§11 第 6 条列的缺口也还是缺口。
+   `posix`/`e2e` 那种全量断言矩阵还没在 treedb 上跑过，本节上面那张缺口表也还是缺口表。
 2. 万级视图 mount + create + readdir 混打，对照 `pg_stat_activity`（旧）与
    `--stats`（新）两条路径的连接数、RSS、p99。
 3. 容灾演练：`kill -9` → 重启 → 已 ack 写全在（§6.4 已在 crate 内自动化，
@@ -1163,7 +1286,12 @@ spike 明确**没**做、也不在接入面上假装做的事 —— 一律返�
    代价只多了一个 `--workers` 旋钮和 §8 第 1 条那三项。接下去要动的是写轴：
    单提交线程已经是上限。
 2. **checkpoint 不阻塞回合**（限制 7）：快照生成挪到辅助线程，主循环只切 WAL 代际。
-3. **`Stats` 加磁盘长度**：现在只有逻辑长度，容量规划要看两个数。
+3. ~~**`Stats` 加磁盘长度**~~ **已完成**：`EngineStats` 多了五个字段 —— `wal_disk_bytes`
+   （文件 `st_size`，预分配后只会 ≥ 逻辑长度）、`snap_bytes`（上一代快照的字节数，
+   没 checkpoint 就是 0）、`tables`/`rows` 两个计数、`proto_version`。两个 WAL 长度各说
+   一件事：逻辑长度决定 checkpoint 何时触发，磁盘长度决定这块盘被占了多少（限制 9）。
+   `proto_version` 不只是好看：帧里没有版本位（§4.1），它是线上唯一能查到对端协议
+   版本的通道。`treedb-server --stats` 把这三个长度并列打出来。
 4. **日志传送做只读副本**：让「无复制」这条限制至少能降级成「无写扩展」。
 5. ~~**接入 spike**~~ **已完成并端到端跑通**（grovefs 实验分支
    `exp/treedb-integration`，用户 2026-11-19 授权），结果与缺口清单见 §10 阶段 B
@@ -1172,12 +1300,20 @@ spike 明确**没**做、也不在接入面上假装做的事 —— 一律返�
    不透明字节、给 `Unlink`/`Rmdir`/`Rename` 补上 GC 线索与 `RENAME_NOREPLACE`。
    原先卡住的「分发方式」已定：本仓推到 gitee+github 并打 `v0.3.0`，grovefs 改成
    按 tag 的 git 依赖，拿没有同级克隆的干净仓验证过默认档与 `--features treedb`
-   均绿。**仍未推 master**：推不推是下一轮的决定，而且 treedb 现在只接了「树」，
-   定义/密钥/账户还在本地 SQLite —— 要么先接受这个分裂上线，要么先把下面第 7 条
-   的通用表能力补进引擎再一次性切（注意：是补「通用表」，不是把 grovefs 的表搬进去）。
-6. **`ReadDirPlus`**：接进去才发现 readdir 一页要付 `1 + N/64` 次往返 —— 目录列表
-   本身不带属性，provider 只能回头逐条 `Getattr`。这是 §7.5 那条读轴在 grovefs 形状上
-   的真实成本，补一个带属性的 dirents 应答即可打平 PG 档的一条 SQL。
+   均绿。**仍未推 master**：推不推是下一轮的决定。原本卡在这条上的理由已经消除：
+   treedb 此前只接了「树」，定义/密钥/账户还在本地 SQLite，要么先接受这个分裂上线，
+   要么先把下面第 7 条的通用表能力补进引擎再一次性切（注意：是补「通用表」，不是把
+   grovefs 的表搬进去）—— **第 7 条的 T2 本轮已完成**，所以现在只剩选择本身；切过去
+   之前还得先算清 §10「bump tag 前必读的两处破坏面」里第 ② 条那个数据目录升级问题。
+6. ~~**`ReadDirPlus`**~~ **协议面已完成**：接进去才发现 readdir 一页要付 `1 + N/64` 次
+   往返 —— 目录列表本身不带属性，provider 只能回头逐条 `Getattr`。现在
+   `Reply::DirentsPlus` 在一页里直接带上与 `Getattr` 同源的 `NodeAttr`：四个平行数组
+   同长（缺 inode 时补默认值而不是丢条目，否则客户端按下标对位会错位），分页边界与
+   `ReadDir` 逐字一致。守门用例两条：
+   `readdir_plus_answers_the_same_page_as_readdir_plus_getattr`（同一页、同一边界、
+   逐字段对齐 —— 属性必须是算出来的而不是另一套真相）、
+   `generic_table_and_readdir_plus_over_tcp`。**剩下的在接入侧**：grovefs 的
+   `treedb_store.rs::readdir` 得改用它才真省掉往返，而它钉 `v0.3.2`（§10）。
 7. **独立性审计：treedb 是一个数据库项目，不是 GroveFS 的一个模块**。用户定的约束
    是：grovefs 的业务语义不得漏进引擎内核，为 grovefs 做的适配一律留在 grovefs 仓里
    拦在 feature 门后，treedb 对外只讲通用元数据引擎接口。本轮对着代码校了一遍，
@@ -1186,7 +1322,7 @@ spike 明确**没**做、也不在接入面上假装做的事 —— 一律返�
    | 档 | 现状 | 是否违背约束 |
    |----|------|------------|
    | **L0 命名与注释** | 引擎内核里 21 处 grovefs 提及**全部是注释**（「与 grovefs `node.is_dir` 的 0/1/2 一致」这类对齐声明）；无 `use grovefs::`，无 grovefs 类型 | ~~无害，但叙述口径要改~~ **已改**（T3）：24 行重写为「POSIX/FUSE/关系库通用形状」的写法，理由保留、主语不再是某个客户端，并由门 1 守住 |
-   | **L1 数据结构与 op 语义** | `KeyRec` 逐列照抄 `grovefs_control.api_keys`（`ro`/`owner`/`note`/`expires_at`/`secret_hint`/`created_by`），`AuditRec` 照抄 `mcp_calls`，`Def*` 就是视图定义，`EADV = 68` 注释写着「借用 grovefs 控制面既有码」，`KeyCheck` 里带 `verb` 授权参数 | **违反**。这是业务形状进了内核 |
+   | **L1 数据结构与 op 语义** | `KeyRec` 逐列照抄 `grovefs_control.api_keys`（`ro`/`owner`/`note`/`expires_at`/`secret_hint`/`created_by`），`AuditRec` 照抄 `mcp_calls`，`Def*` 就是视图定义，`EADV = 68` 注释写着「借用 grovefs 控制面既有码」，`KeyCheck` 里带 `verb` 授权参数 | **仍违反，但已有出路**（T2 完成）：通用表进了内核，那几组专用 op 却还在原地。本轮做的是「补能力」，不是「删专用表」—— 删除得等接入侧真用通用表拼出等价语义并迁完数据，见下面 T2 末与第 10 条 |
    | **L2 依赖图** | ~~`postgres`/`rusqlite(bundled)`/`sha2`/`uuid`/`chrono`/`tracing`/`parking_lot` 全是非 optional 依赖~~ **已关进 `postgres-compat`**（T1 完成）：默认档 `cargo tree` 只剩 `libc` + `thiserror`；依据仍是 grovefs 只用 `treedb::net::Client` 与 `engine::model::Op`，`pool/`、`store/`、`persist/`、`schema/` 一行符号都没用 | ~~违反~~ **已修** |
 
    好消息是边界已经天然存在一半：`data_ref` 是不透明字节（引擎不解释内容键），
@@ -1206,10 +1342,16 @@ spike 明确**没**做、也不在接入面上假装做的事 —— 一律返�
      dev-dependency（拖 11 个 crate，Cargo.lock 少 105 行全是它）。注意锁文件里
      `postgres`/`rusqlite` 条目仍在：cargo 对可选依赖做 union 解析，判据是
      `cargo tree` 与编译日志，不是锁文件行数。
-   - **T2 把密钥/审计/定义三张专用表换成通用表能力**：内核只给 `TableCreate` /
-     `RowPut` / `RowGet` / `RowList` / `RowDelete`（字段为字节列，可加唯一约束与
-     比较条件），具体列名、撤销/过期/只读这些规则全部由客户端定义。协议版本
-     同批递增并补 decode 向量，别弄“字段名改了但版本号不动”。
+   - ~~**T2 把密钥/审计/定义三张专用表换成通用表能力**~~ **引擎侧已完成**（本轮）：
+     内核给的是 `TableCreate`/`TableDrop`/`TableGet`/`TableList` + `RowPut`/`RowGet`/
+     `RowList`/`RowDelete`/`RowCount`，列为不透明字节，可标 `COL_UNIQUE`/`COL_INDEX`，
+     写可带 `PUT_IF_ABSENT`/`PUT_IF_EXISTS` 与按列 CAS，删可带 `DEL_IF_EXISTS`；具体列名、
+     撤销/过期/只读这些规则全部由客户端定义（形状与刻意边界见 §5.1、§5.3）。引擎
+     **没有**替客户端解释任何一列：`revoked_at` 在 `KeyRec` 里是语义，在 `RowPut` 里只是
+     一串字节。协议版本同批递了（`PROTOCOL_VERSION` 2 → 3）并补了 decode 向量：op/reply/`Log`
+     三个 round-trip 用例现在覆盖全 47 op / 26 reply / 22 条 `Log` 变体，不是「字段名改了
+     但版本号不动」。**剩下的一半**：那几张专用表与它们的 op 还在内核里，拆干净才算
+     这项完成（第 10 条）。
    - ~~**T3 叙述去依赖**~~ **已完成**：crate description、`treedb-server --help` 首行、
      `lib.rs` 头部全部改掉「GroveFS 专用/后端专用」的说法，内核注释按行重写（见上）；
      `lib.rs` 的「三层能力」重排为引擎本体 / 连接层 / 过渡档，并把原来四条不变量
@@ -1221,12 +1363,15 @@ spike 明确**没**做、也不在接入面上假装做的事 —— 一律返�
      里非 optional 项只能是 `libc` + `thiserror`；`postgres-compat` 不得进 `default`。
      关键词是拼出来的，文件也不扫 `tests/`，否则门会把自己拦下来。**反向验过**：
      往 `src/engine/` 丢一个含该名字的探针文件，门 1 立刻 FAILED，删掉又绿 —— 门不是装饰。
-     跑法：默认档 `cargo test --release` = **75 passed / 0 failed**（含三把门），
-     `--features postgres-compat` = **106 passed / 0 failed**（数字跟 §9 同步）。
+     跑法：默认档 `cargo test --release` = **83 passed / 0 failed**（含三把门），
+     `--features postgres-compat` = **114 passed / 0 failed**（数字跟 §9 同步，三把门
+     在两档都跑）。本轮加通用表时它们一条没红 —— 新 op 没带进客户端名字，
+     门 1 测的就是这条线。
 
    接入侧因此得到的约束：第 5 条里“把定义/密钥/账户补进引擎”的正解不是
-   `Key*`/`Audit*` 直接给 grovefs 用，而是 grovefs 用 T2 的通用表自己拼语义；
-   §10 阶段 B 第 4 步那句“走 treedb 的 `Key*`/`Audit*`”作废。
+   `Key*`/`Audit*` 直接给 grovefs 用，而是 grovefs 用 T2 的通用表自己拼语义 ——
+   T2 本轮已可用，这句从「得先造工具」变成了「可以开工」；§10 阶段 B 第 4 步那句
+   「走 treedb 的 `Key*`/`Audit*`」作废。
 8. ~~**`always` 档的 flush 流水线**~~ **已完成一半**（§7.9 第 3 条）：按连接串行
    fsync 已删，p99 从 81.5 ms 降到 31.1 ms、吞吐 5.77×，且原判据（与 `group` 同量级、
    崩溃用例全绿）已满足。**没做的那一半才是剩下的肉**：提交线程仍然在
@@ -1240,5 +1385,14 @@ spike 明确**没**做、也不在接入面上假装做的事 —— 一律返�
 9. **dirents 应答直接编进连接发送缓冲**（§7.10 剩下那一条）：一页仍有 104 次堆
    分配，100 次来自 `Reply::Dirents.names` 的逐名 `Vec<u8>`。改造点是 encode 侧
    往调用方给的 `&mut Vec<u8>` 直接写，而不是先造一个 `Vec<Vec<u8>>`。收益只能
-   估（100 次 alloc ≈ 每页 2–3 µs，没实测），所以它排在第 2/6 条之后：默认档
-   读轴已经领先 PG 2.9×，这里不再是短板。
+   估（100 次 alloc ≈ 每页 2–3 µs，没实测），所以它排在第 2 条之后（第 6 条已闭合）：
+   默认档读轴已经领先 PG 2.9×，这里不再是短板。
+10. **两件收尾的活，都是本轮主动留下的**：
+    - **快照迁移工具**：`SNAP_VERSION` 2 → 3 把旧数据目录挡在门外，而引擎现在没有
+      导出/导入等价物（§10 bump tag 必读 ②）。得有一能把旧快照读成当前形状的东西 ——
+      或者一条明说的 `treedb-server --migrate <dir>`，代价是要在内核里养住若干代旧快照
+      的 decode 分支。这一条在灰度之前必须有人接，不接就是「升级等于重建」。
+    - **把 `Key*`/`Audit*`/`Def*`/`Place*` 四组专用 op 从内核拆掉**（T2 剩下的那一半）：
+      顺序只能是先在 grovefs 侧用通用表拼出等价语义、跑过端到端，再删 op；先删后补
+      会把 spike 分支直接弄坏。拆完之后 L1 那档才从「仍违反」改成「不违反」，
+      §5.1 的 12 张表也能缩回 8 张。

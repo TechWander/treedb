@@ -16,8 +16,8 @@ cargo build --release                                   # 默认档：依赖只�
 ./target/release/treedb-server --dir /var/lib/treedb --listen 127.0.0.1:7777
 ./target/release/treedb-bench --op lookup --conns 64 --pipeline 32 --secs 3
 
-cargo test --release                                    # 默认档 75 passed（引擎本体）
-cargo test --release --features postgres-compat         # 106 passed（含 PG 过渡档）
+cargo test --release                                    # 默认档 83 passed（引擎本体）
+cargo test --release --features postgres-compat         # 114 passed（含 PG 过渡档）
 bash benches/throughput_matrix.sh 3 1 2 3 4 5           # 五轴复现，输出进 benches/results/
 bash benches/sync_ratio.sh 3                           # 写路径机制：一次 fsync 摊了多少写
 bash benches/ab_layout.sh <基线 rev>                     # 受控 A/B：只换服务端二进制比引擎改动
@@ -42,7 +42,7 @@ group commit 不丢。默认按核数给：`min(8, 核数/2)`（1–3 核机器�
 | 零旗标默认档（照上面两行命令起服务，同格跑 5 次取中位） | 服务端 banner 就是 `workers=8`：`readdir` **654 983**（= PG 4.5×）、`lookup` **1 062 564**（**5.0×**）、`ping` **1 016 868**（1.9×）—— 领先不靠调用方传 `--workers`；矩阵连跑的那两行是**下界**（`benches/default_check.sh`） |
 | 为什么快（引擎自己的计数器） | 两个「会 fsync」的档位现在共用同一个提交点：64 并发下一轮只付 1 次 fsync、摊 **≈ 55–58 次写/fsync**（`benches/sync_ratio.sh`） |
 | 每 op 一次 fsync（`dur=always` vs PG `synchronous_commit=on`，WAL 同盘） | 改前 1 891 vs 1 469 ops/s（p99 81.5 ms vs 157 ms）；**改后 10 913 vs 1 469 = 7.4×**，p50 优 17×、p99 优 5×（受控 A/B：`benches/ab_durability.sh v0.3.1`）。旧版这句「刨掉合并 fsync，treedb 对 PG 就没有结构性优势」是当时那个**按连接串 fsync** 的实现留下的错判，已作废：两家都是靠一次 fsync 摊多次写，treedb 在这一格摊得动（≈ 55）而 `always` 档以前自己把它抵消掉了 |
-| 持久性 | `kill -9` 六个崩溃用例零丢失（含 checkpoint 瞬间崩、连崩 3 轮） |
+| 持久性 | `kill -9` 六个崩溃用例零丢失（含 checkpoint 瞬间崩、连崩 3 轮）；并另有 `workers=8` 下同语义的一条，目录写与表写逐条交错 |
 
 两个读数字的历史口径要提醒：旧版这张表写的是「64 并发纯读被 PG 反胜 3.6–7.5×」，
 **已作废** —— `treedb-bench` 的分母把「建连 + 预热」算进去了，而 PG 侧对照器没算，
@@ -52,6 +52,22 @@ group commit 不丢。默认按核数给：`min(8, 核数/2)`（1–3 核机器�
 数字全部落在 161 TB 机械 XFS 上，报的是倍率区间而不是单格小数的第六位；逐格原始
 输出在 [benches/results/matrix.log](benches/results/matrix.log)，读法与陷阱在
 DESIGN.md §7（含 §7.8 那次全五轴复跑）。
+
+## 能做什么
+
+三组接口，每组都是定长的 op，逐条分组与只读/写划分见
+[DESIGN.md](DESIGN.md) §4.2：
+
+- **POSIX 元数据面**：视图（命名空间）、目录树、属性、符号链接、整 inode 锁、
+  内容引用账本（GC 的唯一依据）。没有数据面 —— 文件字节永远在客户端侧。
+- **通用表一面**：`TableCreate`/`TableDrop`/`TableGet`/`TableList` + `RowPut`/`RowGet`/
+  `RowList`/`RowDelete`/`RowCount`。列为不透明字节，可标唯一/索引列，写可带
+  `PUT_IF_ABSENT`/`PUT_IF_EXISTS` 与按列 CAS。存在理由：接入方的表形（密钥、审计、
+  定义……）不该被搬进引擎内核，内核只给机制。列名、过期规则、权限语义全部由
+  客户端定义；引擎不解释任何一列，也不做 JOIN、排序、范围谓词（§5.3）。
+- **运维面**：`Ping`/`Stats`/`Checkpoint`/`Shutdown`。`Stats` 同时报 WAL 的逻辑长度与
+  磁盘长度、快照长度与协议版本 —— 帧里没有版本位，`proto_version` 是线上唯一能
+  查到对端协议版本的通道（§4.1）。
 
 ## 独立性策略
 
@@ -69,7 +85,7 @@ DESIGN.md §7（含 §7.8 那次全五轴复跑）。
 
 | 路径 | 内容 |
 |------|------|
-| `src/engine/` | 线协议类型（`model.rs`，37 个 op / 20 个 Reply）、帧编码（`codec.rs`）、状态机（`mem.rs`）、应用与定序（`apply.rs`）、WAL/快照（`wal.rs`）、核心（`core.rs`） |
+| `src/engine/` | 线协议类型（`model.rs`，47 个 op / 26 个 Reply）、帧编码（`codec.rs`）、状态机（`mem.rs`）、应用与定序（`apply.rs`）、WAL/快照（`wal.rs`）、核心（`core.rs`） |
 | `src/net/` | 单线程事件循环（`server.rs`）、多前端 worker + 唯一提交线程（`multi.rs`）、跨线程信箱（`mail.rs`）、阻塞客户端（`client.rs`） |
 | `src/{pool,store,persist,schema,probe}.rs` | `postgres-compat` 过渡档 |
 | `src/bin/` | `treedb-server` / `treedb-bench` / `treedb-pgbench`（对照工具）/ `treedb-micro`（纯计算 + 分配计数）/ `treedb-demo` |
