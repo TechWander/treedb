@@ -30,7 +30,7 @@ grovefs 默认档逐字节不变；treedb 在 grovefs 里是**按 tag 的 git �
 
 | # | 验收项 | 判据 | 实测结果 | 结论 |
 |---|--------|------|----------|------|
-| 1 | 连接轴 | 单进程 ≥10 000 并发连接，且 1 fd/conn | 10 000 连接：RSS +5 MiB、**0.53 KiB/conn**、`fd/conn = 1.0000`；25 000 连接：0.39 KiB/conn | **达成** |
+| 1 | 连接轴 | 单进程 ≥10 000 并发连接，且 1 fd/conn | 10 000 连接：RSS +5 MiB、**0.53 KiB/conn**、`fd/conn = 1.0000`；25 000 连接：0.39 KiB/conn（2026-11-19 复跑：+6 MiB、0.56 KiB/conn，见 §7.8） | **达成** |
 | 2 | 持久性轴 | `kill -9` 后已 ack 的写零丢失 | 6 个崩溃用例全绿（`always`/`group` 两档、6 线程混打中途崩、checkpoint 瞬间崩、连崩 3 轮） | **达成** |
 | 3 | 吞吐轴 | op QPS/p99 与 PG 同语义对照 | 写：treedb 默认档对 PG **1.4–7.6×** QPS（64 并发 + pipeline 时收窄到 1.4×）、p50 **1.5–16×**；读：低并发 2.6–10×；64 并发纯读在默认 `workers=1` 下仍被 PG 反胜 3–8×，**开 `--workers 16` 后反超 2.2–4.1×**（`readdir` 316 780 vs 142 815、`lookup` 861 465 vs 208 239、`ping` 1.72 M vs 509 k，p50 31–113 µs） | **达成**（读轴要显式开并行，代价见 §8 第 1 条） |
 | 4 | 设计文档 | 选型判据 + 协议 + 语义边界 + 数据成文 | 本文档 | 达成 |
@@ -539,6 +539,65 @@ PG 2.2–4.1×（§7.5）。默认档仍是 `workers=1`：不显式开就没有�
 也没有它的那三个代价（§8 第 1 条）。GroveFS 的元数据负载以写和长连接为主，
 这条取舍仍然划得来；写扩展不在这条轴上 —— 它永远只有一个提交线程。
 
+### 7.8 全五轴复跑（2026-11-19）
+
+为什么要有这一节：§7.2–§7.5 的数字是一次性跑出来的，而「独立数据库」的主张要能
+被别人复算。本轮在同一台机器上把轴 1、2、3、4、5 全部重跑（160 格，逐格原始输出
+追加在 `benches/results/matrix.log`），并把连接轴与并发正确性用例一起重跑。
+
+**环境同一性先确认**（否则复跑没有意义）：`Xeon Gold 6338` / 128 核 / 755.284 GiB /
+`/dev/sdb1` 161 TB XFS `ROTA=1` —— 与 §7.1 那台机器逐字相同，PG 仍是 `.pgref` 私有
+集群、`fsync=on` + `synchronous_commit=on`（脚本会读回这两项，不是 on 就整轴作废）。
+
+关键格子的历史值 vs 本次值：
+
+| 格子 | 历史 ops/s | 本次 ops/s | 本次 PG | 判读 |
+|------|-----------|-----------|---------|------|
+| `create` 64/1 `group` | 9 377 | 7 844 | 1 441 | 比 5.4×；机械盘写回方差，±19 % |
+| `create` 64/1 `always` | 1 315 | 1 586 | 1 441 | **1.1×** —— 见判读 2 |
+| `write` 64/32 `group` | （表里没有） | 52 317 | 5 957 | **8.8×**，本轮新增可报格子 |
+| `lookup` 64/1 `group` w=1 | 66 229 | 57 403 | 206 559 | PG 仍反胜 **3.6×** |
+| `lookup` 64/1 w=16 | 861 465 | 792 243 | 206 559 | 反超 **3.8×**，p50 37 µs |
+| `readdir` 64/1 w=1 | 18 769 | 18 930 | 142 507 | PG 反胜 **7.5×**（历史 7.9×） |
+| `readdir` 64/1 w=16 | 316 780 | 288 747 | 142 507 | 反超 **2.0×** |
+| `readdir` 64/32 w=16 | 505 400 | 343 512 | 178 484 | **摆动 1.5×**，正是 §7.5 已经预告的高阶格噪声 |
+| `ping` 64/1 w=16〔never〕 | 1 715 136 | 1 733 155 | 509 099 | 吻合，**3.4×** |
+
+三条判读：
+
+1. **PG 那一侧极可复现**（`lookup` 208 239 → 206 559，`readdir` 142 815 → 142 507，
+   不到 1 %），而 treedb 落在机械盘上的写格与 `pipeline=32` 高 worker 格摆动
+   10–50 %。所以对外报数应当报**倍率区间**和 p50，不该报单格小数的第六位。
+2. **`always` 那一格把「领先从哪来」变成了实测，不是推断**：每 op 一次 fsync 时
+   treedb 1 586 vs PG 1 441 = 1.1×（两边都撞在同一块盘的 fsync 上限），而默认
+   `group` 档是 7 844 = **5.4×**。差出来的全部是「跨连接把 N 次 fsync 合成一次」
+   这一件事，跟语言、跟零拷贝、跟内存布局无关。换到根盘 ext4 上 `always` 档立刻
+   变 12 044–13 557 ops/s（同一格子在机械盘是 1 306–1 586），进一步确认那是盘的
+   天花板不是引擎的。
+3. **写档在开 worker 后没有系统性回退**（`create` 64/1：w=1 9 338 → w=8 12 390；
+   `write` 64/32：w=8 那一格 34 099 是明显 outlier，同档 w=1/w=16 是 52 564/50 554）。
+   这台机械盘上写是 fsync-bound，线程间递交的 µs 级成本量不出来 —— 与 §7.5 结论一致。
+
+连接轴与并发正确性同轮复跑：
+
+| 证据 | 结果 |
+|------|------|
+| `thousand_connections_cost_one_fd_and_a_sliver_of_rss`（默认跑） | RSS 0→2 MiB、2.28 KiB/conn、`fd/conn = 1.0000`、ping p50 74 µs / p99 129 µs |
+| `ten_thousand_connections_in_one_process`（`--ignored`） | 10 000 条全部建立：RSS 0→6 MiB、**0.56 KiB/conn**、`fd/conn = 1.0000`、p50 80 µs / p99 110 µs |
+| `tests/net_protocol.rs` | 9 passed，含 `pipeline_keeps_per_connection_order`、`concurrent_connections_do_not_crosstalk` |
+| `tests/read_scaling.rs` | 7 passed，含 `worker_reads_answer_identically_to_inline_reads`（w=1 与 w=8 答复逐条相同）、`concurrent_reads_do_not_obey_stale_or_torn_writes`（w=4 混打看不到撕裂/陈旧）、`acked_writes_survive_crash_with_workers_on`、`conn_id_reuse_does_not_misroute_acks` |
+| `cargo test --release` 全量（本轮早些时候） | 99 passed / 0 failed |
+
+两处必须说白的地方：
+
+- **`tests/concurrency.rs` 不是引擎并发的证据**。它 7 条里有 6 条 `#[ignore]`，
+  且测的是 PG 过渡档的 `SharedInstancePool`（池上限、排队、reap、KeyStore 并发）。
+  默认 `cargo test` 只会跑到其中 1 条 `dial_failures_do_not_leak_live`。引擎自身的
+  并发证据是上面那两张表里的 `net_protocol` + `read_scaling` + 56 条 lib 单测。
+- 会话里曾经口传过一个「单进程 `max_conn = 4382`」的上限数字，**仓内查无出处**
+  （`grep -rn 4382 DESIGN.md benches/ tests/` 为空），本轮撤回，不再引用。真实
+  约束是 `net.core.somaxconn = 4096` 与临时端口区间，与引擎无关（§7.6 末句）。
+
 ---
 
 ## 8. 已知限制（诚实边界）
@@ -636,6 +695,8 @@ bash benches/throughput_matrix.sh 3        # 五轴吞吐矩阵（默认只跑 1
    （长连接 + pipeline 复用，这才是协议设计的目标用法）。
 4. 控制面（密钥/审计）二选一：走 treedb 的 `Key*`/`Audit*`，或保留过渡档的
    `ApiKeyStore`。建议先保留，减少一次性改动面。（spike 现状：保留本地 SQLite。）
+   本轮重新定调：`Key*`/`Audit*` 本身形状就是 grovefs 的表，直接接上等于把业务
+   语义坐进内核——真正的终态是 §11 第 7 条 T2 的通用表，而不是这两个 op。
 
 ### 阶段 B spike 的实际结果（2026-11-19，`exp/treedb-integration`）
 
@@ -724,8 +785,45 @@ spike 明确**没**做、也不在接入面上假装做的事 —— 一律返�
    原先卡住的「分发方式」已定：本仓推到 gitee+github 并打 `v0.3.0`，grovefs 改成
    按 tag 的 git 依赖，拿没有同级克隆的干净仓验证过默认档与 `--features treedb`
    均绿。**仍未推 master**：推不推是下一轮的决定，而且 treedb 现在只接了「树」，
-   定义/密钥/账户还在本地 SQLite —— 要么先接受这个分裂上线，要么等 §11 把这些表
-   补进引擎再一次性切。
+   定义/密钥/账户还在本地 SQLite —— 要么先接受这个分裂上线，要么先把下面第 7 条
+   的通用表能力补进引擎再一次性切（注意：是补「通用表」，不是把 grovefs 的表搬进去）。
 6. **`ReadDirPlus`**：接进去才发现 readdir 一页要付 `1 + N/64` 次往返 —— 目录列表
    本身不带属性，provider 只能回头逐条 `Getattr`。这是 §7.5 那条读轴在 grovefs 形状上
    的真实成本，补一个带属性的 dirents 应答即可打平 PG 档的一条 SQL。
+7. **独立性审计：treedb 是一个数据库项目，不是 GroveFS 的一个模块**。用户定的约束
+   是：grovefs 的业务语义不得漏进引擎内核，为 grovefs 做的适配一律留在 grovefs 仓里
+   拦在 feature 门后，treedb 对外只讲通用元数据引擎接口。本轮对着代码校了一遍，
+   **三档现状**：
+
+   | 档 | 现状 | 是否违背约束 |
+   |----|------|------------|
+   | **L0 命名与注释** | 引擎内核里 21 处 grovefs 提及**全部是注释**（「与 grovefs `node.is_dir` 的 0/1/2 一致」这类对齐声明）；无 `use grovefs::`，无 grovefs 类型 | 无害，但叙述口径要改（见下） |
+   | **L1 数据结构与 op 语义** | `KeyRec` 逐列照抄 `grovefs_control.api_keys`（`ro`/`owner`/`note`/`expires_at`/`secret_hint`/`created_by`），`AuditRec` 照抄 `mcp_calls`，`Def*` 就是视图定义，`EADV = 68` 注释写着「借用 grovefs 控制面既有码」，`KeyCheck` 里带 `verb` 授权参数 | **违反**。这是业务形状进了内核 |
+   | **L2 依赖图** | `postgres`/`rusqlite(bundled)`/`sha2`/`uuid`/`chrono`/`tracing`/`parking_lot` 全是**非 optional** 依赖，只为过渡档服务；而 grovefs 实际只用了 `treedb::net::Client` 与 `treedb::engine::model::Op`，**从 `pool/`、`store/`、`persist/`、`schema/` 一行符号都没用** | **违反**。任何消费者都白吃一个 PG 客户端 + 一个编译期 SQLite |
+
+   好消息是边界已经天然存在一半：`data_ref` 是不透明字节（引擎不解释内容键），
+   引擎**不算哈希**（`sha2` 只出现在 `store/keys.rs` 和 demo 里，`KeyCheck` 只比较
+   调用者送来的 hash），错误不做二次翻译，字节区间锁与 `link()` 不做 —— 这些都是
+   「通用引擎」该有的形状。要改的是下面四步，**每一步都在本仓**：
+
+   - **T1 过渡档关进 feature**：`pool/`、`store/`、`persist/`、`schema/`、`bin/demo.rs`
+     移到 `postgres-compat`（默认关），`sha2`/`uuid`/`rusqlite`/`postgres`/`chrono` 跟着变
+     optional。先决条件：grovefs 零使用（已核实）+ 本仓 `bin/pgbench.rs` 不依赖它们
+     （对照工具自己开 feature 编）。关完默认 `cargo build` 的依赖应当只剩
+     `libc` + `thiserror`，这才是能被任何项目引用的干净底座。
+   - **T2 把密钥/审计/定义三张专用表换成通用表能力**：内核只给 `TableCreate` /
+     `RowPut` / `RowGet` / `RowList` / `RowDelete`（字段为字节列，可加唯一约束与
+     比较条件），具体列名、撤销/过期/只读这些规则全部由客户端定义。协议版本
+     同批递增并补 decode 向量，别弄“字段名改了但版本号不动”。
+   - **T3 叙述去依赖**：crate description、`treedb-server --help` 首行、DESIGN.md 标题
+     现在都写「GroveFS 元数据引擎」；改成「元数据引擎（为 GroveFS 这类万级视图负载设计，
+     但不绑 GroveFS 业务语义）」。同时把 L0 那 21 处注释里的「与 grovefs X 一致」
+     改成「与 POSIX/FS 语义一致」的写法 —— 对齐理由是真的，但叙述主语不该是某个客户端。
+   - **T4 把「不许漏 grovefs 语义」写成可测的门**：单测断言引擎内核目录
+     （`src/engine/`、`src/net/`）不出现 `grovefs` 字样与非-optional 依赖，并在
+     CI 里跑一次 `--no-default-features` 构建。靠人盯是守不住的：L1 那些字段就
+     是“为了方便把表结构照抄进来”长出来的。
+
+   接入侧因此得到的约束：第 5 条里“把定义/密钥/账户补进引擎”的正解不是
+   `Key*`/`Audit*` 直接给 grovefs 用，而是 grovefs 用 T2 的通用表自己拼语义；
+   §10 阶段 B 第 4 步那句“走 treedb 的 `Key*`/`Audit*`”作废。
