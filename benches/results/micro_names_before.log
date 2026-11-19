@@ -1,0 +1,52 @@
+# treedb-micro 同一工装、**本轮三项优化之前**的二进制（HEAD=v0.3.2），与 micro_names.log 同机同核对照
+# 关键对照项：readdir 的 allocs 随 limit 线性增长（每条一次 malloc），以及 lookup 对 items 的 log 形状
+# treedb-micro tag=before-items32000 items=32000 ops=60000 readdir_limit=100
+ping                 8.5       0.00        0.0
+lookup             367.8       1.00        4.7
+lookup-miss        294.0       1.00        6.0
+readdir           4276.6     104.00     3883.0
+create            1350.4      10.32     1348.9
+# scaling check @ items=96000
+lookup             429.3       2.00       11.5
+readdir           4722.7     104.00     3977.0
+
+# treedb-micro tag=before-items96000 items=96000 ops=60000 readdir_limit=100
+ping                 8.9       0.00        0.0
+lookup             398.0       1.00        4.7
+lookup-miss        320.7       1.00        6.0
+readdir           4484.7     104.00     3883.0
+create            1331.3      10.32     1353.7
+# scaling check @ items=288000
+lookup             508.5       2.00       11.5
+readdir           4241.1     104.00     3883.0
+
+# treedb-micro tag=before-items288000 items=288000 ops=60000 readdir_limit=100
+ping                 9.3       0.00        0.0
+lookup             469.5       1.00        4.7
+lookup-miss        300.5       1.00        6.0
+readdir           4321.0     104.00     3977.0
+create            1377.8      10.32     1353.8
+# scaling check @ items=864000
+lookup             549.1       2.00       11.5
+readdir           4342.0     104.00     3977.0
+
+# treedb-micro tag=before-limit1 items=32000 ops=40000 readdir_limit=1
+readdir            220.6       5.00       40.0
+readdir            251.0       5.00       40.0
+
+# treedb-micro tag=before-limit10 items=32000 ops=40000 readdir_limit=10
+readdir            482.7      14.00      381.0
+readdir            485.8      14.00      385.0
+
+# treedb-micro tag=before-limit50 items=32000 ops=40000 readdir_limit=50
+readdir           2293.5      54.00     1937.0
+readdir           2291.7      54.00     1981.0
+
+# treedb-micro tag=before-limit100 items=32000 ops=40000 readdir_limit=100
+readdir           4280.5     104.00     3883.0
+readdir           4299.2     104.00     3977.0
+
+# treedb-micro tag=before-limit400 items=32000 ops=40000 readdir_limit=400
+readdir          17038.1     404.00    15550.0
+readdir          17348.1     404.00    15944.0
+

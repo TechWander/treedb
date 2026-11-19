@@ -75,7 +75,7 @@ fn tcp_crud_roundtrip() {
     assert_eq!(as_node(call(&mut c, &Op::Getattr { view: v, ino: f.ino })), f);
     match call(&mut c, &Op::ReadDir { view: v, parent: 1, offset: 0, limit: 10 }) {
         Reply::Dirents { names, inos, end, .. } => {
-            assert_eq!(names, vec![b"f".to_vec()]);
+            assert_eq!(names.to_vec(), vec![b"f".to_vec()]);
             assert_eq!(inos, vec![f.ino]);
             assert!(end);
         }

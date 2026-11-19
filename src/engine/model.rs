@@ -936,6 +936,115 @@ impl Op {
     }
 }
 
+/// readdir 一页的名字缓冲：一块扁平字节 + 每项起始偏移。
+///
+/// 为什么不是 `Vec<Vec<u8>>`。micro 实测（`--items 32000`，钉单核）把 readdir 的
+/// 每条目录项定价定得很死：limit 从 1 扫到 400，耗时线性
+/// 220.8 → 490.5 → 2291.3 → 4288.8 → 16988.2 ns，分配数恰好 5 → 14 → 54 → 104 → 404，
+/// 即**每条 42 ns、每条 1 次 malloc**，占一页 100 条成本的 97%。名字本身只有
+/// 十几字节，那 42 ns 几乎全是 glibc 的 malloc/free 对，不是拷贝。
+///
+/// 改成这个形状后，一页只付 2 次摊销分配（`blob` 与 `off` 各自翻倍增长）。
+/// **线协议一个字节都没变** —— 编码仍按 `u32 len + 字节` 逐条写，见 encode。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Names {
+    blob: Vec<u8>,
+    /// 每项的起点，`off[len]` 是末尾哨兵，所以第 i 项 = `blob[off[i]..off[i+1]]`。
+    off: Vec<u32>,
+}
+
+/// 必须手写：derive 出来的全零值 `off` 是空的，而 `len()` 算的是 `off.len() - 1`
+/// （哨兵占一项），下溢后第一次 `get` 就越界。空表只能是 [`Names::new`] 那个形状。
+impl Default for Names {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Names {
+    /// 空表。唯一入口是 [`with_capacity`](Names::with_capacity)，免得两处各自记
+    /// 得补哨兵 —— 上一版就是 `with_capacity` 漏了那个 0，于是 `len()` 下溢、
+    /// 编码侧一项都写不出来。
+    pub fn new() -> Self {
+        Names::with_capacity(0, 0)
+    }
+
+    /// 已知会装多少条时用这个：`entries` 条数、`bytes` 名字总长的估计。
+    pub fn with_capacity(entries: usize, bytes: usize) -> Self {
+        // 先把哨兵推进预分配好的 `off` 里，再返回 —— 两者都要，不能为了哨兵
+        // 放弃容量（那一页 100 条就会退化成 7 次翻倍重分配）。
+        let mut off = Vec::with_capacity(entries + 1);
+        off.push(0);
+        Names {
+            blob: Vec::with_capacity(bytes),
+            off,
+        }
+    }
+
+    /// 从已有名字批量构造（测试与“手上已经是 `Vec<Vec<u8>>`”的调用方）。
+    /// 热路径不要用，那等于把拷贝代价再拾回来。
+    pub fn from_vec<V: AsRef<[u8]>>(v: &[V]) -> Self {
+        let total = v.iter().map(|n| n.as_ref().len()).sum();
+        let mut n = Self::with_capacity(v.len(), total);
+        for name in v {
+            n.push(name.as_ref());
+        }
+        n
+    }
+
+    pub fn push(&mut self, name: &[u8]) {
+        self.blob.extend_from_slice(name);
+        self.off.push(self.blob.len() as u32);
+    }
+
+    #[inline]
+    pub fn get(&self, i: usize) -> &[u8] {
+        let (a, b) = (self.off[i] as usize, self.off[i + 1] as usize);
+        &self.blob[a..b]
+    }
+
+    /// 条目数（不含末尾哨兵）。
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.off.len() - 1
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.off.len() == 1
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &[u8]> + '_ {
+        (0..self.len()).map(move |i| self.get(i))
+    }
+
+    /// 交给需要拥有每条名字的调用方（FUSE 侧填 dirent 缓冲、单元测试断言）。
+    pub fn to_vec(&self) -> Vec<Vec<u8>> {
+        self.iter().map(|n| n.to_vec()).collect()
+    }
+}
+
+/// 下标访问：`names[i] -> &[u8]`。扁平表示不该让调用方多背一个 `get` 的心智负担。
+impl std::ops::Index<usize> for Names {
+    type Output = [u8];
+    #[inline]
+    fn index(&self, i: usize) -> &[u8] {
+        self.get(i)
+    }
+}
+
+/// 借用迭代：`for name in &names` 逐条拿 `&[u8]`。不提供按值 `IntoIterator` ——
+/// 那要么得把 blob 拆成一百个拥有块（本次优化想消掉的就是这个），要么得多写一个
+/// 生命周期相关的 Item。把字段从 `Vec<Vec<u8>>` 换成 `Names` 后，下游原先按值
+/// `zip(names)` 的写法要改成 `zip(&names)`；接线影响面见 DESIGN.md §10。
+impl<'a> IntoIterator for &'a Names {
+    type Item = &'a [u8];
+    type IntoIter = Box<dyn Iterator<Item = &'a [u8]> + 'a>;
+    fn into_iter(self) -> Self::IntoIter {
+        Box::new(self.iter())
+    }
+}
+
 /// 一次应答。`status=0` 成功；否则 `errno` 有效。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Reply {
@@ -955,7 +1064,7 @@ pub enum Reply {
     Dirents {
         inos: Vec<Ino>,
         kinds: Vec<u8>,
-        names: Vec<Vec<u8>>,
+        names: Names,
         next: u64,
         end: bool,
     },
@@ -1023,10 +1132,11 @@ impl Reply {
                 w.u16(0x0122);
                 let n = inos.len();
                 w.u32(n as u32);
-                for i in 0..n {
+                // 逐条写与旧的 `Vec<Vec<u8>>` 表示完全同序同长 —— 换内部表示不动线协议。
+                for (i, name) in (0..n).zip(names.iter()) {
                     w.u64(inos[i]);
                     w.u8(kinds[i]);
-                    w.bytes(&names[i]);
+                    w.bytes(name);
                 }
                 w.u64(*next);
                 w.bool(*end);
@@ -1143,11 +1253,13 @@ impl Reply {
                 let n = r.u32()? as usize;
                 let mut inos = Vec::with_capacity(n.min(200_000));
                 let mut kinds = Vec::with_capacity(n.min(200_000));
-                let mut names = Vec::with_capacity(n.min(200_000));
+                let mut names = Names::new();
                 for _ in 0..n {
                     inos.push(r.u64()?);
                     kinds.push(r.u8()?);
-                    names.push(r.bytes()?);
+                    // `bytes_ref` 借自收到的帧，名字直接落进扁平缓冲 ——
+                    // 解码侧也不再每条一次 `to_vec()`。
+                    names.push(r.bytes_ref()?);
                 }
                 Reply::Dirents {
                     inos,
@@ -1233,6 +1345,40 @@ impl Reply {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `Names` 的哨兵约定很容易被改错（`off` 比条目多一项），所以这里把
+    /// 空表 / 零长名字 / 两种构造路径钉住。
+    #[test]
+    fn names_keeps_the_sentinel_shape() {
+        let mut n = Names::default();
+        assert!(n.is_empty());
+        assert_eq!(n.len(), 0);
+
+        n.push(b"alpha");
+        n.push(b"");
+        n.push(b"b");
+        assert_eq!(n.len(), 3);
+        assert!(!n.is_empty());
+        // 零长名字（POSIX 不允许空名，但编码必须能表达）不能把偏移挤乱。
+        assert_eq!(&n[0], b"alpha");
+        assert_eq!(&n[1], b"");
+        assert_eq!(&n[2], b"b");
+        assert_eq!(
+            n.iter().collect::<Vec<_>>(),
+            vec![&b"alpha"[..], &b""[..], &b"b"[..]]
+        );
+        assert_eq!(n.to_vec(), vec![b"alpha".to_vec(), Vec::new(), b"b".to_vec()]);
+
+        // `with_capacity` 走同一条 push 路径，结果必须与从零增长一致。
+        let mut m = Names::with_capacity(3, 8);
+        assert!(m.is_empty());
+        for s in n.iter() {
+            m.push(s);
+        }
+        assert_eq!(m, n);
+
+        assert_eq!(Names::from_vec(&[b"a".to_vec(), b"bb".to_vec()]).len(), 2);
+    }
 
     #[test]
     fn op_codec_round_trip_all_tags() {
@@ -1427,7 +1573,7 @@ mod tests {
             Reply::Dirents {
                 inos: vec![2, 3],
                 kinds: vec![0, 1],
-                names: vec![b"a".to_vec(), b"b".to_vec()],
+                names: Names::from_vec(&[b"a".to_vec(), b"b".to_vec()]),
                 next: 4,
                 end: false,
             },

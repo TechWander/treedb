@@ -24,7 +24,7 @@ pub mod wal;
 pub use codec::{Rd, W};
 pub use core::{Durability, Engine, EngineStats, now_ms};
 pub use mem::{Log, State};
-pub use model::{Op, Reply};
+pub use model::{Names, Op, Reply};
 pub use wal::Wal;
 
 /// 线协议单帧 payload 上限。目录 readdir 一次 10 万条也够；再大直接拒，

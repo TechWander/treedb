@@ -11,8 +11,8 @@ use crate::engine::mem::{DENT_KIND_UNKNOWN, Log, State};
 use std::collections::BTreeMap;
 use std::ops::Bound;
 use crate::engine::model::{
-    errno, AuditRec, DataRef, DefRec, Ino, LockRec, Node, RefRec, Reply, ViewId, ViewMeta, Kind,
-    Op, RENAME_NOREPLACE, SA_ATIME, SA_DATA_REF, SA_GID, SA_MODE, SA_MTIME, SA_SIZE, SA_UID,
+    errno, AuditRec, DataRef, DefRec, Ino, LockRec, Names, Node, RefRec, Reply, ViewId, ViewMeta,
+    Kind, Op, RENAME_NOREPLACE, SA_ATIME, SA_DATA_REF, SA_GID, SA_MODE, SA_MTIME, SA_SIZE, SA_UID,
 };
 
 /// 名字合法性：POSIX 255 字节上限 + 不允许 `/` 和空。
@@ -308,7 +308,7 @@ pub fn translate(s: &State, now: i64, op: &Op) -> (Vec<Log>, Reply) {
                         Reply::Dirents {
                             inos: Vec::new(),
                             kinds: Vec::new(),
-                            names: Vec::new(),
+                            names: Names::new(),
                             next: *offset,
                             end: true,
                         },
@@ -317,7 +317,9 @@ pub fn translate(s: &State, now: i64, op: &Op) -> (Vec<Log>, Reply) {
             };
             let mut inos = Vec::with_capacity(lim.min(4096));
             let mut kinds = Vec::with_capacity(lim.min(4096));
-            let mut names = Vec::with_capacity(lim.min(4096));
+            // 名字进扁平缓冲，32 B/条是个不需要预知的保守估计 —— 真正的收益
+            // 是不再每条一次 malloc（micro 定价 42 ns/条，占这页成本 97%）。
+            let mut names = Names::with_capacity(lim.min(4096), lim.min(4096) * 32);
             let mut it = dir.iter().skip(off);
             for (name, d) in it.by_ref().take(lim) {
                 // kind 存在 dentry 里，这一页不用回 `nodes` 表下钻（那是
@@ -330,7 +332,7 @@ pub fn translate(s: &State, now: i64, op: &Op) -> (Vec<Log>, Reply) {
                 };
                 inos.push(d.ino);
                 kinds.push(kind);
-                names.push(name.clone());
+                names.push(name);
             }
             let next = (off + inos.len()) as u64;
             // `end` 要说真话：整页恰好装满时再探一项就知道后面还有没有，

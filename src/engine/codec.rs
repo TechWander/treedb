@@ -119,6 +119,14 @@ impl<'a> Rd<'a> {
         let n = self.u32()? as usize;
         Ok(self.take(n)?.to_vec())
     }
+    /// [`bytes`](Rd::bytes) 的零拷贝版：游标照样前进，但返回的切片借自底层缓冲。
+    ///
+    /// readdir 一页几百条名字，用 `bytes()` 就是每条一次 `to_vec()`；解码侧改走
+    /// 这个口子后，名字可以直接落进扁平缓冲（见 [`crate::engine::model::Names`]）。
+    pub fn bytes_ref(&mut self) -> Result<&'a [u8]> {
+        let n = self.u32()? as usize;
+        self.take(n)
+    }
     /// 长度上限：防对端恶意/损坏声明把内存一次吃穿。
     pub fn bytes_bounded(&mut self, cap: u32) -> Result<Vec<u8>> {
         let n = self.u32()?;

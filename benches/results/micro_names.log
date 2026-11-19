@@ -1,0 +1,70 @@
+# treedb-micro 单核（taskset -c 1）本次实测 2026-11-19 10:54:48 UTC —— 二进制含本轮三项优化
+# 目的 1：把「是不是缺索引」变成可复算数字（items 拉散 9×，看是否 log 形状）
+# treedb-micro tag=after-items32000 items=32000 ops=60000 readdir_limit=100
+op                 ns/op  allocs/op   bytes/op
+ping                 8.2       0.00        0.0
+lookup             365.5       1.00        4.7
+lookup-miss        292.0       1.00        6.0
+getattr            174.3       1.00        4.7
+readdir           1292.9       5.00     4509.0
+setattr            458.1       9.00      975.9
+create            1343.6      10.32     1348.9
+unlink             778.0       3.00      476.0
+# scaling check @ items=96000
+lookup             425.1       2.00       11.5
+readdir           1300.1       5.00     4509.0
+
+# treedb-micro tag=after-items96000 items=96000 ops=60000 readdir_limit=100
+op                 ns/op  allocs/op   bytes/op
+ping                 8.5       0.00        0.0
+lookup             391.4       1.00        4.7
+lookup-miss        317.2       1.00        6.0
+getattr            172.9       1.00        4.7
+readdir           1256.5       5.00     4509.0
+setattr            452.2       9.00      975.9
+create            1328.2      10.32     1353.7
+unlink             750.6       3.00      478.0
+# scaling check @ items=288000
+lookup             507.3       2.00       11.5
+readdir           1283.9       5.00     4509.0
+
+# treedb-micro tag=after-items288000 items=288000 ops=60000 readdir_limit=100
+op                 ns/op  allocs/op   bytes/op
+ping                 8.9       0.00        0.0
+lookup             462.7       1.00        4.7
+lookup-miss        291.1       1.00        6.0
+getattr            174.5       1.00        4.7
+readdir           1294.5       5.00     4509.0
+setattr            452.5       9.00      975.9
+create            1371.8      10.32     1353.8
+unlink             831.2       3.00      478.0
+# scaling check @ items=864000
+lookup             541.0       2.00       11.5
+readdir           1302.0       5.00     4509.0
+
+# 目的 2：readdir 每条目录项的定价（limit 扫描 → 分配数与边际 ns）
+# treedb-micro tag=after-limit1 items=32000 ops=40000 readdir_limit=1
+readdir            231.5       5.00       54.0
+# scaling check @ items=96000
+readdir            231.3       5.00       54.0
+
+# treedb-micro tag=after-limit10 items=32000 ops=40000 readdir_limit=10
+readdir            304.1       5.00      459.0
+# scaling check @ items=96000
+readdir            309.4       5.00      459.0
+
+# treedb-micro tag=after-limit50 items=32000 ops=40000 readdir_limit=50
+readdir            778.1       5.00     2259.0
+# scaling check @ items=96000
+readdir            756.9       5.00     2259.0
+
+# treedb-micro tag=after-limit100 items=32000 ops=40000 readdir_limit=100
+readdir           1268.5       5.00     4509.0
+# scaling check @ items=96000
+readdir           1292.0       5.00     4509.0
+
+# treedb-micro tag=after-limit400 items=32000 ops=40000 readdir_limit=400
+readdir           4452.2       5.00    18009.0
+# scaling check @ items=96000
+readdir           4469.0       5.00    18009.0
+
