@@ -175,16 +175,19 @@ fn main() {
             let mut seq: u64 = 0;
             let mut n: u64 = 0;
             let mut ci = 0usize;
-            // lookup/readdir 得先有东西可查：预热 500 个文件，否则量的
-            // 是“查找不中”这条快路径，数字好看但没代表性。
+            // lookup/readdir 得先有东西可查：预热若干文件，否则量的是“找
+            // 不中”这条快路径，数字好看但没代表性。条数由 `TREEDB_BENCH_WARM`
+            // 定（默认 500，与历史格子同形）：目录布局那类优化的收益随目录规模
+            // 长，500 条全部活在 L2 里，根目录到叶子只三跳，分不出两种布局的差。
             //
             // 预热走 pipeline：逐条一问一答时，这一步自己就要几十秒（每条一次
             // fsync 往返），盖过被测区间；挨批送则只花 fsync 次数那么多时间。
             if op == "lookup" || op == "readdir" {
                 const WARM: usize = 250;
+                let span = warm_span();
                 for &v in &vids {
-                    for base in (0..500usize).step_by(WARM) {
-                        let batch: Vec<Op> = (base..(base + WARM).min(500))
+                    for base in (0..span).step_by(WARM) {
+                        let batch: Vec<Op> = (base..(base + WARM).min(span))
                             .map(|k| Op::Create {
                                 view: v,
                                 parent: 1,
@@ -207,10 +210,17 @@ fn main() {
                     }
                 }
             }
-            let deadline = Instant::now() + dur;
+            // 计时窗口只包被测循环。分母不能在 join 前取：那样“建 N 条连接 +
+            // 预热 500 个文件”这段固定开销会被算进去，--secs 3 时 readdir/lookup
+            // 那一格的分母实测被撑到 6.2 s，吞吐虚低一倍；而旧版 pgbench 因为
+            // 预热在父线程做完，同一处只撑到 3.05 s —— 两边口径不一致，对比结果
+            // 就不可信。故每线程自己记窗口，汇总时取最大值当分母（比取均值
+            // 保守），treedb-pgbench 同步改成这个口径。
+            let wstart = Instant::now();
+            let deadline = wstart + dur;
             while Instant::now() < deadline {
                 let view = vids[(seq as usize) % vids.len()];
-                let batch = build(&op, view, seq, pipeline, t, nonce);
+                let batch = build(&op, view, seq, pipeline, t, nonce, warm_span() as u64);
                 let idx = ci % cs.len();
                 ci += 1;
                 let c = &mut cs[idx];
@@ -242,19 +252,22 @@ fn main() {
                 }
                 seq += pipeline as u64;
             }
-            (n, lat)
+            (n, lat, wstart.elapsed())
         }));
     }
 
     let mut total = 0u64;
     let mut all: Vec<u64> = Vec::new();
-    let t0 = Instant::now();
+    let mut span = Duration::ZERO;
     for h in handles {
-        let (n, lat) = h.join().unwrap();
+        let (n, lat, s) = h.join().unwrap();
         total += n;
         all.extend(lat);
+        if s > span {
+            span = s;
+        }
     }
-    let secs = t0.elapsed().as_secs_f64();
+    let secs = span.as_secs_f64();
     let (p50, p90, p99, max) = pct(all);
     println!(
         "op={op} conns={c} threads={t} pipeline={p} → {q:.0} ops/s over {s:.2}s \
@@ -269,11 +282,21 @@ fn main() {
     );
 }
 
+/// 预热条数 = 被测目录的规模。默认 500（历史格子的形），`TREEDB_BENCH_WARM`
+/// 可拉到万级，用来分辨“只在宽目录上生效”的那类优化。
+fn warm_span() -> usize {
+    std::env::var("TREEDB_BENCH_WARM")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|n| *n >= 100)
+        .unwrap_or(500)
+}
+
 /// 造一批 op。名字带 `seq` 保证 create 唯一。
 ///
 /// `nonce` 是本次进程的启动时间：没有它，同一数据目录上重跑 create/key 就
 /// 全在撞 EEXIST，量到的是“已存在”这条早退路径，不是真的建项开销。
-fn build(op: &str, view: u32, seq: u64, n: usize, t: usize, nonce: u64) -> Vec<Op> {
+fn build(op: &str, view: u32, seq: u64, n: usize, t: usize, nonce: u64, span: u64) -> Vec<Op> {
     let mut v = Vec::with_capacity(n);
     for k in 0..n as u64 {
         let s = seq + k;
@@ -283,7 +306,7 @@ fn build(op: &str, view: u32, seq: u64, n: usize, t: usize, nonce: u64) -> Vec<O
             "lookup" => Op::Lookup {
                 view,
                 parent: 1,
-                name: format!("f{}-{}", t, s % 500).into_bytes(),
+                name: format!("f{}-{}", t, s % span).into_bytes(),
             },
             "readdir" => Op::ReadDir {
                 view,

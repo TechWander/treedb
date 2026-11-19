@@ -347,7 +347,8 @@ fn main() {
             let table = tables[t % tables.len()].clone();
             // 计时窗口从本线程连上之后才起算：拿父线程算好的 deadline 的话，
             // 建连慢的线程一上来就少跑几秒，分母却仍按整段算。
-            let deadline = Instant::now() + Duration::from_secs(secs);
+            let wstart = Instant::now();
+            let deadline = wstart + Duration::from_secs(secs);
             let mut lat: Vec<u64> = Vec::with_capacity(1 << 16);
             let mut n = 0u64;
             let mut seq = 0u64;
@@ -374,19 +375,24 @@ fn main() {
                 }
                 seq += args.pipeline as u64;
             }
-            (n, lat)
+            (n, lat, wstart.elapsed())
         }));
     }
 
     let mut total = 0u64;
     let mut all: Vec<u64> = Vec::new();
-    let t0 = Instant::now();
+    // 分母 = 各线程自身窗口的最大值，与 treedb-bench 同一套口径：在父线程取
+    // t0 会把建连开销算进分母，两边必须一样量。
+    let mut span = Duration::ZERO;
     for h in handles {
-        let (n, lat) = h.join().unwrap();
+        let (n, lat, s) = h.join().unwrap();
         total += n;
         all.extend(lat);
+        if s > span {
+            span = s;
+        }
     }
-    let secs = t0.elapsed().as_secs_f64();
+    let secs = span.as_secs_f64();
     let (p50, p90, p99, max) = pct(all);
     println!(
         "pg op={} conns={} pipeline={} → {:.0} ops/s over {:.2}s \
