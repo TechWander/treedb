@@ -4,16 +4,16 @@
 //! checkpoint」——这让它的数据结构直接是索引形状（BTreeMap），op 延迟
 //! 不受页缓存/索引维护拖累，恢复靠 WAL 前缀。代价是活元数据总量受内存
 //! 约束（单节点约 200 B，10 亿 inode ≈ 200 GB）；页式 B+tree 落盘列为
-//! 阶段 2，接入 grovefs 前先把万级视图（10^7 级 inode）这档吃透。
+//! 阶段 2 的目标是把万级视图（10^7 级 inode）这一档先吃透。
 //!
-//! 三张核心索引，形状与 grovefs 的 PG 表一致：
+//! 三张核心索引，形状与关系库版的三张表一致：
 //! - `nodes: (view, ino) → Node`            ← `node` 表主键
 //! - `dentries: (view, parent, name) → ino` ← `node(parent_id,name)` 唯一索引
 //!   （key 的字典序 = 同目录内 name 的字节序，readdir 顺序天然稳定）
 //! - `locks: (view, ino, owner) → LockRec`  ← `locks` 表
 //!
-//! `refs` 是跨视图共享的内容账本（对应 `grovefs_refs` schema）；
-//! `keys`/`audit`/`defs`/`placement` 是控制面（对应 `grovefs_control`）。
+//! `refs` 是跨视图共享的内容账本（对应那个独立的 refs schema）；
+//! `keys`/`audit`/`defs`/`placement` 是控制面（对应那个 control schema）。
 
 use crate::engine::codec::{Rd, W};
 use crate::engine::model::{
@@ -25,7 +25,7 @@ use std::ops::Bound;
 
 /// 快照格式版本。布局变更必须 +1，`load` 拒绝不匹配的旧文件。
 ///
-/// v1 → v2：`data_ref` 从 `u64` 改成不透明字节（接 grovefs 前的格式定案，见
+/// v1 → v2：`data_ref` 从 `u64` 改成不透明字节（格式定案，见
 /// `model::DataRef`）。inode 行与 `refs` 账本行的字段宽度跟着变，旧快照不能被
 /// 新代码重解 —— 不 +1 就会把旧文件的 8 字节整数当长度前缀读，CRC 保护不了
 /// 已经存好的 payload 之外的东西，于是“静默解错”而不是“报错拒收”。

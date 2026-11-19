@@ -1,23 +1,36 @@
-//! treedb — GroveFS 元数据后端专用引擎。
+//! treedb — 元数据引擎：单进程事件循环 + 自定义二进制协议 + WAL/checkpoint。
 //!
 //! ## 定位
 //!
-//! 本 crate 是 GroveFS 现有 `pg_store.rs / control.rs / apikeys.rs` 三块存储职责的
-//! **独立重写**，先把「实例级共享池 + 控制面镜像 + WAL 持久化容灾」三件事做到能在
-//! 无 GroveFS 上下文的情况下独立编译、单测、示例运行，验证设计闭环后再作为
-//! 第三种 `MetaStore` variant 或 `ApiKeyStore` 后端接入 GroveFS。
+//! 这是一个**数据库项目**，不是某个客户端的一个模块。它针对的负载形状是「大量小
+//! 对象 + 高频点查 + 目录遍历 + 万级常驻连接」：关系库在这个形状上要为每条连接
+//! fork 一个 backend、为每个事务付一次 WAL flush，所以上下文里自己做一套。
+//! 类型、语义、op 都按 POSIX 元数据定，不绑某一个客户端：`src/engine` 与 `src/net`
+//! 里没有、也不该有某个具体客户端的业务语义（这条有测试守着，见 `tests/independence.rs`）。
 //!
 //! ## 三层能力
 //!
-//! 1. **共享连接池** [`pool::SharedInstancePool`]：连接数与视图数解耦。
-//!    单池固定 N 条连接（默认 warm=16/max=64），万级视图共用；用 `SET LOCAL
-//!    search_path` 事务级切换目标视图 schema，SQL 文本去 schema 化。
-//! 2. **控制面三表** [`store`]：API 密钥 / 审计日志 / 视图定义，双后端
-//!    （PG + 本地 SQLite 镜像），PG 权威、镜像只读容灾。
-//! 3. **持久化容灾** [`persist`]：PG 不可达时 `fallback_authenticate()`
-//!    仍能在毫秒级完成校验；审计日志缓冲后异步 flush，不丢一行。
+//! 1. **引擎本体** `engine`：内存状态机 + CRC32 WAL + 快照 checkpoint + 崩溃重放；
+//!    POSIX 语义的 create/lookup/getattr/setattr/rename/readdir 与锁、内容引用账本。
+//! 2. **连接层** `net`：默认单线程 `epoll` 事件循环（1 fd/conn，万级连接每连接
+//!    半 KiB RSS）；`--workers N` 起 N 条前端并行读，写永远由唯一提交线程定序。
+//! 3. **过渡档**（feature `postgres-compat`，**默认关**）：`pool` / `store` / `persist`
+//!    / `schema` / `probe` —— PG 共享池 + SQLite 镜像 + `grovefs_control` 表形。它给
+//!    GroveFS 现有的 PostgreSQL 栈做搬迁脚手架，不是引擎的一部分；关掉 feature 后
+//!    依赖只剩 `libc` + `thiserror`。
 //!
-//! ## 关键不变量
+//! 选型判据、协议字节布局、语义边界与五轴实测数据全部在 `DESIGN.md`（本文档只留
+//! 入口）。
+//! ## 关键不变量（引擎本体）
+//!
+//! - **全局定序只有一个点**：所有写都由唯一提交线程排入 WAL，`workers > 1` 也不变；
+//!   group commit 把一轮内所有连接的写合成一次 fsync。
+//! - **已 ack 的写不会被崩溃吞掉**：重放快照 + 尾日志后一定重现；拿不准就报错，
+//!   绝不静默当成「什么都没有」（见 `tests/crash_recovery.rs`）。
+//! - **同连接应答严格按请求顺序**：协议没有 request id，就地并行读也不得插到前面
+//!   那条写的答复之前（`tests/read_scaling.rs` 钉住）。
+//!
+//! ## 关键不变量（`postgres-compat` 过渡档）
 //!
 //! - **PG 是唯一权威**：镜像永远是被写入的一方，任何"以 PG 可用为前提"的路径
 //!   都直接读 PG，不会因为镜像落后而遮蔽新写入。

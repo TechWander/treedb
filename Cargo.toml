@@ -2,7 +2,7 @@
 name = "treedb"
 version = "0.3.0"
 edition = "2021"
-description = "GroveFS 专用元数据引擎：单进程事件循环 + 自定义二进制协议 + WAL/checkpoint"
+description = "元数据引擎：单进程事件循环 + 自定义二进制协议 + WAL/checkpoint（POSIX 元数据语义，客户端无关）"
 license = "Apache-2.0"
 
 [lib]
@@ -30,6 +30,8 @@ path = "src/bin/pgbench.rs"
 required-features = ["postgres-compat"]
 
 [features]
+# 显式写成一行：`tests/independence.rs` 门 3 就在测这个键没把过渡档拖进默认档。
+default = []
 # 默认空：`cargo build` 出来的是纯引擎，依赖只有 libc + thiserror。
 # 过渡档（PG 共享池 + SQLite 镜像 + grovefs_control 表形）全部关在这里，
 # 它服务的是 grovefs 现有的 PostgreSQL 栈，不是元数据引擎本体。

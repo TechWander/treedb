@@ -9,7 +9,7 @@
 //! | [`server`] | `workers = 1`（默认）的单线程事件循环本体，兼作两条路径共用的 `Conn`/`Slot` 构件 |
 //! | [`multi`] | `workers > 1`：N 条前端线程 + 唯一提交线程 |
 //! | [`mail`] | 两者之间那条能被 `epoll` 唤醒的信箱 |
-//! | [`client`] | 同步阻塞客户端（压测与 grovefs 侧调用同一套） |
+//! | [`client`] | 同步阻塞客户端（压测与真实接入方走同一套代码） |
 
 pub mod client;
 pub mod mail;

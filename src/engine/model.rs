@@ -1,13 +1,13 @@
 //! 引擎数据模型与协议语义类型。
 //!
-//! 概念对齐 GroveFS 的 PG 元数据表（`pg_store.rs`），但去掉 SQL：
+//! 概念对齐「把元数据存进关系库」的那张表形状（`pg_store` 这类实现），但去掉 SQL：
 //! - `node` 表 → [`Node`]（inode）+ `dentries`（`(view,parent,name) → ino`）；
 //! - `locks` 表 → [`LockRec`]（`(view,ino,owner) → kind,lease`）；
-//! - `grovefs_refs` 账本 → [`RefRec`]（`data_ref → count,size`，跨视图共享）；
-//! - 控制面 `api_keys` / `mcp_calls` → [`KeyRec`] / [`AuditRec`]。
+//! - 内容引用账本 → [`RefRec`]（`data_ref → count,size`，跨视图共享）；
+//! - 控制面「命名密钥 + 调用审计」两张表 → [`KeyRec`] / [`AuditRec`]。
 //!
-//! 命名与列语义保持与 grovefs 一致，接入时上层映射是逐字段翻译，
-//! 不是重新建模。
+//! 命名与列语义与关系库那一版逐字段对得上，客户端接入时上层映射是翻译，
+//! 不是重新建模 —— 这是这套形状存在的原因，不是对某个具体客户端的契约。
 
 use crate::engine::codec::{Rd, W};
 use crate::error::{Error, Result};
@@ -16,14 +16,14 @@ pub type ViewId = u32;
 pub type Ino = u64;
 /// 内容对象的引用：一段**不透明字节**，引擎不解释其含义。
 ///
-/// 这里曾经是 `u64`，接 grovefs 时改掉：grovefs 的 `data_ref` 是后端自己生成的
+/// 这里曾经是 `u64`，v2 定稿时改掉：客户端侧的 `data_ref` 是后端自己生成的
 /// 字符串键（内容哈希 / 条带化多键），把它折成 `u64` 要么哈希（碰撞 = 两个文件的
 /// 字节互相顶掉），要么在 provider 里养一张 `String ↔ u64` 映射表（表本身要持久化，
 /// 崩溃后还原不出原键 = 已 ack 的文件读不到数据）。字节直接存进 inode 与 `refs`
 /// 账本，两边表示一致，不需要任何映射层。空 = 尚未提交内容。
 pub type DataRef = Vec<u8>;
 
-/// inode 类型，与 grovefs `node.is_dir` 的 0/1/2 一致。
+/// inode 类型，编码 0/1/2，与关系库元数据表里 `node.is_dir` 的取值同序。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
     File,
@@ -50,7 +50,7 @@ impl Kind {
 }
 
 /// POSIX inode。`data_ref` 指向内容对象（空 = 未提交内容），字节本体
-/// 不在元数据引擎里——与 grovefs 的 data-server/meta-server 分层一致。
+/// 不在元数据引擎里——字节走客户端自己的数据面，引擎只记账它存在（§5.1）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Node {
     pub ino: Ino,
@@ -106,8 +106,8 @@ impl Node {
     }
 }
 
-/// 文件锁记录，对齐 grovefs `locks(ino, owner, kind, lease_expiry)`。
-/// `kind`: 0 = fcntl read, 1 = fcntl write, 2 = flock（与 grovefs 同码）。
+/// 文件锁记录，形状同 `locks(ino, owner, kind, lease_expiry)`。
+/// `kind`: 0 = fcntl read, 1 = fcntl write, 2 = flock（沿用同一套编码，不重排）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LockRec {
     pub kind: u8,
@@ -152,7 +152,8 @@ impl RefRec {
     }
 }
 
-/// 控制面 API 密钥行，字段对齐 `grovefs_control.api_keys`。
+/// 控制面 API 密钥行。列形状照「关系库版 api_keys 表」来，字段都是字节串；
+/// 撤销/过期/只读这些规则由客户端解释（§11 第 7 条 T2 会把它换成通用表）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KeyRec {
     pub id: Vec<u8>,
@@ -203,7 +204,7 @@ impl KeyRec {
             secret_hint: r.bytes()?,
         })
     }
-    /// 0 = 不过期（对齐 grovefs `expires_at` 为空串的语义）。
+    /// 0 = 不过期（对应关系库里这一列存空串的做法）。
     pub fn expired(&self, now_ms: i64) -> bool {
         self.expires_at != 0 && self.expires_at <= now_ms
     }
@@ -212,7 +213,7 @@ impl KeyRec {
     }
 }
 
-/// 审计行，对齐 `grovefs_control.mcp_calls`。
+/// 审计行：一次外部调用的记账，形状同关系库版的 mcp_calls 表。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuditRec {
     pub seq: u64,
@@ -312,7 +313,7 @@ pub const SA_DATA_REF: u32 = 1 << 6;
 pub const RENAME_NOREPLACE: u32 = 1 << 0;
 
 /// 协议错误码：直接复用 POSIX errno 数值，客户端拿到后可原样回给 FUSE，
-/// 不做二次翻译（grovefs 现有 pg_store 就是把 PG 错映射成 errno）。
+/// 不做二次翻译（把后端错误字符串映射成 errno 的做法会丢信息，这里直接回码）。
 pub mod errno {
     pub const EPERM: u16 = 1;
     pub const ENOENT: u16 = 2;
@@ -331,11 +332,11 @@ pub mod errno {
     pub const ENAMETOOLONG: u16 = 36;
     pub const ENOTEMPTY: u16 = 39;
     pub const EAGAIN: u16 = 11;
-    pub const EADV: u16 = 68; // 认证被拒（借用 grovefs 控制面既有码）
+    pub const EADV: u16 = 68; // 认证被拒（复用既有的「协议错误」码位，不另立）
     pub const ESTALE: u16 = 116;
 }
 
-/// 一次请求。字段直接用二进制编码进帧；语义与 grovefs 的 FUSE op 一一对应。
+/// 一次请求。字段直接用二进制编码进帧；语义与 POSIX/FUSE 的元数据 op 一一对应。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Op {
     Ping,
@@ -375,7 +376,7 @@ pub enum Op {
         data_ref: DataRef,
         ref_bytes: u64,
     },
-    /// 创建普通文件（不存在才建；存在 → EEXIST，与 grovefs create 主路径一致）。
+    /// 创建普通文件（不存在才建；存在 → EEXIST，即 POSIX `O_CREAT|O_EXCL`）。
     Create {
         view: ViewId,
         parent: Ino,

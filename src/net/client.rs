@@ -1,6 +1,6 @@
 //! 同步客户端：一条 TCP 连接 = 一个 pipelined 会话。
 //!
-//! 故意做成阻塞式（`std::net`）：grovefs 侧的 FUSE 多线程派发已经负责
+//! 故意做成阻塞式（`std::net`）：调用方那边的多线程 / FUSE 派发已经负责
 //! 并发，客户端再引异步只会把依赖图搞脏。协议本身支持 pipeline，
 //! [`Client::pipeline`] 就是「一次写多个请求、再一次读多个应答」，
 //! 这是压满服务端 group commit 的正确姿势。
@@ -35,7 +35,7 @@ impl Client {
 
     /// 用已建好、已调优的 socket 构造客户端。
     ///
-    /// 给两类场景用：测试要先把缓冲区调小以触发服务端背压；grovefs 侧
+    /// 给两类场景用：测试要先把缓冲区调小以触发服务端背压；调用方
     /// 如果想自己管 socket（复用、绑定、超时）也不必经本模块的 `connect`。
     pub fn from_stream(stream: TcpStream) -> Client {
         let _ = stream.set_nodelay(true);

@@ -180,7 +180,7 @@ fn main() {
 }
 
 const HELP: &str = "\
-treedb-server — GroveFS 元数据引擎
+treedb-server — 元数据引擎服务端（POSIX 元数据语义，客户端无关）
 
   --dir PATH                 数据目录（WAL + 快照），默认 /var/lib/treedb
   --listen HOST:PORT         监听地址，默认 127.0.0.1:7777

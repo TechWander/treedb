@@ -322,7 +322,7 @@ impl Engine {
 
     /// 内嵌用法（不经网络）：一个 op 走完 stage → WAL → 返回 ack。
     ///
-    /// grovefs 如果选同进程嵌入而非连 TCP，这就是入口；测试也走它，
+    /// 客户端如果选同进程嵌入而非连 TCP，这就是入口；测试也走它，
     /// 能把“语义对不对”与“网络对不对”分开验。服务端事件循环不用它
     /// （那里需要跨连接 group commit）。
     pub fn submit(&mut self, op: &Op) -> Result<Reply> {

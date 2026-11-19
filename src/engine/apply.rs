@@ -478,7 +478,7 @@ pub fn translate(s: &State, now: i64, op: &Op) -> (Vec<Log>, Reply) {
                     ino,
                 },
             ];
-            // 唯一一条链接断开 = 内容对象少一次引用（grovefs 的 data_ref
+            // 唯一一条链接断开 = 内容对象少一次引用（客户端的 data_ref
             // 由 inode 持有，没有额外硬链接，故 unlink 必然减引用）。
             let mut book = RefBook::default();
             if !node.data_ref.is_empty() {

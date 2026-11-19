@@ -1,19 +1,27 @@
 # treedb 设计文档
 
-**定位**：GroveFS 的专用元数据引擎。单进程、epoll 事件循环（默认单线程；`--workers N`
-开 N 条前端 worker 并行读，但写永远只有一个提交线程在定序）、自定义二进制线协议、
-自带 WAL + 快照恢复。目标是把「万级并发视图 × 每视图多条活跃连接」这件事从 PG 的
-process-per-connection 成本模型里解放出来，同时不牺牲已 ack 写入的持久性。
+**定位**：元数据引擎。单进程、epoll 事件循环（默认单线程；`--workers N` 开 N 条
+前端 worker 并行读，但写永远只有一个提交线程在定序）、自定义二进制线协议、自带
+WAL + 快照恢复。要解的问题形状是「万级并发视图 × 每视图多条活跃连接」，把这件事从
+PG 的 process-per-connection 成本模型里解放出来，同时不牺牲已 ack 写入的持久性。
+它**不绑某个客户端**：类型与语义按 POSIX 元数据定，为客户端服务的适配层留在客户端
+自己的仓里；本仓唯一与 PostgreSQL 有关的东西是默认关掉的 `postgres-compat` 脚手架，
+而这条约束有测试守着（`tests/independence.rs`，详见 §11 第 7 条）。
 
-**状态**：v0.3.0，引擎本体已落地并跑完五轴验收；已建 git 仓推 `origin`(gitee)
-+ `github` 两远端并打 tag `v0.3.0`。接入 spike 已在 grovefs 实验分支
-`exp/treedb-integration` 上**端到端跑通**（§10 阶段 B 末节：31 条 e2e 断言全过，
-grovefs 默认档逐字节不变；treedb 在 grovefs 里是**按 tag 的 git 依赖**，不再依赖
-同级克隆）。`cargo test` 99 条全绿（56 lib +
-19 engine_crud + 9 net_protocol + 6 crash_recovery + 7 read_scaling + 1 concurrency +
-1 scale_connections）。PG 只出现在
-过渡档模块（`src/pool`、`src/store`、`src/persist`）和性能对照器（`src/bin/pgbench.rs`）里，
-引擎本体对 PG 零依赖。
+**状态**：v0.3.0，引擎本体已落地并跑完五轴验收（§7.8 是 2026-11-19 的全轴复跑）；
+已建 git 仓推 `origin`(gitee) + `github` 两远端并打 tag `v0.3.0`。接入 spike 已在
+grovefs 实验分支 `exp/treedb-integration` 上**端到端跑通**（§10 阶段 B 末节：31 条
+e2e 断言全过，grovefs 默认档逐字节不变；treedb 在 grovefs 里是**按 tag 的 git 依赖**，
+不再依赖同级克隆）。
+
+test 现在分两档报：默认档（纯引擎）`cargo test --release` = **71 passed**（26 lib +
+19 engine_crud + 9 net_protocol + 7 read_scaling + 6 crash_recovery + 3 independence +
+1 scale_connections，10k 那条仍 `#[ignore]`）；`--features postgres-compat` =
+**102 passed**，多出的 31 条 = 过渡档自己的 30 条单测 + `concurrency.rs` 里那条
+不需要 PG 的拨号用例（剩下 6 条要真 PG，默认 `#[ignore]`，不计入 passed）。即 PG 只出现在
+`postgres-compat` 后面的 `src/pool`、`src/store`、
+`src/persist`、`src/schema`、`src/probe.rs` 里，以及性能对照器 `src/bin/pgbench.rs`
+（同样 `required-features`）—— 默认构建的直接依赖只有 `libc` + `thiserror`。
 
 ---
 
@@ -586,7 +594,7 @@ PG 2.2–4.1×（§7.5）。默认档仍是 `workers=1`：不显式开就没有�
 | `ten_thousand_connections_in_one_process`（`--ignored`） | 10 000 条全部建立：RSS 0→6 MiB、**0.56 KiB/conn**、`fd/conn = 1.0000`、p50 80 µs / p99 110 µs |
 | `tests/net_protocol.rs` | 9 passed，含 `pipeline_keeps_per_connection_order`、`concurrent_connections_do_not_crosstalk` |
 | `tests/read_scaling.rs` | 7 passed，含 `worker_reads_answer_identically_to_inline_reads`（w=1 与 w=8 答复逐条相同）、`concurrent_reads_do_not_obey_stale_or_torn_writes`（w=4 混打看不到撕裂/陈旧）、`acked_writes_survive_crash_with_workers_on`、`conn_id_reuse_does_not_misroute_acks` |
-| `cargo test --release` 全量（本轮早些时候） | 99 passed / 0 failed |
+| `cargo test --release`（默认档，本轮复跑） | 71 passed / 0 failed（T1 之前是 99 条一起跑，拆分后语义不变） |
 
 两处必须说白的地方：
 
@@ -636,21 +644,26 @@ PG 2.2–4.1×（§7.5）。默认档仍是 `workers=1`：不显式开就没有�
 ## 9. 测试清单
 
 ```sh
-cargo test --release            # 全量，99 条
-cargo test --release --lib      # 只看引擎单测
-cargo test --release --test scale_connections -- --ignored --nocapture   # 万级连接重压
-bash benches/throughput_matrix.sh 3        # 五轴吞吐矩阵（默认只跑 1–4）
+cargo test --release                            # 默认档（纯引擎），71 条
+cargo test --release --features postgres-compat # 加上过渡档，102 条
+cargo test --release --lib                      # 只看引擎单测
+cargo test --release --test scale_connections -- --ignored   # 万级连接重压（§7.6）
+bash benches/throughput_matrix.sh 3             # 五轴吞吐矩阵（默认只跑 1–4）
 ```
+
+两档都跑完才是全量：`--features postgres-compat` 多出的 31 条 = 过渡档自己的 30 条
+单测 + `concurrency.rs` 里那条不需要 PG 的拨号用例。
 
 | 目标 | 数量 | 覆盖 |
 |------|------|------|
-| `--lib` | **56** | codec round-trip（全 tag）、CRC 已知向量、碎帧/超长帧、WAL 帧与截断重放、**预分配空洞重开**（`prealloc_padding_reopens_cleanly`）、**大批次不跳写**（`huge_batch_writes_every_record`）、**seq 跳号硬错**、状态快照保留 node key、缓冲压缩、租约过期边界 |
+| `--lib` | **26**（+30 属 `postgres-compat`） | codec round-trip（全 tag）、CRC 已知向量、碎帧/超长帧、WAL 帧与截断重放、**预分配空洞重开**（`prealloc_padding_reopens_cleanly`）、**大批次不跳写**（`huge_batch_writes_every_record`）、**seq 跳号硬错**、状态快照保留 node key、缓冲压缩、租约过期边界 |
 | `tests/engine_crud.rs` | **19** | §5.2 全部 POSIX 语义（含 GC 线索与 NOREPLACE）+ 控制面（密钥/审计/定义/放置）+ checkpoint 后重开 + 坏尾截断 |
 | `tests/net_protocol.rs` | **9** | TCP 端到端：CRUD、碎帧、pipeline 保序、并发连接不串扰、超长帧只杀违规者、大回包流式读完、`--stats`/`--checkpoint`/`--shutdown`、优雅停服后同地址立刻重绑 |
 | `tests/crash_recovery.rs` | **6** | §6.4 |
 | `tests/read_scaling.rs` | **7** | 只读分派表逐条对 `translate`（判错一条就是丢写）、`workers=1/8` 答复逐条相同、每连接流内顺序、一写多读不读到半截状态、`ops_total` 记上 worker 就地算的读、并行档下 `kill -9` 已 ack 的写全在、**fd 复用不会把上一任的应答塞给新任** |
-| `tests/concurrency.rs` | 1（+6 ignored） | 无 PG 时跑「拨号失败不漏 live」；其余需要真实 PG，属过渡档 |
+| `tests/concurrency.rs` | 0（+7，整文件 feature 门控） | T1 之后整个文件在 `postgres-compat` 后面：无 PG 时跑「拨号失败不漏 live」（1 条，要 feature），其余 6 条 `#[ignore]` 需真实 PG。**它测的是共享池，不是引擎并发**（§7.8）|
 | `tests/scale_connections.rs` | 1（+1 ignored） | 1 000 连接 fd/RSS 断言每次跑；万级（`TREEDB_CONNS`，含 25 000）手动 |
+| `tests/independence.rs` | **3** | 独立性三把门：内核目录（`src/engine`、`src/net`）不出现客户端名字；`[dependencies]` 非 optional 项只能是 `libc` + `thiserror`；`postgres-compat` 不得进 `default`（§11 第 7 条） |
 
 本轮新加/改写的回归锁：
 `prealloc_padding_reopens_cleanly`（预分配空洞不能被当记录）、
@@ -797,7 +810,7 @@ spike 明确**没**做、也不在接入面上假装做的事 —— 一律返�
 
    | 档 | 现状 | 是否违背约束 |
    |----|------|------------|
-   | **L0 命名与注释** | 引擎内核里 21 处 grovefs 提及**全部是注释**（「与 grovefs `node.is_dir` 的 0/1/2 一致」这类对齐声明）；无 `use grovefs::`，无 grovefs 类型 | 无害，但叙述口径要改（见下） |
+   | **L0 命名与注释** | 引擎内核里 21 处 grovefs 提及**全部是注释**（「与 grovefs `node.is_dir` 的 0/1/2 一致」这类对齐声明）；无 `use grovefs::`，无 grovefs 类型 | ~~无害，但叙述口径要改~~ **已改**（T3）：24 行重写为「POSIX/FUSE/关系库通用形状」的写法，理由保留、主语不再是某个客户端，并由门 1 守住 |
    | **L1 数据结构与 op 语义** | `KeyRec` 逐列照抄 `grovefs_control.api_keys`（`ro`/`owner`/`note`/`expires_at`/`secret_hint`/`created_by`），`AuditRec` 照抄 `mcp_calls`，`Def*` 就是视图定义，`EADV = 68` 注释写着「借用 grovefs 控制面既有码」，`KeyCheck` 里带 `verb` 授权参数 | **违反**。这是业务形状进了内核 |
    | **L2 依赖图** | ~~`postgres`/`rusqlite(bundled)`/`sha2`/`uuid`/`chrono`/`tracing`/`parking_lot` 全是非 optional 依赖~~ **已关进 `postgres-compat`**（T1 完成）：默认档 `cargo tree` 只剩 `libc` + `thiserror`；依据仍是 grovefs 只用 `treedb::net::Client` 与 `engine::model::Op`，`pool/`、`store/`、`persist/`、`schema/` 一行符号都没用 | ~~违反~~ **已修** |
 
@@ -822,14 +835,19 @@ spike 明确**没**做、也不在接入面上假装做的事 —— 一律返�
      `RowPut` / `RowGet` / `RowList` / `RowDelete`（字段为字节列，可加唯一约束与
      比较条件），具体列名、撤销/过期/只读这些规则全部由客户端定义。协议版本
      同批递增并补 decode 向量，别弄“字段名改了但版本号不动”。
-   - **T3 叙述去依赖**：crate description、`treedb-server --help` 首行、DESIGN.md 标题
-     现在都写「GroveFS 元数据引擎」；改成「元数据引擎（为 GroveFS 这类万级视图负载设计，
-     但不绑 GroveFS 业务语义）」。同时把 L0 那 21 处注释里的「与 grovefs X 一致」
-     改成「与 POSIX/FS 语义一致」的写法 —— 对齐理由是真的，但叙述主语不该是某个客户端。
-   - **T4 把「不许漏 grovefs 语义」写成可测的门**：单测断言引擎内核目录
-     （`src/engine/`、`src/net/`）不出现 `grovefs` 字样与非-optional 依赖，并在
-     CI 里跑一次 `--no-default-features` 构建。靠人盯是守不住的：L1 那些字段就
-     是“为了方便把表结构照抄进来”长出来的。
+   - ~~**T3 叙述去依赖**~~ **已完成**：crate description、`treedb-server --help` 首行、
+     `lib.rs` 头部全部改掉「GroveFS 专用/后端专用」的说法，内核注释按行重写（见上）；
+     `lib.rs` 的「三层能力」重排为引擎本体 / 连接层 / 过渡档，并把原来四条不变量
+     拆成「引擎本体的」（单一定序点、acked 写不丢、同连接应答不乱序）与「过渡档的」（PG
+     唯一权威、只在不可达时降级）两组 —— 原来那四条全在讲脚手架，这本身就是定位跑偏。
+     另外补了 `README.md`：公开仓库此前只有一份 800 行设计文档，没有门牌。
+   - ~~**T4 把「不许漏 grovefs 语义」写成可测的门**~~ **已完成**：`tests/independence.rs`
+     三把门 —— 内核目录（`src/engine`、`src/net`）不出现客户端名字；`[dependencies]`
+     里非 optional 项只能是 `libc` + `thiserror`；`postgres-compat` 不得进 `default`。
+     关键词是拼出来的，文件也不扫 `tests/`，否则门会把自己拦下来。**反向验过**：
+     往 `src/engine/` 丢一个含该名字的探针文件，门 1 立刻 FAILED，删掉又绿 —— 门不是装饰。
+     跑法：默认档 `cargo test --release` = **71 passed / 0 failed**（含三把门），
+     `--features postgres-compat` = **102 passed / 0 failed**。
 
    接入侧因此得到的约束：第 5 条里“把定义/密钥/账户补进引擎”的正解不是
    `Key*`/`Audit*` 直接给 grovefs 用，而是 grovefs 用 T2 的通用表自己拼语义；
