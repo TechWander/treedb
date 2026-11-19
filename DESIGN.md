@@ -217,7 +217,8 @@ test 现在分两档报：默认档（纯引擎）`cargo test --release` = **112
 | `src/bin/{server,bench,pgbench,micro,migrate,standby,demo}.rs` | 1946 | 可执行入口；`pgbench` 是 PG 对照器，`migrate` 是快照升级工具（§6.5），`standby` 是只读副本（§6.6） |
 | `benches/throughput_matrix.sh` | 188 | 五轴吞吐矩阵（§7 的数据来源） |
 | `benches/rehearse_migrate.sh` | 147 | 快照升级的真机彩排：旧 tag → 当前树，逐格核四条承诺与回滚窗口（§6.5 的外部效度） |
-| `benches/single_conn.sh` | 89 | 单连接对标（§7.11）：`conns=1` 下 treedb 默认档 vs 私有 PG 集群，`$PIPE` 选一问一答还是批量，逐格附带引擎自计的 fsync 计数 |
+| `benches/single_conn.sh` | 99 | 单连接与并发档对标（§7.11）：treedb 默认档 vs 私有 PG 集群，`$PIPE` 选一问一答还是批量、`$CONNS`/`$WORKERS` 选形状，逐格附带引擎自计的 fsync 计数 |
+| `benches/backup_probe.sh` | 133 | 备份/还原三形状实测（§6.7）：冷拷贝、写入进行中的热拷贝、副本目录当还原点，逐档拿 `--stats` 的数据面四行对拍 |
 
 行是 `wc -l`，含各文件自己的 `mod tests`（旧版这张表是历史快照，已与代码脱开的
 那几个文件本轮按实测回填）。
@@ -656,6 +657,30 @@ committer，`workers = 1` 时是轮末周期任务）。两档跑的是同一份
    限频、`max_bytes` 默认 1 MiB，名义上限 ≈ 50 MiB/s；快照下载期间不限频，所以
    实际取决于块大小与往返。真数字要的是 §11 第 4 条末那三项。
 
+### 6.7 备份与还原（实测三形状，2026-11-19）
+
+「有 WAL + 快照」不等于「能备份」。这一节把三种做法逐个跑一遍，工具
+`benches/backup_probe.sh`（逐档取 `--stats` 的 nodes/dentries/refs/seq 对拍，原始输出
+`benches/results/backup_probe.log`）。三档都只用临时目录，不碰真数据。
+
+| 形状 | 做法 | 实测结果（rev `d610663`，每档写 2 s） | 能当备份用吗 |
+|------|------|--------------------------------------|--------------|
+| **冷备份** | 写 → `SIGTERM` 优雅停服 → `cp -a` → 从拷贝起服 | nodes 13 968 / dentries 13 936 / refs 0 / seq 41 872 **逐项相等 ✓** | 能，RPO = 停服那一刻 |
+| **热拷贝** | 写入进行中 `cp -a`，源端继续跑 | 拷贝前一刻 seq 41 872、拷完源端 89 536、还原出来 **56 272** | **不能当备份工具用**：能起服、无撕裂、状态自洽，但切点落在写入流中间（比「拷贝前一刻」多 14 400 条）—— 无法承诺还原到哪一刻，也无法向调用方报 RPO |
+| **副本目录** | 主写 → `treedb-standby` 追平 → 把副本目录当普通主起服 | nodes/dentries/refs/seq 与主 **一致 ✓**（当时 `lag 0`、`resyncs 1`、`errors 0`） | 数据面等价于一份可持续追平的异地镜像；但**这不是提升**：没有 fence，旧主必须确认真停（§11 第 4 条③的 `--promote` 还欠着） |
+
+三条顺带量出来的行为，都容易踩：
+
+- **优雅停服自带最后一次 checkpoint**。冷备份拷贝里快照水位已经 == seq，所以还原
+  不依赖尾日志重放；而 `checkpoints` 计数在新进程从 0 起 —— 拿 `--stats` 这两行做
+  「备份是否成功」的断言会假红，脚本因此只比数据面那四行。
+- **`checkpoint` 会把 WAL 重置（`wal.reset`），因此没有 PITR**。能还原到的时间点只有
+  「最近一次快照 + 其后的尾日志」这一条线，历史切面不归档、不落地。要按时间点
+  恢复就得在外面自己留 WAL 分段，或者靠副本（§8 第 14 条）。
+- **没有独立的 backup/restore 命令**。可用面就三条：停服后 `cp -a` 目录、
+  `treedb-standby` 拉一份持续追平的镜像、`treedb-migrate` 只处理快照格式版本（§6.5）。
+  没有 dump/load、没有增量备份、没有加密备份。
+
 ---
 
 ## 7. 性能实测（五轴）
@@ -998,6 +1023,28 @@ syscall」有关。
 **+3 fd/worker**（1 张 `SO_REUSEPORT` 监听 + 上/下行各 1 个 eventfd），**与连接数无关**：
 `workers=16` 就是多 48 个 fd，1 000 连接那格从 1.0000 变成 1.048 fd/conn（两条断言
 的阈值是 1.05/1.02，跑的都是默认档，所以不会被前端 worker 撑爆）。
+
+**`v0.3.5` 上重跑了一次，并把它往 5 万推**（逐格原始输出
+`benches/results/scale_connections.log`）：
+
+```sh
+TREEDB_CONNS=25000 cargo test --release --test scale_connections -- --ignored --nocapture
+```
+
+| 目标连接数 | 结果 | 读数 |
+|-----------|------|------|
+| 25 000 | **通过** | RSS 0 → 8 MiB（**0.31 KiB/conn**）、fd 57 → 25 057（`fd/conn = 1.0000`）、`ping` p50 23 µs / **p99 65 µs** |
+| 50 000 | **失败，但不是引擎挡住的** | 8 条连接器线程在各自第 6 250 条上收到 `EADDRNOTAVAIL`；服务端 `RLIMIT_NOFILE` soft=1 048 576 远没用满 |
+
+失败那一格得说清是谁的上限：量具与被测者在同一台机器上，客户端源端口池就是
+`ip_local_port_range = 32768–60999`（28 232 个），而四元组的目的地只有一个
+`127.0.0.1:port`，所以 5 万条 loopback 连接**在建立侧就凑不齐源端口**。要真验 5 万，
+得换多目标 IP 或多台真客户端。也就是说「最大支持多少连接」这个问题，现在手上的
+证据只到 **2.5 万条常驻、每条约 0.3 KiB、一个 fd、p99 仍在一次系统调用的量级**，
+再往上是被本机量具的源端口空间截断，而不是被引擎截断。引擎自己没有任何连接数
+上限常量：服务端侧只剩 `RLIMIT_NOFILE` 与 `somaxconn`（后者只影响突发 accept 队列，
+不影响常驻数），客户端侧每连接还有 4 MiB 的发送缓存上限 `MAX_BACKLOG`（满了就不
+再收它的写，不是掉线）。
 
 ### 7.7 一句话结论
 
@@ -1357,6 +1404,19 @@ checkpoint 之后首次改页的 full-page write 会让一次 commit 写的字�
     「可以攒着」。另一条：它不 flock，只在改写前后各读一次源文件比对，服务端没停就
     动手只能靠这个哨兵赌输。迁移本身是「全量读进内存 `State` 再全量写出」，成本
     正比于快照大小与 §8 第 2 条同源，没有增量路径。
+13. **接入面没有认证、没有授权、没有传输加密**。这条以前只在第 6 条记了「副本对
+    主」那一侧，而客户端这一侧更常用，故单独钉住：线协议是裸 TCP + 长度前缀 +
+    CRC32，而 CRC32 只判损坏，不防篡改也不提供身份；`Client::connect` 连上就拿到全部
+    49 个 op 的权限，包括 `Shutdown` 与 `Checkpoint`。所以「谁能连到这个端口」=
+    「谁能改整个状态」：多租户、配额、审计归属都得在**引擎之外**做（grovefs 的
+    apikey 与网关白名单就是这一层的现状），或者把端口锁在本机回环/私有网段里 ——
+    `--listen` 默认就是 `127.0.0.1:7777`。也没有 TLS，没有 Unix socket 选项。视图名
+    25 字节那道墙（第 8 条）只是命名空间隔离，不是访问控制。
+14. **备份能力就到 §6.7 那三形状，不再多**。具体边界：无 PITR（`checkpoint` 会
+    `wal.reset()`，历史切面不归档）；无 dump/load、无增量备份、无加密备份；运行中
+    `cp -a` 拷不到撕裂尾但切点不可控（实测：比拷贝前一刻多 14 400 条 seq），所以它不是
+    备份工具；副本目录可以当还原点，但没有 fence 也没有 `--promote`，拿它顶替主是
+    手工操作（第 6 条②③）。
 
 ---
 
@@ -1367,7 +1427,8 @@ cargo test --release                            # 默认档（纯引擎），112
 cargo test --release --features postgres-compat # 加上过渡档，143 条（+7 ignored）
 cargo test --release --lib                      # 只看引擎单测
 cargo test --release --test migrate              # 快照升级：8 条走 API + 3 条真进程跑 CLI（§6.5）
-cargo test --release --test scale_connections -- --ignored   # 万级连接重压（§7.6）
+cargo test --release --test scale_connections -- --ignored   # 万级连接重压（§7.6）；并发数由 TREEDB_CONNS 控制，本机到 25 000 为限（再高是客户端源端口不够）
+bash benches/backup_probe.sh 2                  # 备份/还原三形状：冷拷贝、热拷贝、副本目录（§6.7）
 bash benches/throughput_matrix.sh 3             # 五轴吞吐矩阵（默认只跑 1–4）
 bash benches/default_check.sh                   # 零旗标默认档同格重跑 5 次（§7.5）
 bash benches/ab_layout.sh <基线 rev>            # 受控 A/B：只换服务端二进制（§7.10）

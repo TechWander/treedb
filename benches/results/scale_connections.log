@@ -1,0 +1,27 @@
+=== 连接轴重压 2026-11-19 16:29:44 UTC rev=d610663 ===
+host nproc=128  ulimit -n=1048576  ip_local_port_range=32768	60999  somaxconn=4096
+服务端 fd 上限 soft=1048576 hard=1048576（要撑 25000 条连接，soft 必须够）
+常驻连接 25000 条 | RSS 0 MiB → 8 MiB | fd 57 → 25057 | TCP sockmem 344 → 25594 页
+RSS/conn = 0.31 KiB | fd/conn = 1.0000 | ping p50 = 23 us p99 = 65 us
+结论：单进程 25000 条连接，总增量 RSS ≈ 7.5 MiB（约 0.31 KiB/连接）
+test ten_thousand_connections_in_one_process ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 3.03s
+服务端 fd 上限 soft=1048576 hard=1048576（要撑 50000 条连接，soft 必须够）
+thread '<unnamed>' (1033844) panicked at tests/scale_connections.rs:151:25:
+连接 6250 条时反复失败: io: connect 127.0.0.1:34239: Cannot assign requested address (os error 99)
+thread '<unnamed>' (1033843) panicked at tests/scale_connections.rs:151:25:
+连接 6250 条时反复失败: io: connect 127.0.0.1:34239: Cannot assign requested address (os error 99)
+thread 'ten_thousand_connections_in_one_process' (1033841) panicked at tests/scale_connections.rs:172:40:
+connector thread panicked: Any { .. }
+thread '<unnamed>' (1033846) panicked at tests/scale_connections.rs:151:25:
+连接 6250 条时反复失败: io: connect 127.0.0.1:34239: Cannot assign requested address (os error 99)
+thread '<unnamed>' (1033850) panicked at tests/scale_connections.rs:151:25:
+连接 6250 条时反复失败: io: connect 127.0.0.1:34239: Cannot assign requested address (os error 99)
+thread '<unnamed>' (1033848) panicked at tests/scale_connections.rs:151:25:
+连接 6250 条时反复失败: io: connect 127.0.0.1:34239: Cannot assign requested address (os error 99)
+test ten_thousand_connections_in_one_process ... FAILED
+failures:
+failures:
+    ten_thousand_connections_in_one_process
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1 filtered out; finished in 22.95s
+error: test failed, to rerun pass `--test scale_connections`

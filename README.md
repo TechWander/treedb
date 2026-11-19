@@ -21,6 +21,7 @@ cargo test --release --features postgres-compat        # 143 passed（含 PG 过
 bash benches/throughput_matrix.sh 3 1 2 3 4 5           # 五轴复现，输出进 benches/results/
 bash benches/sync_ratio.sh 3                           # 写路径机制：一次 fsync 摊了多少写
 bash benches/single_conn.sh 3                          # 单连接对标 PG（$PIPE=32 走批量档、$CONNS/$WORKERS 走并发档）
+bash benches/backup_probe.sh 2                         # 备份/还原三形状实测（冷拷贝 / 热拷贝 / 副本目录）
 bash benches/ab_layout.sh <基线 rev>                     # 受控 A/B：只换服务端二进制比引擎改动
 bash benches/default_check.sh                           # 零旗标默认档同格跑 5 次，验默认值真的生效
 bash benches/ab_durability.sh <基线 rev>                  # 写轴 A/B：只换服务端二进制比持久化档
@@ -63,7 +64,7 @@ group commit 不丢。默认按核数给：`min(8, 核数/2)`（1–3 核机器�
 
 | 轴 | 结果 |
 |----|------|
-| 连接 | 单进程 10 000 常驻连接：RSS +6 MiB、**0.56 KiB/conn**、`fd/conn = 1.0000` |
+| 连接 | 单进程 10 000 常驻连接：RSS +6 MiB、**0.56 KiB/conn**、`fd/conn = 1.0000`。v0.3.5 重跑到 **25 000 条仍全绿**：RSS +8 MiB（**0.31 KiB/conn**）、`fd/conn = 1.0000`、`ping` p50 23 µs / **p99 65 µs**（逐格原始输出 `benches/results/scale_connections.log`）；再往上到 50 000 败在**客户端源端口耗尽**（`ip_local_port_range` 只有 28 232 个，`EADDRNOTAVAIL`）而不是引擎 —— 服务端 `RLIMIT_NOFILE` 1 048 576 没用满，引擎也没任何连接数上限常量（DESIGN.md §7.6） |
 | 写（`dur=group` vs PG `synchronous_commit=on`，WAL 同盘） | 64 并发 `create` **10 386 vs 1 837 ops/s**（**5.7×**，PG 那一格 p50 = 33.6 ms）、`write` **12 753 vs 1 415**（**9.0×**） |
 | 64 并发纯读（默认档 `workers=8`） | `readdir` **427 092 vs 146 203** ops/s（**2.9×**）、`lookup` **847 297 vs 210 868**（**4.0×**）、`ping` **977 771 vs 531 437**（**1.8×**）；p50 62–112 µs vs PG 117–431 µs |
 | **单连接**（`conns=1`，v0.3.5 复测，同机同盘两边都真落盘） | 一问一答：`lookup` **43 567–44 597 vs 4 421–4 606** ops/s（**9.5–10.1×**，p50 19 µs vs 211 µs）、`readdir` 36 775–37 715 vs 3 184–3 238（**11.4–11.9×**）、`create` 1 740–1 753 vs 531–550（**3.2–3.3×**，p50 优 1.6×、p99 优 11–13×）、`write` 1 764–1 816 vs 232–614。单连接批量（`pipeline=32`）：`lookup` **77–80×**、`create` 5.0–5.6× 且 p50 优 **13×**（treedb 把 32 次写合成一次 fsync，PG 的 p50 不随批量降）。写入那一格 treedb **也每 op 付一次真盘**（引擎自计 `syncs == writes`），3× 不是靠放松持久化换来的 —— 逐格原始输出 `benches/results/single_conn.log`，机制解释见 [DESIGN.md](DESIGN.md) §7.11 |
@@ -101,6 +102,33 @@ DESIGN.md §7（含 §7.8 那次全五轴复跑）。
 - **日志传送两面**：`WalFetch`（从指定 seq 起按 durable 水位送记录）、`SnapFetch`（按
   字节切快照文件）。它们是服务端与副本之间的两面，客户端不会发到它们；
   客户端看见的差别只有一条：副本上写拿 `EROFS`。
+- **连接与网络面**：一个地址一条 TCP 连接，服务端单进程 epoll，**每连接 1 个 fd +
+  约 0.3 KiB**，实跑到 25 000 条常驻全绿（§7.6）。`--listen` 接 `host:port` 或
+  `名字:端口`（走 std DNS），默认 `127.0.0.1:7777`，也可以给 `0.0.0.0`。新连接一律
+  `TCP_NODELAY` + keepalive 空闲 60 s、探活 10 s×3（客户端崩了不会长期占 fd）。多条
+  连接只共享一个状态机：锁按**连接号**归属（不用会被复用的 fd），死连接的锁由租约过期回收。
+  引擎没有连接数上限常量，卡它的是服务端 `RLIMIT_NOFILE` 与客户端源端口空间（§7.6）。
+- **持久性与备份面**：CRC32 WAL + 快照 checkpoint + 崩溃重放（§6.1/§6.2），优雅停服
+  自带最后一次 checkpoint。备份可用的形状有三种且都跑过（§6.7）：停服后 `cp -a` 目录、
+  `treedb-standby` 拉一份持续追平的异地镜像（那个目录可以直接当还原点起服）、
+  `treedb-migrate` 处理快照格式跨代。`--durability` 三档：`group`（默认，一轮一次
+  fsync、跨连接合并）/ `always`（同一个提交点，单连接下自然退化成每 op 一次盘）/
+  `never`（会丢一个窗口）。
+
+## 接入前必读：没做的四件事
+
+- **连接面没有认证、没有授权、没有传输加密**（§8 第 13 条）。线协议是裸 TCP + 长度
+  前缀 + CRC32，而 CRC32 只判损坏；连上端口就能用全部 49 个 op，包括 `Shutdown` 与
+  `Checkpoint`。「谁能连上」= 「谁能改整个状态」，所以多租户、配额、审计归属必须在
+  引擎之外做（grovefs 的 apikey + 网关白名单就是这一层），或者把端口锁在回环/私有网段。
+  副本对主那一侧同样没有身份认证与 fence（§8 第 6 条②）。
+- **没有 PITR、没有 dump/load、没有增量与加密备份**（§8 第 14 条、§6.7）。checkpoint 会
+  `wal.reset()`，历史切面不归档；运行中 `cp -a` 能起服、无撕裂，但切点不可控（实测比
+  「拷贝前一刻」多 14 400 条 seq），所以它不是备份工具。
+- **没有 SQL、没有 JOIN/排序/范围谓词、没有用户可见事务、没有跨视图原子 op**（§5.3）。
+  通用表只给「按唯一键取一行、按前缀列举个数」这一档机制，语义留给接入方。
+- **没有数据面**（§5.3）：文件字节永远在客户端侧，引擎只答元数据。也没有同步复制、
+  没有自动故障转移（`--promote` 还欠着，§11 第 4 条③）。
 
 ## 独立性策略
 
