@@ -1,0 +1,13 @@
+/target
+*.pdb
+*.so
+*.dylib
+# Cargo.lock 是**入库**的：本 crate 交付 `treedb-server` 这个要部署的
+# 二进制，可复现构建比“库依赖不读锁文件”这条惯例更值钱。
+# PG 连接成本对照用的私有集群
+/.pgref
+# 吞吐矩阵与诊断用临时数据目录
+/.matrix
+/.diag
+/.spot
+

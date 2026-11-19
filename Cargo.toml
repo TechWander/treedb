@@ -1,0 +1,50 @@
+[package]
+name = "treedb"
+version = "0.3.0"
+edition = "2021"
+description = "GroveFS 专用元数据引擎：单进程事件循环 + 自定义二进制协议 + WAL/checkpoint"
+license = "Apache-2.0"
+
+[lib]
+name = "treedb"
+path = "src/lib.rs"
+
+[[bin]]
+name = "treedb-demo"
+path = "src/bin/demo.rs"
+
+[[bin]]
+name = "treedb-server"
+path = "src/bin/server.rs"
+
+[[bin]]
+name = "treedb-bench"
+path = "src/bin/bench.rs"
+
+# 吞吐对照：同一套 op 打到 PG，给引擎数字装配母分母。
+[[bin]]
+name = "treedb-pgbench"
+path = "src/bin/pgbench.rs"
+
+[dependencies]
+# --- engine（自研引擎本体）：只依赖 libc + thiserror + 标准库 ---
+libc = "0.2"
+thiserror = "1"
+
+# --- 过渡档：PG 共享池 + SQLite 镜像（grovefs 现有栈，接入期保留）---
+postgres = { version = "0.19", default-features = false }
+rusqlite = { version = "0.31", features = ["bundled"] }
+parking_lot = "0.12"
+uuid = { version = "1", features = ["v4"] }
+sha2 = { version = "0.11.1" }
+chrono = "0.4"
+tracing = "0.1"
+
+[dev-dependencies]
+tempfile = "3"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = 3

@@ -1,0 +1,249 @@
+//! 集成测试共用脚手架：起真进程 `treedb-server`、挑端口、等就绪、可控地杀掉它。
+//!
+//! 每个 `Server` 拥有自己的数据目录（`tempfile::TempDir`）与子进程，Drop 时
+//! 保证回收，不会留下占着端口的孤儿进程。
+
+use std::net::TcpListener;
+use std::os::unix::process::ExitStatusExt;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::time::{Duration, Instant};
+use tempfile::TempDir;
+use treedb::net::client::Client;
+
+/// 找一个没人用的 127.0.0.1 端口。绑定后立刻释放，交给服务端去占。
+pub fn free_addr() -> String {
+    let l = TcpListener::bind("127.0.0.1:0").expect("bind :0");
+    let a = l.local_addr().expect("local_addr");
+    drop(l);
+    a.to_string()
+}
+
+pub struct Server {
+    pub addr: String,
+    dir: PathBuf,
+    child: Option<Child>,
+    log: PathBuf,
+    pid: u32,
+    // 数据目录就住在这个 TempDir 里。用 `Option` 是因为 `Server` 实现了
+    // `Drop`，字段不能直接搬出去；而崩溃恢复用例必须把目录交给重启的
+    // 那个 `Server`，所以得能把它取出来。
+    tmp: Option<TempDir>,
+}
+
+/// 停服后交还的现场：退出码 + 完整保留的数据目录。
+///
+/// `dir` 住在 `tmp` 里，想让它在重启后还存在，就必须自己拿着 `tmp`。
+pub struct Stopped {
+    pub status: std::process::ExitStatus,
+    pub dir: PathBuf,
+    pub tmp: TempDir,
+}
+
+impl Server {
+    /// 在全新目录里起一个服务端。`durability` = `always|group|never`。
+    pub fn start(durability: &str) -> Server {
+        Server::start_backlog(durability, 4096)
+    }
+
+    /// 同上，但显式指定 `--workers`（前端 worker 线程数）。读扩展类用例走这里。
+    pub fn start_workers(durability: &str, workers: usize) -> Server {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("data");
+        let s = Server::spawn(tmp, dir, free_addr(), durability, 4096, workers);
+        s.wait_ready();
+        s
+    }
+
+    /// 同上，但显式指定 `--backlog`：万级连接风暴用例需要把它拉大。
+    pub fn start_backlog(durability: &str, backlog: i32) -> Server {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("data");
+        let s = Server::spawn(tmp, dir, free_addr(), durability, backlog, 1);
+        s.wait_ready();
+        s
+    }
+
+    /// 用**同一个数据目录**在新端口重启（崩溃恢复用例的核心动作）。
+    pub fn restart_at(tmp: TempDir, dir: PathBuf, durability: &str) -> Server {
+        Server::restart_at_addr(tmp, dir, free_addr(), durability)
+    }
+
+    /// 同上，但重启后也带多前端 worker：验证“并行读档下的写 ack”在崩溃路径
+    /// 上同样成立。
+    pub fn restart_at_workers(
+        tmp: TempDir,
+        dir: PathBuf,
+        durability: &str,
+        workers: usize,
+    ) -> Server {
+        let s = Server::spawn(tmp, dir, free_addr(), durability, 4096, workers);
+        s.wait_ready();
+        s
+    }
+
+    /// 用同一个数据目录 + **同一个地址**重启：优雅停服后端口必须能立刻重绑
+    /// （std 的 `TcpListener::bind` 自带 SO_REUSEADDR，TIME_WAIT 不该挡道）。
+    pub fn restart_at_addr(tmp: TempDir, dir: PathBuf, addr: String, durability: &str) -> Server {
+        let s = Server::spawn(tmp, dir, addr, durability, 4096, 1);
+        s.wait_ready();
+        s
+    }
+
+    fn spawn(
+        tmp: TempDir,
+        dir: PathBuf,
+        addr: String,
+        durability: &str,
+        backlog: i32,
+        workers: usize,
+    ) -> Server {
+        let log = tmp.path().join(format!("server-{addr}.log"));
+        let pid_file = tmp.path().join("server.pid");
+        let out = Stdio::from(std::fs::File::create(&log).expect("create server log"));
+        let child = Command::new(env!("CARGO_BIN_EXE_treedb-server"))
+            .arg("--dir")
+            .arg(&dir)
+            .arg("--listen")
+            .arg(&addr)
+            .arg("--durability")
+            .arg(durability)
+            .arg("--backlog")
+            .arg(backlog.to_string())
+            .arg("--workers")
+            .arg(workers.to_string())
+            .arg("--pid-file")
+            .arg(&pid_file)
+            .stdin(Stdio::null())
+            .stdout(out)
+            .stderr(Stdio::from(
+                std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&log)
+                    .expect("open server log"),
+            ))
+            .spawn()
+            .expect("spawn treedb-server");
+        let pid = child.id();
+        Server { addr, dir, child: Some(child), log, pid, tmp: Some(tmp) }
+    }
+
+    /// 轮询 Ping 直到服务端能答话。冷启动（含 WAL 重放）可能慢，给 15s。
+    pub fn wait_ready(&self) {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            if Client::ping(&self.addr) {
+                return;
+            }
+            if Instant::now() > deadline {
+                panic!("server at {} never became ready:\n{}", self.addr, self.log_text());
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    pub fn client(&self) -> Client {
+        Client::connect(&self.addr, 0).expect("connect")
+    }
+
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    pub fn pid(&self) -> u32 {
+        self.pid
+    }
+
+    pub fn log_text(&self) -> String {
+        std::fs::read_to_string(&self.log).unwrap_or_default()
+    }
+
+    /// 读回 `--pid-file`，用来验证 bin 真的把 pid 写对了（外部看护靠它 kill）。
+    pub fn pid_from_file(&self) -> u32 {
+        let p = self.tmp_path().join("server.pid");
+        std::fs::read_to_string(&p)
+            .unwrap_or_else(|e| panic!("read {}: {e}", p.display()))
+            .trim()
+            .parse()
+            .expect("pid file is a number")
+    }
+
+    fn tmp_path(&self) -> &Path {
+        self.tmp.as_ref().expect("temp dir already handed over").path()
+    }
+
+    /// `kill -9`：不给进程任何清理机会，然后 reap。
+    /// 返回 `(TempDir, dir)`：目录必须被调用方握住，重启后才还在。
+    pub fn sigkill_and_take_dir(mut self) -> (TempDir, PathBuf) {
+        let mut child = self.child.take().expect("child already reaped");
+        let pid = self.pid;
+        // SIGKILL 而非 SIGTERM：SIGTERM 走的是优雅退出路径，测不到崩溃语义。
+        let rc = unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+        assert_eq!(rc, 0, "kill -9 {pid} failed");
+        let st = child.wait().expect("wait after SIGKILL");
+        assert!(
+            st.signal() == Some(9),
+            "server did not die from SIGKILL: {st:?}"
+        );
+        let tmp = self.tmp.take().expect("temp dir already handed over");
+        (tmp, self.dir.clone())
+    }
+
+    /// 优雅停服：发 `Op::Shutdown`，等服务端自己退出并检查退出码。
+    /// 只想验退码的用例直接丢掉返回值即可（数据目录随之一同清理）。
+    pub fn graceful_shutdown(mut self) -> Stopped {
+        let status = self.wait_for_exit();
+        Stopped {
+            status,
+            dir: self.dir.clone(),
+            tmp: self.tmp.take().expect("temp dir already handed over"),
+        }
+    }
+
+    fn wait_for_exit(&mut self) -> std::process::ExitStatus {
+        {
+            let mut c = self.client();
+            let _ = c.call(&treedb::engine::Op::Shutdown);
+        }
+        let mut child = self.child.take().expect("child already reaped");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match child.try_wait().expect("try_wait") {
+                Some(st) => {
+                    assert!(
+                        st.success(),
+                        "non-zero exit after Shutdown: {st:?}\n{}",
+                        self.log_text()
+                    );
+                    return st;
+                }
+                // `wait_timeout` 仍是 nightly，故自己轮询 try_wait。
+                None if Instant::now() > deadline => {
+                    panic!("server did not exit on Shutdown:\n{}", self.log_text())
+                }
+                None => std::thread::sleep(Duration::from_millis(20)),
+            }
+        }
+    }
+}
+
+impl Drop for Server {
+    fn drop(&mut self) {
+        // 用例中途 panic 也不能留孤儿：直接 SIGKILL + reap。
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+/// 轮询直到条件成立，失败即 panic（带服务端日志，省一轮复现）。
+pub fn wait_until<F: FnMut() -> bool>(what: &str, srv: &Server, mut f: F) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !f() {
+        if Instant::now() > deadline {
+            panic!("condition never held: {what}\nserver log:\n{}", srv.log_text());
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}

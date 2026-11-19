@@ -1,0 +1,271 @@
+=== 机器/存储基线 ===
+model name	: Intel(R) Xeon(R) Gold 6338 CPU @ 2.00GHz
+mem 755.284 GiB
+nproc 128
+/dev/sdb1                         xfs   161T  1.9T  159T    2% /data
+/dev/mapper/ubuntu--vg-ubuntu--lv ext4  875G  704G  127G   85% /
+NAME  ROTA   SIZE MOUNTPOINT
+sda      1 893.8G 
+sdb      1 160.1T 
+=== 轴 1  dur=never（无持久化，事件循环上限） dir=.matrix ===
+never wal=.matrix op=ping conns=1 threads=1 pipeline=1 → 47575 ops/s over 3.00s | lat us: p50=19 p90=28 p99=39 max=13016 | errors=0
+never wal=.matrix op=ping conns=1 threads=1 pipeline=32 → 1032915 ops/s over 3.03s | lat us: p50=0 p90=0 p99=1 max=598 | errors=0
+never wal=.matrix op=ping conns=8 threads=8 pipeline=1 → 137190 ops/s over 3.01s | lat us: p50=47 p90=90 p99=101 max=17079 | errors=0
+never wal=.matrix op=ping conns=8 threads=8 pipeline=32 → 2591852 ops/s over 3.04s | lat us: p50=3 p90=4 p99=4 max=585 | errors=0
+never wal=.matrix op=ping conns=64 threads=64 pipeline=1 → 135631 ops/s over 3.03s | lat us: p50=443 p90=553 p99=627 max=19103 | errors=0
+never wal=.matrix op=ping conns=64 threads=64 pipeline=32 → 2447561 ops/s over 3.05s | lat us: p50=24 p90=27 p99=49 max=380 | errors=0
+never wal=.matrix op=stat conns=1 threads=1 pipeline=1 → 45301 ops/s over 3.00s | lat us: p50=19 p90=30 p99=41 max=32106 | errors=0
+never wal=.matrix op=stat conns=1 threads=1 pipeline=32 → 845748 ops/s over 3.02s | lat us: p50=1 p90=1 p99=1 max=599 | errors=0
+never wal=.matrix op=stat conns=8 threads=8 pipeline=1 → 132290 ops/s over 3.00s | lat us: p50=49 p90=93 p99=112 max=24377 | errors=0
+never wal=.matrix op=stat conns=8 threads=8 pipeline=32 → 2110219 ops/s over 3.03s | lat us: p50=3 p90=4 p99=5 max=379 | errors=0
+never wal=.matrix op=stat conns=64 threads=64 pipeline=1 → 133342 ops/s over 3.02s | lat us: p50=459 p90=532 p99=619 max=13869 | errors=0
+never wal=.matrix op=stat conns=64 threads=64 pipeline=32 → 2010424 ops/s over 3.04s | lat us: p50=29 p90=32 p99=60 max=485 | errors=0
+never wal=.matrix op=lookup conns=1 threads=1 pipeline=1 → 45670 ops/s over 3.06s | lat us: p50=20 p90=20 p99=32 max=31835 | errors=0
+never wal=.matrix op=lookup conns=1 threads=1 pipeline=32 → 508658 ops/s over 3.05s | lat us: p50=1 p90=1 p99=3 max=2035 | errors=0
+never wal=.matrix op=lookup conns=8 threads=8 pipeline=1 → 104346 ops/s over 3.45s | lat us: p50=51 p90=100 p99=116 max=40739 | errors=0
+never wal=.matrix op=lookup conns=8 threads=8 pipeline=32 → 981145 ops/s over 3.31s | lat us: p50=6 p90=7 p99=7 max=734 | errors=0
+never wal=.matrix op=lookup conns=64 threads=64 pipeline=1 → 63264 ops/s over 4.92s | lat us: p50=591 p90=688 p99=777 max=115396 | errors=0
+never wal=.matrix op=lookup conns=64 threads=64 pipeline=32 → 493592 ops/s over 5.01s | lat us: p50=69 p90=78 p99=151 max=4508 | errors=0
+never wal=.matrix op=readdir conns=1 threads=1 pipeline=1 → 21056 ops/s over 3.04s | lat us: p50=43 p90=44 p99=65 max=38857 | errors=0
+never wal=.matrix op=readdir conns=1 threads=1 pipeline=32 → 43800 ops/s over 3.04s | lat us: p50=18 p90=19 p99=25 max=1358 | errors=0
+never wal=.matrix op=readdir conns=8 threads=8 pipeline=1 → 35455 ops/s over 3.29s | lat us: p50=201 p90=228 p99=254 max=36577 | errors=0
+never wal=.matrix op=readdir conns=8 threads=8 pipeline=32 → 73779 ops/s over 3.46s | lat us: p50=88 p90=90 p99=96 max=1652 | errors=0
+never wal=.matrix op=readdir conns=64 threads=64 pipeline=1 → 18538 ops/s over 4.63s | lat us: p50=1981 p90=2406 p99=4897 max=124023 | errors=0
+never wal=.matrix op=readdir conns=64 threads=64 pipeline=32 → 36168 ops/s over 5.14s | lat us: p50=1122 p90=1344 p99=2912 max=3757 | errors=0
+never wal=.matrix op=create conns=1 threads=1 pipeline=1 → 18712 ops/s over 3.00s | lat us: p50=28 p90=51 p99=64 max=38491 | errors=0
+never wal=.matrix op=create conns=1 threads=1 pipeline=32 → 69372 ops/s over 3.00s | lat us: p50=4 p90=9 p99=15 max=1990 | errors=0
+never wal=.matrix op=create conns=8 threads=8 pipeline=1 → 33290 ops/s over 3.01s | lat us: p50=86 p90=171 p99=396 max=82286 | errors=0
+never wal=.matrix op=create conns=8 threads=8 pipeline=32 → 88113 ops/s over 3.02s | lat us: p50=27 p90=80 p99=1318 max=2147 | errors=0
+never wal=.matrix op=create conns=64 threads=64 pipeline=1 → 31102 ops/s over 3.07s | lat us: p50=862 p90=1411 p99=29475 max=96960 | errors=0
+never wal=.matrix op=create conns=64 threads=64 pipeline=32 → 92027 ops/s over 3.07s | lat us: p50=260 p90=1533 p99=2177 max=2289 | errors=0
+=== 轴 2  dur=group（默认档，WAL 在 /data 机械盘）===
+group wal=.matrix op=create conns=1 threads=1 pipeline=1 → 1702 ops/s over 3.03s | lat us: p50=390 p90=843 p99=1905 max=23444 | errors=0
+group wal=.matrix op=create conns=1 threads=1 pipeline=32 → 8599 ops/s over 3.03s | lat us: p50=46 p90=365 p99=676 max=1101 | errors=0
+group wal=.matrix op=create conns=8 threads=8 pipeline=1 → 4378 ops/s over 3.02s | lat us: p50=951 p90=2225 p99=16607 max=51197 | errors=0
+group wal=.matrix op=create conns=8 threads=8 pipeline=32 → 17420 ops/s over 3.08s | lat us: p50=452 p90=908 p99=1206 max=1388 | errors=0
+group wal=.matrix op=create conns=64 threads=64 pipeline=1 → 9377 ops/s over 3.04s | lat us: p50=3131 p90=16430 p99=32426 max=71720 | errors=0
+group wal=.matrix op=create conns=64 threads=64 pipeline=32 → 51788 ops/s over 3.05s | lat us: p50=1075 p90=1637 p99=2122 max=3430 | errors=0
+group wal=.matrix op=write conns=1 threads=1 pipeline=1 → 1812 ops/s over 3.02s | lat us: p50=375 p90=794 p99=1539 max=34110 | errors=0
+group wal=.matrix op=write conns=1 threads=1 pipeline=32 → 8462 ops/s over 3.02s | lat us: p50=43 p90=398 p99=700 max=935 | errors=0
+group wal=.matrix op=write conns=8 threads=8 pipeline=1 → 4419 ops/s over 3.03s | lat us: p50=851 p90=2067 p99=18333 max=43281 | errors=0
+group wal=.matrix op=write conns=8 threads=8 pipeline=32 → 18486 ops/s over 3.06s | lat us: p50=447 p90=801 p99=1465 max=1762 | errors=0
+group wal=.matrix op=write conns=64 threads=64 pipeline=1 → 9515 ops/s over 3.07s | lat us: p50=2945 p90=14958 p99=31421 max=68385 | errors=0
+group wal=.matrix op=write conns=64 threads=64 pipeline=32 → 69311 ops/s over 3.08s | lat us: p50=946 p90=1449 p99=2208 max=2758 | errors=0
+group wal=.matrix op=lock conns=1 threads=1 pipeline=1 → 2229 ops/s over 3.02s | lat us: p50=368 p90=628 p99=1192 max=19240 | errors=0
+group wal=.matrix op=lock conns=1 threads=1 pipeline=32 → 18576 ops/s over 3.02s | lat us: p50=21 p90=53 p99=637 max=1481 | errors=0
+group wal=.matrix op=lock conns=8 threads=8 pipeline=1 → 8790 ops/s over 3.03s | lat us: p50=506 p90=1250 p99=10781 max=26326 | errors=0
+group wal=.matrix op=lock conns=8 threads=8 pipeline=32 → 36198 ops/s over 3.08s | lat us: p50=98 p90=556 p99=974 max=1732 | errors=0
+group wal=.matrix op=lock conns=64 threads=64 pipeline=1 → 15722 ops/s over 3.06s | lat us: p50=2131 p90=12073 p99=22353 max=58827 | errors=0
+group wal=.matrix op=lock conns=64 threads=64 pipeline=32 → 125599 ops/s over 3.13s | lat us: p50=417 p90=1030 p99=1705 max=2110 | errors=0
+group wal=.matrix op=key conns=1 threads=1 pipeline=1 → 2040 ops/s over 3.02s | lat us: p50=365 p90=622 p99=1340 max=29249 | errors=0
+group wal=.matrix op=key conns=1 threads=1 pipeline=32 → 10037 ops/s over 3.02s | lat us: p50=42 p90=287 p99=734 max=1543 | errors=0
+group wal=.matrix op=key conns=8 threads=8 pipeline=1 → 6124 ops/s over 3.02s | lat us: p50=694 p90=1584 p99=15602 max=41273 | errors=0
+group wal=.matrix op=key conns=8 threads=8 pipeline=32 → 22559 ops/s over 3.06s | lat us: p50=296 p90=749 p99=1322 max=1650 | errors=0
+group wal=.matrix op=key conns=64 threads=64 pipeline=1 → 13103 ops/s over 3.07s | lat us: p50=2432 p90=13234 p99=24395 max=43983 | errors=0
+group wal=.matrix op=key conns=64 threads=64 pipeline=32 → 77668 ops/s over 3.07s | lat us: p50=787 p90=1372 p99=2325 max=3639 | errors=0
+group wal=.matrix op=lookup conns=1 threads=1 pipeline=1 → 42755 ops/s over 3.19s | lat us: p50=20 p90=26 p99=35 max=283 | errors=0
+group wal=.matrix op=lookup conns=1 threads=1 pipeline=32 → 491526 ops/s over 3.20s | lat us: p50=1 p90=2 p99=3 max=6 | errors=0
+group wal=.matrix op=lookup conns=8 threads=8 pipeline=1 → 94569 ops/s over 3.82s | lat us: p50=50 p90=100 p99=115 max=30827 | errors=0
+group wal=.matrix op=lookup conns=8 threads=8 pipeline=32 → 873157 ops/s over 3.79s | lat us: p50=6 p90=7 p99=8 max=1316 | errors=0
+group wal=.matrix op=lookup conns=64 threads=64 pipeline=1 → 66229 ops/s over 4.71s | lat us: p50=592 p90=699 p99=780 max=41368 | errors=0
+group wal=.matrix op=lookup conns=64 threads=64 pipeline=32 → 516774 ops/s over 5.05s | lat us: p50=67 p90=75 p99=144 max=3496 | errors=0
+group wal=.matrix op=readdir conns=1 threads=1 pipeline=1 → 19868 ops/s over 3.22s | lat us: p50=43 p90=46 p99=84 max=257 | errors=0
+group wal=.matrix op=readdir conns=1 threads=1 pipeline=32 → 41134 ops/s over 3.22s | lat us: p50=19 p90=20 p99=26 max=56 | errors=0
+group wal=.matrix op=readdir conns=8 threads=8 pipeline=1 → 31227 ops/s over 3.80s | lat us: p50=196 p90=218 p99=250 max=32417 | errors=0
+group wal=.matrix op=readdir conns=8 threads=8 pipeline=32 → 70574 ops/s over 3.72s | lat us: p50=87 p90=88 p99=95 max=1516 | errors=0
+group wal=.matrix op=readdir conns=64 threads=64 pipeline=1 → 18166 ops/s over 4.79s | lat us: p50=2056 p90=2438 p99=4556 max=101252 | errors=0
+group wal=.matrix op=readdir conns=64 threads=64 pipeline=32 → 35334 ops/s over 5.11s | lat us: p50=1202 p90=1418 p99=2524 max=3426 | errors=0
+=== 轴 3  dur=always（每 op 一次 fsync）===
+always wal=.matrix op=create conns=1 threads=1 pipeline=1 → 1598 ops/s over 3.02s | lat us: p50=383 p90=851 p99=1834 max=38206 | errors=0
+always wal=.matrix op=create conns=8 threads=8 pipeline=1 → 1640 ops/s over 3.07s | lat us: p50=3366 p90=7209 p99=22872 max=38740 | errors=0
+always wal=.matrix op=create conns=64 threads=64 pipeline=1 → 1315 ops/s over 3.47s | lat us: p50=34241 p90=63269 p99=315374 max=401233 | errors=0
+always wal=.matrix op=write conns=1 threads=1 pipeline=1 → 1683 ops/s over 3.06s | lat us: p50=383 p90=845 p99=1783 max=48780 | errors=0
+always wal=.matrix op=write conns=8 threads=8 pipeline=1 → 1625 ops/s over 3.07s | lat us: p50=3422 p90=7246 p99=23703 max=45746 | errors=0
+always wal=.matrix op=write conns=64 threads=64 pipeline=1 → 1586 ops/s over 3.34s | lat us: p50=32123 p90=49569 p99=83308 max=113316 | errors=0
+--- 同档把 WAL 挑到根盘（fsync 236 us），只回答'一次 fsync 多贵' ---
+always wal=treedb-matrix op=create conns=8 threads=8 pipeline=1 → 13149 ops/s over 3.01s | lat us: p50=533 p90=912 p99=1147 max=2159 | errors=0
+always wal=treedb-matrix op=create conns=64 threads=64 pipeline=1 → 13165 ops/s over 3.04s | lat us: p50=4651 p90=5381 p99=6927 max=12701 | errors=0
+always wal=treedb-matrix op=write conns=8 threads=8 pipeline=1 → 14409 ops/s over 3.01s | lat us: p50=511 p90=874 p99=956 max=1896 | errors=0
+always wal=treedb-matrix op=write conns=64 threads=64 pipeline=1 → 13869 ops/s over 3.04s | lat us: p50=4414 p90=4948 p99=6705 max=12636 | errors=0
+=== 轴 4  PG 12 私有集群（同 op 语义，synchronous_commit=on）===
+fsync 基线（PG 也吃这块盘）：
+/data/grovefs/treedb/.pgref/probe.f: fsync avg 3865 us, max 24496 us, n=200
+pg op=ping conns=1 pipeline=1 → 11485 ops/s over 3.01s | lat us: p50=77 p90=119 p99=162 max=674 | errors=0
+  ! setup 8 个视图 schema 耗时 7.1 ms（每视图 0.9 ms，不进 op QPS）
+pg op=ping conns=1 pipeline=32 → 12428 ops/s over 3.01s | lat us: p50=76 p90=94 p99=131 max=210 | errors=0
+  ! setup 8 个视图 schema 耗时 6.8 ms（每视图 0.9 ms，不进 op QPS）
+pg op=ping conns=8 pipeline=1 → 93159 ops/s over 3.01s | lat us: p50=78 p90=113 p99=153 max=901 | errors=0
+  ! setup 8 个视图 schema 耗时 7.2 ms（每视图 0.9 ms，不进 op QPS）
+pg op=ping conns=8 pipeline=32 → 94092 ops/s over 3.01s | lat us: p50=78 p90=104 p99=151 max=226 | errors=0
+  ! setup 8 个视图 schema 耗时 5.0 ms（每视图 0.6 ms，不进 op QPS）
+pg op=ping conns=64 pipeline=1 → 509099 ops/s over 3.05s | lat us: p50=119 p90=140 p99=190 max=24477 | errors=0
+  ! setup 8 个视图 schema 耗时 9.1 ms（每视图 1.1 ms，不进 op QPS）
+pg op=ping conns=64 pipeline=32 → 518143 ops/s over 3.06s | lat us: p50=121 p90=128 p99=137 max=570 | errors=0
+  ! setup 8 个视图 schema 耗时 8.1 ms（每视图 1.0 ms，不进 op QPS）
+pg op=lookup conns=1 pipeline=1 → 4461 ops/s over 3.01s | lat us: p50=211 p90=284 p99=465 max=2969 | errors=0
+  ! setup 8 个视图 schema 耗时 4.2 ms（每视图 0.5 ms，不进 op QPS）
+pg op=lookup conns=1 pipeline=32 → 7004 ops/s over 3.01s | lat us: p50=130 p90=165 p99=329 max=379 | errors=0
+  ! setup 8 个视图 schema 耗时 8.4 ms（每视图 1.1 ms，不进 op QPS）
+pg op=lookup conns=8 pipeline=1 → 36313 ops/s over 3.01s | lat us: p50=211 p90=268 p99=453 max=2474 | errors=0
+  ! setup 8 个视图 schema 耗时 11.1 ms（每视图 1.4 ms，不进 op QPS）
+pg op=lookup conns=8 pipeline=32 → 56239 ops/s over 3.01s | lat us: p50=130 p90=165 p99=283 max=460 | errors=0
+  ! setup 8 个视图 schema 耗时 8.4 ms（每视图 1.0 ms，不进 op QPS）
+pg op=lookup conns=64 pipeline=1 → 208239 ops/s over 3.04s | lat us: p50=303 p90=346 p99=398 max=16924 | errors=0
+  ! setup 8 个视图 schema 耗时 6.8 ms（每视图 0.8 ms，不进 op QPS）
+pg op=lookup conns=64 pipeline=32 → 299561 ops/s over 3.05s | lat us: p50=208 p90=239 p99=257 max=623 | errors=0
+  ! setup 8 个视图 schema 耗时 8.0 ms（每视图 1.0 ms，不进 op QPS）
+pg op=readdir conns=1 pipeline=1 → 3176 ops/s over 3.01s | lat us: p50=306 p90=392 p99=523 max=3070 | errors=0
+  ! setup 8 个视图 schema 耗时 7.1 ms（每视图 0.9 ms，不进 op QPS）
+pg op=readdir conns=1 pipeline=32 → 4341 ops/s over 3.01s | lat us: p50=216 p90=255 p99=410 max=610 | errors=0
+  ! setup 8 个视图 schema 耗时 8.6 ms（每视图 1.1 ms，不进 op QPS）
+pg op=readdir conns=8 pipeline=1 → 25107 ops/s over 3.01s | lat us: p50=311 p90=389 p99=588 max=3185 | errors=0
+  ! setup 8 个视图 schema 耗时 9.4 ms（每视图 1.2 ms，不进 op QPS）
+pg op=readdir conns=8 pipeline=32 → 33921 ops/s over 3.01s | lat us: p50=218 p90=267 p99=403 max=575 | errors=0
+  ! setup 8 个视图 schema 耗时 5.6 ms（每视图 0.7 ms，不进 op QPS）
+pg op=readdir conns=64 pipeline=1 → 142815 ops/s over 3.05s | lat us: p50=434 p90=530 p99=604 max=4553 | errors=0
+  ! setup 8 个视图 schema 耗时 5.8 ms（每视图 0.7 ms，不进 op QPS）
+pg op=readdir conns=64 pipeline=32 → 179454 ops/s over 3.04s | lat us: p50=351 p90=398 p99=439 max=715 | errors=0
+  ! setup 8 个视图 schema 耗时 6.2 ms（每视图 0.8 ms，不进 op QPS）
+pg op=create conns=1 pipeline=1 → 553 ops/s over 3.02s | lat us: p50=582 p90=995 p99=22778 max=38712 | errors=0
+  ! setup 8 个视图 schema 耗时 5.5 ms（每视图 0.7 ms，不进 op QPS）
+pg op=create conns=1 pipeline=32 → 1050 ops/s over 3.02s | lat us: p50=1046 p90=1294 p99=1826 max=2609 | errors=0
+  ! setup 8 个视图 schema 耗时 8.9 ms（每视图 1.1 ms，不进 op QPS）
+pg op=create conns=8 pipeline=1 → 662 ops/s over 3.01s | lat us: p50=1565 p90=30750 p99=66863 max=90012 | errors=0
+  ! setup 8 个视图 schema 耗时 5.8 ms（每视图 0.7 ms，不进 op QPS）
+pg op=create conns=8 pipeline=32 → 6480 ops/s over 3.03s | lat us: p50=1083 p90=1562 p99=2305 max=2306 | errors=0
+  ! setup 8 个视图 schema 耗时 11.3 ms（每视图 1.4 ms，不进 op QPS）
+pg op=create conns=64 pipeline=1 → 1692 ops/s over 3.05s | lat us: p50=33584 p90=56411 p99=80769 max=81166 | errors=0
+  ! setup 8 个视图 schema 耗时 221.4 ms（每视图 27.7 ms，不进 op QPS）
+pg op=create conns=64 pipeline=32 → 37489 ops/s over 3.06s | lat us: p50=1651 p90=2295 p99=2693 max=3424 | errors=0
+  ! setup 8 个视图 schema 耗时 5.4 ms（每视图 0.7 ms，不进 op QPS）
+pg op=write conns=1 pipeline=1 → 378 ops/s over 3.01s | lat us: p50=766 p90=1407 p99=23483 max=55271 | errors=0
+  ! setup 8 个视图 schema 耗时 7.3 ms（每视图 0.9 ms，不进 op QPS）
+pg op=write conns=1 pipeline=32 → 1524 ops/s over 3.05s | lat us: p50=595 p90=822 p99=1552 max=1580 | errors=0
+  ! setup 8 个视图 schema 耗时 9.2 ms（每视图 1.2 ms，不进 op QPS）
+pg op=write conns=8 pipeline=1 → 632 ops/s over 3.02s | lat us: p50=13900 p90=31368 p99=48376 max=64196 | errors=0
+  ! setup 8 个视图 schema 耗时 8.7 ms（每视图 1.1 ms，不进 op QPS）
+pg op=write conns=8 pipeline=32 → 5425 ops/s over 3.03s | lat us: p50=1267 p90=2057 p99=5136 max=11317 | errors=0
+  ! setup 8 个视图 schema 耗时 9.1 ms（每视图 1.1 ms，不进 op QPS）
+pg op=write conns=64 pipeline=1 → 1395 ops/s over 3.05s | lat us: p50=33577 p90=66970 p99=165685 max=989466 | errors=0
+  ! setup 8 个视图 schema 耗时 9.1 ms（每视图 1.1 ms，不进 op QPS）
+pg op=write conns=64 pipeline=32 → 6236 ops/s over 4.54s | lat us: p50=1949 p90=22367 p99=88210 max=94632 | errors=0
+  ! setup 8 个视图 schema 耗时 6.9 ms（每视图 0.9 ms，不进 op QPS）
+pg op=lock conns=1 pipeline=1 → 895 ops/s over 3.02s | lat us: p50=531 p90=795 p99=21207 max=45551 | errors=0
+  ! setup 8 个视图 schema 耗时 11.1 ms（每视图 1.4 ms，不进 op QPS）
+pg op=lock conns=1 pipeline=32 → 1914 ops/s over 3.01s | lat us: p50=573 p90=694 p99=1625 max=1636 | errors=0
+  ! setup 8 个视图 schema 耗时 10.3 ms（每视图 1.3 ms，不进 op QPS）
+pg op=lock conns=8 pipeline=1 → 1364 ops/s over 3.04s | lat us: p50=1122 p90=20757 p99=46430 max=54431 | errors=0
+  ! setup 8 个视图 schema 耗时 8.5 ms（每视图 1.1 ms，不进 op QPS）
+pg op=lock conns=8 pipeline=32 → 6996 ops/s over 3.04s | lat us: p50=1052 p90=1327 p99=2521 max=2524 | errors=0
+  ! setup 8 个视图 schema 耗时 8.6 ms（每视图 1.1 ms，不进 op QPS）
+pg op=lock conns=64 pipeline=1 → 2133 ops/s over 3.05s | lat us: p50=33218 p90=40752 p99=64166 max=82968 | errors=0
+  ! setup 8 个视图 schema 耗时 11.3 ms（每视图 1.4 ms，不进 op QPS）
+pg op=lock conns=64 pipeline=32 → 40297 ops/s over 3.06s | lat us: p50=1551 p90=2043 p99=2714 max=3483 | errors=0
+  ! setup 8 个视图 schema 耗时 8.6 ms（每视图 1.1 ms，不进 op QPS）
+pg op=key conns=1 pipeline=1 → 674 ops/s over 3.03s | lat us: p50=580 p90=929 p99=20977 max=79063 | errors=0
+  ! setup 8 个视图 schema 耗时 7.9 ms（每视图 1.0 ms，不进 op QPS）
+pg op=key conns=1 pipeline=32 → 1656 ops/s over 3.05s | lat us: p50=523 p90=682 p99=2059 max=2615 | errors=0
+  ! setup 8 个视图 schema 耗时 624.2 ms（每视图 78.0 ms，不进 op QPS）
+pg op=key conns=8 pipeline=1 → 1023 ops/s over 3.01s | lat us: p50=1292 p90=22220 p99=37918 max=49637 | errors=0
+  ! setup 8 个视图 schema 耗时 9.1 ms（每视图 1.1 ms，不进 op QPS）
+pg op=key conns=8 pipeline=32 → 6229 ops/s over 3.05s | lat us: p50=1060 p90=1849 p99=3165 max=3401 | errors=0
+  ! setup 8 个视图 schema 耗时 8.4 ms（每视图 1.1 ms，不进 op QPS）
+pg op=key conns=64 pipeline=1 → 1729 ops/s over 3.08s | lat us: p50=33491 p90=40494 p99=100370 max=140414 | errors=0
+  ! setup 8 个视图 schema 耗时 8.7 ms（每视图 1.1 ms，不进 op QPS）
+pg op=key conns=64 pipeline=32 → 37293 ops/s over 3.08s | lat us: p50=1648 p90=2162 p99=2583 max=2866 | errors=0
+  ! setup 8 个视图 schema 耗时 6.0 ms（每视图 0.8 ms，不进 op QPS）
+=== 机器/存储基线 ===
+model name	: Intel(R) Xeon(R) Gold 6338 CPU @ 2.00GHz
+mem 755.284 GiB
+nproc 128
+/dev/sdb1                         xfs   161T  1.9T  159T    2% /data
+/dev/mapper/ubuntu--vg-ubuntu--lv ext4  875G  706G  126G   85% /
+NAME  ROTA   SIZE MOUNTPOINT
+sda      1 893.8G 
+sdb      1 160.1T 
+=== 轴 5  读并行：扫 --workers（dur=group，WAL 在 /data）===
+group wal=.matrix workers=1 op=lookup conns=64 threads=64 pipeline=1 → 59952 ops/s over 5.00s | lat us: p50=609 p90=720 p99=1017 max=31103 | errors=0
+group wal=.matrix workers=2 op=lookup conns=64 threads=64 pipeline=1 → 129559 ops/s over 5.03s | lat us: p50=293 p90=338 p99=607 max=4429 | errors=0
+group wal=.matrix workers=4 op=lookup conns=64 threads=64 pipeline=1 → 273677 ops/s over 4.90s | lat us: p50=139 p90=182 p99=332 max=2672 | errors=0
+group wal=.matrix workers=8 op=lookup conns=64 threads=64 pipeline=1 → 492923 ops/s over 5.12s | lat us: p50=66 p90=128 p99=211 max=4592 | errors=0
+group wal=.matrix workers=16 op=lookup conns=64 threads=64 pipeline=1 → 857642 ops/s over 4.94s | lat us: p50=37 p90=79 p99=119 max=3416 | errors=0
+group wal=.matrix workers=1 op=lookup conns=64 threads=64 pipeline=32 → 478288 ops/s over 4.95s | lat us: p50=76 p90=82 p99=157 max=3288 | errors=0
+group wal=.matrix workers=2 op=lookup conns=64 threads=64 pipeline=32 → 1033782 ops/s over 4.97s | lat us: p50=32 p90=64 p99=70 max=191 | errors=0
+group wal=.matrix workers=4 op=lookup conns=64 threads=64 pipeline=32 → 1318836 ops/s over 5.08s | lat us: p50=26 p90=47 p99=59 max=241 | errors=0
+group wal=.matrix workers=8 op=lookup conns=64 threads=64 pipeline=32 → 1641332 ops/s over 5.40s | lat us: p50=16 p90=42 p99=67 max=226 | errors=0
+group wal=.matrix workers=16 op=lookup conns=64 threads=64 pipeline=32 → 1871490 ops/s over 5.08s | lat us: p50=18 p90=32 p99=50 max=259 | errors=0
+group wal=.matrix workers=1 op=readdir conns=64 threads=64 pipeline=1 → 17314 ops/s over 5.23s | lat us: p50=1979 p90=2379 p99=4145 max=115856 | errors=0
+group wal=.matrix workers=2 op=readdir conns=64 threads=64 pipeline=1 → 40965 ops/s over 5.10s | lat us: p50=959 p90=1308 p99=2090 max=8215 | errors=0
+group wal=.matrix workers=4 op=readdir conns=64 threads=64 pipeline=1 → 78610 ops/s over 5.58s | lat us: p50=386 p90=697 p99=943 max=10260 | errors=0
+group wal=.matrix workers=8 op=readdir conns=64 threads=64 pipeline=1 → 160973 ops/s over 5.21s | lat us: p50=217 p90=330 p99=544 max=5269 | errors=0
+group wal=.matrix workers=16 op=readdir conns=64 threads=64 pipeline=1 → 276296 ops/s over 5.21s | lat us: p50=111 p90=203 p99=329 max=5739 | errors=0
+group wal=.matrix workers=1 op=readdir conns=64 threads=64 pipeline=32 → 39294 ops/s over 5.02s | lat us: p50=1142 p90=1276 p99=1431 max=3544 | errors=0
+group wal=.matrix workers=2 op=readdir conns=64 threads=64 pipeline=32 → 94051 ops/s over 5.13s | lat us: p50=392 p90=472 p99=532 max=674 | errors=0
+group wal=.matrix workers=4 op=readdir conns=64 threads=64 pipeline=32 → 182752 ops/s over 5.24s | lat us: p50=205 p90=247 p99=286 max=563 | errors=0
+group wal=.matrix workers=8 op=readdir conns=64 threads=64 pipeline=32 → 328150 ops/s over 5.44s | lat us: p50=98 p90=134 p99=309 max=518 | errors=0
+group wal=.matrix workers=16 op=readdir conns=64 threads=64 pipeline=32 → 624685 ops/s over 5.04s | lat us: p50=54 p90=81 p99=109 max=281 | errors=0
+--- ping（never 档，纯事件循环）---
+never wal=.matrix workers=1 op=ping conns=64 threads=64 pipeline=1 → 128550 ops/s over 3.03s | lat us: p50=474 p90=568 p99=651 max=16970 | errors=0
+never wal=.matrix workers=2 op=ping conns=64 threads=64 pipeline=1 → 257194 ops/s over 3.03s | lat us: p50=237 p90=263 p99=492 max=1241 | errors=0
+never wal=.matrix workers=4 op=ping conns=64 threads=64 pipeline=1 → 524228 ops/s over 3.03s | lat us: p50=117 p90=142 p99=253 max=957 | errors=0
+never wal=.matrix workers=8 op=ping conns=64 threads=64 pipeline=1 → 988236 ops/s over 3.02s | lat us: p50=54 p90=100 p99=186 max=3091 | errors=0
+never wal=.matrix workers=16 op=ping conns=64 threads=64 pipeline=1 → 1688009 ops/s over 3.04s | lat us: p50=31 p90=60 p99=97 max=18925 | errors=0
+never wal=.matrix workers=1 op=ping conns=64 threads=64 pipeline=32 → 2290406 ops/s over 3.06s | lat us: p50=26 p90=29 p99=52 max=610 | errors=0
+never wal=.matrix workers=2 op=ping conns=64 threads=64 pipeline=32 → 3655028 ops/s over 3.07s | lat us: p50=16 p90=26 p99=35 max=96 | errors=0
+never wal=.matrix workers=4 op=ping conns=64 threads=64 pipeline=32 → 5143819 ops/s over 3.11s | lat us: p50=9 p90=19 p99=37 max=101 | errors=0
+never wal=.matrix workers=8 op=ping conns=64 threads=64 pipeline=32 → 6302948 ops/s over 3.10s | lat us: p50=8 p90=17 p99=30 max=80 | errors=0
+never wal=.matrix workers=16 op=ping conns=64 threads=64 pipeline=32 → 6665442 ops/s over 3.10s | lat us: p50=7 p90=18 p99=30 max=93 | errors=0
+=== 机器/存储基线 ===
+model name	: Intel(R) Xeon(R) Gold 6338 CPU @ 2.00GHz
+mem 755.284 GiB
+nproc 128
+/dev/sdb1                         xfs   161T  1.9T  159T    2% /data
+/dev/mapper/ubuntu--vg-ubuntu--lv ext4  875G  706G  126G   85% /
+NAME  ROTA   SIZE MOUNTPOINT
+sda      1 893.8G 
+sdb      1 160.1T 
+=== 轴 5  读并行：扫 --workers（dur=group，WAL 在 /data）===
+group wal=.matrix workers=1 op=lookup conns=64 threads=64 pipeline=1 → 60499 ops/s over 5.00s | lat us: p50=612 p90=716 p99=789 max=102035 | errors=0
+group wal=.matrix workers=2 op=lookup conns=64 threads=64 pipeline=1 → 127722 ops/s over 4.94s | lat us: p50=292 p90=338 p99=608 max=7683 | errors=0
+group wal=.matrix workers=4 op=lookup conns=64 threads=64 pipeline=1 → 255665 ops/s over 5.09s | lat us: p50=162 p90=202 p99=365 max=4539 | errors=0
+group wal=.matrix workers=8 op=lookup conns=64 threads=64 pipeline=1 → 513872 ops/s over 5.07s | lat us: p50=68 p90=120 p99=169 max=4493 | errors=0
+group wal=.matrix workers=16 op=lookup conns=64 threads=64 pipeline=1 → 861465 ops/s over 4.91s | lat us: p50=37 p90=73 p99=128 max=3870 | errors=0
+group wal=.matrix workers=1 op=lookup conns=64 threads=64 pipeline=32 → 493548 ops/s over 4.86s | lat us: p50=74 p90=78 p99=153 max=2912 | errors=0
+group wal=.matrix workers=2 op=lookup conns=64 threads=64 pipeline=32 → 717991 ops/s over 4.90s | lat us: p50=46 p90=91 p99=130 max=370 | errors=0
+group wal=.matrix workers=4 op=lookup conns=64 threads=64 pipeline=32 → 1856005 ops/s over 4.98s | lat us: p50=16 p90=33 p99=37 max=152 | errors=0
+group wal=.matrix workers=8 op=lookup conns=64 threads=64 pipeline=32 → 1948841 ops/s over 5.03s | lat us: p50=17 p90=30 p99=55 max=212 | errors=0
+group wal=.matrix workers=16 op=lookup conns=64 threads=64 pipeline=32 → 1832608 ops/s over 5.20s | lat us: p50=16 p90=36 p99=74 max=250 | errors=0
+group wal=.matrix workers=1 op=readdir conns=64 threads=64 pipeline=1 → 18769 ops/s over 4.89s | lat us: p50=1999 p90=2239 p99=4111 max=98165 | errors=0
+group wal=.matrix workers=2 op=readdir conns=64 threads=64 pipeline=1 → 42562 ops/s over 5.01s | lat us: p50=976 p90=1261 p99=2190 max=12756 | errors=0
+group wal=.matrix workers=4 op=readdir conns=64 threads=64 pipeline=1 → 84162 ops/s over 5.16s | lat us: p50=405 p90=671 p99=1080 max=7136 | errors=0
+group wal=.matrix workers=8 op=readdir conns=64 threads=64 pipeline=1 → 150176 ops/s over 5.98s | lat us: p50=210 p90=337 p99=538 max=6580 | errors=0
+group wal=.matrix workers=16 op=readdir conns=64 threads=64 pipeline=1 → 316780 ops/s over 4.99s | lat us: p50=113 p90=176 p99=345 max=5438 | errors=0
+group wal=.matrix workers=1 op=readdir conns=64 threads=64 pipeline=32 → 39057 ops/s over 4.82s | lat us: p50=1194 p90=1338 p99=2467 max=3805 | errors=0
+group wal=.matrix workers=2 op=readdir conns=64 threads=64 pipeline=32 → 88432 ops/s over 5.33s | lat us: p50=390 p90=469 p99=631 max=945 | errors=0
+group wal=.matrix workers=4 op=readdir conns=64 threads=64 pipeline=32 → 165565 ops/s over 5.92s | lat us: p50=191 p90=267 p99=525 max=811 | errors=0
+group wal=.matrix workers=8 op=readdir conns=64 threads=64 pipeline=32 → 338430 ops/s over 5.22s | lat us: p50=94 p90=158 p99=273 max=522 | errors=0
+group wal=.matrix workers=16 op=readdir conns=64 threads=64 pipeline=32 → 505400 ops/s over 5.94s | lat us: p50=49 p90=99 p99=167 max=456 | errors=0
+--- ping（never 档，纯事件循环）---
+never wal=.matrix workers=1 op=ping conns=64 threads=64 pipeline=1 → 136655 ops/s over 3.02s | lat us: p50=444 p90=536 p99=632 max=12491 | errors=0
+never wal=.matrix workers=2 op=ping conns=64 threads=64 pipeline=1 → 257048 ops/s over 3.03s | lat us: p50=244 p90=265 p99=495 max=1442 | errors=0
+never wal=.matrix workers=4 op=ping conns=64 threads=64 pipeline=1 → 517624 ops/s over 3.02s | lat us: p50=123 p90=141 p99=259 max=967 | errors=0
+never wal=.matrix workers=8 op=ping conns=64 threads=64 pipeline=1 → 990382 ops/s over 3.03s | lat us: p50=62 p90=101 p99=161 max=8131 | errors=0
+never wal=.matrix workers=16 op=ping conns=64 threads=64 pipeline=1 → 1715136 ops/s over 3.04s | lat us: p50=31 p90=59 p99=109 max=3450 | errors=0
+never wal=.matrix workers=1 op=ping conns=64 threads=64 pipeline=32 → 2196644 ops/s over 3.08s | lat us: p50=26 p90=30 p99=53 max=952 | errors=0
+never wal=.matrix workers=2 op=ping conns=64 threads=64 pipeline=32 → 3188868 ops/s over 3.06s | lat us: p50=18 p90=22 p99=41 max=80 | errors=0
+never wal=.matrix workers=4 op=ping conns=64 threads=64 pipeline=32 → 4989784 ops/s over 3.08s | lat us: p50=10 p90=20 p99=26 max=297 | errors=0
+never wal=.matrix workers=8 op=ping conns=64 threads=64 pipeline=32 → 6240328 ops/s over 3.09s | lat us: p50=8 p90=16 p99=21 max=91 | errors=0
+never wal=.matrix workers=16 op=ping conns=64 threads=64 pipeline=32 → 7272338 ops/s over 3.11s | lat us: p50=7 p90=14 p99=25 max=89 | errors=0
+--- 写档：同一格扫 workers，量 IPC 递交的代价 ---
+group wal=.matrix workers=1 op=create conns=64 threads=64 pipeline=1 → 8410 ops/s over 3.06s | lat us: p50=3193 p90=19073 p99=34512 max=59525 | errors=0
+group wal=.matrix workers=8 op=create conns=64 threads=64 pipeline=1 → 10696 ops/s over 3.08s | lat us: p50=1935 p90=14754 p99=33714 max=53544 | errors=0
+group wal=.matrix workers=16 op=create conns=64 threads=64 pipeline=1 → 10810 ops/s over 3.06s | lat us: p50=1961 p90=15354 p99=27548 max=44766 | errors=0
+group wal=.matrix workers=1 op=create conns=64 threads=64 pipeline=32 → 49205 ops/s over 3.20s | lat us: p50=1045 p90=1835 p99=2743 max=3995 | errors=0
+group wal=.matrix workers=8 op=create conns=64 threads=64 pipeline=32 → 47048 ops/s over 3.13s | lat us: p50=1141 p90=1673 p99=3723 max=3731 | errors=0
+group wal=.matrix workers=16 op=create conns=64 threads=64 pipeline=32 → 47662 ops/s over 3.12s | lat us: p50=1194 p90=1762 p99=2372 max=4138 | errors=0
+group wal=.matrix workers=1 op=write conns=64 threads=64 pipeline=1 → 10724 ops/s over 3.04s | lat us: p50=2650 p90=13631 p99=27721 max=46920 | errors=0
+group wal=.matrix workers=8 op=write conns=64 threads=64 pipeline=1 → 9309 ops/s over 3.05s | lat us: p50=2083 p90=17954 p99=35780 max=73354 | errors=0
+group wal=.matrix workers=16 op=write conns=64 threads=64 pipeline=1 → 10388 ops/s over 3.05s | lat us: p50=1940 p90=14522 p99=34108 max=52573 | errors=0
+group wal=.matrix workers=1 op=write conns=64 threads=64 pipeline=32 → 61680 ops/s over 3.09s | lat us: p50=1014 p90=1610 p99=2160 max=3051 | errors=0
+group wal=.matrix workers=8 op=write conns=64 threads=64 pipeline=32 → 53662 ops/s over 3.13s | lat us: p50=1061 p90=1793 p99=2560 max=3497 | errors=0
+group wal=.matrix workers=16 op=write conns=64 threads=64 pipeline=32 → 61709 ops/s over 3.08s | lat us: p50=1033 p90=1543 p99=2395 max=2405 | errors=0
