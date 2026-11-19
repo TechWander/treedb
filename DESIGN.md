@@ -18,10 +18,14 @@
 阶段 B 末节：31 条 e2e 断言全过，grovefs 默认档逐字节不变；treedb 在 grovefs 里是
 **按 tag 的 git 依赖**，不再依赖同级克隆）。
 
-test 现在分两档报：默认档（纯引擎）`cargo test --release` = **73 passed**（28 lib +
-19 engine_crud + 9 net_protocol + 7 read_scaling + 6 crash_recovery + 3 independence +
+`v0.3.1` 之后又落了一笔**写轴**改动（下一轮定版收入）：`always` 档的按连接串行
+fsync 删掉了，与 `group` 共用一个提交点，机械盘 64 并发 1 891 → 10 913 ops/s、
+p99 81.5 → 31.1 ms（§7.9 第 3 条，受控 A/B 在 `benches/results/ab_durability.log`）。
+
+test 现在分两档报：默认档（纯引擎）`cargo test --release` = **74 passed**（28 lib +
+20 engine_crud + 9 net_protocol + 7 read_scaling + 6 crash_recovery + 3 independence +
 1 scale_connections，10k 那条仍 `#[ignore]`）；`--features postgres-compat` =
-**104 passed**，多出的 31 条 = 过渡档自己的 30 条单测 + `concurrency.rs` 里那条
+**105 passed**，多出的 31 条 = 过渡档自己的 30 条单测 + `concurrency.rs` 里那条
 不需要 PG 的拨号用例（剩下 6 条要真 PG，默认 `#[ignore]`，不计入 passed）。即 PG 只出现在
 `postgres-compat` 后面的 `src/pool`、`src/store`、
 `src/persist`、`src/schema`、`src/probe.rs` 里，以及性能对照器 `src/bin/pgbench.rs`
@@ -322,9 +326,12 @@ checkpoint 之后 WAL 被 `reset` 成空文件，`fast_forward(snap_seq)` 把发
 
 | 档 | 语义 | 什么时候 fsync |
 |----|------|----------------|
-| `always` | POSIX `O_DSYNC` 级 | 每个写 op 一次 |
+| `always` | 同一个不变量：ack 即 durable | 每 epoll 轮一次，覆盖本轮全部已 stage 的写 —— **与 `group` 同一个提交点**；单连接下自然退化为「每个写 op 一次」 |
 | `group`（默认） | group commit | 每 epoll 轮一次，跨连接合并 |
 | `never` | 只 write 不 fsync | 仅按 `sync_ms` 周期刷，崩溃会丢最近窗口 |
+
+`v0.3.1` 之前 `always` 是按连接逐个 fsync，实测证明那只增加排队、不增加已 ack
+写的持久性，已删（§7.9 第 3 条）。名字保留是为了让既有启动参数与用例照旧能跑。
 
 **WAL 预分配**：`posix_fallocate` 把文件长度一次性抬到「逻辑末尾 + 4 MiB」，之后倍增
 （上限单步 256 MiB），commit 用 `sync_data()`（fdatasync）。原因是这台机器上量出来的：
@@ -443,10 +450,11 @@ checkpoint 之后 WAL 被 `reset` 成空文件，`fast_forward(snap_seq)` 把发
 | `/data`（机械盘） | 3.8–4.6 ms | 1 640 ops/s（p50 3.4 ms，p99 22.9 ms） | 1 315 ops/s（**p50 34 ms，p99 315 ms**） | 1 625 |
 | `/`（ext4） | 236 µs | 13 149 ops/s（p50 533 µs） | 13 165 ops/s（p50 4.7 ms） | 14 409 |
 
-同一份代码、同一个 op，**换盘就是 8×**。结论：`always` 档在机械盘上上限约 1.6k ops/s，
-和连接数无关（盘被打满了）；这类格子只能用来比较引擎，不能用来宣称引擎快慢。
-生产默认应该是 `group`，`always` 留给「每个 op 独立可恢复」的强需求 —— 但要看
-§7.9：`always` 在 64 并发下把 fsync 串成一条队，尾延迟会跑飞（§8 第 11 条）。
+同一份代码、同一个 op，**换盘就是 8×**。结论：一次裸 fsync 就是 3.8–4.6 ms，
+所以单连接串行写盘的天花板就在 1.6k ops/s 附近，与连接数无关（盘被打满了）；
+这类格子只能用来比较引擎，不能用来宣称引擎快慢。本表 `create 64/1` 那一格的
+p99 315 ms 是**旧 `always` 实现**（按连接串 fsync）量出来的，该实现已删、现在同一格
+与 `group` 同量级（p99 31 ms），见 §7.9 第 3 条。
 
 ### 7.5 读路径：先纠正一处不对称的量具，再看一个核的天花板
 
@@ -607,7 +615,7 @@ eventfd 递交是 µs 级，在这块机械盘上它没出现在任何一格里�
 | 格子 | 历史 ops/s | 本次 ops/s | 本次 PG | 判读 |
 |------|-----------|-----------|---------|------|
 | `create` 64/1 `group` | 9 377 | 7 844 | 1 441 | 比 5.4×；机械盘写回方差，±19 % |
-| `create` 64/1 `always` | 1 315 | 1 586 | 1 441 | **1.1×** —— 见判读 2 |
+| `create` 64/1 `always`（**旧实现**） | 1 315 | 1 586 | 1 441 | ~~**1.1×**~~ → 合批后 7.4×，见判读 2 与 §7.9 第 3 条 |
 | `write` 64/32 `group` | （表里没有） | 52 317 | 5 957 | **8.8×**，本轮新增可报格子 |
 | `lookup` 64/1 `group` w=1 | 66 229 | 57 403 | 206 559 | PG 仍反胜 **3.6×** |
 | `lookup` 64/1 w=16 | 861 465 | 792 243 | 206 559 | 反超 **3.8×**，p50 37 µs |
@@ -627,6 +635,9 @@ eventfd 递交是 µs 级，在这块机械盘上它没出现在任何一格里�
    这一件事，跟语言、跟零拷贝、跟内存布局无关。换到根盘 ext4 上 `always` 档立刻
    变 12 044–13 557 ops/s（同一格子在机械盘是 1 306–1 586），进一步确认那是盘的
    天花板不是引擎的。
+   **但这句里的 1.1× 不成立了**：它量的是旧 `always`（按连接串 fsync）。合批之后
+   同一格是 10 913 vs PG 1 469 = **7.4×**（§7.9 第 3 条）。当时「刨掉合批就没有
+   结构性优势」的判读只适用于那个实现，不适用于引擎。
 3. **写档在开 worker 后没有系统性回退**（`create` 64/1：w=1 9 338 → w=8 12 390；
    `write` 64/32：w=8 那一格 34 099 是明显 outlier，同档 w=1/w=16 是 52 564/50 554）。
    这台机械盘上写是 fsync-bound，线程间递交的 µs 级成本量不出来 —— 与 §7.5 结论一致。
@@ -668,20 +679,46 @@ eventfd 递交是 µs 级，在这块机械盘上它没出现在任何一格里�
 | 根盘 ext4 | `always` | 13 600（4 567 / 6 704） | 42 604 | 42 604 | **1.00** |
 
 同一轮独立复跑给的是 61.87 / 1.00（机械盘）与 62.55 / 1.00（根盘），即这个比值本身
-很稳。两条结论：
+很稳。（表中两行 `always` 量的是**改前**实现，第 3 条已把它换掉；`group` 那两行仍有效。）
+三条结论：
 
 1. **`group` 档一轮把 ≈ 60 次 fsync 合成了 1 次**（conns=64 几乎全部排上了同一个
    回合），换回 5.1–6.0× 吞吐。这就是 §7.3 那张倍率表的机制本身，现在它在计数器
    上看得见，不用靠吞吐差反推。
-2. **`always` 档在高并发下不领先，尾延迟差于 PG**：同一格 PG（`synchronous_commit=on`、
+2. **（改前）`always` 档在高并发下不领先，尾延迟差于 PG**：同一格 PG（`synchronous_commit=on`、
    WAL 同在机械盘）是 1 469 ops/s（p50 33.5 ms / p99 157 ms），treedb 三次独立量到
    1 306（p99 **556 ms**）、1 722/1 716（p99 84 / 65 ms）—— 吞吐在噪声里持平，尾部
    不可预测。原因在 `commit_batch`：`Always` 分支按组循环 `wal.commit()`，即**单提交
    线程在一回合里串行发 N 次 fsync**，第 k 条连接要等 k × fsync 延迟；而 PG 的
    `XLogFlush` 把后到的等待者挂在一个已在飞的 flush 上，同一个 fsync 能顺手 ack
    一批（对 PG 侧这是其既有语义，本仓未量它内部，仅作机制解释）。
-   → 已记进 §8 第 11 条与 §11 第 8 条（P1）。选 `always` 必须知道这个代价；
-   默认档 `group` 不受影响。
+   → 当时记进了 §8 第 11 条与 §11 第 8 条（P1），**现已按第 3 条修完**。
+   默认档 `group` 从不受影响。
+3. **第 2 条那个串行 fsync 已删**：`commit_batch` 里的 `Always` 分支拿掉，两个档
+   走同一条路径（一轮一次 `wal.commit()` 覆盖本轮所有已 stage 的写）。理由不是
+   「更快就好」，而是**按连接切 fsync 不给已 ack 的写增加任何持久性**：这一档的
+   不变量是「ack 晚于覆盖该 op 的 fsync」，一次覆盖全轮的 fsync 同样满足它。它多
+   买的只是「已收到但未 ack 的字节也落盘」，而那在崩溃恢复后表现为**客户端没收到
+   成功却可能看到生效**，是要避免的行为，不是一条保证。
+
+   受控 A/B（`benches/ab_durability.sh v0.3.1 3 3`：同一份客户端、只换服务端二进制、
+   每格全新 `/data` 目录、old/new 相邻跑、3 次取中位，原始输出在
+   `benches/results/ab_durability.log`）：
+
+   | 档位 | 服务端 | ops/s | p50 µs | p99 µs | 写/fsync |
+   |------|--------|-------|--------|--------|----------|
+   | `always` | v0.3.1 | 1 891 | 29 742 | 81 503 | 1.00 |
+   | `always` | 改后 | **10 913**（5.77×） | **1 953**（15.2× 优） | **31 078**（2.62× 优） | 54.8 |
+   | `group` | v0.3.1 | 10 580 | 1 875 | 28 876 | 55.6 |
+   | `group` | 改后 | 12 232 | 1 882 | 24 485 | 57.7 |
+
+   三点判读：① `always` 现在与 `group` 同一量级（0.89×，已是同一实现，残余差在
+   噪声里）；② `group` 没被改坏（p50 一致，吞吐/p99 在噪声内）；③ 本次 old 臂
+   复现了上表同格的旧数（`always` 1 716 → 1 891、`group` 10 322 → 10 580，差
+   4–10 %），说明这一格的跨日可比性够，因此引 §7.9 表里同格的 PG（`synchronous_commit=on`、
+   WAL 同在机械盘）1 469 ops/s（p50 33.5 ms / p99 157 ms）作对照是站得住的：
+   **`always` 档现在是 PG 同格的 7.4× 吞吐、p50 优 17×、p99 优 5×** —— 上一轮
+   「吞吐持平、尾部差于 PG」的结论作废。
 
 ### 7.10 计算侧：readdir 一页为什么要钻 100 次树（两层 dentry + kind 冗余）
 
@@ -785,11 +822,13 @@ O(目录数)）另开了 `Engine::wal_bytes()`（`src/engine/core.rs`）：auto-
    `Stats.wal_bytes` 报的是**逻辑长度**（checkpoint 阈值按它算），磁盘长度只会 ≥ 它。
 10. **`--bench`/`--pgbench` 是本机同盘对照，不是云端结论**：换 SSD/NVMe、换 PG 大版本、
     换 `wal_compression`/`full_page_writes` 配置，绝对数字都会变，倍数关系才可信。
-11. **`always` 档在高并发下没有优势，尾延迟还会跑飞**（§7.9）：它是每 op 一次
-    fsync，而且这些 fsync 由单提交线程**在一回合里串行**发出，第 k 条连接的 ack
-    要等在前面 k−1 次 fsync 后面；64 并发机械盘上量到 p99 65–556 ms，而同一格
-    PG 是 157 ms。要「每个 op 独立可恢复」又要尾巴好看，得先把 flush 改成流水线
-    （多个 in-flight flush，按区间完成逐个 ack），见 §11 第 8 条。
+11. ~~`always` 档在高并发下没有优势，尾延迟还会跑飞~~ **已修**（§7.9 第 3 条）：
+    `Always` 分支删了，`always` 与 `group` 现在走同一个「一轮一次 fsync」的提交点，
+    64 并发机械盘上 1 891 → 10 913 ops/s、p99 81.5 → 31.1 ms。留下的真实边界有两条：
+    ① 不再提供「已收到但未 ack 的写也立即落盘」这一档（合批后就没这个语义了，
+    单连接下 `always` 自然退化为每 op 一次 fsync）；② 写扩展仍付「单提交线程 +
+    每轮一次阻塞 fsync」的代价（机械盘 ≈ 3.8 ms/轮），要再进一层得把 flush 从提交
+    线程挪出去，见 §11 第 8 条。
 
 ---
 
@@ -804,6 +843,7 @@ bash benches/throughput_matrix.sh 3             # 五轴吞吐矩阵（默认只
 bash benches/default_check.sh                   # 零旗标默认档同格重跑 5 次（§7.5）
 bash benches/ab_layout.sh <基线 rev>            # 受控 A/B：只换服务端二进制（§7.10）
 bash benches/sync_ratio.sh 3                    # 一次 fsync 摊了几次写（§7.9）
+bash benches/ab_durability.sh <基线 rev>        # 写轴 A/B：持久化档的吞吐与尾延迟（§7.9 第 3 条）
 bash benches/probe_srv.sh                       # 服务端吃了几核（/proc 计数，§7.5）
 ./target/release/treedb-micro --items 32000     # 纯计算档 ns/op + allocs/op（§7.10）
 ```
@@ -1019,18 +1059,22 @@ spike 明确**没**做、也不在接入面上假装做的事 —— 一律返�
      里非 optional 项只能是 `libc` + `thiserror`；`postgres-compat` 不得进 `default`。
      关键词是拼出来的，文件也不扫 `tests/`，否则门会把自己拦下来。**反向验过**：
      往 `src/engine/` 丢一个含该名字的探针文件，门 1 立刻 FAILED，删掉又绿 —— 门不是装饰。
-     跑法：默认档 `cargo test --release` = **73 passed / 0 failed**（含三把门），
-     `--features postgres-compat` = **104 passed / 0 failed**（数字跟 §9 同步）。
+     跑法：默认档 `cargo test --release` = **74 passed / 0 failed**（含三把门），
+     `--features postgres-compat` = **105 passed / 0 failed**（数字跟 §9 同步）。
 
    接入侧因此得到的约束：第 5 条里“把定义/密钥/账户补进引擎”的正解不是
    `Key*`/`Audit*` 直接给 grovefs 用，而是 grovefs 用 T2 的通用表自己拼语义；
    §10 阶段 B 第 4 步那句“走 treedb 的 `Key*`/`Audit*`”作废。
-8. **`always` 档的 flush 流水线**（P1，本轮新发现，§7.9 / §8 第 11 条）：把
-   `commit_batch` 的 `Always` 分支从「串行 N 次 fsync」改成「多个 in-flight
-   flush，哪一段先落盘先 ack 哪一段的等待者」。语义不变（ack 即 durable），
-   但不再把第 k 条连接排在前面 k−1 次盘等待之后。验收判据就用本轮那张表：
-   64 并发 `write` `always` 档 p99 从 65–556 ms 降到与 `group` 同量级（≤30 ms），
-   而崩溃用例六条仍全绿 —— 不然只是把耐久度换成了延迟数字。
+8. ~~**`always` 档的 flush 流水线**~~ **已完成一半**（§7.9 第 3 条）：按连接串行
+   fsync 已删，p99 从 81.5 ms 降到 31.1 ms、吞吐 5.77×，且原判据（与 `group` 同量级、
+   崩溃用例全绿）已满足。**没做的那一半才是剩下的肉**：提交线程仍然在
+   `wal.commit()` 里**阻塞等盘**，这一窗口内它既不接 worker 的转发也不发 ack，
+   `group` 档 64 并发那 p99 24–29 ms 就是「堆在 fsync 窗口外面」的排队。
+   改法：专用 flusher 线程持有 WAL 的 `try_clone()` fd，提交线程只 append（一次
+   write）并把目标 seq 交给 flusher，完成事件回送到提交线程后再 ack 那一批；
+   checkpoint / 退出前必须 drain（`wal.reset()` 不能与 in-flight flush 共命）。
+   验收判据：`benches/ab_durability.sh` 同格 p99 ≤ 8 ms、机械盘 ops/s 从 12 k 再往上，
+   且 `tests/crash_recovery.rs` 六条仍全绿 —— 不然只是把尾延迟换成了丢写。
 9. **dirents 应答直接编进连接发送缓冲**（§7.10 剩下那一条）：一页仍有 104 次堆
    分配，100 次来自 `Reply::Dirents.names` 的逐名 `Vec<u8>`。改造点是 encode 侧
    往调用方给的 `&mut Vec<u8>` 直接写，而不是先造一个 `Vec<Vec<u8>>`。收益只能

@@ -45,7 +45,11 @@ pub fn write_of<'a>(s: &'a Arc<RwLock<State>>) -> RwLockWriteGuard<'a, State> {
 /// 落盘强度。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Durability {
-    /// 每个写 op 一次 fsync：最安全，吞吐最低（约 1-3 万 ops/s 量级）。
+    /// 每个已 ack 的 op 都晚于一次覆盖它的 fsync。实现上与 [`Durability::Group`]
+    /// 共用同一条路径（一轮一次 fsync 覆盖本轮全部已 stage 的写）：把 fsync
+    /// 按连接切开**不给已 ack 的写增加任何持久性**，只是让第 k 条连接多等
+    /// (k-1) × fsync 延迟。旧实现正是那样，实测差 6×（DESIGN.md §7.9）。
+    /// 保留这个名字只为兼容既有启动参数与测试。
     Always,
     /// 每轮事件循环一次 fsync，覆盖本轮所有已 stage 的写：group commit。
     /// ack 一定晚于 fsync，所以「已确认的写不丢」不变量成立。
@@ -336,46 +340,30 @@ impl Engine {
 
     /// 一轮 event loop 的收口：把本轮所有 op 的日志一次 write + 一次 fsync。
     ///
+    /// `Always` 与 `Group` 在这里走同一条路径，区别只在[`Durability`]的文档语义；
+    /// 按连接逐个 fsync 的旧实现已于实测后废除（§7.9：机械盘 1 716 → 接近
+    /// `group` 那一档，尾延迟从 p99 65–556 ms 回到同一个量级）。
+    ///
     /// 返回 Err 时**内存状态已经超前于磁盘**，调用方必须停止服务并退出
     /// 进程；继续 ack 会违反「已确认的写不丢」。
     pub fn commit_batch(&mut self, groups: &[&[Log]]) -> Result<()> {
         let t0 = std::time::Instant::now();
-        // Always：一个 op 一次 fsync，ack 粒度最细；Group：本轮一次。
-        let n_syncs = match self.durability {
-            Durability::Always => groups.len() as u64,
-            _ => 1,
-        };
-        let last = if self.durability == Durability::Always {
-            let mut last = self.wal.durable_seq();
-            for g in groups {
-                let payload: Vec<Vec<u8>> = g.iter().map(log_payload).collect();
-                if payload.is_empty() {
-                    continue;
-                }
-                last = self.wal.commit(&payload)?;
+        let mut payloads: Vec<Vec<u8>> = Vec::new();
+        for g in groups {
+            for l in *g {
+                payloads.push(log_payload(l));
             }
-            last
-        } else {
-            let mut payloads: Vec<Vec<u8>> = Vec::new();
-            for g in groups {
-                for l in *g {
-                    payloads.push(log_payload(l));
-                }
-            }
-            if payloads.is_empty() {
-                return Ok(());
-            }
-            match self.durability {
-                Durability::Never => self.wal.append_nodur(&payloads)?,
-                _ => self.wal.commit(&payloads)?,
-            }
-        };
-        if n_syncs == 0 {
+        }
+        if payloads.is_empty() {
             return Ok(());
         }
+        let last = match self.durability {
+            Durability::Never => self.wal.append_nodur(&payloads)?,
+            _ => self.wal.commit(&payloads)?,
+        };
         let us = t0.elapsed().as_micros() as u64;
         if self.durability != Durability::Never {
-            self.stats.syncs_total += n_syncs;
+            self.stats.syncs_total += 1;
             self.stats.sync_us_total += us;
         }
         self.stats.seq = last;

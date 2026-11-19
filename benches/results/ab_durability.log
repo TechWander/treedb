@@ -1,0 +1,26 @@
+
+=== ab_durability @ 2026-11-19T08:54:49+00:00 base=v0.3.1 op=write conns=64 pipeline=1 3s x3 ===
+raw  old always #1  op=write conns=64 threads=64 pipeline=1 → 1991 ops/s over 3.01s | lat us: p50=29792 p90=40807 p99=53666 max=78244 | errors=0
+cell old always #1  writes=6515 syncs=6515 ratio=1.00
+raw  new always #1  op=write conns=64 threads=64 pipeline=1 → 11597 ops/s over 3.00s | lat us: p50=1953 p90=14698 p99=25352 max=42443 | errors=0
+cell new always #1  writes=35341 syncs=645 ratio=54.79
+raw  old group #1  op=write conns=64 threads=64 pipeline=1 → 12242 ops/s over 3.01s | lat us: p50=1873 p90=14482 p99=26898 max=47083 | errors=0
+cell old group #1  writes=37348 syncs=658 ratio=56.76
+raw  new group #1  op=write conns=64 threads=64 pipeline=1 → 13067 ops/s over 3.02s | lat us: p50=1882 p90=12950 p99=23577 max=40806 | errors=0
+cell new group #1  writes=39934 syncs=692 ratio=57.71
+raw  old always #2  op=write conns=64 threads=64 pipeline=1 → 1785 ops/s over 3.02s | lat us: p50=29742 p90=53704 p99=92147 max=115778 | errors=0
+cell old always #2  writes=5912 syncs=5912 ratio=1.00
+raw  new always #2  op=write conns=64 threads=64 pipeline=1 → 10775 ops/s over 3.03s | lat us: p50=2206 p90=15895 p99=31078 max=59363 | errors=0
+cell new always #2  writes=33153 syncs=615 ratio=53.91
+raw  old group #2  op=write conns=64 threads=64 pipeline=1 → 10580 ops/s over 3.00s | lat us: p50=1875 p90=16634 p99=33719 max=49993 | errors=0
+cell old group #2  writes=32296 syncs=581 ratio=55.59
+raw  new group #2  op=write conns=64 threads=64 pipeline=1 → 11488 ops/s over 3.01s | lat us: p50=1887 p90=14586 p99=33601 max=49041 | errors=0
+cell new group #2  writes=35050 syncs=607 ratio=57.74
+raw  old always #3  op=write conns=64 threads=64 pipeline=1 → 1891 ops/s over 3.04s | lat us: p50=29290 p90=46971 p99=81503 max=88758 | errors=0
+cell old always #3  writes=6251 syncs=6251 ratio=1.00
+raw  new always #3  op=write conns=64 threads=64 pipeline=1 → 10913 ops/s over 3.02s | lat us: p50=1947 p90=16584 p99=39276 max=53729 | errors=0
+cell new always #3  writes=33431 syncs=579 ratio=57.74
+raw  old group #3  op=write conns=64 threads=64 pipeline=1 → 10122 ops/s over 3.05s | lat us: p50=1945 p90=15531 p99=28876 max=77247 | errors=0
+cell old group #3  writes=31393 syncs=570 ratio=55.08
+raw  new group #3  op=write conns=64 threads=64 pipeline=1 → 12232 ops/s over 3.02s | lat us: p50=1840 p90=14162 p99=24485 max=48217 | errors=0
+cell new group #3  writes=37438 syncs=645 ratio=58.04

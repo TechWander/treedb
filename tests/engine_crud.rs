@@ -12,7 +12,7 @@ use treedb::engine::model::{
     errno, AuditRec, DefRec, KeyRec, Kind, Node, Op, Reply, RENAME_NOREPLACE, SA_DATA_REF, SA_MODE,
     SA_SIZE,
 };
-use treedb::engine::{now_ms, Durability, Engine, State};
+use treedb::engine::{now_ms, Durability, Engine, Log, State};
 
 // ---------------------------------------------------------------- 驱动脚手架
 
@@ -1246,4 +1246,47 @@ fn dropped_view_id_is_never_reused_across_reopen() {
     let mut e2 = d.open();
     assert_eq!(e2.state_snapshot(), before, "checkpoint 后的写同样不能丢");
     assert_eq!(dir_names(&mut e2, v, 1, 0, 10).0, vec!["post-ckpt"]);
+}
+
+// ---------------------------------------------------------------- 落盘合批
+
+/// `always` 与 `group` 都必须**一轮一次 fsync 覆盖本轮全部连接**。
+///
+/// 这颗钉子是 §7.9 那次改动的回归防线：旧实现里 `always` 按组逐个 `commit`，
+/// 64 并发下第 k 条连接要排 k × fsync（机械盘上量到 p99 65–556 ms、吞吐只有
+/// `group` 的约 1/6）。而两个档位的不变量本来就是同一句「ack 晚于覆盖该 op 的
+/// fsync」，合批不破坏它 —— 所以这里断言的不是性能，而是「合批没吞记录」：
+/// 四个组一次提交，重启后四个视图必须全在。
+#[test]
+fn both_durable_tiers_fsync_once_per_round_not_per_group() {
+    for tier in [Durability::Always, Durability::Group] {
+        let d = Dir::new("fsync-per-round");
+        let mut e = Engine::open(&d.path(), tier).expect("engine open");
+        let mut groups: Vec<Vec<Log>> = Vec::new();
+        for i in 0..4 {
+            let (logs, reply) = e.exec(&Op::CreateView {
+                name: format!("v{i}").into_bytes(),
+            });
+            assert!(matches!(reply, Reply::View { .. }), "{tier:?}: {reply:?}");
+            assert!(!logs.is_empty(), "{tier:?}: CreateView 必须产出日志");
+            groups.push(logs);
+        }
+        let refs: Vec<&[Log]> = groups.iter().map(|g| g.as_slice()).collect();
+        let before = e.snapshot_stats().syncs_total;
+        e.commit_batch(&refs).expect("commit");
+        let after = e.snapshot_stats();
+        assert_eq!(
+            after.syncs_total - before,
+            1,
+            "{tier:?}: 一轮四个组只能付一次 fsync（旧 `always` 就是在这里翻了 4 倍）"
+        );
+        drop(e);
+        // 合批不能吞记录：重开必须看见全部四个视图。
+        let mut reopened = Engine::open(&d.path(), tier).expect("reopen");
+        assert_eq!(
+            reopened.snapshot_stats().views,
+            4,
+            "{tier:?}: 一次 fsync 必须覆盖本轮所有组，一条不能少"
+        );
+    }
 }

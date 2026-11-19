@@ -190,7 +190,8 @@ treedb-server — 元数据引擎服务端（POSIX 元数据语义，客户端�
 
   --dir PATH                 数据目录（WAL + 快照），默认 /var/lib/treedb
   --listen HOST:PORT         监听地址，默认 127.0.0.1:7777
-  --durability NAME          group（默认，每轮一次 fsync）| always | never
+  --durability NAME          group（默认，每轮一次 fsync）| always（与 group 同一个
+                             落盘点：已 ack 的写必已落盘，不再按连接串 fsync）| never
   --backlog N                listen 接受队列长度，默认 4096（受 somaxconn 截断）
   --workers N                前端 worker 线程数，默认 0 = auto（按核数取
                              min(8, 核数/2)，至少 1）。=1 就是单线程事件
