@@ -41,7 +41,13 @@ pub const MAX_FRAME: u32 = 8 * 1024 * 1024;
 /// 只在第一次 `Stats` 上能查到对端跑的是哪一版；新版客户端解旧服务端的
 /// `Stats` 会因多出一个字段而短读报错（大声失败），旧客户端解新服务端的
 /// 则会丢掉尾部字节（静默少一个字段）—— 升级先升服务端、后升客户端。
-pub const PROTOCOL_VERSION: u16 = 3;
+///
+/// 历史：v3 加通用表（`Table*` / `Row*`）与 `ReadDirPlus`；v4 加日志传送那两条
+/// 控制面 op（`WalFetch` / `SnapFetch`）与对应应答（`WalBatch` / `SnapChunk`），
+/// 并给 `EngineStats` 尾部追加副本水位那几个字段。tag 空间依旧只追加不改旧值，
+/// 所以 v3 认识的字节在 v4 里一字未动；但 `Stats` 的尾部多长出一截 —— 上面那
+/// 条「旧客户端静默少一个字段」的兼容缺口，v4 正正好踩在 `Stats` 这一个口上。
+pub const PROTOCOL_VERSION: u16 = 4;
 /// 帧头长度：payload 字节数（u32 小端，不含头）。
 pub const FRAME_HDR: usize = 4;
 

@@ -10,13 +10,16 @@
 //! | [`multi`] | `workers > 1`：N 条前端线程 + 唯一提交线程 |
 //! | [`mail`] | 两者之间那条能被 `epoll` 唤醒的信箱 |
 //! | [`client`] | 同步阻塞客户端（压测与真实接入方走同一套代码） |
+//! | [`replicate`] | 只读副本的追平循环（拉主，不是主推） |
 
 pub mod client;
 pub mod mail;
 pub mod multi;
+pub mod replicate;
 pub mod server;
 
 pub use client::Client;
+pub use replicate::{Follower, ReplicaCfg};
 pub use server::{serve, Report, ServerConfig};
 
 /// 默认前端 worker 线程数（`ServerConfig::new` 与 `--workers` 不显式给值时走这里）。

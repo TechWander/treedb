@@ -408,6 +408,28 @@ pub const PUT_IF_EXISTS: u32 = 1 << 1;
 /// `RowDelete` 的 flags：不给则删不存在的行幂等成功。
 pub const DEL_IF_EXISTS: u32 = 1 << 0;
 
+/// `WalFetch` 的 `hint_off` 保留值：没有提示，服务端自己按 seq 定位。
+///
+/// 提示只在「那个偏移上确实坐着 `want_seq`」时才用，所以丢了不致命（§6.6）。
+pub const WAL_HINT_NONE: u64 = u64::MAX;
+
+/// 一次 `WalFetch` 能要的记录负载上限，与一次 `SnapFetch` 的块长上限。
+///
+/// 这两个数存在的理由是帧长（[`crate::engine::MAX_FRAME`] = 8 MiB）：回包是把
+/// 记录/字节直接编进一个帧的，不设上限就是拿一个请求把服务端的内存吃穿。
+/// 留出一半给帧头与数组计数，所以上限 4 MiB 而不是 8 MiB。
+pub const WAL_FETCH_MAX: u32 = 4 << 20;
+pub const SNAP_CHUNK_MAX: u32 = 4 << 20;
+
+/// 一个 `WalBatch` 里的记录条数上限，作用与 [`MAX_TABLE_ITEMS`] 相同：只给
+/// 解码侧的 `Vec::with_capacity` 一个界，不拿敌意计数直接预分配巨大数组。
+///
+/// 取值不是拍的：一帧之内每条记录至少占 4 字节长度位 + 13 字节负载（最小的
+/// `Log` 是 `DelNode`：tag + view + ino），所以 [`WAL_FETCH_MAX`] 封顶的真实供
+/// 应最多 4 MiB / 17 B ≈ 25 万条。取 `1 << 18` = 262_144 略高于它 —— 这一条
+/// 不该挡掉任何合法应答，只挡编出来的计数。越界拒帧，不截断。
+pub const MAX_FETCH_RECORDS: usize = 262_144;
+
 /// `ReadDirPlus` 带回的属性：inode 里除 ino/kind/name 之外的那几列。
 ///
 /// 为什么不直接复用 [`Node`]：ino/kind/name 在平行数组里已经各有一份，随每条
@@ -775,6 +797,26 @@ pub enum Op {
         offset: u64,
         limit: u32,
     },
+
+    // ---- 日志传送（§6.6）----
+    /// 只读副本的拉记接口：把主上 `seq >= want_seq` 的 WAL 记录**原字节**交出来。
+    ///
+    /// 它不进只读工作池：要答它得碰 WAL 文件，而 `translate` 只拿得到 `&State`。
+    /// 这与 `Stats` 同档 —— 属于控制面而不是可并行的数据面（见 [`Op::is_control`]）。
+    WalFetch {
+        want_seq: u64,
+        /// 上一次交付返回的 `next_off`；没有就填 [`WAL_HINT_NONE`]。
+        hint_off: u64,
+        /// 本次要的记录负载上限（硬上限 [`WAL_FETCH_MAX`]，超了 `EINVAL`）。
+        max_bytes: u32,
+    },
+    /// 分块读主的 `state.snap`。副本两处在用它：冷启动要追上主的 WAL 起点，
+    /// 以及主 checkpoint 把自己缺的那段截掉之后的重同步。
+    SnapFetch {
+        offset: u64,
+        /// 上限 [`SNAP_CHUNK_MAX`]，超了 `EINVAL`。
+        len: u32,
+    },
 }
 
 impl Op {
@@ -827,7 +869,27 @@ impl Op {
             Op::RowDelete { .. } => 0x0077,
             Op::RowCount { .. } => 0x0078,
             Op::ReadDirPlus { .. } => 0x002b,
+            Op::WalFetch { .. } => 0x0080,
+            Op::SnapFetch { .. } => 0x0081,
         }
+    }
+
+    /// 该 op 是否属于**控制面**：不改客户端可见状态，但答它需要的不是 `State`
+    /// 而是 `Engine`（计数、WAL 文件、快照文件），因此既不能进只读工作池
+    /// （[`is_readonly`](Op::is_readonly) 为 `false`），也不该在只读副本上被拒。
+    ///
+    /// 副本拒写的判据就是它：`!is_readonly() && !is_control()` 才是真的写。
+    /// 分成三档而不是两档是因为两档下这个判据会连 `Stats` 一起拒掉 ——
+    /// 而 `Stats` 恰恰是运维看副本落后多少的那个口，拒了它副本就没法监控。
+    pub fn is_control(&self) -> bool {
+        matches!(
+            self,
+            Op::Stats
+                | Op::Checkpoint
+                | Op::Shutdown
+                | Op::WalFetch { .. }
+                | Op::SnapFetch { .. }
+        )
     }
 
     /// 该 op 是否**只改统计、不改状态**（`translate` 返回空 logs）。
@@ -840,7 +902,9 @@ impl Op {
     /// 拿真实状态跑一遍 `translate`，断言判为只读的确实不产 logs。
     ///
     /// `Stats` 判 `false`：它要读 WAL 水位并动累计计数，属于控制面而不属于
-    /// 可并行的数据面读；`Checkpoint`/`Shutdown` 同理。
+    /// 可并行的数据面读；`Checkpoint`/`Shutdown` 同理。`WalFetch`/`SnapFetch` 判
+    /// `false` 是第三个理由：**它们需要的不是状态而是磁盘上的日志与快照**，
+    /// `translate(&State, ..)` 根本拿不到。三档的划分见 [`Op::is_control`]。
     pub fn is_readonly(&self) -> bool {
         match self {
             Op::Ping
@@ -889,7 +953,9 @@ impl Op {
             | Op::TableCreate { .. }
             | Op::TableDrop { .. }
             | Op::RowPut { .. }
-            | Op::RowDelete { .. } => false,
+            | Op::RowDelete { .. }
+            | Op::WalFetch { .. }
+            | Op::SnapFetch { .. } => false,
         }
     }
 
@@ -1131,6 +1197,15 @@ impl Op {
                 w.u32(*column);
                 w.bytes(value);
             }
+            Op::WalFetch { want_seq, hint_off, max_bytes } => {
+                w.u64(*want_seq);
+                w.u64(*hint_off);
+                w.u32(*max_bytes);
+            }
+            Op::SnapFetch { offset, len } => {
+                w.u64(*offset);
+                w.u32(*len);
+            }
         }
     }
 
@@ -1331,6 +1406,19 @@ impl Op {
                 column: r.u32()?,
                 value: r.bytes()?,
             },
+            // 两个长度上限（`WAL_FETCH_MAX` / `SNAP_CHUNK_MAX`）**不在这里拦**：
+            // 越界的解码会连带断连（解码失败在事件循环里就是 `drop_conn`），
+            // 而「你要得太多」是个该回 EINVAL 的参数问题，不是协议坏了 ——
+            // 拦住它的是 `Engine::exec` 的 `WalFetch`/`SnapFetch` 分支。
+            0x0080 => Op::WalFetch {
+                want_seq: r.u64()?,
+                hint_off: r.u64()?,
+                max_bytes: r.u32()?,
+            },
+            0x0081 => Op::SnapFetch {
+                offset: r.u64()?,
+                len: r.u32()?,
+            },
             x => return Err(Error::Codec(format!("unknown op tag 0x{x:04x}"))),
         };
         Ok(op)
@@ -1515,6 +1603,32 @@ pub enum Reply {
     /// `RowCount`。
     Count(u64),
     Stats(Box<crate::engine::core::EngineStats>),
+    /// [`Op::WalFetch`] 的应答：`records` 是 WAL 记录的 payload **原字节**，按
+    /// seq 升序且连续，`records[i]` 的 seq 就是 `base_seq + i`。
+    ///
+    /// `durable_seq` 是主上已落盘的最大 seq，副本的可读水位永远不能越过它 ——
+    /// 越过就是让副本读到主还没确认的写，主一旦崩溃回滚，副本就撒了谎。
+    /// `snap_seq` 是主当前快照的水位，`gap = want_seq <= snap_seq`：要的那条已经
+    /// 被 checkpoint 截进快照，日志里没有，副本得整份重装快照（§6.6）。
+    WalBatch {
+        records: Vec<Vec<u8>>,
+        base_seq: u64,
+        /// 下次请求原样回送当 `hint_off`。
+        next_off: u64,
+        durable_seq: u64,
+        snap_seq: u64,
+        gap: bool,
+    },
+    /// [`Op::SnapFetch`] 的应答：`state.snap` 从 `offset` 起的一段。
+    ///
+    /// `total` 是整份快照的字节数（副本据此知道下完没有），`snap_seq` 是这份快照
+    /// 的水位，起代际标签的作用：分块下载中途它变了，说明主的快照被 checkpoint
+    /// 换过一代，手里这几块拼起来也不是同一份，只能整份重下。
+    SnapChunk {
+        bytes: Vec<u8>,
+        total: u64,
+        snap_seq: u64,
+    },
 }
 
 impl Reply {
@@ -1710,6 +1824,35 @@ impl Reply {
                 w.u16(0x0102);
                 s.encode(w);
             }
+            Reply::WalBatch {
+                records,
+                base_seq,
+                next_off,
+                durable_seq,
+                snap_seq,
+                gap,
+            } => {
+                w.u16(0x0180);
+                w.u32(records.len() as u32);
+                for rec in records {
+                    w.bytes(rec);
+                }
+                w.u64(*base_seq);
+                w.u64(*next_off);
+                w.u64(*durable_seq);
+                w.u64(*snap_seq);
+                w.bool(*gap);
+            }
+            Reply::SnapChunk {
+                bytes,
+                total,
+                snap_seq,
+            } => {
+                w.u16(0x0181);
+                w.bytes(bytes);
+                w.u64(*total);
+                w.u64(*snap_seq);
+            }
         }
     }
 
@@ -1882,6 +2025,33 @@ impl Reply {
                 }
             }
             0x0174 => Reply::Count(r.u64()?),
+            0x0180 => {
+                let n = r.u32()? as usize;
+                if n > MAX_FETCH_RECORDS {
+                    return Err(Error::Codec(format!(
+                        "reply carries {n} wal records, over {MAX_FETCH_RECORDS}"
+                    )));
+                }
+                let mut records = Vec::with_capacity(n.min(1024));
+                for _ in 0..n {
+                    // 单条按 WAL 那侧的 payload 上限拦：应答里的记录必须可能是
+                    // 一条真记录，不然就是坏帧（帧长本身还另有 `MAX_FRAME` 兜底）。
+                    records.push(r.bytes_bounded(crate::engine::wal::MAX_RECORD)?);
+                }
+                Reply::WalBatch {
+                    records,
+                    base_seq: r.u64()?,
+                    next_off: r.u64()?,
+                    durable_seq: r.u64()?,
+                    snap_seq: r.u64()?,
+                    gap: r.bool()?,
+                }
+            }
+            0x0181 => Reply::SnapChunk {
+                bytes: r.bytes_bounded(crate::engine::MAX_FRAME)?,
+                total: r.u64()?,
+                snap_seq: r.u64()?,
+            },
             x => return Err(Error::Codec(format!("unknown reply tag 0x{x:04x}"))),
         };
         Ok(rep)
@@ -2132,6 +2302,26 @@ mod tests {
                 offset: 10,
                 limit: 100,
             },
+            // ---- 日志传送 ----
+            Op::WalFetch {
+                want_seq: 7,
+                hint_off: 4096,
+                max_bytes: WAL_FETCH_MAX,
+            },
+            // 首轮拉取：没提示、不要记录，只为拿主的 durable_seq / snap_seq。
+            Op::WalFetch {
+                want_seq: 1,
+                hint_off: WAL_HINT_NONE,
+                max_bytes: 0,
+            },
+            Op::SnapFetch {
+                offset: 0,
+                len: SNAP_CHUNK_MAX,
+            },
+            Op::SnapFetch {
+                offset: 1 << 40,
+                len: 0,
+            },
         ];
         for op in ops {
             let mut w = W::new();
@@ -2263,6 +2453,34 @@ mod tests {
                 next: 4,
                 end: false,
             },
+            // ---- 日志传送 ----
+            Reply::WalBatch {
+                records: vec![vec![0x01u8, 0x02, 0x03], Vec::new()],
+                base_seq: 41,
+                next_off: 96,
+                durable_seq: 42,
+                snap_seq: 40,
+                gap: false,
+            },
+            // 空交付也得能往返：这是空闲副本每一轮拿到的那个应答。
+            Reply::WalBatch {
+                records: Vec::new(),
+                base_seq: 43,
+                next_off: 96,
+                durable_seq: 42,
+                snap_seq: 40,
+                gap: true,
+            },
+            Reply::SnapChunk {
+                bytes: vec![7; 64],
+                total: 4096,
+                snap_seq: 40,
+            },
+            Reply::SnapChunk {
+                bytes: Vec::new(),
+                total: 0,
+                snap_seq: 0,
+            },
         ];
         for rep in replies {
             let mut w = W::new();
@@ -2273,6 +2491,53 @@ mod tests {
             assert_eq!(rep, back, "reply mismatch");
             assert_eq!(r.remaining(), 0);
         }
+    }
+
+    /// 传送应答的两个护栏在解码侧的形状：条数超 `MAX_FETCH_RECORDS` 拒帧，
+    /// 单条超 `MAX_RECORD` 拒帧。两者都必须是 `Err` 而不是 panic：解码失败在
+    /// 事件循环里就是断连，而越界的 `with_capacity` 会先一步把内存吃掉。
+    #[test]
+    fn fetch_reply_bounds_are_enforced_on_decode() {
+        // 一个合法的 `WalBatch` 编码前缀长什么样，这里手工编两个越界帧。
+        let mut w = W::new();
+        w.u16(0x0180);
+        w.u32(MAX_FETCH_RECORDS as u32 + 1);
+        let over_count = w.finish();
+        let mut r = Rd::new(&over_count);
+        assert!(
+            Reply::decode(&mut r).is_err(),
+            "条数越上限要拒帧，不能先分配再撑"
+        );
+
+        let mut w = W::new();
+        w.u16(0x0180);
+        w.u32(1);
+        w.u32(crate::engine::wal::MAX_RECORD + 1);
+        let over_len = w.finish();
+        let mut r = Rd::new(&over_len);
+        assert!(
+            Reply::decode(&mut r).is_err(),
+            "单条记录超 `MAX_RECORD` 要拒，不能按声明长度读进来"
+        );
+
+        // 反之 `SnapFetch` 的 `len` 上限**不在解码侧拦**（见 decode 处的注释）：
+        // 越界得在 `Engine::exec` 回 `EINVAL`，不能让一个请求把连接敲掉。
+        let mut w = W::new();
+        Op::SnapFetch {
+            offset: 0,
+            len: SNAP_CHUNK_MAX + 1,
+        }
+        .encode(&mut w);
+        let bytes = w.finish();
+        let mut r = Rd::new(&bytes);
+        assert_eq!(
+            Op::decode(&mut r).unwrap(),
+            Op::SnapFetch {
+                offset: 0,
+                len: SNAP_CHUNK_MAX + 1
+            },
+            "越上限的请求要能解出来，才能被回一个 EINVAL 而不是被断连"
+        );
     }
 
     fn sample_key() -> KeyRec {

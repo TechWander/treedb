@@ -59,9 +59,10 @@ use crate::engine::model::errno;
 use crate::engine::{reply_frame, Engine, Op, Reply};
 use crate::error::{Error, Result};
 use crate::net::mail::Mail;
+use crate::net::replicate::Follower;
 use crate::net::server::{
-    close, epoll_create, epoll_set, flush_dirty, last_os, tune_conn, Conn, Report, ServerConfig,
-    Slot, Staged, MAX_BACKLOG, MAX_EVENTS, READ_CHUNK,
+    close, epoll_create, epoll_set, flush_dirty, last_os, open_engine, tune_conn, Conn, Report,
+    ServerConfig, Slot, Staged, MAX_BACKLOG, MAX_EVENTS, READ_CHUNK,
 };
 use std::collections::HashMap;
 use std::io::{ErrorKind, Read};
@@ -115,7 +116,7 @@ pub(crate) fn serve(
     live_out: &AtomicUsize,
 ) -> Result<Report> {
     let n = cfg.workers.max(2);
-    let mut engine = Engine::open(&cfg.dir, cfg.durability)?;
+    let mut engine = open_engine(cfg)?;
     let state = engine.shared_state();
     let ops_ctr = engine.attach_external_ops();
     let flag = Arc::new(AtomicBool::new(false));
@@ -667,6 +668,13 @@ fn committer(
     let mut rep = Report::default();
     rep.rec = engine.recovery();
     rep.workers = cfg.workers;
+    // 副本追平（§6.6）。`Follower` 只能在 committer 里构造：apply 需要
+    // `&mut Engine`，而 `Engine` 只活在这一条线程上 —— 拿 `None` 时下面那句
+    // tick 就是一次指针判空，主那侧的代码路径与改造之前逐字一致。
+    let mut follower = cfg
+        .replication
+        .as_ref()
+        .map(|c| Follower::new(c.clone()));
     let mut events: Vec<libc::epoll_event> = vec![unsafe { std::mem::zeroed() }; MAX_EVENTS];
     let mut pend = Pending::default();
     // Never 档的周期 sync 计时基准；Group/Always 的 fsync 已经在 flush 里按
@@ -719,6 +727,9 @@ fn committer(
                 engine.checkpoint()?;
             }
         }
+        if let Some(f) = follower.as_mut() {
+            f.tick(engine)?;
+        }
         let us = t0.elapsed().as_micros() as u64;
         if us > rep.worst_round_us {
             rep.worst_round_us = us;
@@ -748,6 +759,11 @@ fn committer(
     } else {
         0
     };
+    rep.replica = s.replica;
+    rep.replica_applied = s.replica_applied;
+    rep.replica_lag = s.replica_lag;
+    rep.replica_resyncs = s.replica_resyncs;
+    rep.replica_errors = s.replica_errors;
     live_out.store(cnt.live.load(Ordering::Relaxed), Ordering::Relaxed);
     unsafe { libc::close(ep) };
     Ok(rep)

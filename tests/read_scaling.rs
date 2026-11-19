@@ -20,7 +20,7 @@ mod common;
 use common::Server;
 use treedb::engine::model::{
     errno, AuditRec, ColumnDef, DefRec, KeyRec, Op, Reply, TableDef, COL_INDEX, COL_UNIQUE,
-    COND_NONE, ROW_PK,
+    COND_NONE, ROW_PK, SNAP_CHUNK_MAX, WAL_FETCH_MAX, WAL_HINT_NONE,
 };
 use treedb::engine::{Durability, Engine};
 use treedb::net::client::Client;
@@ -94,7 +94,7 @@ fn rowput(table: &str, key: &str, val: &str, cond_col: u32, cond_val: &str) -> O
     }
 }
 
-/// 47 个 op 变体的语料，每条都带能让它走到真实分支的参数（视图/文件名/表名
+/// 49 个 op 变体的语料，每条都带能让它走到真实分支的参数（视图/文件名/表名
 /// 取自下面 `seed` 播好的状态，所以视图 id 由调用方递进来）。加新 op 必须同时
 /// 补这里 —— 最后两个计数断言就是报警器。
 fn corpus(v: u32) -> Vec<Op> {
@@ -166,6 +166,11 @@ fn corpus(v: u32) -> Vec<Op> {
         Op::RowCount { table: name("seed-table"), column: 1, value: name("x") },
         // ---- readdir 带属性 ----
         Op::ReadDirPlus { view: v, parent: 1, offset: 0, limit: 100 },
+        // ---- 日志传送 ----
+        // 参数取真值形状：`want_seq=1` 在种子状态下确实还没被截进快照，
+        // 走的是交付而不是 gap 那条支路。
+        Op::WalFetch { want_seq: 1, hint_off: WAL_HINT_NONE, max_bytes: WAL_FETCH_MAX },
+        Op::SnapFetch { offset: 0, len: SNAP_CHUNK_MAX },
     ]
 }
 
@@ -235,9 +240,38 @@ fn readonly_classification_matches_translate() {
         }
     }
     let cs_len = cs.len();
-    assert_eq!(cs_len, 47, "op 语料必须覆盖全部变体");
+    assert_eq!(cs_len, 49, "op 语料必须覆盖全部变体");
     assert_eq!(ro, 22, "只读 op 数变了：分派表、这里和 DESIGN.md §4.2 分组表要一起改");
-    assert_eq!(wr, 25, "非只读 op 数变了：同上");
+    assert_eq!(wr, 27, "非只读 op 数变了：同上");
+}
+
+/// 三档划分必须穷举且两两不交：只读 / 真写 / 控制面。
+///
+/// 这条断言存在的理由不是形式上好看：副本拒写的判据是
+/// `!is_readonly() && !is_control()`。漏一档（一条其实不改状态的 op 被归进
+/// 真写）会让副本把它拒成 `EROFS`，客户端看到的是一个没道理的错误；多一档
+/// （一条真写被归进控制面）就是副本接受了本该拒绝的写 —— 那是数据分叉。
+/// 两个方向都得有人接住，这里就用三个数接：上面那条分类断言只兜「只读不
+/// 产 logs」，兜不到控制面这一档。
+#[test]
+fn ops_partition_into_three_classes() {
+    let cs = corpus(1);
+    let (mut ro, mut wr, mut ctl) = (0usize, 0usize, 0usize);
+    for op in &cs {
+        match (op.is_readonly(), op.is_control()) {
+            (true, false) => ro += 1,
+            (false, false) => wr += 1,
+            (false, true) => ctl += 1,
+            (true, true) => panic!("{op:?} 既只读又是控制面：两档必须不交"),
+        }
+    }
+    assert_eq!(
+        (ro, wr, ctl),
+        (22, 22, 5),
+        "三档的分布：只读 22 / 真写 22 / 控制面 5（Stats、Checkpoint、Shutdown、WalFetch、SnapFetch）"
+    );
+    // 语料覆盖全部变体，因此三档之和就是 op 总数。
+    assert_eq!(ro + wr + ctl, cs.len());
 }
 
 /// 抹掉时间戳。两次独立运行的 `now_ms()` 必然不同，拿它们比“语义是否一致”

@@ -38,6 +38,12 @@ pub enum Error {
     /// 底层 IO：数据目录不可写、fsync 失败。
     #[error("io: {0}")]
     Io(String),
+
+    /// 副本追平时交付接不上号：本地缺一段日志，只能重装快照（§6.6）。
+    /// 单开一个变体而不是拿 `Io` 的文案当判据：`net::replicate` 要靠它区分
+    /// 「能自动重来」与「得报出去让人看」。
+    #[error("replication gap: {0}")]
+    Gap(String),
 }
 
 // 这两个 `From` 只为过渡档服务：`Error::Pg`/`Error::Mirror` 存的是字面量串，

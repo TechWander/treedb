@@ -85,6 +85,45 @@ pub fn log_payload(log: &Log) -> Vec<u8> {
     w.finish()
 }
 
+/// 日志传送（DESIGN.md §6.6）的一次只读交付结果。
+///
+/// 交付的是 payload **原字节**，不是解码后的 `Log`：副本把收到的记录逐字节落进
+/// 自己的 WAL，两份日志因此可以按字节比对 —— 「副本重放的是同一条记录」这句
+/// 话才有得验，而不是只能信一个「语义应该等价」的口头承诺。
+pub struct WalDeliver {
+    /// 要送出去的 payload，按 seq 升序且连续（`base_seq + i` 即 `records[i]`）。
+    pub records: Vec<Vec<u8>>,
+    /// `records[0]` 的 seq；没交付时等于请求的 `want_seq`。
+    pub base_seq: u64,
+    /// 交付末尾之后的偏移。调用方下次把它当 `hint_off` 回送就是顺序读，不必让
+    /// 服务端从头扫 —— 这是个提示，丢了不致命，见 [`Wal::deliver`]。
+    pub next_off: u64,
+}
+
+/// `deliver` 扫日志时的窗口大小：只读头就能跳记录，读一整窗比一条一次
+/// `pread` 少两个数量级的系统调用。
+const SCAN_WINDOW: usize = 256 * 1024;
+
+/// 一条记录的头（[`HDR`] 那 20 字节）。
+struct Header {
+    seq: u64,
+    crc: u32,
+    len: u32,
+}
+
+/// [`Wal::deliver`] 与 [`Wal::locate`] 共用的只读滑动窗口。
+///
+/// 存在的理由只有一个数字：默认 64 MB 的 WAL 按 ~120 B/条算是 50 万条记录，
+/// 逐条 `pread` 就是 100 万次系统调用（头一次、体一次）；按 256 KB 一窗读则是
+/// 256 次。窗口不管记录会不会跨界 —— 跨界就从那一条的起点重读，多付几十
+/// 字节，换来一个能用一句话说清的不变量：**窗口起点永远坐在记录边界上**。
+#[derive(Default)]
+struct Scan {
+    /// 窗口首字节对应的文件偏移；`data` 为空 = 还没读过。
+    off: u64,
+    data: Vec<u8>,
+}
+
 pub struct Wal {
     path: PathBuf,
     file: File,
@@ -324,6 +363,190 @@ impl Wal {
             }
         }
         Ok(out)
+    }
+
+    /// 下一条要写的 seq。副本 apply 前用它验连续性：交付区间里跳号等于记录丢了。
+    pub fn next_seq(&self) -> u64 {
+        self.next_seq
+    }
+
+    /// 只读交付 `seq >= want_seq` 的记录，负载合计不超过 `max_bytes`。
+    ///
+    /// 三条口径都是刻意的：
+    ///
+    /// 1. **只给已 durable 的**。`Durability::Never` 下逻辑末尾比 `durable_seq`
+    ///    超前，把没落盘的记录送给副本，等于让副本答出主随时可能丢的写 ——
+    ///    副本的读必须永远落后或等于主的已确认集，绝不能领先。
+    /// 2. `hint_off` 只在「那个偏移上确实坐着 `want_seq`，且它声明的记录完整落在
+    ///    逻辑末尾之内」时才用；校验不过就退回从头扫。副本重启后没有提示，付一次
+    ///    全扫，此后的每批都走顺序读。残留一种极端情形：伪提示恰好读出一个 seq
+    ///    相符的假头，那第一次 CRC 校验会报错而不是静默错送 —— 副本收到错误会
+    ///    把提示清空重试（回到 `WAL_HINT_NONE`），不会永久卡在同一个游标上。
+    /// 3. 头读不全、CRC 不符一律**报错而不是当成尾部**。`open` 早就把坏尾截掉了，
+    ///    所以 `seq <= durable_seq` 区间里出现坏记录只能是真损坏；在这里当尾部
+    ///    咽下去，副本会永远停在同一个游标上不动，那比一次报错难查得多。
+    ///
+    /// 「缺的那段还在不在日志里」不在这个结构的答案里：那由调用方拿快照水位
+    /// 判（见 [`crate::engine::core::Engine`] 的 `Op::WalFetch` 分支），日志本身只
+    /// 回答「这段字节我给不给得出」。
+    pub fn deliver(&self, want_seq: u64, hint_off: u64, max_bytes: u32) -> Result<WalDeliver> {
+        let mut sc = Scan::default();
+        // 已经给无可给：把调用方的游标原样退回，一个字节也不读。
+        // 空闲副本每轮都走这一条，所以这条快路径值这个钱。
+        if want_seq > self.durable_seq {
+            return Ok(WalDeliver {
+                records: Vec::new(),
+                base_seq: want_seq,
+                next_off: hint_off,
+            });
+        }
+        let mut off = match self.peek(&mut sc, hint_off)? {
+            Some(h)
+                if h.seq == want_seq
+                    && hint_off + HDR as u64 + h.len as u64 <= self.end =>
+            {
+                hint_off
+            }
+            _ => self.locate(&mut sc, want_seq)?,
+        };
+        let mut records: Vec<Vec<u8>> = Vec::new();
+        let mut given = 0u32;
+        let mut expect = want_seq;
+        // 送达的上界是 `durable_seq`，不是「文件里已经写出去的字节」：`Never` 档的
+        // 逻辑末尾超前已确认集，把那段送出去等于让副本答出主随时可能丢的写。
+        while expect <= self.durable_seq {
+            let h = match self.peek(&mut sc, off)? {
+                Some(h) => h,
+                None => break,
+            };
+            if h.seq != expect {
+                return Err(Error::Io(format!(
+                    "wal deliver: expected seq {expect} at offset {off}, found {} \
+                     (a durable record is gone)",
+                    h.seq
+                )));
+            }
+            if off + HDR as u64 + h.len as u64 > self.end {
+                return Err(Error::Io(format!(
+                    "wal deliver: record {} at offset {off} claims len {}, past logical end {}",
+                    h.seq, h.len, self.end
+                )));
+            }
+            let body = self.chunk(&mut sc, off + HDR as u64, h.len as usize)?;
+            if crc32(body) != h.crc {
+                return Err(Error::Io(format!(
+                    "wal deliver: crc mismatch on durable record {} at offset {off}",
+                    h.seq
+                )));
+            }
+            records.push(body.to_vec());
+            given += h.len;
+            off += HDR as u64 + h.len as u64;
+            expect += 1;
+            if given >= max_bytes {
+                break;
+            }
+        }
+        Ok(WalDeliver {
+            records,
+            base_seq: want_seq,
+            next_off: off,
+        })
+    }
+
+    /// 读 `off` 处的记录头。越界、或读到预分配空洞（`len == 0`）都返回 `None`，
+    /// 语义与 [`scan`] 的「到这里就是尾」一致 —— 两条路径不能对同一个文件
+    /// 给出不一致的结论，否则副本会停在主自己当成尾部的那个位置上。
+    ///
+    /// 先单独比 `off >= end` 再算 `off + HDR`：`hint_off` 可以是
+    /// [`WAL_HINT_NONE`](crate::engine::model::WAL_HINT_NONE) = `u64::MAX`，
+    /// 加法在那儿绕过一圈回来会落在一个看似合理的小偏移上。
+    fn peek(&self, sc: &mut Scan, off: u64) -> Result<Option<Header>> {
+        if off >= self.end || off + HDR as u64 > self.end {
+            return Ok(None);
+        }
+        let raw = self.chunk(sc, off, HDR)?;
+        let len = u32::from_le_bytes(raw[12..16].try_into().unwrap());
+        if len == 0 || len > MAX_RECORD {
+            return Ok(None);
+        }
+        Ok(Some(Header {
+            seq: u64::from_le_bytes(raw[0..8].try_into().unwrap()),
+            crc: u32::from_le_bytes(raw[8..12].try_into().unwrap()),
+            len,
+        }))
+    }
+
+    /// 从头扫到 `want_seq` 那条记录的偏移：只读头，payload 靠偏移跳过。
+    ///
+    /// 提示失效时的退路，不在稳态路径上。代价是 `WAL / SCAN_WINDOW` 次 `pread`
+    /// 加一次内存里的线性扫头。
+    fn locate(&self, sc: &mut Scan, want_seq: u64) -> Result<u64> {
+        let mut off = 0u64;
+        while let Some(h) = self.peek(sc, off)? {
+            if h.seq == want_seq {
+                return Ok(off);
+            }
+            if h.seq > want_seq {
+                return Err(Error::Io(format!(
+                    "wal locate: seq {want_seq} is not in the log; it starts at {}",
+                    h.seq
+                )));
+            }
+            off += HDR as u64 + h.len as u64;
+        }
+        Err(Error::Io(format!(
+            "wal locate: seq {want_seq} past the last record (logical end {})",
+            self.end
+        )))
+    }
+
+    /// 保证 `[off, off + n)` 在窗口里，返回那段切片。不够就整窗重读。
+    ///
+    /// 生命周期只挂在 `sc` 上而不是 `&self`：返的切片来自窗口缓冲，而窗口缓冲归
+    /// `Scan` —— 写成默认省略规则会绑到 `&self` 上，调用方马上拿不到。
+    fn chunk<'a>(&self, sc: &'a mut Scan, off: u64, n: usize) -> Result<&'a [u8]> {
+        if off + n as u64 > self.end {
+            return Err(Error::Io(format!(
+                "wal window read [{off}, {}) past logical end {}",
+                off + n as u64,
+                self.end
+            )));
+        }
+        let hit = !sc.data.is_empty()
+            && sc.off <= off
+            && (off - sc.off) as usize + n <= sc.data.len();
+        if !hit {
+            let room = (self.end - off).min(n.max(SCAN_WINDOW) as u64) as usize;
+            sc.data = self.read_at(off, room)?;
+            sc.off = off;
+            if sc.data.len() < n {
+                return Err(Error::Io(format!(
+                    "wal window short at {off}: wanted {n}, got {}",
+                    sc.data.len()
+                )));
+            }
+        }
+        let b = (off - sc.off) as usize;
+        Ok(&sc.data[b..b + n])
+    }
+
+    /// `pread`：不动写入端的文件游标，也不需要一个只读 `try_clone` 的 fd。
+    /// 交付路径与提交路径因此可以在同一个 `Wal` 上各读各的、各写各的。
+    fn read_at(&self, off: u64, len: usize) -> Result<Vec<u8>> {
+        use std::os::unix::fs::FileExt;
+        let mut buf = vec![0u8; len];
+        let mut got = 0usize;
+        while got < len {
+            match self.file.read_at(&mut buf[got..], off + got as u64) {
+                Ok(0) => break,
+                Ok(n) => got += n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(Error::Io(format!("read wal at {}: {e}", off + got as u64))),
+            }
+        }
+        buf.truncate(got);
+        Ok(buf)
     }
 
     /// checkpoint 之后清空日志：新文件从 `seq` 之后继续编号。
@@ -678,5 +901,162 @@ mod tests {
         assert!(e.to_string().contains("gap"), "{e}");
         let e = Wal::replay(&p, 0).err().expect("replay 同样不能咽下跳号");
         assert!(e.to_string().contains("gap"), "{e}");
+    }
+
+    // ---- 日志传送：`deliver` 的四条口径各占一个用例 ----
+
+    /// 稳态形状：上一轮返回的 `next_off` 当下一轮的 `hint_off` 回送，
+    /// 就能一路顺序读到底，而且交出来的是 payload 原字节。
+    #[test]
+    fn deliver_streams_forward_with_the_returned_hint() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("t.wal");
+        let payloads: Vec<Vec<u8>> = (1..=4u8)
+            .map(|i| log_payload(&put_view(&[b'a' + i], i as u32)))
+            .collect();
+        let mut w = Wal::open(&p).unwrap().0;
+        for pl in &payloads {
+            w.commit(std::slice::from_ref(pl)).unwrap();
+        }
+
+        let d = w.deliver(1, u64::MAX, u32::MAX).unwrap();
+        assert_eq!(d.records, payloads, "交付必须与落盘的字节一字不差");
+        assert_eq!(d.base_seq, 1);
+        assert_eq!(d.next_off, w.logical_size().unwrap(), "游标要正好停在尾");
+
+        // 拿着提示接着要第 3、4 条：走的是顺序读，不回头扫。
+        let d = w.deliver(3, d.next_off - (HDR as u64 * 2 + payloads[2].len() as u64 + payloads[3].len() as u64), u32::MAX).unwrap();
+        assert_eq!(d.records, vec![payloads[2].clone(), payloads[3].clone()]);
+        assert_eq!(d.base_seq, 3);
+
+        // 已经读到尾：一个字节也不给，游标原样退回，不报错。
+        let end = d.next_off;
+        let d = w.deliver(5, end, u32::MAX).unwrap();
+        assert!(d.records.is_empty());
+        assert_eq!(d.base_seq, 5);
+        assert_eq!(d.next_off, end, "空交付不能把调用方的游标弄丢");
+    }
+
+    /// 提示只是个提示：偏移上坐着的不是 `want_seq`（甚至根本不是个记录边界）
+    /// 也要能给出正确答案，代价退回从头扫。副本重启、主做过 `reset` 都走这条。
+    #[test]
+    fn deliver_ignores_a_stale_or_absent_hint_and_still_lands_right() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("t.wal");
+        let payloads: Vec<Vec<u8>> = (1..=3u8)
+            .map(|i| log_payload(&put_view(&[b'a' + i], i as u32)))
+            .collect();
+        let mut w = Wal::open(&p).unwrap().0;
+        w.commit(&payloads).unwrap();
+
+        for hint in [u64::MAX, 0, 7, HDR as u64] {
+            let d = w.deliver(3, hint, u32::MAX).unwrap();
+            assert_eq!(d.records, vec![payloads[2].clone()], "hint {hint}");
+            assert_eq!(d.base_seq, 3, "hint {hint}");
+        }
+
+        // 要一条从来没存在过的 seq：不是错，是「还没轮到」。
+        let d = w.deliver(99, u64::MAX, u32::MAX).unwrap();
+        assert!(d.records.is_empty());
+    }
+
+    /// `Never` 档的口径：已写出但未 fsync 的记录不能送。副本读到它们的瞬间，
+    /// 主崩一下就会发现自己答了一条从未被确认的写。
+    #[test]
+    fn deliver_stops_at_the_durable_watermark_not_the_logical_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("t.wal");
+        let a = log_payload(&put_view(b"a", 1));
+        let b = log_payload(&put_view(b"b", 2));
+        let c = log_payload(&put_view(b"c", 3));
+        let mut w = Wal::open(&p).unwrap().0;
+        w.commit(&[a.clone(), b.clone()]).unwrap(); // durable = 2
+        w.append_nodur(&[c.clone()]).unwrap(); // 已写出，未落盘
+
+        let d = w.deliver(1, u64::MAX, u32::MAX).unwrap();
+        assert_eq!(d.records, vec![a, b], "未 durable 的那条不能送出去");
+        // 要第 3 条：快路径直接拒，连文件都不碰。
+        let d = w.deliver(3, u64::MAX, u32::MAX).unwrap();
+        assert!(d.records.is_empty());
+
+        // `sync` 之后同一条就可给了：送不送只由水位决定，不由谁读过决定。
+        w.sync().unwrap();
+        let d = w.deliver(3, u64::MAX, u32::MAX).unwrap();
+        assert_eq!(d.records, vec![c]);
+    }
+
+    /// 窗口比一批记录短的时候必须还能逐条给对 —— 这是 `Scan` 那个滑动窗口
+    /// 存在的全部理由，也是它最容易被改坏的地方（窗口起点错位一格，
+    /// 后面每一条的 CRC 都对不上）。
+    #[test]
+    fn deliver_slides_the_window_across_many_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("t.wal");
+        // 记录名长度递增，让记录边界与窗口边界不周期性对齐。
+        let payloads: Vec<Vec<u8>> = (1..=20_000usize)
+            .map(|i| {
+                let mut name = vec![b'x'; i % 97];
+                name.extend_from_slice(i.to_string().as_bytes());
+                log_payload(&put_view(&name, i as u32))
+            })
+            .collect();
+        let mut w = Wal::open(&p).unwrap().0;
+        w.commit(&payloads).unwrap();
+        let bytes: usize = payloads.iter().map(|x| x.len()).sum();
+        assert!(
+            bytes > 4 * SCAN_WINDOW,
+            "这一条要真的跨过多个窗口，否则测不到重点：{bytes}"
+        );
+
+        // 整批一次要完：扫到底、条数对、最后一条也对。
+        let d = w.deliver(1, u64::MAX, u32::MAX).unwrap();
+        assert_eq!(d.records.len(), payloads.len());
+        assert_eq!(d.records, payloads, "滑窗把记录读串了");
+        assert_eq!(d.next_off, w.logical_size().unwrap());
+
+        // 再按中段随机要一次：不走从头扫的那条路也能落在正确边界上。
+        let mid = 13_777usize;
+        let mut off = 0u64;
+        for pl in &payloads[..mid - 1] {
+            off += HDR as u64 + pl.len() as u64;
+        }
+        let d = w.deliver(mid as u64, off, 1 << 20).unwrap();
+        assert_eq!(d.base_seq, mid as u64);
+        assert_eq!(d.records[0], payloads[mid - 1]);
+        assert!(!d.records.is_empty());
+    }
+
+    /// `max_bytes` 是软上限：到线就停，但至少要给一条 —— 一条都不给的话，
+    /// 副本的游标永远推不动，一个最小的请求值就能把它钉死在原地。
+    #[test]
+    fn deliver_honors_max_bytes_but_always_gives_at_least_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("t.wal");
+        let payloads: Vec<Vec<u8>> = (1..=5u8)
+            .map(|i| log_payload(&put_view(&[b'a' + i; 40], i as u32)))
+            .collect();
+        let mut w = Wal::open(&p).unwrap().0;
+        w.commit(&payloads).unwrap();
+
+        // 1 字节上限：仍旧交一条。
+        let d = w.deliver(1, u64::MAX, 1).unwrap();
+        assert_eq!(d.records.len(), 1, "上限再小也得往前走一格");
+
+        // 逐轮把 `next_off` 回送，应当恰好吃完整批，一轮不多一轮不少。
+        let (mut seq, mut hint, mut got) = (1u64, u64::MAX, 0usize);
+        for _ in 0..10 {
+            let d = w.deliver(seq, hint, payloads[0].len() as u32 * 2).unwrap();
+            if d.records.is_empty() {
+                break;
+            }
+            got += d.records.len();
+            for rec in &d.records {
+                assert_eq!(*rec, payloads[seq as usize - 1]);
+                seq += 1;
+            }
+            hint = d.next_off;
+        }
+        assert_eq!(got, payloads.len(), "按 max_bytes 分轮不该丢也不该重");
+        assert_eq!(seq, payloads.len() as u64 + 1);
     }
 }

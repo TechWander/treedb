@@ -54,6 +54,7 @@ use crate::engine::codec::Rd;
 use crate::engine::mem::Log;
 use crate::engine::{reply_frame, Durability, Engine, FRAME_HDR, Op, Reply, RxBuf};
 use crate::error::{Error, Result};
+use crate::net::replicate::{Follower, ReplicaCfg};
 use std::collections::{HashMap, VecDeque};
 use std::io::{ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -92,6 +93,12 @@ pub struct ServerConfig {
     /// `--workers 1` 是旧默认，也是全部历史基线数字的档。超过核数没有意义，
     /// 超过并发连接数也没有意义（内核按四元组哈希分流，多出来的线程只会空转）。
     pub workers: usize,
+    /// 非 `None` 就是**只读副本**：本实例以 [`Engine::open_replica`] 开局，事件
+    /// 循环每轮拿这个配置去主那里追一次（§6.6）。
+    ///
+    /// 主那侧不需要任何对应配置：传送是 pull 的，主只是回答 `WalFetch` /
+    /// `SnapFetch`，它不知道也不需要有谁在拉。
+    pub replication: Option<ReplicaCfg>,
 }
 
 impl ServerConfig {
@@ -110,7 +117,17 @@ impl ServerConfig {
             // 理由见 [`crate::net::default_workers`]；旧版这里写的那句「高并发纯读
             // 直接输给 PG（实测 3-8×）」已作废，见 DESIGN.md §9.1 第 3、4 条。
             workers: crate::net::default_workers(),
+            replication: None,
         }
+    }
+}
+
+/// 按配置打开引擎。`replication` 里有主就以只读副本身份开 —— 这个单点存在
+/// 是为了让两条事件循环（单线程与多 worker）不可能一个开了副本、一个忘了。
+pub(crate) fn open_engine(cfg: &ServerConfig) -> Result<Engine> {
+    match &cfg.replication {
+        Some(_) => Engine::open_replica(&cfg.dir, cfg.durability),
+        None => Engine::open(&cfg.dir, cfg.durability),
     }
 }
 
@@ -136,6 +153,18 @@ pub struct Report {
     /// 交给提交线程的 op 数（写 + 排在写之后的读）。这个数占比高说明负载
     /// 混打，并行只捞到了读的那一部分。
     pub forwarded: u64,
+    /// 本实例是不是以只读副本身份跑的（§6.6）。
+    pub replica: bool,
+    /// 退出时已 apply 到第几条日志。与 `replica_lag` 一起才说明得清：
+    /// lag = 0 可能是“真追上了”，也可能是“从来没连上过、水位还在 0”。
+    pub replica_applied: u64,
+    /// 退出时还差主多少条。副本停在一个谁也没告诉过它的 lag 上是运维最不想
+    /// 看到的场景，所以这几个数进 `Report` 而不是只留在 `Stats` 里。
+    pub replica_lag: u64,
+    /// 退出前重装过几次快照。
+    pub replica_resyncs: u64,
+    /// 退出前拉取/应用失败过几轮。
+    pub replica_errors: u64,
 }
 
 pub(crate) enum Slot {
@@ -390,7 +419,13 @@ pub fn serve(cfg: &ServerConfig, stop: &AtomicBool, live: &AtomicUsize) -> Resul
 
 /// 单线程事件循环：一个监听 fd、一个 epoll、全部连接。
 pub(crate) fn serve_single(cfg: &ServerConfig, stop: &AtomicBool, live: &AtomicUsize) -> Result<Report> {
-    let mut engine = Engine::open(&cfg.dir, cfg.durability)?;
+    let mut engine = open_engine(cfg)?;
+    // 副本的追平状态机。`None` 时下面那句 tick 就是一次指针判空，主那侧的
+    // 代码路径与改造之前逐字一致。
+    let mut follower = cfg
+        .replication
+        .as_ref()
+        .map(|c| Follower::new(c.clone()));
     let listener = TcpListener::bind(cfg.listen)
         .map_err(|e| Error::Io(format!("bind {}: {e}", cfg.listen)))?;
     if cfg.backlog > 0 {
@@ -625,6 +660,11 @@ pub(crate) fn serve_single(cfg: &ServerConfig, stop: &AtomicBool, live: &AtomicU
                 engine.checkpoint()?;
             }
         }
+        // 副本追平（§6.6）。放在 checkpoint 之后：自己这边的周期任务先做完，
+        // 拉回来的记录才不会当场又逼出一次 checkpoint。
+        if let Some(f) = follower.as_mut() {
+            f.tick(&mut engine)?;
+        }
         let us = t0.elapsed().as_micros() as u64;
         if us > rep.worst_round_us {
             rep.worst_round_us = us;
@@ -644,6 +684,11 @@ pub(crate) fn serve_single(cfg: &ServerConfig, stop: &AtomicBool, live: &AtomicU
     } else {
         0
     };
+    rep.replica = s.replica;
+    rep.replica_applied = s.replica_applied;
+    rep.replica_lag = s.replica_lag;
+    rep.replica_resyncs = s.replica_resyncs;
+    rep.replica_errors = s.replica_errors;
     live.store(0, Ordering::Relaxed);
     let fds: Vec<i32> = conns.keys().copied().collect();
     for fd in fds {

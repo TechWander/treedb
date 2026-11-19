@@ -1282,6 +1282,11 @@ pub fn translate(s: &State, now: i64, op: &Op) -> (Vec<Log>, Reply) {
         }
 
         // 由 Engine 直接应答的控制 op 不落到这里。
-        Op::Ping | Op::Stats | Op::Checkpoint | Op::Shutdown => (vec![], Reply::Pong),
+        Op::Ping
+        | Op::Stats
+        | Op::Checkpoint
+        | Op::Shutdown
+        | Op::WalFetch { .. }
+        | Op::SnapFetch { .. } => (vec![], Reply::Pong),
     }
 }

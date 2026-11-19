@@ -9,7 +9,7 @@
 自己的仓里；本仓唯一与 PostgreSQL 有关的东西是默认关掉的 `postgres-compat` 脚手架，
 而这条约束有测试守着（`tests/independence.rs`，详见 §11 第 7 条）。
 
-**状态**：v0.3.4。引擎本体已落地并跑完五轴验收（§7.8 是 2026-11-19 的全轴复跑）；
+**状态**：v0.3.5。引擎本体已落地并跑完五轴验收（§7.8 是 2026-11-19 的全轴复跑）；
 已建 git 仓推 `origin`(gitee) + `github` 两远端。0.3.0 之后的一批全在**读轴**上：
 量具口径对称化（§9.1 第 3 条）、默认前端 worker 按核数（§8 第 1 条）、目录项两层表
 + kind 冗余（§7.10）；那一批**线协议、WAL 与快照的字节格式一个字节没动**（当时
@@ -40,10 +40,17 @@ dirents 直接带属性，`Stats` 补上 WAL 磁盘长度、快照长度与协�
 一个新命令（`treedb-migrate`）、一对迁移专用的读写入口（`State::load_for_migration` /
 `State::save_v2`）与两个离线 API（`probe_snapshot` / `migrate_snapshot`）。定版 `v0.3.4`。
 
-test 现在分两档报：默认档（纯引擎）`cargo test --release` = **96 passed**（32 lib +
-26 engine_crud + 11 migrate + 10 net_protocol + 7 read_scaling + 6 crash_recovery +
-3 independence + 1 scale_connections，10k 那条仍 `#[ignore]`）；
-`--features postgres-compat` = **127 passed**，多出的 31 条 = 过渡档自己的 30 条单测 +
+`v0.3.4` 之后是**日志传送与只读副本**一轮（§6.6，收掉 §11 第 4 条与限制 6）：两条新
+op（`WalFetch` 读 WAL 帧、`SnapFetch` 切快照文件）、一个只读实例入口
+（`treedb-standby`：拉快照 → 追 WAL → 只读应答，写拿 `EROFS`）。**这一轮又动了字节
+格式**：`PROTOCOL_VERSION` 3 → 4（49 op / 28 reply，`EngineStats` 尾部多六个 `replica_*`），
+而 `SNAP_VERSION` 仍是 3 —— 副本装的就是主的快照原件，格式一变就得先给副本出一条
+迁移路径，所以快照布局本轮刻意不动。落盘的旧目录与新二进制之间没有任何新闸门。定版 `v0.3.5`。
+
+test 现在分两档报：默认档（纯引擎）`cargo test --release` = **112 passed**（38 lib +
+26 engine_crud + 11 migrate + 10 net_protocol + 9 replication + 8 read_scaling +
+6 crash_recovery + 3 independence + 1 scale_connections，10k 那条仍 `#[ignore]`）；
+`--features postgres-compat` = **143 passed**，多出的 31 条 = 过渡档自己的 30 条单测 +
 `concurrency.rs` 里那条
 不需要 PG 的拨号用例（剩下 6 条要真 PG，默认 `#[ignore]`，不计入 passed）。即 PG 只出现在
 `postgres-compat` 后面的 `src/pool`、`src/store`、
@@ -173,7 +180,7 @@ test 现在分两档报：默认档（纯引擎）`cargo test --release` = **96 
                                   │            src/net/mail.rs     纯读批次就地算完直接回；
                                   │           （eventfd 信箱）     含写批次整批 ──► 唯一提交线程
                                   │                                 （只有它持 Engine/WAL/stats）
-                                  │  Op/Reply（src/engine/model.rs，47 op / 26 reply）
+                                  │  Op/Reply（src/engine/model.rs，49 op / 28 reply）
                                   ▼
                                   src/engine/core.rs   Engine：apply → WAL → 持久化 → 回包
                                   │  src/engine/apply.rs  语义实现（rename/锁/账本/分页/表约束）
@@ -182,6 +189,11 @@ test 现在分两档报：默认档（纯引擎）`cargo test --release` = **96 
                                   ▼
                             /data/…/treedb.wal + state.snap
                             （快照换代时：src/bin/migrate.rs 只重写 state.snap，WAL 不动，§6.5）
+
+  只读副本（同一个 `Engine`，另一个进程，§6.6）：
+     src/bin/standby.rs   ── WalFetch / SnapFetch ──► 主（pull；主不持任何副本状态）
+     src/net/replicate.rs Follower：拉快照 → 追 WAL → gap 重装；tick 在提交线程末
+                          └─► 自己的 wal + snap；真写在 Engine::exec 处拿 EROFS
 
   过渡档（PG 后端，不参与引擎路径）：
      src/pool/shared.rs   实例级共享连接池（search_path 化）
@@ -192,18 +204,20 @@ test 现在分两档报：默认档（纯引擎）`cargo test --release` = **96 
 
 | 文件 | 行 | 职责 |
 |------|----|------|
-| `src/engine/wal.rs` | 682 | WAL 帧格式、CRC32、预分配、group commit、扫描/重放、`reset` |
-| `src/engine/core.rs` | 792 | `Engine`：op 入口、durability 分档、checkpoint、`Stats`、只读入口 `exec_read`；外加快照探测与迁移（`probe_snapshot`/`migrate_snapshot`，§6.5） |
+| `src/engine/wal.rs` | 1062 | WAL 帧格式、CRC32、预分配、group commit、扫描/重放、`reset`，外加面向副本的只读交付入口 `deliver`（§6.6） |
+| `src/engine/core.rs` | 1111 | `Engine`：op 入口、durability 分档、checkpoint、`Stats`、只读入口 `exec_read`、副本侧的 `install_snapshot`/`replicate_records`；外加快照探测与迁移（`probe_snapshot`/`migrate_snapshot`，§6.5） |
 | `src/engine/mem.rs` | 1637 | `State`（views/nodes/dentries/locks/refs/keys/audit/defs/place/tables/rows/row_index）+ `Log`；快照的版本闸门与两代读入口（`load` / `load_for_migration`） |
-| `src/engine/apply.rs` | 1287 | 47 个 op 的具体语义：环检测、nlink、租约过滤、分页游标、表形状校验与约束 |
-| `src/engine/model.rs` | 2310 | `Op`/`Reply` 定义与 codec 实现 |
-| `src/net/server.rs` | 758 | `workers=1` 的 epoll 循环、连接生命周期、写回背压、周期任务；兼作两条路径共用的 `Conn`/`Slot` 构件 |
-| `src/net/multi.rs` | 834 | `workers>1`：N 条前端 worker + 唯一提交线程（路由闸门、按连接号回程、停机收尾） |
+| `src/engine/apply.rs` | 1292 | 49 个 op 的具体语义：环检测、nlink、租约过滤、分页游标、表形状校验与约束、副本拒写 |
+| `src/engine/model.rs` | 2575 | `Op`/`Reply` 定义与 codec 实现 |
+| `src/net/server.rs` | 803 | `workers=1` 的 epoll 循环、连接生命周期、写回背压、周期任务（含追平 tick）；兼作两条路径共用的 `Conn`/`Slot` 构件 |
+| `src/net/multi.rs` | 850 | `workers>1`：N 条前端 worker + 唯一提交线程（路由闸门、按连接号回程、停机收尾） |
+| `src/net/replicate.rs` | 379 | 副本侧跟踪器 `Follower`：拉快照 → 追 WAL → gap 重装，连不上主退避重连（§6.6） |
 | `src/net/mail.rs` | 114 | 两者之间那条能被 `epoll` 唤醒的信箱（`Mutex<VecDeque>` + eventfd） |
 | `src/net/client.rs` | 115 | 同步客户端 + pipeline |
-| `src/bin/{server,bench,pgbench,micro,migrate,demo}.rs` | 1718 | 可执行入口；`pgbench` 是 PG 对照器，`migrate` 是快照升级工具（§6.5） |
+| `src/bin/{server,bench,pgbench,micro,migrate,standby,demo}.rs` | 1946 | 可执行入口；`pgbench` 是 PG 对照器，`migrate` 是快照升级工具（§6.5），`standby` 是只读副本（§6.6） |
 | `benches/throughput_matrix.sh` | 188 | 五轴吞吐矩阵（§7 的数据来源） |
 | `benches/rehearse_migrate.sh` | 147 | 快照升级的真机彩排：旧 tag → 当前树，逐格核四条承诺与回滚窗口（§6.5 的外部效度） |
+| `benches/single_conn.sh` | 89 | 单连接对标（§7.11）：`conns=1` 下 treedb 默认档 vs 私有 PG 集群，`$PIPE` 选一问一答还是批量，逐格附带引擎自计的 fsync 计数 |
 
 行是 `wc -l`，含各文件自己的 `mod tests`（旧版这张表是历史快照，已与代码脱开的
 那几个文件本轮按实测回填）。
@@ -228,16 +242,24 @@ payload = tag: u16 | 字段…            （Op / Reply 各自的 tag 空间，R
 - 错误：`Reply::Err { code: u16, msg }`，`code` 就是 POSIX `errno`。
 - **帧里没有版本位**（v1 定形时就没给，现在也不能塞 —— 塞进去就把旧客户端的
   整个 payload 偏移挪了两位）。版本只能靠 `Stats.proto_version` 在第一次握手后
-  查到，当前 `PROTOCOL_VERSION = 3`。升级顺序因此是硬约束：**先升服务端，后升客户端**。
+  查到，当前 `PROTOCOL_VERSION = 4`。升级顺序因此是硬约束：**先升服务端，后升客户端**。
   新客户端解旧服务端的帧会短读报错（能看见），旧客户端解新服务端的帧会**静默丢掉
   尾部字段**（看不见）—— 后者正是 `SNAP_VERSION` 那道闸门在磁盘上防的事，线上没有
   等价物，只能靠顺序。
+- 版本历史：`3 → 4`（§6.6）加了两条 op 与两个 reply tag（`WalFetch`/`SnapFetch` →
+  `WalBatch` 0x0180 / `SnapChunk` 0x0181），tag 空间仍然只追加、既有帧一个字节未动；
+  但 `EngineStats` 尾部多了六个 `replica_*` 字段。这就是上面那句“旧客户端静默丢掉
+  尾部字段”的唯一实例：`Rd` 不要求读完（只有 round-trip 用例断言
+  `remaining() == 0`），所以 v3 的 `--stats` 拿到 v4 的应答只会少印那六个数，不报错。
+  反过来不行：v3 服务端会把 `WalFetch` 的 tag 当未知 op 拒掉，副本就此追不动 ——
+  所以副本与主必须同代，而升级顺序照旧（先服务端后客户端）。
 
-### 4.2 op 分组（47 个）
+### 4.2 op 分组（49 个）
 
 | 组 | op |
 |----|----|
 | 运维 | `Ping` `Stats` `Checkpoint` `Shutdown` |
+| 日志传送 | `WalFetch` `SnapFetch` |
 | 视图 | `CreateView` `DropView` `ListViews` |
 | 名字/属性 | `Lookup` `Getattr` `Setattr` `ReadDir` `ReadDirPlus` |
 | 增删 | `Create` `Mkdir` `Symlink` `Readlink` `Unlink` `Rmdir` `Rename` |
@@ -248,21 +270,35 @@ payload = tag: u16 | 字段…            （Op / Reply 各自的 tag 空间，R
 | 定义/放置 | `DefPut` `DefGet` `DefList` `DefDel` `PlaceSet` `PlaceGet` `PlaceList` |
 | 通用表 | `TableCreate` `TableDrop` `TableGet` `TableList` `RowPut` `RowGet` `RowList` `RowDelete` `RowCount` |
 
-**只读集（22 个）= worker 可就地执行集**：`Ping` `ListViews` `Lookup` `Getattr`
-`Readlink` `ReadDir` `ReadDirPlus` `RefLookup` `LockQuery` `KeyGet` `KeyList` `KeyCheck`
-`AuditList` `DefGet` `DefList` `PlaceGet` `PlaceList` `TableGet` `TableList` `RowGet`
-`RowList` `RowCount`；剩下的 25 个全部要过 WAL。
+49 个 op 分**三档**，两个布尔判据（`is_readonly` / `is_control`）恰好切出三块，
+两两不交、并起来是全集：
 
-- 这份划分不只是优化提示，**它是语义地基**：`Op::is_readonly()` 判错一条，就是把
-  一次应当被确认的写丢在 worker 手里。`readonly_classification_matches_translate`
-  拿 47 个 op 的语料逐条跑 `translate`，断言「判为只读 ⇒ logs 必空」，同时钉住
-  22/25 这两个数 —— 加 op、改分派表，这里和测试必须一起动。语料里每条只读 op 都要
+- **只读 22 个 = worker 可就地执行集**：`Ping` `ListViews` `Lookup` `Getattr`
+  `Readlink` `ReadDir` `ReadDirPlus` `RefLookup` `LockQuery` `KeyGet` `KeyList` `KeyCheck`
+  `AuditList` `DefGet` `DefList` `PlaceGet` `PlaceList` `TableGet` `TableList` `RowGet`
+  `RowList` `RowCount`；
+- **真写 22 个**：`!is_readonly() && !is_control()`，全部要过 WAL；
+- **控制面 5 个**：`Stats` `Checkpoint` `Shutdown` `WalFetch` `SnapFetch`。
+
+前两档是语义分档，第三档是**执行位置**分档：控制面既不改状态也不产出 logs，
+但它必须在提交线程上跑 —— `Stats` 要读只有提交线程碰得到的计数器，
+`Checkpoint`/`Shutdown` 要动 WAL，而 `WalFetch`/`SnapFetch` 要的是**磁盘上的日志与
+快照**，`translate(&State, ..)` 根本拿不到它们需要的东西。三档的现值由
+`tests/read_scaling.rs::ops_partition_into_three_classes` 钉住（22/22/5）。
+
+- 只读那一档的划分不只是优化提示，**它是语义地基**：`Op::is_readonly()` 判错一条，
+  就是把一次应当被确认的写丢在 worker 手里。`readonly_classification_matches_translate`
+  拿 49 个 op 的语料逐条跑 `translate`，断言「判为只读 ⇒ logs 必空」，同时钉住
+  49/22/27 这三个数 —— 加 op、改分派表，这里和测试必须一起动。语料里每条只读 op 都要
   真查到东西（`seed` 因此也建表灌行），否则「不产 logs」这句只在测「查不存在的表
   不产 logs」那种废话。
 - `Stats` 刻意**不在**只读集里：它不写 WAL，但它读的是 `Engine` 手里的计数器，而那些
   计数器只有提交线程碰得到。worker 就地算的 op 数走一个 `AtomicU64` 折回
   `ops_total`（`Engine::attach_external_ops`），否则运维看到的 QPS 会少一大截
   （`stats_counts_worker_reads`）。
+- 副本拒写用的也是这条分档（§6.6）：判据写成 `!is_readonly() && !is_control()`，
+  所以 `Stats`/`Checkpoint` 在只读副本上仍然可用 —— 一个连自己状态都问不出来的
+  副本没法监控，不让它 checkpoint 就等于让它拖着一个与主同大的日志。
 
 ### 4.3 pipeline 语义
 
@@ -533,12 +569,100 @@ treedb-migrate --dir /var/lib/treedb --apply --force   # 连既有备份一起�
 checkpoint 之后 64 888 → 41 512 有损）。最近一次原始输出在
 `benches/results/rehearse_migrate.log`。
 
+### 6.6 日志传送与只读副本（`treedb-standby`）
+
+限制 6 原来写的是「单机、无复制」。这一节把它降级成「有异步只读副本，无同步
+复制」：副本不开新写路径、不参与定序，它只是**同一份日志的第二个消费者**。
+
+#### pull 而不是 push
+
+主不需要知道有任何副本存在：它只是回答两条新 op（`WalFetch` / `SnapFetch`），
+副本按自己的节奏拉，拉到什么就 apply 什么。于是服务端主循环一行未动 ——
+不往连接表里挂反向通道，不为「副本掉线」维护任何状态，副本也不需要在主那边注册。
+新增的代码全部在 `net::replicate`（追平状态机）与 `bin/standby.rs`（入口）加上
+引擎侧四条方法。push 要付的代价是反面：主得为每条副本连接维护游标、重连、
+慢副本的背压，而那些状态恰好是最容易写坏的一类。
+
+#### 传送口径（这四条是这一节的正文）
+
+| 口径 | 定案 | 为什么不是别的 |
+|------|------|----------------|
+| 交付上界 | 只交付 `seq <= durable_seq` 的记录 | 越过就是把主尚未确认的写交给副本；主一崩就回滚，副本却已经拿它答过读 |
+| gap 判据 | `gap = want_seq <= 主.snap_seq` | 主每次 checkpoint 都会截掉水位以下的日志。跳号不是「补一下」的理由，而是「你跟不上」的结论，所以补洞路径只有一条：重装快照 |
+| `hint_off` | 是提示不是承诺：上一轮主给的 `next_off` 原样回送 | 采纳前必须验「读出的 seq 相符 **且** 记录完整落在逻辑末尾内」，否则退回从头扫。不验就直接 `seek` 的话，一次 checkpoint 之后的旧偏移会读出垃圾帧；而 `WAL_HINT_NONE = u64::MAX` 那个占位值不做前置判还会让 `off + HDR` 回绕成一个看起来很合理的偏移 |
+| 负载上限 | `WAL_FETCH_MAX = SNAP_CHUNK_MAX = 4 MiB`，`MAX_FRAME = 8 MiB` 仍是硬天花板；条数上限 `MAX_FETCH_RECORDS = 262 144` | 最小的 `Log` 是 `DelNode`（13 B），线上一条记录至少 17 B，4 MiB 装满约 25 万条 —— 取 `1 << 18` 刚好高于这个天花板，于是长度先越界、计数这条不会误挡合法应答 |
+
+#### 副本是一个完整的 `Engine`，不是一份缓存
+
+`Engine::open_replica(dir, durability)` 与 `Engine::open` 只差一件事：真写在
+`Engine::exec` 那里被 `EROFS` 拒掉。剩下全部一样 —— 自己的 WAL、自己的快照、
+自己的 checkpoint。
+
+- **记录以 payload 原字节落盘**，所以两份日志、两份 `state.snap` 都可以按字节
+  比对（`a_gap_reinstalls_the_snapshot_in_chunks` 就在校这一件事）。`replicate_records`
+  因此对每条做「解码 → 再编码 == 原字节」的往返校验：线帧里每条记录没有自己的
+  CRC，而副本落盘时会重算一份新 CRC —— 不拦这一道，在线上悄悄坏掉的字节就永久
+  合法了。这一条同时验两件事：内容没坏，两代编码格式没分叉。
+- **先 WAL 后 apply**：崩溃重启由自己的日志重放还原，不必再向主拉一轮。这是
+  `a_replica_restart_resumes_from_its_own_log` 测的东西，也是「副本自带 WAL」这个
+  决定的全部回报（没它的话每次重启都要先过一遍全量下载，而重启恰恰是副本最
+  频繁的事件）。
+- **拒写拦在引擎层而不是网络层**，判据是 §4.2 的三档（`!is_readonly() &&
+  !is_control()`）。多 worker 下写 op 本来就要送到提交线程，两处各拦一份一定会
+  对不齐；而拿「非只读」当判据会连 `Stats`/`Checkpoint` 一起拒掉 —— 前者让副本
+  没法监控，后者让它拖着一个与主同大的日志。
+- **`install_snapshot` 拒绝水位回退**：主交来的快照代际比自己低，只能是连错了主
+  或把两代拼错了。这是整个设计里唯一让进程退出的错误 —— 继续服务一份谁也不认的
+  状态比停下来更坏。
+
+#### tick 住在提交线程里
+
+`Follower::tick` 由事件循环每轮调一次，不是另一条线程：apply 需要 `&mut Engine`，
+而 `Engine` 按单写者约定只活在提交线程上（`workers > 1` 时就是 `net::multi` 的
+committer，`workers = 1` 时是轮末周期任务）。两档跑的是同一份断言
+（`the_standby_binary_serves_reads_on_the_{single_thread,multi_worker}_loop`）。
+代价是一次 tick 会占住本轮循环，所以每 tick 只做**一次**往返（一块快照或一批
+记录）：快照因此是一块一块下的，不会一口气下完几十 MB 把客户端全关在门外。
+连不上主时按倍增退避（从 `interval_ms` 到 2 000 ms 封顶），否则主宕机后每条 tick
+都要在监听线程上付一次 SYN 超时。
+
+#### 失败政策与可观测面
+
+失败默认**不致命**：连不上主、主回报 `EIO`、交付对不上号，都只抬 `Stats` 里的
+`replica_errors`，副本继续用已有状态答读 —— 只读副本最有用的一刻恰恰是主没了的
+时候。`gap` 不抬 `replica_errors` 而是抬 `replica_resyncs`：两个数混在一起，运维就
+分不出哪一种该报警。六个新字段：`replica`（自报身份）、`replica_primary_seq`、
+`replica_lag`、`replica_applied`、`replica_resyncs`、`replica_errors`。`lag` 在引擎里
+现算（`replica_primary_seq - 本地 durable_seq`）而不是让调用方自己减，减错一次就是
+一个永久不对的数。
+
+两个读法上的坑，都进了 `treedb-server --stats` 的输出说明：`lag == 0` 单独不构成
+「已追平」（一个从没联系上主的副本 lag 也是 0），必须与 `replica_applied` /
+`replica_primary_seq > 0` 同看；`replica_resyncs` 持续上涨说明追不上主（主 checkpoint
+太快或 `--fetch-bytes` 太小），不是 bug 但是要调参的信号。
+
+#### 边界（这一节没做到的）
+
+1. **异步，不保证读到已确认的写**。副本能读到多少取决于上一次 tick 到哪。要
+   「读己之写」的客户端必须继续读主，或者自己等 `lag == 0`（这一手很弱，因为
+   `lag` 是上次往返的快照而不是未来承诺）。
+2. **没有主身份认证与 fence**。`install_snapshot` 拒绝水位回退只能挡住「连到了一
+   个更旧的主」这一种错配，挡不住「两个同代但互不知情的主各自被一个副本跟着」。
+   定序仍然只在单主上成立，切主必须先把旧主真停掉。
+3. **`SnapFetch` 把整个元数据状态交出去**，`WalFetch` 交出全部尚未截进的写。引擎
+   本来就假定这个端口在受控网络内（任何客户端都能 `ListViews`/`RowList`），所以
+   这不新增一类暴露面 —— 但它把「端口只能对内」这条部署约束的重要性抬高了。
+4. **没有传输吞吐实测**。已知上界只有算术量：稳态按 `interval_ms`（默认 20 ms）
+   限频、`max_bytes` 默认 1 MiB，名义上限 ≈ 50 MiB/s；快照下载期间不限频，所以
+   实际取决于块大小与往返。真数字要的是 §11 第 4 条末那三项。
+
 ---
 
 ## 7. 性能实测（五轴）
 
 口径提醒：本节各节里的「本轮」指**它所记录的那一轮**（v0.3.1 读轴、v0.3.2 写轴），
-不是本文开头那句 v0.3.3 —— 能力面那一轮没动性能，所以本节数字一个没重跑。
+不是本文开头那句 v0.3.5 —— 从 v0.3.3 起那三批（能力面、快照迁移、日志传送）都没动
+性能，所以本节数字一个没重跑；**唯一的例外是 §7.11**，那是 `v0.3.5` 上重测的单连接格。
 
 复现：`benches/throughput_matrix.sh [每格秒数=3] [轴…]`，原始逐格输出在
 `benches/results/matrix.log`。下面只报表格化的结论。注意脚本默认只跑轴 1–4，
@@ -597,6 +721,9 @@ checkpoint 之后 64 888 → 41 512 有损）。最近一次原始输出在
 | `key` | 64/1 | 13 103（2 432 / 24 395） | 1 729（33 491 / 100 370） | 7.6× | 13.8× |
 
 怎么读这张表：
+
+> 表里 `1/1` 那两行是单连接形状，`v0.3.5` 上已单独重测并配了 fsync 计数器对照，
+> 看 §7.11。与本表不同日期，两边的数字不要互减（§7.10 那条教训）。
 
 - **treedb 全程领先，并发越高、p99 越夸张的地方领先越多**。原因是两边的持久化单位
   不同：treedb 一轮一次 fdatasync 且跨连接合并；PG 每个事务一次 `XLogFlush`，
@@ -1074,6 +1201,103 @@ O(目录数)）另开了 `Engine::wal_bytes()`（`src/engine/core.rs`）：auto-
 是自查改动时拦下来的回归，没量到开销，但它属于「读锁 + 全表计数放在热路径」这类
 一旦进去就很难发现的问题，所以函数注释里写明了只能用在诊断路径。
 
+### 7.11 单连接对标 + 并发档复核（`v0.3.5` 复测，2026-11-19）
+
+上面几张表都是 8/64 并发的形状，而接入方第一个问题通常是「**我只开一条连接**，
+比你快多少」。这一格形状完全不同：`conns=1 pipeline=1` 下 group commit **无对象可合**，
+每个写都要自己付一次盘；而副本/多 worker 这两轮新加的东西也都不在这条路径上。
+所以单独量一支，工具 `benches/single_conn.sh`（两遍取区间，原始输出
+`benches/results/single_conn.log`，两边都钉了 `fsync=on` + `synchronous_commit=on`）。
+
+**一问一答（`conns=1` / `pipeline=1`）**：
+
+| op | treedb ops/s（p50 / p99 µs） | PG ops/s（p50 / p99 µs） | QPS 比 | p50 比 |
+|----|------------------------------|--------------------------|--------|--------|
+| `lookup` | 43 567–44 597（19 / 36） | 4 421–4 606（210–212 / 453–473） | **9.5–10.1×** | 11× |
+| `readdir` | 36 775–37 715（25 / 41–43） | 3 184–3 238（307 / 447–643） | **11.4–11.9×** | 12× |
+| `create` | 1 740–1 753（373–385 / 1 747–1 990） | 531–550（624–625 / **22 022–22 816**） | 3.2–3.3× | 1.6×（p99 优 11–13×） |
+| `write` | 1 764–1 816（375–377 / 1 747–1 954） | 232–614（711–766 / 22 686–39 139） | 2.9–7.8×（中位 ≈ 3.1×） | 1.9–2.0× |
+
+**单连接但批量（`conns=1` / `pipeline=32`）**：
+
+| op | treedb ops/s（p50 µs） | PG ops/s（p50 µs） | QPS 比 | p50 比 |
+|----|------------------------|--------------------|--------|--------|
+| `lookup` | 563 356–576 098（1） | 7 168–7 359（129） | **77–80×** | 129× |
+| `readdir` | 143 390–145 565（6） | 4 152–4 220（227–232） | **34–35×** | 38× |
+| `create` | 7 664–8 031（47–48） | 1 447–1 525（614–652） | 5.0–5.6× | **13×** |
+| `write` | 7 957–9 241（44） | 1 282–1 384（630–671） | 5.8–7.2× | **14–15×** |
+
+**写入档这一格两边是同一个持久化语义，3× 不是靠少付 fsync 换来的** —— 直接拿
+引擎自计的计数器作证（同一份 log 里每一格后面那行 `[stats]`）：
+
+| 形状 | writes | syncs | 一次 fsync | 折算吞吐 |
+|------|--------|-------|-----------|----------|
+| 1/1 `create` | 5 267 | **5 267** | 505–527 µs | 1/570 µs ≈ 1 750 ops/s ✓ |
+| 1/32 `create` | 23 048 | **728**（平均一轮合 31.7 条） | 3.7–3.9 ms | 32 条/4 ms ≈ 8 000 ops/s ✓ |
+
+也就是：单连接一问一答时 treedb **每 op 付一次真 fsync**（`syncs == writes`），ack 一定
+晚于它；PG 那一格每事务一次 `XLogFlush`。两边的中位盘成本在同一量级（373 µs vs
+624 µs），差在尾延迟：PG 的 p99 稳定在 22–24 ms，而**同一块盘上** treedb 同一格只有
+1.7–2.0 ms —— 所以那 22 ms 不是盘的固有尾延迟，而是 PG 每事务多付的东西（
+checkpoint 之后首次改页的 full-page write 会让一次 commit 写的字节数跳档，同机
+其他 PG 实例也在搅盘）。**本支没做归因实验**，只报读数；但结论不依赖归因：
+**单连接也躲不掉那个 p99**。而 pipeline=32 就是分界线：treedb 把 32 次写合成一次盘（
+吞吐 1 753 → 8 031，p50 373 → 47 µs），PG 的 p50 几乎不动（624 → 614 µs），因为它不能把
+别人的 commit record 算成自己的已持久化。
+
+**把连接数提上来（同一支脚本、同一天、同一块盘、`pipeline=1`）** —— 接第二个问题
+「多连接是不是更快」。两遍区间，treedb 一侧给了两档：`workers=1`（历史基线档，与本节
+上面两张表同档）与本机默认档 `workers=8`：
+
+| op | conns | treedb w=1 ops/s（p50 µs） | treedb w=8 ops/s（p50 µs） | PG ops/s（p50 µs） | QPS 比 w=1 | QPS 比 w=8 |
+|----|-------|---------------------------|---------------------------|-------------------|-----------|-----------|
+| `lookup` | 8 | 131 706–133 112（43–44） | 355 073–387 466（19–21） | 35 553–36 478（212） | 3.6–3.7× | **9.9–10.6×** |
+| `readdir` | 8 | 105 464–106 716（84–89） | 248 548–269 984（27–31） | 24 269–25 229（311–314） | 4.3–4.4× | **9.9–10.8×** |
+| `create` | 8 | 3 489–4 335（957–996） | 3 859–4 534（992–1 166） | 395–750（1 747–16 779） | 6.1–8.8× | 5.1–6.5× |
+| `write` | 8 | 4 365–4 530（921–970） | 3 766–3 894（1 167–1 180） | 326–801（1 726–17 251） | 5.6–13.9× | 4.9–10.2× |
+| `lookup` | 64 | 115 507–117 013（501–518） | **984 190–984 811（57–61）** | 208 731–209 912（305–307） | **0.55–0.56×** | 4.7× |
+| `readdir` | 64 | 84 545–86 878（695–717） | **763 878–763 941（72–75）** | 144 904–145 878（431–434） | **0.58–0.60×** | 5.2–5.3× |
+| `create` | 64 | 9 884–10 468（2 743–2 806） | 10 397–11 822（2 044–2 104） | 1 656–1 848（33 546–33 574） | 5.4–6.3× | 5.9–6.9×（**p50 优 16×**） |
+| `write` | 64 | 10 583–11 003（2 680–2 751） | 11 071–11 766（1 818–1 916） | 1 287–1 468（33 493–39 936） | 7.2–8.6× | 6.5–8.7×（**p50 优 17–18×**） |
+
+三件事，第二件最容易被说错：
+
+- **写确实更快，而且不是靠多核**：`workers` 两边都是同一个提交线程，treedb 的 `create`
+  还是从 1 740–1 816（1/1）涨到 3 489–4 534（8/1）再到 10 397–11 822（64/1）。涨的是
+  **group commit 的合并度**，引擎自计数器把这条线钉得很直（`[stats]` 行，`create` 档）：
+
+  | conns（一问一答） | writes | syncs | 一次 fsync 摊几条 |
+  |---|---|---|---|
+  | 1 | 5 267 | 5 267 | **1** |
+  | 8 | 11 649–13 670 | 2 670–2 944 | 4.4–4.6 |
+  | 64 | 31 832–36 029 | 601–618 | **53–58** |
+
+  盘的成本从「每 op 一次」变成「每 55 op 一次」，而 PG 那一侧 64/1 的 p50 两遍都钉在
+  33.5–39.9 ms（四个 op 里写档全一样），那是它 commit 队列的排布，不是盘。64 连接这一档
+  提交线程还没排干（`workers` 再加也不涨，§8 第 1 条第 ③ 项）。
+- **读在 `workers=1` 下 64 连接会被 PG 反超（0.55–0.60×），这一档不能拿来说赢**。根因
+  §7.5 归过：一条线程上「每连接一次 read + 一次 write」全排在一个核，PG 每 backend 一个
+  进程天然摊在 64 个核。本机默认档 `min(8, 核/2)` 把这一格翻成 4.7×（`lookup`）与
+  5.2–5.3×（`readdir`），8 连接那档甚至 9.9–10.8×；也就是说**报并发数字必须把 workers 档
+  一起报**。`benches/single_conn.sh` 的 `WORKERS` 默认 1 只是为了和本节上面两张表同档。
+- **提高 pipeline 会让倍率收窄而不是继续拉大**：同一份 log 里 `PIPE=32` 那两遍，
+  `lookup` 8/32 是 23.2–23.9×，但 64/32 只剩 3.2×；`readdir` 64/32 1.98–1.99×；`create`
+  64/32 1.6–1.7×。原因还是 §7.3 那句：一个回合排干 64 条连接各 32 条就是 2 048 条 op，
+  后面的连接只能排在同一轮里，这是单提交线程用延迟换吞吐的固有形状。`write` 64/32
+  那两格 PG 的测量窗口溢出到 3.95 s / 4.16 s（§7.5 记过同一口径问题），不入对照。
+
+三条不能不说的提醒：
+
+- **这两张表与 §7.2–§7.5 那些行不可相减**。§7.10 已经记过一次这个坑（不同日期的
+  矩阵格子不能互减）。本支只回答「现在这一版、这一格、两边同盘同参数下是多少」。
+  例如 `readdir` 1/1 这里量到 36–37 k，而旧矩阵同形状那行是 19 715（p50 42 → 25 µs）：
+  本支没有逐项 A/B，不拿它当「快了 1.9×」的结论，只当作 v0.3.5 的新基准。
+- **`write` 那一格 PG 自己两遍差 2.6×**（232 vs 614 ops/s）。机械盘上只跑 3 s、
+  单连接、每 op 一次 flush 的形状就是会抖；报区间而不是报小数，中位倍率取 ≈ 3.1×。
+- **一次 fsync 从 0.5 ms 变 3.9 ms 不是回退，是载荷变大**。§7.4 那个「裸 fsync
+  3.8–4.6 ms」探针对应的恰好是“一批已摊开”的形状，而本支 1/1 那格是“每轮只追
+  一条十几字节的记录”的形状。两者测的不是同一次盘，不要把其中一个当“这台盘的 fsync 单价”。
+
 ---
 
 ## 8. 已知限制（诚实边界）
@@ -1100,8 +1324,12 @@ O(目录数)）另开了 `Engine::wal_bytes()`（`src/engine/core.rs`）：auto-
 4. **无数据面 / 无 fd 语义**（§5.3）：`O_TRUNC`、POSIX 记录锁的 `(pid,fd)` 所有权这类
    由 FUSE 层自己维护，引擎不参与。
 5. **无跨视图原子 op、无用户可见事务**（§5.3）。
-6. **单机、无复制**：`refs` 账本和 WAL 都是单主。HA 需要日志传送或让上层继续用 PG
-   做权威（过渡档的现状）。
+6. **有异步只读副本，无同步复制**（§6.6）：`refs` 账本和 WAL 仍是单主，副本只是
+   同一份日志的第二个消费者。三条具体边界：① 副本**不保证读到已确认的写**，
+   要「读己之写」的客户端仍得读主；② 没有主身份认证也没有 fence，`install_snapshot`
+   只拒绝「水位往回走」这一种错配，切主必须先把旧主真停掉；③ 没有自动故障
+   转移 —— 主没了副本只是继续答读，不会把自己提上去。写扩展也不因副本而变
+   （第 1 条第 ③ 项那句仍成立）。HA 要拿上层继续用 PG 做权威仍是另一条路（过渡档现状）。
 7. **`checkpoint` 是 stop-the-round**：快照在提交线程里同步生成，期间不接新写。
    `workers=1` 时整个循环停住；`workers>1` 时前端仍能就地服务纯读（快照只持**读锁**，
    与 `exec_read` 共享），但已转发的写得等它。大状态下的停顿没有上限保护
@@ -1135,8 +1363,8 @@ O(目录数)）另开了 `Engine::wal_bytes()`（`src/engine/core.rs`）：auto-
 ## 9. 测试清单
 
 ```sh
-cargo test --release                            # 默认档（纯引擎），96 条
-cargo test --release --features postgres-compat # 加上过渡档，127 条
+cargo test --release                            # 默认档（纯引擎），112 条（+1 ignored）
+cargo test --release --features postgres-compat # 加上过渡档，143 条（+7 ignored）
 cargo test --release --lib                      # 只看引擎单测
 cargo test --release --test migrate              # 快照升级：8 条走 API + 3 条真进程跑 CLI（§6.5）
 cargo test --release --test scale_connections -- --ignored   # 万级连接重压（§7.6）
@@ -1164,11 +1392,12 @@ gcc -O2 -pthread -o /tmp/lb_floor benches/lb_floor.c && /tmp/lb_floor 1 64 3   #
 
 | 目标 | 数量 | 覆盖 |
 |------|------|------|
-| `--lib` | **32**（+30 属 `postgres-compat`） | codec round-trip（全 tag：47 op / 26 reply）、**`Log` 全变体 round-trip**（含本轮四条表日志）、CRC 已知向量、碎帧/超长帧、WAL 帧与截断重放、**预分配空洞重开**（`prealloc_padding_reopens_cleanly`）、**大批次不跳写**（`huge_batch_writes_every_record`）、**两代快照正文逐字节相同**（`legacy_snapshot_decodes_from_the_same_prefix`，§6.5 的前提）、**旧布局写回不能默默丢表**（`legacy_writer_refuses_to_drop_tables`）、**seq 跳号硬错**、状态快照保留 node key、**两层 dentry 与 kind 冗余过快照不坏**（`dentries_are_two_level_and_kind_survives_snapshot`，§7.10）、**通用表行与索引过快照不坏**（`generic_tables_keep_rows_and_rebuild_indexes`，§5.1）、缓冲压缩、租约过期边界、`default_workers` 上下界 |
+| `--lib` | **38**（+30 属 `postgres-compat`） | codec round-trip（全 tag：49 op / 28 reply）、**fetch 应答的两条长度/计数上限在 decode 处兼得**（`fetch_reply_bounds_are_enforced_on_decode`，§6.6）、**`Log` 全变体 round-trip**（含本轮四条表日志）、CRC 已知向量、碎帧/超长帧、WAL 帧与截断重放、**预分配空洞重开**（`prealloc_padding_reopens_cleanly`）、**大批次不跳写**（`huge_batch_writes_every_record`）、**交付只到 durable 水位**（`deliver_stops_at_the_durable_watermark_not_the_logical_end`，§6.6 第一条口径）、**hint 命中与退回全扫**（`deliver_streams_forward_with_the_returned_hint` / `deliver_ignores_a_stale_or_absent_hint_and_still_lands_right`）、**跨滑动窗口不丢记录**、**max_bytes 是软上限**（至少给一条 + 逐轮恰好吃完整批）、**两代快照正文逐字节相同**（`legacy_snapshot_decodes_from_the_same_prefix`，§6.5 的前提）、**旧布局写回不能默默丢表**（`legacy_writer_refuses_to_drop_tables`）、**seq 跳号硬错**、状态快照保留 node key、**两层 dentry 与 kind 冗余过快照不坏**（`dentries_are_two_level_and_kind_survives_snapshot`，§7.10）、**通用表行与索引过快照不坏**（`generic_tables_keep_rows_and_rebuild_indexes`，§5.1）、缓冲压缩、租约过期边界、`default_workers` 上下界 |
 | `tests/engine_crud.rs` | **26** | §5.2 全部 POSIX 语义（含 GC 线索与 NOREPLACE）+ 控制面（密钥/审计/定义/放置）+ checkpoint 后重开 + 坏尾截断；本轮新增 6 条：4 条盖通用表（表形状校验与表名回收、行写边界/约束/CAS/flags、主键与索引列游标翻页、表状态过 checkpoint+重开），1 条盖 `ReadDirPlus` 与 `ReadDir`+`Getattr` 逐字段对齐，1 条盖 `Stats` 新字段 |
 | `tests/net_protocol.rs` | **10** | TCP 端到端：CRUD、碎帧、pipeline 保序、并发连接不串扰、超长帧只杀违规者、大回包流式读完、`--stats`/`--checkpoint`/`--shutdown`（含两个磁盘长度与协议版本）、优雅停服后同地址立刻重绑、**通用表 + readdirplus 走 TCP**（1000 行 pipeline、错误帧经网络回真实 errno、8 KiB 收缓冲下大应答完整接回） |
 | `tests/crash_recovery.rs` | **6** | §6.4 |
-| `tests/read_scaling.rs` | **7** | 只读分派表逐条对 `translate`（判错一条就是丢写；语料 47 条全变体，钉住 47/22/25 三个数）、`workers=1/8` 答复逐条相同（负载含表读与 `ReadDirPlus`，混合批里把 CAS 写夹在读之间）、每连接流内顺序、一写多读不读到半截状态、`ops_total` 记上 worker 就地算的读、并行档下 `kill -9` 已 ack 的写全在（目录写与表写逐条交错）、**fd 复用不会把上一任的应答塞给新任** |
+| `tests/read_scaling.rs` | **8** | 只读分派表逐条对 `translate`（判错一条就是丢写；语料 49 条全变体，钉住 49/22/27 三个数）、**三档划分穷举且两两不交**（`ops_partition_into_three_classes`，22/22/5，§4.2 与副本拒写的判据同源）、`workers=1/8` 答复逐条相同（负载含表读与 `ReadDirPlus`，混合批里把 CAS 写夹在读之间）、每连接流内顺序、一写多读不读到半截状态、`ops_total` 记上 worker 就地算的读、并行档下 `kill -9` 已 ack 的写全在（目录写与表写逐条交错）、**fd 复用不会把上一任的应答塞给新任** |
+| `tests/replication.rs` | **9** | §6.6 的八件事（九条用例，端到端那一件两档各一条；主是真进程，副本是测试里的 `Engine` + `Follower`，只有最后三条起真 `treedb-standby`）：主写逐条收敛（ino/属性/readdir 与主对齐）、**主被 `kill -9` 后副本仍答读且不退出**（`replica_errors` 抬、`connected` 落 true→false）、**gap 触发分块重装快照**（4 KiB 块下 ≥ 2 块，且副本落盘的 `state.snap` 与主的逐字节相同）、**副本拒写在引擎层**（五个形状不同的写真 op 全 `EROFS` 且零 logs、零水位推进，而 `ListViews`/`Stats`/`Checkpoint` 放行）、**lag 中途为正、追平归零**（2 KiB/轮 喂不饱一批）、**副本重启靠自己的日志接上**（`resyncs == 0`，快照+尾巴那条恢复路径）、端到端两档事件循环同一份断言（`workers=1`/`2`：线上 `EROFS`、`Stats` 新字段过线、追平后读到主的新写）、启动参数三道门（缺 `--primary` / 自己拉自己 / `--fetch-bytes 0` 均退出码 2） |
 | `tests/concurrency.rs` | 0（+7，整文件 feature 门控） | T1 之后整个文件在 `postgres-compat` 后面：无 PG 时跑「拨号失败不漏 live」（1 条，要 feature），其余 6 条 `#[ignore]` 需真实 PG。**它测的是共享池，不是引擎并发**（§7.8）|
 | `tests/scale_connections.rs` | 1（+1 ignored） | 1 000 连接 fd/RSS 断言每次跑；万级（`TREEDB_CONNS`，含 25 000）手动 |
 | `tests/independence.rs` | **3** | 独立性三把门：内核目录（`src/engine`、`src/net`）不出现客户端名字；`[dependencies]` 非 optional 项只能是 `libc` + `thiserror`；`postgres-compat` 不得进 `default`（§11 第 7 条） |
@@ -1206,7 +1435,7 @@ checkpoint 前 `snap_bytes == 0`、`proto_version == PROTOCOL_VERSION`）。
 「索引必须被重推」的验收面。`seed` 现在也建表灌行 —— 不然五条只读表 op 的
 「不产 logs」只在测「查不存在的表」那种废话（§4.2）。
 
-本轮（快照迁移）新加的回归锁：
+上一轮（快照迁移，`v0.3.4`）新加的回归锁：
 `legacy_snapshot_decodes_from_the_same_prefix`（lib，§6.5 的地基：同一状态按两代布局
 各写一遍，比前缀必须逐字节相同 —— 正文漂了就得把 v2 写出侧一起改，不然迁移工具
 在说谎）、
@@ -1215,6 +1444,40 @@ checkpoint 前 `snap_bytes == 0`、`proto_version == PROTOCOL_VERSION`）。
 `migration_preserves_every_field_and_leaves_the_wal_alone`（集成：用
 `downgrade_to_v2` 造样本 —— checkpoint 后按 v2 重写快照文件，而不是手工拼一个假文件，
 这样「旧布局」永远与代码里的写出侧同步）。
+
+本轮（日志传送/只读副本）新加的回归锁。
+lib 侧六条全部压在「传送口径」的四条句子上：
+`fetch_reply_bounds_are_enforced_on_decode`（越上限的 `WalBatch` 必须在 **decode**
+处拒帧，不能先按对端自报的计数分配再去索引一个更短的 body；反之 `SnapFetch` 的
+`len` 越上限**不在解码侧拦**，得解出来回 `EINVAL` —— 一个请求不该把连接敲掉，两边
+不对称是有意的）、
+`deliver_stops_at_the_durable_watermark_not_the_logical_end`（一条已 `write` 未
+`fsync` 的记录绝不能交付：副本照收无误、主随即崩掉，那条写在主上根本不存在，副本就
+凭空多了一个主永远答不出的 seq；而 `sync()` 之后同一条立即可给 —— 送不送只由水位
+决定，不由谁读过决定）、
+`deliver_streams_forward_with_the_returned_hint` 与
+`deliver_ignores_a_stale_or_absent_hint_and_still_lands_right`（hint 是提示不是
+承诺：命中时按它跳，指错位置时必须退回全扫并落在同一处 —— 否则「按 offset 恢复」
+这个机制本身就是丢记录的原因）、`deliver_slides_the_window_across_many_records`（一批
+记录多到跨过 256 KiB 滑动窗口时不能丢也不能重）、
+`deliver_honors_max_bytes_but_always_gives_at_least_one`（`max_bytes` 是软上限：
+至少给一条，否则一条大记录就能让副本永久卡住）。
+
+集成侧九条见上表，其中三处的断言形状是写用例时才浮出来的：
+`the_replica_keeps_answering_reads_after_the_primary_dies` 用 `kill -9` 而不是优雅停服
+（副本在主消失后必须继续答读、必须不退，这是本轮唯一的产品级承诺）、
+`a_gap_reinstalls_the_snapshot_in_chunks` 把每轮字节数压到 4 KiB 让「分块」真的发生
+（不压就是一次下完，`chunks >= 2` 根本过不去 —— 分块那整条路径等于没被走过）、
+`a_replica_restart_resumes_from_its_own_log` 必须在 checkpoint **之后**再写尾巴 ——
+没 checkpoint 过的副本目录里根本没有快照文件，那条 `resyncs == 0` 会恒真。
+
+同一轮里被改写而不只是新增的报警器：`tests/read_scaling.rs` 的
+`readonly_classification_matches_translate` 语料 47 → 49、计数断言改钉 49/22/27，
+并新增 `ops_partition_into_three_classes`。理由是副本拒写用的是**同一条三档判据**
+（`!is_readonly() && !is_control()`）—— 判据一改，副本的读写面跟着改，所以它必须和
+分派表钉在同一个穷举下（§4.2）。`op_codec_round_trip_all_tags` /
+`reply_codec_round_trip` 也从「逐 tag 列名」改成按 49 / 28 计数，新增两条 op 与两个
+reply tag 自动进语料。
 
 ### 9.1 四条被作废的测量（记录过程，防止有人复用假数据）
 
@@ -1377,7 +1640,7 @@ spike 明确**没**做、也不在接入面上假装做的事 —— 一律返�
 | readdir 的属性 | 仍是 N/64 次往返 | **协议面已闭合**（`ReadDirPlus` 进了 `v0.3.3`，§11 第 6 条），断的是接入侧：provider 还没改用它，而且 grovefs 钉的是 `v0.3.2`。改造前这个缺口真实存在，不能因为 op 进了协议就算完成 |
 | 定义/密钥/账户 | 还在本地 SQLite | 引擎侧的通用表本轮已可用（§11 第 7 条 T2），但 grovefs 未拿它拼过语义；`Key*`/`Audit*` 那三个专用 op 仍是业务形状，不能当接入面（上文第 4 步） |
 | `view list` 的物理树 | 列不出来 | 控制面枚举器只看本地 db 文件 |
-| HA / 快照传送 | 启动即拒绝 | §8「无复制」这条限制本身 |
+| HA / 快照传送 | 启动即拒绝 | 接入面用不上它：§8 限制 6 现在是「有异步只读副本、无同步复制」，而 grovefs 要的是「主挂了切副本」—— 那一步没有提升路径（§11 第 4 条③） |
 | ~~path 依赖的分发方式~~ | 已定：按 tag 的 git 依赖 | 钉 `v0.3.2`（随定版前移），无同级克隆也能构建（实测） |
 
 ### 阶段 C（回归与灰度）
@@ -1408,7 +1671,14 @@ spike 明确**没**做、也不在接入面上假装做的事 —— 一律返�
    一件事：逻辑长度决定 checkpoint 何时触发，磁盘长度决定这块盘被占了多少（限制 9）。
    `proto_version` 不只是好看：帧里没有版本位（§4.1），它是线上唯一能查到对端协议
    版本的通道。`treedb-server --stats` 把这三个长度并列打出来。
-4. **日志传送做只读副本**：让「无复制」这条限制至少能降级成「无写扩展」。
+4. ~~**日志传送做只读副本**~~ **已完成**（§6.6）：pull 式 `WalFetch` + 分块 `SnapFetch`，
+   新入口 `treedb-standby`（拉快照 → 追 WAL → 只读应答），限制 6 从「无复制」
+   降级成「无同步复制」。原写法里那句「至少能降级成无写扩展」只做到一半：
+   副本确实开了只读容量，但写扩展仍在单提交线程上（§8 第 1 条第 ③ 项）。
+   接下去要动的三项，按价值排序：① 传送吞吐与它对主 p99 的影响都没实测（现在
+   手里只有算术上界），要的是冷启动下载速率、稳态追平速率、每 tick 占住提交线程
+   多久这三格；② 没有主身份认证与 fence，多主错配只能靠部署挡住；③ 没有提升
+   路径（`--promote`），副本坏了只能新起一个主重拉。
 5. ~~**接入 spike**~~ **已完成并端到端跑通**（grovefs 实验分支
    `exp/treedb-integration`，用户 2026-11-19 授权），结果与缺口清单见 §10 阶段 B
    末节。与本节原写法有两处偏离，原因已写进 §10：CLI 入口用
@@ -1466,7 +1736,8 @@ spike 明确**没**做、也不在接入面上假装做的事 —— 一律返�
      撤销/过期/只读这些规则全部由客户端定义（形状与刻意边界见 §5.1、§5.3）。引擎
      **没有**替客户端解释任何一列：`revoked_at` 在 `KeyRec` 里是语义，在 `RowPut` 里只是
      一串字节。协议版本同批递了（`PROTOCOL_VERSION` 2 → 3）并补了 decode 向量：op/reply/`Log`
-     三个 round-trip 用例现在覆盖全 47 op / 26 reply / 22 条 `Log` 变体，不是「字段名改了
+     三个 round-trip 用例当时覆盖全 47 op / 26 reply / 22 条 `Log` 变体（`v0.3.5` 起是
+     49/28，§4.2），不是「字段名改了
      但版本号不动」。**剩下的一半**：那几张专用表与它们的 op 还在内核里，拆干净才算
      这项完成（第 10 条）。
    - ~~**T3 叙述去依赖**~~ **已完成**：crate description、`treedb-server --help` 首行、
@@ -1480,9 +1751,8 @@ spike 明确**没**做、也不在接入面上假装做的事 —— 一律返�
      里非 optional 项只能是 `libc` + `thiserror`；`postgres-compat` 不得进 `default`。
      关键词是拼出来的，文件也不扫 `tests/`，否则门会把自己拦下来。**反向验过**：
      往 `src/engine/` 丢一个含该名字的探针文件，门 1 立刻 FAILED，删掉又绿 —— 门不是装饰。
-     跑法：默认档 `cargo test --release` = **96 passed / 0 failed**（含三把门），
-     `--features postgres-compat` = **127 passed / 0 failed**（数字跟 §9 同步，三把门
-     在两档都跑）。本轮加通用表时它们一条没红 —— 新 op 没带进客户端名字，
+     跑法：默认档与 `--features postgres-compat` 两档都要跑这三门。**具体计数不复述**
+     （写了就会漂）：以 §9 那张表为准，本轮那一格是 112 / 143。本轮加通用表时它们一条没红 —— 新 op 没带进客户端名字，
      门 1 测的就是这条线。
 
    接入侧因此得到的约束：第 5 条里“把定义/密钥/账户补进引擎”的正解不是

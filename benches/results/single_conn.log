@@ -1,0 +1,286 @@
+=== 单连接对标 pipeline=1 ===
+pg PostgreSQL 12.22 (Ubuntu 12.22-0ubuntu0.  fsync=on synchronous_commit=on
+host nproc=128  WAL 盘：xfs /data
+--- pass 1 (pipeline=1) ---
+treedb op=lookup conns=1 threads=1 pipeline=1 → 43567 ops/s over 3.00s | lat us: p50=19 p90=31 p99=36 max=223 | errors=0
+treedb   [stats] ops        = 134710 (writes 4008, syncs 24, avg fsync 6157 us)
+pg     pg op=lookup conns=1 pipeline=1 → 4421 ops/s over 3.00s | lat us: p50=212 p90=283 p99=473 max=2595 | errors=0
+  ! setup 8 个视图 schema 耗时 9.3 ms（每视图 1.2 ms，不进 op QPS）
+treedb op=readdir conns=1 threads=1 pipeline=1 → 36775 ops/s over 3.00s | lat us: p50=25 p90=29 p99=43 max=570 | errors=0
+treedb   [stats] ops        = 114335 (writes 4008, syncs 24, avg fsync 8688 us)
+pg     pg op=readdir conns=1 pipeline=1 → 3184 ops/s over 3.00s | lat us: p50=307 p90=395 p99=643 max=3165 | errors=0
+  ! setup 8 个视图 schema 耗时 11.8 ms（每视图 1.5 ms，不进 op QPS）
+treedb op=create conns=1 threads=1 pipeline=1 → 1753 ops/s over 3.00s | lat us: p50=373 p90=769 p99=1990 max=40140 | errors=0
+treedb   [stats] ops        = 5269 (writes 5267, syncs 5267, avg fsync 523 us)
+pg     pg op=create conns=1 pipeline=1 → 531 ops/s over 3.01s | lat us: p50=624 p90=1056 p99=22816 max=55352 | errors=0
+  ! setup 8 个视图 schema 耗时 12.2 ms（每视图 1.5 ms，不进 op QPS）
+treedb op=write conns=1 threads=1 pipeline=1 → 1764 ops/s over 3.00s | lat us: p50=375 p90=794 p99=1747 max=35688 | errors=0
+treedb   [stats] ops        = 5302 (writes 5300, syncs 5300, avg fsync 527 us)
+pg     pg op=write conns=1 pipeline=1 → 232 ops/s over 3.01s | lat us: p50=766 p90=17521 p99=39139 max=55377 | errors=0
+  ! setup 8 个视图 schema 耗时 10.9 ms（每视图 1.4 ms，不进 op QPS）
+--- pass 2 (pipeline=1) ---
+treedb op=lookup conns=1 threads=1 pipeline=1 → 44597 ops/s over 3.00s | lat us: p50=19 p90=29 p99=36 max=161 | errors=0
+treedb   [stats] ops        = 137801 (writes 4008, syncs 24, avg fsync 6552 us)
+pg     pg op=lookup conns=1 pipeline=1 → 4606 ops/s over 3.00s | lat us: p50=210 p90=257 p99=453 max=2332 | errors=0
+  ! setup 8 个视图 schema 耗时 10.1 ms（每视图 1.3 ms，不进 op QPS）
+treedb op=readdir conns=1 threads=1 pipeline=1 → 37715 ops/s over 3.00s | lat us: p50=25 p90=26 p99=41 max=136 | errors=0
+treedb   [stats] ops        = 117156 (writes 4008, syncs 24, avg fsync 6464 us)
+pg     pg op=readdir conns=1 pipeline=1 → 3238 ops/s over 3.00s | lat us: p50=307 p90=380 p99=447 max=3037 | errors=0
+  ! setup 8 个视图 schema 耗时 8.7 ms（每视图 1.1 ms，不进 op QPS）
+treedb op=create conns=1 threads=1 pipeline=1 → 1740 ops/s over 3.00s | lat us: p50=385 p90=828 p99=1758 max=43474 | errors=0
+treedb   [stats] ops        = 5232 (writes 5230, syncs 5230, avg fsync 526 us)
+pg     pg op=create conns=1 pipeline=1 → 550 ops/s over 3.01s | lat us: p50=625 p90=1056 p99=22022 max=54347 | errors=0
+  ! setup 8 个视图 schema 耗时 10.7 ms（每视图 1.3 ms，不进 op QPS）
+treedb op=write conns=1 threads=1 pipeline=1 → 1816 ops/s over 3.00s | lat us: p50=377 p90=755 p99=1954 max=28908 | errors=0
+treedb   [stats] ops        = 5459 (writes 5457, syncs 5457, avg fsync 505 us)
+pg     pg op=write conns=1 pipeline=1 → 614 ops/s over 3.01s | lat us: p50=711 p90=1041 p99=22686 max=46592 | errors=0
+  ! setup 8 个视图 schema 耗时 10.4 ms（每视图 1.3 ms，不进 op QPS）
+--- 以上： treedb 默认档（dur=group） vs PG（synchronous_commit=on），两边 ack 前都已落盘 ---
+=== 单连接对标 pipeline=32 ===
+pg PostgreSQL 12.22 (Ubuntu 12.22-0ubuntu0.  fsync=on synchronous_commit=on
+host nproc=128  WAL 盘：xfs /data
+--- pass 1 (pipeline=32) ---
+treedb op=lookup conns=1 threads=1 pipeline=32 → 576098 ops/s over 3.00s | lat us: p50=1 p90=1 p99=2 max=6 | errors=0
+treedb   [stats] ops        = 1732330 (writes 4008, syncs 24, avg fsync 7123 us)
+pg     pg op=lookup conns=1 pipeline=32 → 7359 ops/s over 3.00s | lat us: p50=129 p90=150 p99=254 max=354 | errors=0
+  ! setup 8 个视图 schema 耗时 8.6 ms（每视图 1.1 ms，不进 op QPS）
+treedb op=readdir conns=1 threads=1 pipeline=32 → 143390 ops/s over 3.00s | lat us: p50=6 p90=7 p99=11 max=21 | errors=0
+treedb   [stats] ops        = 434186 (writes 4008, syncs 24, avg fsync 6107 us)
+pg     pg op=readdir conns=1 pipeline=32 → 4220 ops/s over 3.00s | lat us: p50=227 p90=268 p99=397 max=510 | errors=0
+  ! setup 8 个视图 schema 耗时 8.8 ms（每视图 1.1 ms，不进 op QPS）
+treedb op=create conns=1 threads=1 pipeline=32 → 7664 ops/s over 3.01s | lat us: p50=48 p90=402 p99=1033 max=1474 | errors=0
+treedb   [stats] ops        = 23050 (writes 23048, syncs 728, avg fsync 3890 us)
+pg     pg op=create conns=1 pipeline=32 → 1525 ops/s over 3.02s | lat us: p50=614 p90=958 p99=1663 max=1977 | errors=0
+  ! setup 8 个视图 schema 耗时 9.4 ms（每视图 1.2 ms，不进 op QPS）
+treedb op=write conns=1 threads=1 pipeline=32 → 9241 ops/s over 3.00s | lat us: p50=44 p90=347 p99=698 max=1317 | errors=0
+treedb   [stats] ops        = 27754 (writes 27752, syncs 875, avg fsync 3226 us)
+pg     pg op=write conns=1 pipeline=32 → 1384 ops/s over 3.01s | lat us: p50=630 p90=1300 p99=1568 max=1769 | errors=0
+  ! setup 8 个视图 schema 耗时 9.4 ms（每视图 1.2 ms，不进 op QPS）
+--- pass 2 (pipeline=32) ---
+treedb op=lookup conns=1 threads=1 pipeline=32 → 563356 ops/s over 3.00s | lat us: p50=1 p90=1 p99=2 max=7 | errors=0
+treedb   [stats] ops        = 1694090 (writes 4008, syncs 24, avg fsync 6220 us)
+pg     pg op=lookup conns=1 pipeline=32 → 7168 ops/s over 3.00s | lat us: p50=129 p90=156 p99=327 max=362 | errors=0
+  ! setup 8 个视图 schema 耗时 11.7 ms（每视图 1.5 ms，不进 op QPS）
+treedb op=readdir conns=1 threads=1 pipeline=32 → 145565 ops/s over 3.00s | lat us: p50=6 p90=6 p99=11 max=21 | errors=0
+treedb   [stats] ops        = 440714 (writes 4008, syncs 24, avg fsync 6643 us)
+pg     pg op=readdir conns=1 pipeline=32 → 4152 ops/s over 3.01s | lat us: p50=232 p90=265 p99=419 max=493 | errors=0
+  ! setup 8 个视图 schema 耗时 8.3 ms（每视图 1.0 ms，不进 op QPS）
+treedb op=create conns=1 threads=1 pipeline=32 → 8031 ops/s over 3.00s | lat us: p50=47 p90=377 p99=893 max=1235 | errors=0
+treedb   [stats] ops        = 24106 (writes 24104, syncs 761, avg fsync 3681 us)
+pg     pg op=create conns=1 pipeline=32 → 1447 ops/s over 3.01s | lat us: p50=652 p90=840 p99=1495 max=1733 | errors=0
+  ! setup 8 个视图 schema 耗时 8.2 ms（每视图 1.0 ms，不进 op QPS）
+treedb op=write conns=1 threads=1 pipeline=32 → 7957 ops/s over 3.01s | lat us: p50=44 p90=423 p99=789 max=1905 | errors=0
+treedb   [stats] ops        = 23946 (writes 23944, syncs 756, avg fsync 3787 us)
+pg     pg op=write conns=1 pipeline=32 → 1282 ops/s over 3.02s | lat us: p50=671 p90=1277 p99=1800 max=2329 | errors=0
+  ! setup 8 个视图 schema 耗时 10.1 ms（每视图 1.3 ms，不进 op QPS）
+--- 以上： treedb 默认档（dur=group） vs PG（synchronous_commit=on），两边 ack 前都已落盘 ---
+=== 逐格对标 pipeline=1 conns="8 64" ===
+pg PostgreSQL 12.22 (Ubuntu 12.22-0ubuntu0.  fsync=on synchronous_commit=on
+host nproc=128  WAL 盘：xfs /data
+--- pass 1 (pipeline=1 conns="8 64") ---
+treedb op=lookup conns=8 threads=8 pipeline=1 → 131706 ops/s over 3.00s | lat us: p50=44 p90=89 p99=102 max=32714 | errors=0
+treedb   [stats] ops        = 427189 (writes 32064, syncs 42, avg fsync 13827 us)
+pg     pg op=lookup conns=8 pipeline=1 → 36272 ops/s over 3.00s | lat us: p50=212 p90=267 p99=462 max=12079 | errors=0
+  ! setup 8 个视图 schema 耗时 9.9 ms（每视图 1.2 ms，不进 op QPS）
+treedb op=readdir conns=8 threads=8 pipeline=1 → 106716 ops/s over 3.00s | lat us: p50=89 p90=99 p99=117 max=42444 | errors=0
+treedb   [stats] ops        = 352225 (writes 32064, syncs 43, avg fsync 11277 us)
+pg     pg op=readdir conns=8 pipeline=1 → 24957 ops/s over 3.00s | lat us: p50=311 p90=396 p99=623 max=3269 | errors=0
+  ! setup 8 个视图 schema 耗时 9.5 ms（每视图 1.2 ms，不进 op QPS）
+treedb op=create conns=8 threads=8 pipeline=1 → 3489 ops/s over 3.01s | lat us: p50=996 p90=2203 p99=21713 max=206219 | errors=0
+treedb   [stats] ops        = 10561 (writes 10559, syncs 1857, avg fsync 1508 us)
+pg     pg op=create conns=8 pipeline=1 → 395 ops/s over 3.01s | lat us: p50=16779 p90=44244 p99=68200 max=116433 | errors=0
+  ! setup 8 个视图 schema 耗时 10.3 ms（每视图 1.3 ms，不进 op QPS）
+treedb op=write conns=8 threads=8 pipeline=1 → 4530 ops/s over 3.00s | lat us: p50=921 p90=2005 p99=17363 max=25022 | errors=0
+treedb   [stats] ops        = 13661 (writes 13659, syncs 2214, avg fsync 1240 us)
+pg     pg op=write conns=8 pipeline=1 → 326 ops/s over 3.02s | lat us: p50=22444 p90=44553 p99=76538 max=202348 | errors=0
+  ! setup 8 个视图 schema 耗时 5.9 ms（每视图 0.7 ms，不进 op QPS）
+treedb op=lookup conns=64 threads=64 pipeline=1 → 117013 ops/s over 3.00s | lat us: p50=518 p90=630 p99=705 max=107746 | errors=0
+treedb   [stats] ops        = 607616 (writes 256512, syncs 28, avg fsync 36907 us)
+pg     pg op=lookup conns=64 pipeline=1 → 209024 ops/s over 3.00s | lat us: p50=307 p90=350 p99=414 max=17922 | errors=0
+  ! setup 8 个视图 schema 耗时 7.7 ms（每视图 1.0 ms，不进 op QPS）
+treedb op=readdir conns=64 threads=64 pipeline=1 → 84545 ops/s over 3.00s | lat us: p50=717 p90=843 p99=1463 max=79960 | errors=0
+treedb   [stats] ops        = 510210 (writes 256512, syncs 28, avg fsync 37152 us)
+pg     pg op=readdir conns=64 pipeline=1 → 145745 ops/s over 3.00s | lat us: p50=432 p90=533 p99=607 max=9523 | errors=0
+  ! setup 8 个视图 schema 耗时 9.1 ms（每视图 1.1 ms，不进 op QPS）
+treedb op=create conns=64 threads=64 pipeline=1 → 10468 ops/s over 3.01s | lat us: p50=2806 p90=16363 p99=26996 max=41988 | errors=0
+treedb   [stats] ops        = 32048 (writes 32046, syncs 505, avg fsync 4836 us)
+pg     pg op=create conns=64 pipeline=1 → 1656 ops/s over 3.03s | lat us: p50=33566 p90=61665 p99=76259 max=93841 | errors=0
+  ! setup 8 个视图 schema 耗时 8.7 ms（每视图 1.1 ms，不进 op QPS）
+treedb op=write conns=64 threads=64 pipeline=1 → 11003 ops/s over 3.00s | lat us: p50=2680 p90=14838 p99=24747 max=49980 | errors=0
+treedb   [stats] ops        = 33547 (writes 33545, syncs 527, avg fsync 4660 us)
+pg     pg op=write conns=64 pipeline=1 → 1287 ops/s over 3.03s | lat us: p50=39936 p90=75312 p99=196663 max=1015896 | errors=0
+  ! setup 8 个视图 schema 耗时 10.1 ms（每视图 1.3 ms，不进 op QPS）
+--- pass 2 (pipeline=1 conns="8 64") ---
+treedb op=lookup conns=8 threads=8 pipeline=1 → 133112 ops/s over 3.00s | lat us: p50=43 p90=86 p99=130 max=26245 | errors=0
+treedb   [stats] ops        = 431414 (writes 32064, syncs 46, avg fsync 12129 us)
+pg     pg op=lookup conns=8 pipeline=1 → 35553 ops/s over 3.00s | lat us: p50=213 p90=278 p99=473 max=2475 | errors=0
+  ! setup 8 个视图 schema 耗时 8.8 ms（每视图 1.1 ms，不进 op QPS）
+treedb op=readdir conns=8 threads=8 pipeline=1 → 105464 ops/s over 3.00s | lat us: p50=84 p90=102 p99=124 max=27695 | errors=0
+treedb   [stats] ops        = 348464 (writes 32064, syncs 44, avg fsync 13647 us)
+pg     pg op=readdir conns=8 pipeline=1 → 24269 ops/s over 3.00s | lat us: p50=314 p90=409 p99=681 max=3302 | errors=0
+  ! setup 8 个视图 schema 耗时 8.8 ms（每视图 1.1 ms，不进 op QPS）
+treedb op=create conns=8 threads=8 pipeline=1 → 4335 ops/s over 3.00s | lat us: p50=957 p90=2164 p99=17360 max=53110 | errors=0
+treedb   [stats] ops        = 13078 (writes 13076, syncs 2152, avg fsync 1280 us)
+pg     pg op=create conns=8 pipeline=1 → 709 ops/s over 3.01s | lat us: p50=1739 p90=23453 p99=55826 max=62924 | errors=0
+  ! setup 8 个视图 schema 耗时 6.5 ms（每视图 0.8 ms，不进 op QPS）
+treedb op=write conns=8 threads=8 pipeline=1 → 4365 ops/s over 3.00s | lat us: p50=970 p90=2071 p99=18805 max=40013 | errors=0
+treedb   [stats] ops        = 13163 (writes 13161, syncs 2151, avg fsync 1277 us)
+pg     pg op=write conns=8 pipeline=1 → 783 ops/s over 3.01s | lat us: p50=1800 p90=22418 p99=41702 max=93124 | errors=0
+  ! setup 8 个视图 schema 耗时 9.1 ms（每视图 1.1 ms，不进 op QPS）
+treedb op=lookup conns=64 threads=64 pipeline=1 → 115507 ops/s over 3.00s | lat us: p50=501 p90=661 p99=1073 max=88611 | errors=0
+treedb   [stats] ops        = 603102 (writes 256512, syncs 27, avg fsync 37708 us)
+pg     pg op=lookup conns=64 pipeline=1 → 208731 ops/s over 3.00s | lat us: p50=307 p90=350 p99=419 max=16841 | errors=0
+  ! setup 8 个视图 schema 耗时 8.9 ms（每视图 1.1 ms，不进 op QPS）
+treedb op=readdir conns=64 threads=64 pipeline=1 → 86878 ops/s over 3.00s | lat us: p50=695 p90=794 p99=1379 max=102570 | errors=0
+treedb   [stats] ops        = 517242 (writes 256512, syncs 27, avg fsync 35015 us)
+pg     pg op=readdir conns=64 pipeline=1 → 145878 ops/s over 3.00s | lat us: p50=431 p90=530 p99=603 max=4891 | errors=0
+  ! setup 8 个视图 schema 耗时 11.3 ms（每视图 1.4 ms，不进 op QPS）
+treedb op=create conns=64 threads=64 pipeline=1 → 9884 ops/s over 3.01s | lat us: p50=2743 p90=16487 p99=31976 max=42374 | errors=0
+treedb   [stats] ops        = 30217 (writes 30215, syncs 476, avg fsync 5267 us)
+pg     pg op=create conns=64 pipeline=1 → 1848 ops/s over 3.03s | lat us: p50=33546 p90=40481 p99=54010 max=65695 | errors=0
+  ! setup 8 个视图 schema 耗时 9.9 ms（每视图 1.2 ms，不进 op QPS）
+treedb op=write conns=64 threads=64 pipeline=1 → 10583 ops/s over 3.02s | lat us: p50=2751 p90=16186 p99=37790 max=82270 | errors=0
+treedb   [stats] ops        = 32465 (writes 32463, syncs 511, avg fsync 4797 us)
+pg     pg op=write conns=64 pipeline=1 → 1468 ops/s over 3.04s | lat us: p50=33493 p90=74931 p99=172297 max=701742 | errors=0
+  ! setup 8 个视图 schema 耗时 12.0 ms（每视图 1.5 ms，不进 op QPS）
+--- 以上： treedb 默认档（dur=group、workers=1）vs PG（synchronous_commit=on），两边 ack 前都已落盘 ---
+=== 逐格对标 pipeline=32 conns="8 64" ===
+pg PostgreSQL 12.22 (Ubuntu 12.22-0ubuntu0.  fsync=on synchronous_commit=on
+host nproc=128  WAL 盘：xfs /data
+--- pass 1 (pipeline=32 conns="8 64") ---
+treedb op=lookup conns=8 threads=8 pipeline=32 → 1271992 ops/s over 3.00s | lat us: p50=5 p90=6 p99=7 max=1112 | errors=0
+treedb   [stats] ops        = 3848162 (writes 32064, syncs 39, avg fsync 13377 us)
+pg     pg op=lookup conns=8 pipeline=32 → 53209 ops/s over 3.00s | lat us: p50=132 p90=190 p99=317 max=410 | errors=0
+  ! setup 8 个视图 schema 耗时 10.2 ms（每视图 1.3 ms，不进 op QPS）
+treedb op=readdir conns=8 threads=8 pipeline=32 → 416845 ops/s over 3.00s | lat us: p50=18 p90=19 p99=21 max=1071 | errors=0
+treedb   [stats] ops        = 1282786 (writes 32064, syncs 47, avg fsync 13574 us)
+pg     pg op=readdir conns=8 pipeline=32 → 31285 ops/s over 3.01s | lat us: p50=241 p90=326 p99=453 max=642 | errors=0
+  ! setup 8 个视图 schema 耗时 8.8 ms（每视图 1.1 ms，不进 op QPS）
+treedb op=create conns=8 threads=8 pipeline=32 → 19655 ops/s over 3.02s | lat us: p50=368 p90=782 p99=1178 max=1644 | errors=0
+treedb   [stats] ops        = 59458 (writes 59456, syncs 473, avg fsync 5837 us)
+pg     pg op=create conns=8 pipeline=32 → 6045 ops/s over 3.03s | lat us: p50=1107 p90=2060 p99=3144 max=3146 | errors=0
+  ! setup 8 个视图 schema 耗时 8.8 ms（每视图 1.1 ms，不进 op QPS）
+treedb op=write conns=8 threads=8 pipeline=32 → 17685 ops/s over 3.03s | lat us: p50=427 p90=847 p99=1429 max=1811 | errors=0
+treedb   [stats] ops        = 53666 (writes 53664, syncs 421, avg fsync 6777 us)
+pg     pg op=write conns=8 pipeline=32 → 5534 ops/s over 3.03s | lat us: p50=1317 p90=2006 p99=4468 max=11975 | errors=0
+  ! setup 8 个视图 schema 耗时 8.4 ms（每视图 1.0 ms，不进 op QPS）
+treedb op=lookup conns=64 threads=64 pipeline=32 → 969316 ops/s over 3.00s | lat us: p50=60 p90=67 p99=128 max=3285 | errors=0
+treedb   [stats] ops        = 3166402 (writes 256512, syncs 29, avg fsync 34104 us)
+pg     pg op=lookup conns=64 pipeline=32 → 304225 ops/s over 3.01s | lat us: p50=209 p90=240 p99=257 max=574 | errors=0
+  ! setup 8 个视图 schema 耗时 7.2 ms（每视图 0.9 ms，不进 op QPS）
+treedb op=readdir conns=64 threads=64 pipeline=32 → 364148 ops/s over 3.01s | lat us: p50=139 p90=278 p99=297 max=3589 | errors=0
+treedb   [stats] ops        = 1351810 (writes 256512, syncs 27, avg fsync 38767 us)
+pg     pg op=readdir conns=64 pipeline=32 → 182963 ops/s over 3.01s | lat us: p50=348 p90=396 p99=435 max=704 | errors=0
+  ! setup 8 个视图 schema 耗时 8.4 ms（每视图 1.0 ms，不进 op QPS）
+treedb op=create conns=64 threads=64 pipeline=32 → 56496 ops/s over 3.02s | lat us: p50=1048 p90=1514 p99=1594 max=2237 | errors=0
+treedb   [stats] ops        = 170882 (writes 170880, syncs 93, avg fsync 25656 us)
+pg     pg op=create conns=64 pipeline=32 → 32422 ops/s over 3.06s | lat us: p50=1839 p90=2751 p99=4322 max=4333 | errors=0
+  ! setup 8 个视图 schema 耗时 8.6 ms（每视图 1.1 ms，不进 op QPS）
+treedb op=write conns=64 threads=64 pipeline=32 → 58109 ops/s over 3.03s | lat us: p50=1039 p90=1585 p99=2608 max=3683 | errors=0
+treedb   [stats] ops        = 176418 (writes 176416, syncs 97, avg fsync 27696 us)
+pg     pg op=write conns=64 pipeline=32 → 6426 ops/s over 3.95s | lat us: p50=2047 p90=29571 p99=96452 max=101670 | errors=0
+  ! setup 8 个视图 schema 耗时 6.8 ms（每视图 0.9 ms，不进 op QPS）
+--- pass 2 (pipeline=32 conns="8 64") ---
+treedb op=lookup conns=8 threads=8 pipeline=32 → 1277933 ops/s over 3.00s | lat us: p50=5 p90=6 p99=6 max=1457 | errors=0
+treedb   [stats] ops        = 3866082 (writes 32064, syncs 42, avg fsync 16053 us)
+pg     pg op=lookup conns=8 pipeline=32 → 55009 ops/s over 3.00s | lat us: p50=131 p90=177 p99=295 max=451 | errors=0
+  ! setup 8 个视图 schema 耗时 6.7 ms（每视图 0.8 ms，不进 op QPS）
+treedb op=readdir conns=8 threads=8 pipeline=32 → 418897 ops/s over 3.00s | lat us: p50=18 p90=19 p99=21 max=1269 | errors=0
+treedb   [stats] ops        = 1288930 (writes 32064, syncs 47, avg fsync 11551 us)
+pg     pg op=readdir conns=8 pipeline=32 → 32900 ops/s over 3.01s | lat us: p50=228 p90=283 p99=430 max=595 | errors=0
+  ! setup 8 个视图 schema 耗时 6.0 ms（每视图 0.8 ms，不进 op QPS）
+treedb op=create conns=8 threads=8 pipeline=32 → 19633 ops/s over 3.03s | lat us: p50=343 p90=813 p99=1349 max=1710 | errors=0
+treedb   [stats] ops        = 59554 (writes 59552, syncs 464, avg fsync 5871 us)
+pg     pg op=create conns=8 pipeline=32 → 6075 ops/s over 3.03s | lat us: p50=1084 p90=2036 p99=2573 max=2648 | errors=0
+  ! setup 8 个视图 schema 耗时 11.5 ms（每视图 1.4 ms，不进 op QPS）
+treedb op=write conns=8 threads=8 pipeline=32 → 17703 ops/s over 3.02s | lat us: p50=452 p90=809 p99=1261 max=1765 | errors=0
+treedb   [stats] ops        = 53602 (writes 53600, syncs 418, avg fsync 6716 us)
+pg     pg op=write conns=8 pipeline=32 → 5772 ops/s over 3.02s | lat us: p50=1311 p90=1852 p99=2928 max=8858 | errors=0
+  ! setup 8 个视图 schema 耗时 8.4 ms（每视图 1.1 ms，不进 op QPS）
+treedb op=lookup conns=64 threads=64 pipeline=32 → 965681 ops/s over 3.00s | lat us: p50=60 p90=67 p99=130 max=2996 | errors=0
+treedb   [stats] ops        = 3155074 (writes 256512, syncs 27, avg fsync 37691 us)
+pg     pg op=lookup conns=64 pipeline=32 → 305739 ops/s over 3.01s | lat us: p50=207 p90=239 p99=257 max=653 | errors=0
+  ! setup 8 个视图 schema 耗时 8.9 ms（每视图 1.1 ms，不进 op QPS）
+treedb op=readdir conns=64 threads=64 pipeline=32 → 365188 ops/s over 3.00s | lat us: p50=139 p90=277 p99=295 max=2646 | errors=0
+treedb   [stats] ops        = 1353666 (writes 256512, syncs 31, avg fsync 28653 us)
+pg     pg op=readdir conns=64 pipeline=32 → 184157 ops/s over 3.01s | lat us: p50=346 p90=394 p99=434 max=719 | errors=0
+  ! setup 8 个视图 schema 耗时 10.1 ms（每视图 1.3 ms，不进 op QPS）
+treedb op=create conns=64 threads=64 pipeline=32 → 51767 ops/s over 3.02s | lat us: p50=1143 p90=1603 p99=1897 max=2191 | errors=0
+treedb   [stats] ops        = 156994 (writes 156992, syncs 124, avg fsync 20877 us)
+pg     pg op=create conns=64 pipeline=32 → 31579 ops/s over 3.10s | lat us: p50=1827 p90=3092 p99=4406 max=4410 | errors=0
+  ! setup 8 个视图 schema 耗时 11.3 ms（每视图 1.4 ms，不进 op QPS）
+treedb op=write conns=64 threads=64 pipeline=32 → 58537 ops/s over 3.03s | lat us: p50=1041 p90=1492 p99=2180 max=2886 | errors=0
+treedb   [stats] ops        = 177922 (writes 177920, syncs 100, avg fsync 26294 us)
+pg     pg op=write conns=64 pipeline=32 → 6958 ops/s over 4.16s | lat us: p50=1568 p90=27637 p99=83945 max=94599 | errors=0
+  ! setup 8 个视图 schema 耗时 6.4 ms（每视图 0.8 ms，不进 op QPS）
+--- 以上： treedb 默认档（dur=group、workers=1）vs PG（synchronous_commit=on），两边 ack 前都已落盘 ---
+=== 逐格对标 pipeline=1 conns="8 64" workers=8 ===
+pg PostgreSQL 12.22 (Ubuntu 12.22-0ubuntu0.  fsync=on synchronous_commit=on
+host nproc=128  WAL 盘：xfs /data
+--- pass 1 (pipeline=1 conns="8 64" workers=8) ---
+treedb op=lookup conns=8 threads=8 pipeline=1 → 387466 ops/s over 3.00s | lat us: p50=19 p90=27 p99=38 max=724 | errors=0
+treedb   [stats] ops        = 1194482 (writes 32064, syncs 32, avg fsync 15759 us)
+pg     pg op=lookup conns=8 pipeline=1 → 36478 ops/s over 3.00s | lat us: p50=212 p90=265 p99=451 max=2923 | errors=0
+  ! setup 8 个视图 schema 耗时 7.2 ms（每视图 0.9 ms，不进 op QPS）
+treedb op=readdir conns=8 threads=8 pipeline=1 → 248548 ops/s over 3.00s | lat us: p50=31 p90=39 p99=48 max=628 | errors=0
+treedb   [stats] ops        = 777720 (writes 32064, syncs 33, avg fsync 32834 us)
+pg     pg op=readdir conns=8 pipeline=1 → 25229 ops/s over 3.00s | lat us: p50=312 p90=380 p99=525 max=3231 | errors=0
+  ! setup 8 个视图 schema 耗时 10.1 ms（每视图 1.3 ms，不进 op QPS）
+treedb op=create conns=8 threads=8 pipeline=1 → 3859 ops/s over 3.00s | lat us: p50=1166 p90=2205 p99=19342 max=33638 | errors=0
+treedb   [stats] ops        = 11651 (writes 11649, syncs 2670, avg fsync 1089 us)
+pg     pg op=create conns=8 pipeline=1 → 750 ops/s over 3.00s | lat us: p50=1747 p90=23213 p99=48191 max=58269 | errors=0
+  ! setup 8 个视图 schema 耗时 6.4 ms（每视图 0.8 ms，不进 op QPS）
+treedb op=write conns=8 threads=8 pipeline=1 → 3766 ops/s over 3.00s | lat us: p50=1180 p90=2199 p99=21008 max=47342 | errors=0
+treedb   [stats] ops        = 11367 (writes 11365, syncs 2506, avg fsync 1165 us)
+pg     pg op=write conns=8 pipeline=1 → 368 ops/s over 3.04s | lat us: p50=17251 p90=39533 p99=77436 max=192379 | errors=0
+  ! setup 8 个视图 schema 耗时 9.2 ms（每视图 1.1 ms，不进 op QPS）
+treedb op=lookup conns=64 threads=64 pipeline=1 → 984811 ops/s over 3.00s | lat us: p50=57 p90=108 p99=140 max=3614 | errors=0
+treedb   [stats] ops        = 3211061 (writes 256512, syncs 27, avg fsync 53921 us)
+pg     pg op=lookup conns=64 pipeline=1 → 209912 ops/s over 3.00s | lat us: p50=305 p90=349 p99=408 max=23026 | errors=0
+  ! setup 8 个视图 schema 耗时 8.4 ms（每视图 1.0 ms，不进 op QPS）
+treedb op=readdir conns=64 threads=64 pipeline=1 → 763878 ops/s over 3.00s | lat us: p50=75 p90=161 p99=207 max=5112 | errors=0
+treedb   [stats] ops        = 2548232 (writes 256512, syncs 28, avg fsync 42599 us)
+pg     pg op=readdir conns=64 pipeline=1 → 144904 ops/s over 3.00s | lat us: p50=434 p90=530 p99=603 max=11440 | errors=0
+  ! setup 8 个视图 schema 耗时 10.1 ms（每视图 1.3 ms，不进 op QPS）
+treedb op=create conns=64 threads=64 pipeline=1 → 10397 ops/s over 3.01s | lat us: p50=2104 p90=16298 p99=28977 max=41042 | errors=0
+treedb   [stats] ops        = 31834 (writes 31832, syncs 601, avg fsync 4654 us)
+pg     pg op=create conns=64 pipeline=1 → 1771 ops/s over 3.03s | lat us: p50=33549 p90=44548 p99=116531 max=123553 | errors=0
+  ! setup 8 个视图 schema 耗时 8.6 ms（每视图 1.1 ms，不进 op QPS）
+treedb op=write conns=64 threads=64 pipeline=1 → 11766 ops/s over 3.01s | lat us: p50=1818 p90=14562 p99=30880 max=68290 | errors=0
+treedb   [stats] ops        = 35877 (writes 35875, syncs 596, avg fsync 4715 us)
+pg     pg op=write conns=64 pipeline=1 → 1358 ops/s over 3.07s | lat us: p50=33726 p90=66672 p99=162852 max=1172121 | errors=0
+  ! setup 8 个视图 schema 耗时 6.7 ms（每视图 0.8 ms，不进 op QPS）
+--- pass 2 (pipeline=1 conns="8 64" workers=8) ---
+treedb op=lookup conns=8 threads=8 pipeline=1 → 355073 ops/s over 3.00s | lat us: p50=21 p90=26 p99=39 max=4358 | errors=0
+treedb   [stats] ops        = 1097291 (writes 32064, syncs 32, avg fsync 19473 us)
+pg     pg op=lookup conns=8 pipeline=1 → 35959 ops/s over 3.00s | lat us: p50=212 p90=277 p99=461 max=2285 | errors=0
+  ! setup 8 个视图 schema 耗时 4.1 ms（每视图 0.5 ms，不进 op QPS）
+treedb op=readdir conns=8 threads=8 pipeline=1 → 269984 ops/s over 3.00s | lat us: p50=27 p90=34 p99=47 max=919 | errors=0
+treedb   [stats] ops        = 842031 (writes 32064, syncs 33, avg fsync 15312 us)
+pg     pg op=readdir conns=8 pipeline=1 → 25084 ops/s over 3.00s | lat us: p50=312 p90=391 p99=607 max=3181 | errors=0
+  ! setup 8 个视图 schema 耗时 568.6 ms（每视图 71.1 ms，不进 op QPS）
+treedb op=create conns=8 threads=8 pipeline=1 → 4534 ops/s over 3.00s | lat us: p50=992 p90=1883 p99=17578 max=36842 | errors=0
+treedb   [stats] ops        = 13672 (writes 13670, syncs 2944, avg fsync 977 us)
+pg     pg op=create conns=8 pipeline=1 → 697 ops/s over 3.01s | lat us: p50=2617 p90=23522 p99=59412 max=96037 | errors=0
+  ! setup 8 个视图 schema 耗时 4.1 ms（每视图 0.5 ms，不进 op QPS）
+treedb op=write conns=8 threads=8 pipeline=1 → 3894 ops/s over 3.00s | lat us: p50=1167 p90=2001 p99=25767 max=37336 | errors=0
+treedb   [stats] ops        = 11754 (writes 11752, syncs 2815, avg fsync 1035 us)
+pg     pg op=write conns=8 pipeline=1 → 801 ops/s over 3.02s | lat us: p50=1726 p90=22214 p99=41867 max=81311 | errors=0
+  ! setup 8 个视图 schema 耗时 6.2 ms（每视图 0.8 ms，不进 op QPS）
+treedb op=lookup conns=64 threads=64 pipeline=1 → 984190 ops/s over 3.00s | lat us: p50=61 p90=94 p99=171 max=2710 | errors=0
+treedb   [stats] ops        = 3209201 (writes 256512, syncs 28, avg fsync 34771 us)
+pg     pg op=lookup conns=64 pipeline=1 → 209603 ops/s over 3.00s | lat us: p50=306 p90=350 p99=419 max=15144 | errors=0
+  ! setup 8 个视图 schema 耗时 6.3 ms（每视图 0.8 ms，不进 op QPS）
+treedb op=readdir conns=64 threads=64 pipeline=1 → 763941 ops/s over 3.00s | lat us: p50=72 p90=139 p99=205 max=3207 | errors=0
+treedb   [stats] ops        = 2548486 (writes 256512, syncs 27, avg fsync 36276 us)
+pg     pg op=readdir conns=64 pipeline=1 → 145824 ops/s over 3.00s | lat us: p50=431 p90=527 p99=600 max=8915 | errors=0
+  ! setup 8 个视图 schema 耗时 9.8 ms（每视图 1.2 ms，不进 op QPS）
+treedb op=create conns=64 threads=64 pipeline=1 → 11822 ops/s over 3.00s | lat us: p50=2044 p90=14973 p99=27031 max=40635 | errors=0
+treedb   [stats] ops        = 36031 (writes 36029, syncs 618, avg fsync 4398 us)
+pg     pg op=create conns=64 pipeline=1 → 1710 ops/s over 3.05s | lat us: p50=33574 p90=48618 p99=74457 max=75127 | errors=0
+  ! setup 8 个视图 schema 耗时 8.9 ms（每视图 1.1 ms，不进 op QPS）
+treedb op=write conns=64 threads=64 pipeline=1 → 11071 ops/s over 3.01s | lat us: p50=1916 p90=14947 p99=26225 max=54885 | errors=0
+treedb   [stats] ops        = 33807 (writes 33805, syncs 573, avg fsync 4923 us)
+pg     pg op=write conns=64 pipeline=1 → 1706 ops/s over 3.05s | lat us: p50=33453 p90=51046 p99=110913 max=674378 | errors=0
+  ! setup 8 个视图 schema 耗时 6.3 ms（每视图 0.8 ms，不进 op QPS）
+--- 以上： treedb 默认档（dur=group、workers=8）vs PG（synchronous_commit=on），两边 ack 前都已落盘 ---

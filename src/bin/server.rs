@@ -58,6 +58,15 @@ fn print_stats(addr: &str) -> Result<(), String> {
                 if s.syncs_total > 0 { s.sync_us_total / s.syncs_total } else { 0 }
             );
             println!("checkpoints= {}", s.checkpoints);
+            // 只在副本上打印：主那边这几个数永远是 0，多打几行只会让运维
+            // 以为“0 lag”是一种健康状态。
+            if s.replica {
+                println!(
+                    "replica    = yes (primary seq {} lag {} applied {} resyncs {} errors {})",
+                    s.replica_primary_seq, s.replica_lag, s.replica_applied,
+                    s.replica_resyncs, s.replica_errors
+                );
+            }
             Ok(())
         }
         Reply::Err { code, msg } => Err(format!("server error {code}: {}", String::from_utf8_lossy(&msg))),
@@ -154,6 +163,10 @@ fn main() {
         auto_checkpoint_bytes: auto_ckpt_mb * 1024 * 1024,
         backlog,
         workers,
+        // 这个二进制永远是主：副本入口是 `treedb-standby`，它把同一个
+        // `serve` 配上 `replication` 就跑起来。两边各留一套 flag 解析的话，
+        // 副本会拿到一份没人测过的默认值。
+        replication: None,
     };
     eprintln!(
         // 帧里没有版本位（§4.1），升级顺序又是硬约束，所以 banner 一开就把它摆出来：

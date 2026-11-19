@@ -101,6 +101,23 @@ pub struct EngineStats {
     /// 线协议版本（[`crate::engine::PROTOCOL_VERSION`]）。拿它核对客户端与
     /// 服务端是不是同一代字节布局。
     pub proto_version: u16,
+    /// 本实例是只读副本（由 [`Engine::open_replica`] 置位）。运维拿它一眼分清
+    /// 主与副本 —— 两者的 `seq` 长得很像，但一个是发的、一个是追的。
+    pub replica: bool,
+    /// 主最近一次报上来的 durable 水位；不是副本自己算的。
+    pub replica_primary_seq: u64,
+    /// `replica_primary_seq - 本地 durable_seq`：副本落后多少条。运维面板上
+    /// 那个唯一需要报警的数（`replica_primary_seq` 未拿到前为 0）。
+    pub replica_lag: u64,
+    /// 追平落地的记录数。与 `writes_total` 差别在于：后者数的是客户端写 op，
+    /// 副本一个也没有，它的应用量只能单开一个口。
+    pub replica_applied: u64,
+    /// 因 gap 重装快照的次数。每次重装 = 下完一份快照 + 从头追日志，主
+    /// checkpoint 得比副本追得快才会有；一直涨就是副本跟不上了。
+    pub replica_resyncs: u64,
+    /// 拉取/应用失败的轮次（连不上主、记录不连续、解码不过……）。
+    /// 不数这个的话，一个静默断线的副本跟一个空闲副本在 `Stats` 里一模一样。
+    pub replica_errors: u64,
 }
 
 impl EngineStats {
@@ -127,6 +144,12 @@ impl EngineStats {
         w.u64(self.wal_disk_bytes);
         w.u64(self.snap_bytes);
         w.u16(self.proto_version);
+        w.bool(self.replica);
+        w.u64(self.replica_primary_seq);
+        w.u64(self.replica_lag);
+        w.u64(self.replica_applied);
+        w.u64(self.replica_resyncs);
+        w.u64(self.replica_errors);
     }
     pub fn decode(r: &mut Rd) -> Result<Self> {
         Ok(EngineStats {
@@ -150,6 +173,12 @@ impl EngineStats {
             wal_disk_bytes: r.u64()?,
             snap_bytes: r.u64()?,
             proto_version: r.u16()?,
+            replica: r.bool()?,
+            replica_primary_seq: r.u64()?,
+            replica_lag: r.u64()?,
+            replica_applied: r.u64()?,
+            replica_resyncs: r.u64()?,
+            replica_errors: r.u64()?,
         })
     }
 }
@@ -192,6 +221,10 @@ pub struct Engine {
     /// 别的线程（前端 worker）已经执行掉、还没折进 `stats.ops_total` 的只读
     /// op 数。写路径永远只在提交线程上，所以整个引擎只有这一个数需要原子。
     external_ops: Arc<AtomicU64>,
+    /// 只读副本模式：真写一律 `EROFS` 挡在 [`Engine::exec`]（§6.6）。
+    replica: bool,
+    /// 主最近一次 `WalBatch` 报上来的 durable 水位，只为算 `replica_lag`。
+    replica_primary: u64,
 }
 
 impl Engine {
@@ -242,6 +275,8 @@ impl Engine {
             snap_seq,
             stats: EngineStats::default(),
             external_ops: Arc::new(AtomicU64::new(0)),
+            replica: false,
+            replica_primary: 0,
             recovery: Recovery {
                 snap_seq,
                 wal_records: replayed.len() as u64,
@@ -258,6 +293,29 @@ impl Engine {
 
     pub fn dir(&self) -> &Path {
         &self.dir
+    }
+
+    /// 以**只读副本**身份打开一个数据目录（§6.6）。
+    ///
+    /// 与 [`Engine::open`] 只差一件事：真写在 `exec` 那里被 `EROFS` 拒掉。剩下
+    /// 的全部一样：自己的 WAL、自己的快照、自己的 checkpoint。
+    ///
+    /// 为什么副本要自带 WAL 而不是「内存状态 + 拉到什么算什么」：
+    ///
+    /// - 崩溃后能自己从本地日志重放还原，不必从主那里再拉一轮；
+    /// - 记录存的是 payload 原字节，两份日志因此可以按字节比对，
+    ///   「副本重放的是同一条记录」这句话才有得验；
+    /// - checkpoint 能把 WAL 长度控住，不然只靠日志的副本运行一天就
+    ///   拖着一个与主同大的日志文件。
+    pub fn open_replica(dir: &Path, durability: Durability) -> Result<Engine> {
+        let mut eng = Self::open(dir, durability)?;
+        eng.replica = true;
+        eng.stats.replica = true;
+        Ok(eng)
+    }
+
+    pub fn is_replica(&self) -> bool {
+        self.replica
     }
 
     /// 把「别的线程执行掉的只读 op」计数句柄交给调用方（前端 worker 线程）。
@@ -301,6 +359,15 @@ impl Engine {
         self.wal.durable_seq()
     }
 
+    /// 下一条要落进自己 WAL 的 seq。副本拿它当拉取请求的 `want_seq`，
+    /// [`Engine::replicate_records`] 拿它验交付是否接得上。
+    ///
+    /// 与 `durable_seq` 的差别在 `Never` 档才存在（已写出未 fsync），而副本永远
+    /// 走 durable 提交，所以这两个数在副本上只差一个已提交批次的尾巴。
+    pub fn apply_seq(&self) -> u64 {
+        self.wal.next_seq()
+    }
+
     /// 翻译 op 并把结果 applied 到内存状态。**不做 fsync**，也不发 ack。
     ///
     /// 返回的 `Vec<Log>` 是该 op 需要进 WAL 的记录（只读 op 为空）。
@@ -316,7 +383,27 @@ impl Engine {
                 Err(e) => (vec![], Reply::err(crate::engine::model::errno::EIO, e.to_string())),
             },
             Op::Shutdown => (vec![], Reply::Ok),
+            Op::WalFetch {
+                want_seq,
+                hint_off,
+                max_bytes,
+            } => (vec![], self.wal_fetch(*want_seq, *hint_off, *max_bytes)),
+            Op::SnapFetch { offset, len } => (vec![], self.snap_fetch(*offset, *len)),
             _ => {
+                // 只读副本的真写挡在这里而不是网络层：写 op 在多 worker 下本来
+                // 就要送到提交线程上来，拦在这一处等于只拦一处；两处各拦一份
+                // 则一定会对不齐。判据是三档里的那一档：`is_readonly` 与
+                // `is_control` 同时为假（见 [`Op::is_control`]），不然连 `Stats`
+                // 都会被拒，副本就没法被监控了。
+                if self.replica && !op.is_readonly() && !op.is_control() {
+                    return (
+                        vec![],
+                        Reply::err(
+                            crate::engine::model::errno::EROFS,
+                            "read-only replica: this instance follows a primary (§6.6)",
+                        ),
+                    );
+                }
                 // 只读：取读锁即可，写者可以插到两条读中间。写：translate+apply
                 // 整段在写锁里完成，但锁**绝不横跨 fsync** —— 那会把所有读者
                 // 卡在机械盘的一次寻道外面。
@@ -454,6 +541,230 @@ impl Engine {
         Ok(seq)
     }
 
+    // ---- 日志传送与只读副本（§6.6）----
+
+    /// `Op::WalFetch` 的应答。三段口径各自的位置不同：
+    ///
+    /// 1. 越上限是**请求方的错** → `EINVAL`。不在解码侧拦（见 `model.rs` 那条
+    ///    注释）：解码失败在事件循环里就是断连，一个合法的请求值不该敲掉一条
+    ///    连接，而副本那边重试比重新建连便宜得多。
+    /// 2. **gap 优先于交付**：`want_seq <= snap_seq` 意味着要的那条已经被 checkpoint
+    ///    截进快照，日志里根本没有。与其让 [`Wal::deliver`] 报「not in the log」
+    ///    （那听起来像真损坏），不如照实说 gap，并把游标退回 [`WAL_HINT_NONE`]
+    ///    —— 快照水位之前的偏移在新日志里没有意义，留着只会误导下一轮。
+    /// 3. 剩下的错才是真损坏 → `EIO`。交付永远不越过 `durable_seq`（那三条口径
+    ///    在 [`Wal::deliver`] 里），副本因此不会领先于主的已确认集。
+    fn wal_fetch(&self, want_seq: u64, hint_off: u64, max_bytes: u32) -> Reply {
+        use crate::engine::model::{errno, WAL_FETCH_MAX, WAL_HINT_NONE};
+        if want_seq == 0 {
+            return Reply::err(
+                errno::EINVAL,
+                "wal fetch: seq numbers start at 1, there is no record 0",
+            );
+        }
+        if max_bytes > WAL_FETCH_MAX {
+            return Reply::err(
+                errno::EINVAL,
+                format!("wal fetch of {max_bytes} bytes over {WAL_FETCH_MAX}"),
+            );
+        }
+        let durable = self.wal.durable_seq();
+        if want_seq <= self.snap_seq {
+            return Reply::WalBatch {
+                records: Vec::new(),
+                base_seq: want_seq,
+                next_off: WAL_HINT_NONE,
+                durable_seq: durable,
+                snap_seq: self.snap_seq,
+                gap: true,
+            };
+        }
+        match self.wal.deliver(want_seq, hint_off, max_bytes) {
+            Ok(d) => Reply::WalBatch {
+                records: d.records,
+                base_seq: d.base_seq,
+                next_off: d.next_off,
+                durable_seq: durable,
+                snap_seq: self.snap_seq,
+                gap: false,
+            },
+            Err(e) => Reply::err(errno::EIO, e.to_string()),
+        }
+    }
+
+    fn snap_fetch(&self, offset: u64, len: u32) -> Reply {
+        use crate::engine::model::{errno, SNAP_CHUNK_MAX};
+        if len > SNAP_CHUNK_MAX {
+            return Reply::err(
+                errno::EINVAL,
+                format!("snapshot chunk of {len} bytes over {SNAP_CHUNK_MAX}"),
+            );
+        }
+        match self.snap_chunk(offset, len) {
+            Ok((bytes, total)) => Reply::SnapChunk {
+                bytes,
+                total,
+                snap_seq: self.snap_seq,
+            },
+            Err(e) => Reply::err(errno::EIO, e.to_string()),
+        }
+    }
+
+    /// 从 `state.snap` 的 `offset` 读至多 `len` 字节，返回 (字节, 整份长度)。
+    ///
+    /// 越过文件尾是短读不是错：副本按 `total` 判下完没有。跨代的拼接由
+    /// `snap_seq` 兑：checkpoint 换过快照文件，本函数给出的就是新代的水位，
+    /// 副本看到它变了会整份重下 —— 手里那几块来自旧 inode 也一起丢掉，
+    /// 代价是白下一块，好处是不会拼出一份两个时代都不属于的快照。
+    ///
+    /// 用 `seek` + `read` 循环而不是 `read_exact`：后两者之间文件可能被换掉，
+    /// 短读要照实交出去，不该把一次正常的重下载报成 `EIO`。
+    fn snap_chunk(&self, offset: u64, len: u32) -> Result<(Vec<u8>, u64)> {
+        use std::io::{Read, Seek, SeekFrom};
+        let path = self.dir.join(SNAP_FILE);
+        let mut f = match File::open(&path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((Vec::new(), 0)),
+            Err(e) => return Err(Error::Io(format!("open {}: {e}", path.display()))),
+        };
+        let total = f.metadata()?.len();
+        if offset >= total || len == 0 {
+            return Ok((Vec::new(), total));
+        }
+        let want = (len as u64).min(total - offset) as usize;
+        f.seek(SeekFrom::Start(offset))?;
+        let mut buf = vec![0u8; want];
+        let mut got = 0usize;
+        while got < want {
+            match f.read(&mut buf[got..]) {
+                Ok(0) => break,
+                Ok(n) => got += n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(Error::Io(format!("read {}: {e}", path.display()))),
+            }
+        }
+        buf.truncate(got);
+        Ok((buf, total))
+    }
+
+    /// 副本装快照：整份替换内存状态，把快照字节原样落进自己的数据目录，
+    /// 再把 WAL 截到快照水位。
+    ///
+    /// 落盘顺序与 [`Engine::checkpoint`] 一致：tmp → fsync → rename → fsync(dir) →
+    /// `wal.reset`。任一步崩溃都只可能留下「旧快照 + 更长的 WAL」，重启后重放
+    /// 仍能把状态还原到一个自洽点。快照字节不重编而是直接存主的原件：两份
+    /// `state.snap` 因此可以按字节比对，也让副本重启后不必重新下载。
+    ///
+    /// 拒绝水位回退：`seq < 本地 snap_seq` 等于把已有的更新状态换成旧的。主的
+    /// 快照水位只前进不回退，看到回退只能是把两代拼错了，宁可报错。
+    pub fn install_snapshot(&mut self, bytes: &[u8]) -> Result<u64> {
+        if bytes.len() < 8 {
+            return Err(Error::Codec(
+                "snapshot shorter than its 8-byte seq trailer".into(),
+            ));
+        }
+        let seq = u64::from_le_bytes(bytes[bytes.len() - 8..].try_into().unwrap());
+        if seq < self.snap_seq {
+            return Err(Error::Io(format!(
+                "snapshot generation {seq} is behind the local watermark {}; refusing to rewind",
+                self.snap_seq
+            )));
+        }
+        let mut r = Rd::new(bytes);
+        let fresh = State::load(&mut r)?;
+        *write_of(&self.state) = fresh;
+        let tmp = self.dir.join(format!("{SNAP_FILE}.tmp"));
+        {
+            let mut f = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&tmp)?;
+            f.write_all(bytes)?;
+            f.sync_all()?;
+        }
+        std::fs::rename(&tmp, self.dir.join(SNAP_FILE))?;
+        if let Ok(d) = File::open(&self.dir) {
+            let _ = d.sync_all();
+        }
+        self.wal.reset(seq)?;
+        self.snap_seq = seq;
+        self.stats.snap_seq = seq;
+        self.stats.seq = seq;
+        Ok(seq)
+    }
+
+    /// 副本追平：把主交来的记录**原字节**落进自己的 WAL，再逐条 apply。
+    ///
+    /// 先 WAL 后 apply：崩溃重启由自己的日志重放还原，不必再向主拉一轮；反过来
+    /// （先 apply）会留下「内存比日志新」的状态，重启就退回到 apply 之前。
+    ///
+    /// `base_seq` 必须正好接在自己的水位后面：跳号 = 交付缺一块，静默补上等于
+    /// 把一份永远对不齐的状态留着当真相用。直接报错，让调用方去走 gap 那条
+    /// 重装快照的路。
+    ///
+    /// 每条都验「解码 → 再编码 == 原字节」。需要这一道的原因很具体：线帧里每条
+    /// 记录没有自己的 CRC，而本函数之后记录会以**新算的 CRC** 落进副本自己的
+    /// WAL —— 在线上悄悄坏掉的字节过了这一关就永久合法了。这一条同时验两件
+    /// 事：内容没坏，两代编码格式没分叉。
+    ///
+    /// 不看 `durability`：副本的 WAL 就是它的崩溃依恃，每批一次 fsync 不可省。
+    pub fn replicate_records(&mut self, base_seq: u64, payloads: &[Vec<u8>]) -> Result<u64> {
+        if payloads.is_empty() {
+            return Ok(self.wal.durable_seq());
+        }
+        let want = self.wal.next_seq();
+        if base_seq != want {
+            return Err(Error::Gap(format!(
+                "replica is at seq {want}, the batch starts at {base_seq} \
+                 (records in between are gone locally: reinstall the snapshot)"
+            )));
+        }
+        let mut logs = Vec::with_capacity(payloads.len());
+        for (i, p) in payloads.iter().enumerate() {
+            let mut r = Rd::new(p);
+            let log = Log::decode(&mut r)?;
+            let mut w = W::new();
+            log.encode(&mut w);
+            let back = w.finish();
+            if back != *p {
+                return Err(Error::Codec(format!(
+                    "replicated record at seq {} does not survive a decode/encode round trip \
+                     (bytes corrupted in flight, or the two ends disagree on the log format)",
+                    base_seq + i as u64
+                )));
+            }
+            logs.push(log);
+        }
+        let last = self.wal.commit(payloads)?;
+        {
+            let mut s = write_of(&self.state);
+            for l in &logs {
+                s.apply(l);
+            }
+        }
+        self.stats.seq = last;
+        self.stats.replica_applied += payloads.len() as u64;
+        Ok(last)
+    }
+
+    /// 副本每轮拉取后记下主的水位。取 max：主自己的 durable_seq 不会倒退，
+    /// 看到倒退只能是有两轮应答乱序到了这里。
+    pub fn note_replica_progress(&mut self, primary_durable_seq: u64) {
+        self.replica_primary = self.replica_primary.max(primary_durable_seq);
+    }
+
+    /// 拉取/应用失败一轮。不数这个的话，一个静默断线的副本跟一个空闲副本
+    /// 在 `Stats` 里一模一样（lag 也是 0，因为拿不到主的水位）。
+    pub fn note_replica_error(&mut self) {
+        self.stats.replica_errors += 1;
+    }
+
+    /// 因 gap 重装了一次快照。
+    pub fn note_replica_resync(&mut self) {
+        self.stats.replica_resyncs += 1;
+    }
+
     /// 给 `Op::Stats` 用的即时快照。
     pub fn snapshot_stats(&mut self) -> EngineStats {
         // 先把前端线程的量折进来。`swap(0)` 而不是 `load + fetch_sub`：后者在
@@ -496,6 +807,14 @@ impl Engine {
             .map(|m| m.len())
             .unwrap_or(0);
         self.stats.proto_version = crate::engine::PROTOCOL_VERSION;
+        // 副本那几个数：lag 现算而不是让调用方自己减，减错一次就是一个永久
+        // 不对的数。主那边这六个字段全是默认值（`replica_primary` 永远是 0，
+        // 因为没人为它调 `note_replica_progress`），所以 lag 自然也是 0。
+        self.stats.replica = self.replica;
+        self.stats.replica_primary_seq = self.replica_primary;
+        self.stats.replica_lag = self
+            .replica_primary
+            .saturating_sub(self.wal.durable_seq());
         self.stats.clone()
     }
 

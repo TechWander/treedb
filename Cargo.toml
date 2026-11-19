@@ -1,6 +1,6 @@
 [package]
 name = "treedb"
-version = "0.3.4"
+version = "0.3.5"
 edition = "2021"
 description = "元数据引擎：单进程事件循环 + 自定义二进制协议 + WAL/checkpoint（POSIX 元数据语义，客户端无关）"
 license = "Apache-2.0"
@@ -18,6 +18,12 @@ required-features = ["postgres-compat"]
 [[bin]]
 name = "treedb-server"
 path = "src/bin/server.rs"
+
+# 只读副本：pull 式日志传送（§6.6）。它不是一个独立的服务端实现，而是
+# `serve` 加了一份 `replication` 配置 —— 所以协议、帧、apply 路径两边共用。
+[[bin]]
+name = "treedb-standby"
+path = "src/bin/standby.rs"
 
 # 快照升级：把上一代布局的数据目录搬到当前布局（只动 state.snap，不动 WAL）。
 # 有旧数据目录的人唯一的出路，所以它必须是装完就有的命令，不是要另编的脚本。
