@@ -19,7 +19,7 @@
 
 use crate::engine::apply::translate;
 use crate::engine::codec::{Rd, W};
-use crate::engine::mem::{Log, State};
+use crate::engine::mem::{Log, State, SNAP_LEGACY_VERSION, SNAP_VERSION};
 use crate::engine::model::{Op, Reply};
 use crate::engine::wal::{log_payload, Wal};
 use crate::error::{Error, Result};
@@ -63,6 +63,8 @@ pub enum Durability {
 pub const SNAP_FILE: &str = "state.snap";
 /// WAL 文件名。
 pub const WAL_FILE: &str = "treedb.wal";
+/// 上一代快照的备份文件名（迁移工具写，见 [`migrate_snapshot`]）。
+pub const SNAP_BACKUP: &str = "state.snap.v2.bak";
 
 /// 引擎自报状态，`Op::Stats` 的载荷，也是 `treedb-server` 健康检查的来源。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -502,4 +504,289 @@ impl Engine {
     pub fn next_seq(&self) -> u64 {
         self.stats.seq
     }
+}
+
+// ---- 快照升级（§6.5）------------------------------------------------------------
+//
+// 这一段的存立理由：`SNAP_VERSION` 从 2 升到 3 把已有数据目录挡在门外，而
+// 引擎不会替旧文件猜布局。它**只在离线工具里被调用**（`treedb-migrate`），
+// 常规启动路径一个字节也不走这里 —— `Engine::open` 永远用 [`State::load`]，
+// 那个入口不开兼容口子。
+
+/// 快照文件的体检结果。`treedb-migrate` 不带 `--apply` 时打的就是它，也是它动手前
+/// 的唯一判断依据：只有 `version == SNAP_LEGACY_VERSION` 才允许改写。
+#[derive(Debug, Clone, Default)]
+pub struct SnapshotInfo {
+    /// 快照文件路径（不存在也填，供上层报账）。
+    pub path: PathBuf,
+    /// 目录里有没有快照文件。没有 = 新目录，本来没什么可迁移。
+    pub present: bool,
+    /// 文件自报的版本位。
+    pub version: u32,
+    /// 本二进制会写的版本。两个数不等就是「这个目录开不了门」。
+    pub written_by_this_build: u32,
+    /// 正文能否被当前代码解释。解不开时 `note` 给出原因，计数字段全 0
+    /// 且不应当被引用。
+    pub decodable: bool,
+    pub note: Option<String>,
+    /// 快照尾 8 字节：这份快照覆盖到哪个 seq。
+    pub snap_seq: u64,
+    pub bytes: u64,
+    /// WAL 文件的磁盘长度（st_size）。迁移不碰 WAL，所以这个数在迁移前后必须
+    /// 一致；它是「日志一个字节没动」那句承诺的可验证据。
+    pub wal_disk_bytes: u64,
+    pub views: u64,
+    pub nodes: u64,
+    pub dentries: u64,
+    pub locks: u64,
+    pub refs: u64,
+    pub keys: u64,
+    pub audit: u64,
+    pub defs: u64,
+    pub placement: u64,
+    pub tables: u64,
+    pub rows: u64,
+}
+
+impl SnapshotInfo {
+    /// 已经是本二进制认识的当前布局，不需要也不应该动手。
+    pub fn is_current(&self) -> bool {
+        self.present && self.version == SNAP_VERSION
+    }
+
+    /// 处于「能升、该升」的那一档。
+    pub fn needs_migration(&self) -> bool {
+        self.present && self.version == SNAP_LEGACY_VERSION && self.decodable
+    }
+}
+
+fn file_len(path: &Path) -> u64 {
+    std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
+}
+
+/// 读快照头并尽量把计数填上。**不写任何东西**，也不打开 WAL。
+///
+/// 认不认识的版本都返回 `Ok`：只读排查的价值就是「不动手也知道目录里是什么」，
+/// 而版本不认识的目录本来就没有可迁移的语义，把它做成 panic 级的错误只会让
+/// 运维在只读排查时也多一个出口。真正的「要不要改」由调用方看 `note` 决定。
+pub fn probe_snapshot(dir: &Path) -> Result<SnapshotInfo> {
+    let snap = dir.join(SNAP_FILE);
+    let mut info = SnapshotInfo {
+        path: snap.clone(),
+        written_by_this_build: SNAP_VERSION,
+        wal_disk_bytes: file_len(&dir.join(WAL_FILE)),
+        ..Default::default()
+    };
+    if !snap.exists() {
+        info.note = Some("no snapshot file: a fresh data dir starts on the current layout".into());
+        return Ok(info);
+    }
+    info.present = true;
+    info.bytes = file_len(&snap);
+    let raw = std::fs::read(&snap).map_err(|e| Error::Io(format!("read {}: {e}", snap.display())))?;
+    info.version = State::snapshot_version(&raw)?;
+    if info.version != SNAP_VERSION && info.version != SNAP_LEGACY_VERSION {
+        info.note = Some(format!(
+            "snapshot reports version {}, which this build neither writes nor migrates",
+            info.version
+        ));
+        return Ok(info);
+    }
+    // 走迁移专用的严格解码：整个文件必须正好被布局吃完（尾巴只剩 8 字节 seq）。
+    // 用它而不是 [`State::load`] 是为了让只读体检在 v2 目录上也能报出计数。
+    match State::load_for_migration(&mut Rd::new(&raw)) {
+        Ok(s) => {
+            info.decodable = true;
+            info.snap_seq = u64::from_le_bytes(raw[raw.len() - 8..].try_into().unwrap());
+            info.views = s.views.len() as u64;
+            info.nodes = s.nodes.len() as u64;
+            info.dentries = s.dentry_count() as u64;
+            info.locks = s.locks.len() as u64;
+            info.refs = s.refs.len() as u64;
+            info.keys = s.keys.len() as u64;
+            info.audit = s.audit.len() as u64;
+            info.defs = s.defs.len() as u64;
+            info.placement = s.placement.len() as u64;
+            info.tables = s.tables.len() as u64;
+            info.rows = s.row_count() as u64;
+        }
+        Err(e) => {
+            info.note = Some(format!("snapshot body cannot be decoded: {e}"));
+        }
+    }
+    Ok(info)
+}
+
+/// [`migrate_snapshot`] 的结果。三态而不是一个 bool：脚本要能区分
+/// 「无事可做」与「真的改了东西」，两者的退出码一样但日志完全不一样。
+#[derive(Debug, Clone)]
+pub enum MigrationOutcome {
+    /// 目录里还没有快照：新目录，本来就没东西可升。
+    NoSnapshot(PathBuf),
+    /// 已经是当前布局（包括迁移后再跑一次的幂等情形）。
+    AlreadyCurrent(SnapshotInfo),
+    Migrated {
+        before: SnapshotInfo,
+        after: SnapshotInfo,
+        /// 原 v2 快照的逐字节副本。WAL 没被碰过，所以「备份文件 + 现有 WAL」
+        /// 仍是旧二进制可完整还原的一组件 —— 这就是回滚路径。
+        backup: PathBuf,
+        /// 搬运前后必须相等的那个 seq 水位。
+        seq: u64,
+        elapsed_ms: u64,
+    },
+}
+
+/// 把旧布局的快照就地重写成当前布局：读旧 → 内存状态 → 按新布局写回。
+///
+/// **WAL 一个字节不动**。这不只是为了少做一步：不碰日志才保住「已 ack 的写
+/// 不会因迁移而丢」与「回滚只要把备份文件挪回去」两条，而那些只要把
+/// 快照重放后做一次 checkpoint 就得付代价（`wal.reset` 会把旧一代记录物理抹掉）。
+///
+/// 同一个理由也定了回滚窗口的长度：只要新二进制还没做过第一次 checkpoint，
+/// 把备份拷回去跑旧二进制就是无损的（那些写还在 WAL 里）；checkpoint 之后就只剩
+/// 有损一条路。`benches/rehearse_migrate.sh` 拿两个真二进制把这两个窗口都量过。
+///
+/// 写回用的是 [`Engine::checkpoint`] 那同一条顺序：先落盘 `.tmp` 并 fsync，再
+/// rename，再 fsync 目录。任一步崩溃只会留下「旧快照 + 完整 WAL」，下次启动
+/// 仍然是旧行为。动手前还有一道自检：把即将写出的字节先解一遍并与手上的状态
+/// 逐字段比，不等就直接失败 —— 此刻原文件一个字节都没改过。
+///
+/// `force` 只影响一件事：已存在备份文件时要不要覆盖。默认不覆盖，因为那份
+/// 备份可能是上一轮唯一可回滚的原件。
+///
+/// **前提：服务端已停**。本函数不 flock（服务端也没持文件锁，锁不住任何东西），
+/// 只在写回前再读一次原文件与手上的字节比对：并发写者会在这里露馅。那是
+/// best-effort 的哨兵，不是互斥，不要把「没报错」当成「与并发安全」。
+pub fn migrate_snapshot(dir: &Path, force: bool) -> Result<MigrationOutcome> {
+    let t0 = std::time::Instant::now();
+    let before = probe_snapshot(dir)?;
+    if !before.present {
+        return Ok(MigrationOutcome::NoSnapshot(before.path.clone()));
+    }
+    if !before.decodable {
+        return Err(Error::Config(format!(
+            "refusing to touch {}: {}",
+            before.path.display(),
+            before.note.unwrap_or_else(|| "undecodable".into())
+        )));
+    }
+    if before.version == SNAP_VERSION {
+        return Ok(MigrationOutcome::AlreadyCurrent(before));
+    }
+    if before.version != SNAP_LEGACY_VERSION {
+        return Err(Error::Config(format!(
+            "no migration path from snapshot version {} to {SNAP_VERSION}: this tool knows \
+             exactly one previous generation ({SNAP_LEGACY_VERSION})",
+            before.version
+        )));
+    }
+
+    let raw = std::fs::read(&before.path).map_err(|e| Error::Io(format!("read {}: {e}", before.path.display())))?;
+    if raw.len() < 12 {
+        return Err(Error::Codec(format!(
+            "snapshot {} is {} bytes, too short to hold a body plus the seq trailer",
+            before.path.display(),
+            raw.len()
+        )));
+    }
+    let state = State::load_for_migration(&mut Rd::new(&raw))?;
+    // 尾巴照搬：这个数是「快照覆盖到哪个 seq」，重算一次就是自己发明一个水位，
+    // 下次启动按它跳记录就会丢写。
+    let trailer: [u8; 8] = raw[raw.len() - 8..].try_into().unwrap();
+    let seq = u64::from_le_bytes(trailer);
+
+    // 动手前的自检：编 → 解 → 逐字段比。这里用的解法是严格入口（不是迁移入口），
+    // 等于把「新二进制明天能不能开门」先问一遍。
+    let mut w = W::new();
+    state.save(&mut w);
+    let mut out = w.finish();
+    out.extend_from_slice(&trailer);
+    let check = State::load(&mut Rd::new(&out))
+        .map_err(|e| Error::Codec(format!("the rewritten snapshot does not reload: {e}")))?;
+    if check != state {
+        return Err(Error::Codec(
+            "rewritten snapshot decodes to a different state than the source: refusing to write".into(),
+        ));
+    }
+
+    // 哨兵：源文件在我们手上变过，说明有写者。此刻还没写任何东西，直接退出
+    // 就是零代价。
+    let again = std::fs::read(&before.path).map_err(|e| Error::Io(format!("re-read {}: {e}", before.path.display())))?;
+    if again != raw {
+        return Err(Error::Config(format!(
+            "{} changed while the migration was reading it: a server is still writing this \
+             directory, stop it first",
+            SNAP_FILE
+        )));
+    }
+
+    // 备份先落盘。没有备份就改写是单程票：万一这份旧文件是最后一份原件，
+    // 覆盖掉它就把回滚路径一起抹了。
+    let backup = dir.join(SNAP_BACKUP);
+    if backup.exists() && !force {
+        return Err(Error::Config(format!(
+            "backup {} already exists; re-run with --force to replace it",
+            backup.display()
+        )));
+    }
+    {
+        let mut f = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&backup)
+            .map_err(|e| Error::Io(format!("open backup {}: {e}", backup.display())))?;
+        f.write_all(&raw)?;
+        f.sync_all()?;
+    }
+
+    let tmp = dir.join(format!("{SNAP_FILE}.tmp"));
+    {
+        let mut f = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp)
+            .map_err(|e| Error::Io(format!("open {}: {e}", tmp.display())))?;
+        f.write_all(&out)?;
+        f.sync_all()?;
+    }
+    // 再确认一次（上面那次比对到这里已经过了几次磁盘操作），失败就清掉 `.tmp`：
+    // 留下一个没人认的临时文件只会让下一个运维不确定它能不能删。
+    let again = std::fs::read(&before.path).map_err(|e| Error::Io(format!("re-read {}: {e}", before.path.display())))?;
+    if again != raw {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(Error::Config(format!(
+            "{} changed between the backup and the swap: refusing to rename over a live writer",
+            SNAP_FILE
+        )));
+    }
+    std::fs::rename(&tmp, &before.path)?;
+    if let Ok(d) = File::open(dir) {
+        let _ = d.sync_all();
+    }
+
+    // 写后读回：不只看字节相等，还按严格入口再解一遍并确认版本位已经对上。
+    // 这一步跑完才敢说「新二进制现在能开这个目录」。
+    let written = std::fs::read(&before.path).map_err(|e| Error::Io(format!("re-read {}: {e}", before.path.display())))?;
+    if written != out {
+        return Err(Error::Codec(
+            "the snapshot on disk is not the bytes the migration wrote".into(),
+        ));
+    }
+    let after = probe_snapshot(dir)?;
+    if !after.is_current() || after.snap_seq != seq {
+        return Err(Error::Codec(format!(
+            "post-migration probe disagrees: version {}, seq {} (expected {SNAP_VERSION}, {seq})",
+            after.version, after.snap_seq
+        )));
+    }
+    Ok(MigrationOutcome::Migrated {
+        before,
+        after,
+        backup,
+        seq,
+        elapsed_ms: t0.elapsed().as_millis() as u64,
+    })
 }

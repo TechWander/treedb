@@ -1,0 +1,52 @@
+# benches/rehearse_migrate.sh 的原始输出，逐格判据见脚本头部注释与 DESIGN.md §6.5。
+# 13:22 那一格的 "FAIL 快照水位照搬" 是**脚本自己的 bug**（拿 `--stats` 在优雅停服
+# 之前读到的内存 seq 当期望值，而最后一次 checkpoint 还没落盘），不是迁移工具失败：
+# 脚本随后改成直接读快照文件尾那 8 字节，13:24 与 13:28 两格全绿。
+---- 彩排 v0.3.2 → 当前树（2026-11-19T13:22:59+00:00）----
+旧二进制：views=64 nodes=18840 dentries=18776 seq=111120 snap=2441555 B（版本位 2）
+ok   不带 --apply 的退出码 = 10
+ok   体检不写任何文件 = 0ef5899acf3b1825
+ok   --apply 退出码 = 0
+ok   WAL 逐字节没动 = bb9f8df61474d25e
+ok   备份 = 原件 = 0ef5899acf3b1825
+ok   快照尺寸增量 = 12 B（尾部三段计数） = 2441567
+apply 输出：wal         = 4194304 B on disk (untouched by migration) migrated    = 2 -> 3 (2441555 B -> 2441567 B, seq 123264 preserved, 144 ms) backup      = /data/grovefs/treedb/.matrix/mig/data/state.snap.v2.bak wal         = untouched: 4194304 B -> 4194304 B 
+ok   迁移后 views = 64
+ok   迁移后 nodes = 18840
+ok   迁移后 dentries = 18776
+FAIL 快照水位照搬: 期望 111120, 实得 123264
+ok   WAL 完好时回滚无损（旧二进制读到迁移后的全部写） = 39760
+ok   checkpoint 之后回滚确实丢写：64056 → 39760（回滚窗口 = 第一次 checkpoint 之前）
+---- 结论：有格失败：快照水位照搬 ----
+---- 彩排 v0.3.2 → 当前树（2026-11-19T13:24:04+00:00）----
+旧二进制：views=64 nodes=18840 dentries=18776 snap_seq=121992 snap=2445012 B（版本位 2）
+ok   不带 --apply 的退出码 = 10
+ok   体检不写任何文件 = 7b55faebb70df6e1
+ok   --apply 退出码 = 0
+ok   WAL 逐字节没动 = bb9f8df61474d25e
+ok   备份 = 原件 = 7b55faebb70df6e1
+ok   快照尺寸增量 = 12 B（尾部三段计数） = 2445024
+apply 输出：wal         = 4194304 B on disk (untouched by migration) migrated    = 2 -> 3 (2445012 B -> 2445024 B, seq 121992 preserved, 89 ms) backup      = /data/grovefs/treedb/.matrix/mig/data/state.snap.v2.bak wal         = untouched: 4194304 B -> 4194304 B 
+ok   迁移后 views = 64
+ok   迁移后 nodes = 18840
+ok   迁移后 dentries = 18776
+ok   快照水位照搬（尾巴 8 字节逐字节相等） = 121992
+ok   WAL 完好时回滚无损（旧二进制读到迁移后的全部写） = 40400
+ok   checkpoint 之后回滚确实丢写：61408 → 40400（回滚窗口 = 第一次 checkpoint 之前）
+---- 结论：四条承诺全部对上真机数据 ----
+---- 彩排 v0.3.2 → 当前树（2026-11-19T13:28:11+00:00）----
+旧二进制：views=64 nodes=17128 dentries=17064 snap_seq=123432 snap=2225761 B（版本位 2）
+ok   不带 --apply 的退出码 = 10
+ok   体检不写任何文件 = 80f4e5347efb66d5
+ok   --apply 退出码 = 0
+ok   WAL 逐字节没动 = bb9f8df61474d25e
+ok   备份 = 原件 = 80f4e5347efb66d5
+ok   快照尺寸增量 = 12 B（尾部三段计数） = 2225773
+apply 输出：wal         = 4194304 B on disk (untouched by migration) migrated    = 2 -> 3 (2225761 B -> 2225773 B, seq 123432 preserved, 146 ms) backup      = /data/grovefs/treedb/.matrix/mig/data/state.snap.v2.bak wal         = untouched: 4194304 B -> 4194304 B 
+ok   迁移后 views = 64
+ok   迁移后 nodes = 17128
+ok   迁移后 dentries = 17064
+ok   快照水位照搬（尾巴 8 字节逐字节相等） = 123432
+ok   WAL 完好时回滚无损（旧二进制读到迁移后的全部写） = 41512
+ok   checkpoint 之后回滚确实丢写：64888 → 41512（回滚窗口 = 第一次 checkpoint 之前）
+---- 结论：四条承诺全部对上真机数据 ----

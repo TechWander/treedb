@@ -22,8 +22,11 @@ pub mod model;
 pub mod wal;
 
 pub use codec::{Rd, W};
-pub use core::{Durability, Engine, EngineStats, now_ms};
-pub use mem::{Log, State};
+pub use core::{
+    migrate_snapshot, now_ms, probe_snapshot, Durability, Engine, EngineStats, MigrationOutcome,
+    SnapshotInfo,
+};
+pub use mem::{Log, State, SNAP_LEGACY_VERSION, SNAP_VERSION};
 pub use model::{Names, Op, Reply};
 pub use wal::Wal;
 

@@ -11,6 +11,9 @@
 /.diag
 /.spot
 
+# 双档全量回归的原始输出（文档里的 passed 计数只从这里取）
+/.migtest
+
 # 服务端 CPU 探针（benches/probe_srv.sh）的临时数据目录
 /.probe
 

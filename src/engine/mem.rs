@@ -35,7 +35,17 @@ use std::ops::Bound;
 ///
 /// v2 → v3：尾部多出通用表三段（`tables` / `next_table_id` / `rows`）。同样是
 /// “不升版本就会把零字节当长度读”那一类，旧快照必须被拒而不是被解错。
+///
+/// 两代升级的**可迁移性不一样**，这决定了工具能做多少事：v1 → v2 改的是既有
+/// 字段的宽度，没有「读旧写新」的稳妥路子；v2 → v3 只在尾部加了三段，前面逐
+/// 字段一致，所以旧文件可以被当前代码完整解出再按新布局写出 ——
+/// [`State::load_for_migration`] 与 `treedb-migrate`（§6.5）就建立在这个
+/// 事实上，`legacy_snapshot_decodes_from_the_same_prefix` 钉住它。
 pub const SNAP_VERSION: u32 = 3;
+
+/// 上一个会被迁移工具接受的快照版本。**只此一个**：认识两代之前的布局等于把
+/// 「格式变更要 +1 并给出门」这条规矩变成「格式变更可以攒着」。
+pub const SNAP_LEGACY_VERSION: u32 = 2;
 
 /// 已提交（WAL 已 durable）的一条状态变更。重放 = 从头到尾 `apply`，
 /// 因此每条都必须是幂等的整行写入，不记 delta。
@@ -793,7 +803,29 @@ impl State {
     // ---- 快照 ----
 
     pub fn save(&self, w: &mut W) {
-        w.u32(SNAP_VERSION);
+        self.save_versioned(w, SNAP_VERSION);
+    }
+
+    /// 按上一代布局写快照：版本位写 [`SNAP_LEGACY_VERSION`]，尾部三段不写。
+    ///
+    /// 它存在的唯一理由是**让测试能造出真 v2 文件**（`tests/migrate.rs` 与下面的
+    /// 往返用例）。产品路径永远走 [`State::save`]：旧文件是历史版本写出来的，
+    /// 本仓不该假装替它写。所以这里有一道硬闸 —— 有表或有行直接拒，
+    /// v2 布局装不下它们，静默丢掉等于抹掉用户的元数据。
+    pub fn save_v2(&self, w: &mut W) -> Result<()> {
+        if !self.tables.is_empty() || !self.rows.is_empty() {
+            return Err(Error::Config(format!(
+                "cannot write a version {SNAP_LEGACY_VERSION} snapshot while {} table(s) and {} row(s) exist: that layout has no place for them",
+                self.tables.len(),
+                self.row_count()
+            )));
+        }
+        self.save_versioned(w, SNAP_LEGACY_VERSION);
+        Ok(())
+    }
+
+    fn save_versioned(&self, w: &mut W, ver: u32) {
+        w.u32(ver);
         w.u32(self.views.len() as u32);
         for (name, meta) in &self.views {
             w.bytes(name);
@@ -845,32 +877,74 @@ impl State {
             w.bytes(inst);
         }
         // ---- v3：通用表 ----
-        w.u32(self.tables.len() as u32);
-        for t in self.tables.values() {
-            w.u32(t.id);
-            t.def.encode(w);
-        }
-        w.u32(self.next_table_id);
-        // 行数要先扫一遍才能写计数段：`rows` 是分层的，`len()` 是表数不是行数
-        //（与上面 `dentry_count()` 同一个坑）。
-        w.u32(self.row_count() as u32);
-        for (tid, m) in &self.rows {
-            for row in m.values() {
-                w.u32(*tid);
-                row.encode(w);
+        if ver == SNAP_VERSION {
+            w.u32(self.tables.len() as u32);
+            for t in self.tables.values() {
+                w.u32(t.id);
+                t.def.encode(w);
+            }
+            w.u32(self.next_table_id);
+            // 行数要先扫一遍才能写计数段：`rows` 是分层的，`len()` 是表数不是行数
+            //（与上面 `dentry_count()` 同一个坑）。
+            w.u32(self.row_count() as u32);
+            for (tid, m) in &self.rows {
+                for row in m.values() {
+                    w.u32(*tid);
+                    row.encode(w);
+                }
             }
         }
         // `row_index` 不写：它由 `rows` + def 在载入时重建，写进磁盘格式就等于
         // 多一份可以互相矛盾的权威（与 `Dent::kind` 同一条理由）。
     }
 
+    /// 载入快照。版本位不是 [`SNAP_VERSION`] 就拒 —— 包括上一代：常规启动路径
+    /// 永远不开兼容口子，静默收下旧文件等于用错的布局解释已有的字节。
+    /// 旧目录的出路是 `treedb-migrate`（§6.5），错误消息直接把它指出来。
     pub fn load(r: &mut Rd) -> Result<State> {
+        Self::load_gate(r, false)
+    }
+
+    /// 迁移工具专用的载入：额外接受 [`SNAP_LEGACY_VERSION`]。
+    ///
+    /// 与 [`State::load`] 的两点差别都为了「动手之前先把输入看清楚」：只多认
+    /// 一代，且 buffer 必须是**整个快照文件** —— 正文之后只能剩那 8 字节 seq
+    /// 尾巴，多一个字节都说明这文件不是它自称的那个版本，宁可不改也不猜。
+    /// 解出来的 `State` 与解 v3 文件得到的完全同形（表与行两张空表、派生结构
+    /// 为空），所以迁移只是换个布局写回去，中间不发生任何语义翻译。
+    pub fn load_for_migration(r: &mut Rd) -> Result<State> {
+        Self::load_gate(r, true)
+    }
+
+    /// 只读版本位，不碰正文。`treedb-migrate` 靠它决定要不要动手，
+    /// 也靠它把「不认识的版本」和「认识但需要迁移的版本」分开报。
+    pub fn snapshot_version(raw: &[u8]) -> Result<u32> {
+        if raw.len() < 4 {
+            return Err(Error::Codec(format!(
+                "snapshot is {} bytes, shorter than its 4-byte version header",
+                raw.len()
+            )));
+        }
+        Ok(u32::from_le_bytes(raw[..4].try_into().unwrap()))
+    }
+
+    fn load_gate(r: &mut Rd, allow_legacy: bool) -> Result<State> {
         let ver = r.u32()?;
-        if ver != SNAP_VERSION {
+        let tail = if ver == SNAP_VERSION {
+            true
+        } else if allow_legacy && ver == SNAP_LEGACY_VERSION {
+            false
+        } else if ver == SNAP_LEGACY_VERSION {
+            return Err(Error::Config(format!(
+                "snapshot version {ver} is one generation behind (this build writes \
+                 {SNAP_VERSION}): stop the server and run treedb-migrate --dir <data dir>, \
+                 which rewrites the snapshot in place and leaves the WAL alone"
+            )));
+        } else {
             return Err(Error::Config(format!(
                 "snapshot version {ver} unsupported (this build writes {SNAP_VERSION})"
             )));
-        }
+        };
         let mut s = State::new();
         let n = r.u32()?;
         for _ in 0..n {
@@ -936,37 +1010,49 @@ impl State {
             let inst = r.bytes()?;
             s.placement.insert(view, inst);
         }
-        let n = r.u32()? as usize;
-        if n > MAX_TABLE_ITEMS {
-            return Err(Error::Config(format!(
-                "snapshot lists {n} tables, over {MAX_TABLE_ITEMS}"
-            )));
-        }
-        // 计数上限只为拒敌意输入；BTreeMap 没有预留容量这回事，逐项插进去就行。
-        for _ in 0..n {
-            let id = r.u32()?;
-            let def = TableDef::decode(r)?;
-            s.table_by_id.insert(id, def.name.clone());
-            if id >= s.next_table_id {
-                s.next_table_id = id + 1;
+        if tail {
+            let n = r.u32()? as usize;
+            if n > MAX_TABLE_ITEMS {
+                return Err(Error::Config(format!(
+                    "snapshot lists {n} tables, over {MAX_TABLE_ITEMS}"
+                )));
             }
-            s.tables.insert(def.name.clone(), TableMeta { id, def });
+            // 计数上限只为拒敌意输入；BTreeMap 没有预留容量这回事，逐项插进去就行。
+            for _ in 0..n {
+                let id = r.u32()?;
+                let def = TableDef::decode(r)?;
+                s.table_by_id.insert(id, def.name.clone());
+                if id >= s.next_table_id {
+                    s.next_table_id = id + 1;
+                }
+                s.tables.insert(def.name.clone(), TableMeta { id, def });
+            }
+            // 取两个值的较大者：旧快照里 next_table_id 写得比实际 id 小也不能
+            // 让重号发生（与 `Log::PutTable` 那条 `>=` 同一个守口）。
+            s.next_table_id = s.next_table_id.max(r.u32()?);
+            let n = r.u32()? as usize;
+            if n > MAX_TABLE_ITEMS {
+                return Err(Error::Config(format!(
+                    "snapshot lists {n} rows, over {MAX_TABLE_ITEMS}"
+                )));
+            }
+            for _ in 0..n {
+                let tid = r.u32()?;
+                let row = RowRec::decode(r)?;
+                let cols = s.indexed_cols(tid);
+                s.index_row(tid, &row, &cols);
+                s.rows.entry(tid).or_default().insert(row.key.clone(), row);
+            }
         }
-        // 取两个值的较大者：旧快照里 next_table_id 写得比实际 id 小也不能
-        // 让重号发生（与 `Log::PutTable` 那条 `>=` 同一个守口）。
-        s.next_table_id = s.next_table_id.max(r.u32()?);
-        let n = r.u32()? as usize;
-        if n > MAX_TABLE_ITEMS {
-            return Err(Error::Config(format!(
-                "snapshot lists {n} rows, over {MAX_TABLE_ITEMS}"
+        // `allow_legacy` 只可能来自 [`State::load_for_migration`]，而它按整个文件解：
+        // 正文之后必须正好只剩 seq 尾巴。多出来的字节要么是更新的版本，要么
+        // 是坏文件，两种都不能当成「可以改写它」。
+        if allow_legacy && r.remaining() != 8 {
+            return Err(Error::Codec(format!(
+                "snapshot body does not match its version {ver}: {} byte(s) trail the payload, \
+                 expected only the 8-byte seq trailer",
+                r.remaining()
             )));
-        }
-        for _ in 0..n {
-            let tid = r.u32()?;
-            let row = RowRec::decode(r)?;
-            let cols = s.indexed_cols(tid);
-            s.index_row(tid, &row, &cols);
-            s.rows.entry(tid).or_default().insert(row.key.clone(), row);
         }
         Ok(s)
     }
@@ -1424,5 +1510,128 @@ mod tests {
         assert!(s.tables.is_empty() && s.table_by_id.is_empty() && s.rows.is_empty());
         assert!(s.row_index.is_empty(), "删表后残留索引项 = 永久泄漏");
         assert_eq!(s.indexed_cols(0), Vec::<u32>::new());
+    }
+
+    /// 一份只用了 v2 就能装下的状态，按两代布局各写一遍。
+    fn legacy_sample() -> State {
+        let mut s = State::new();
+        s.apply(&Log::PutView {
+            name: b"alice".to_vec(),
+            meta: ViewMeta { id: 1, root: 1, next_ino: 3 },
+        });
+        s.apply(&Log::PutNode { view: 1, node: node(1, 1, b"", Kind::Dir) });
+        s.apply(&Log::PutNode { view: 1, node: node(2, 1, b"a.txt", Kind::File) });
+        s.apply(&Log::PutDentry { view: 1, parent: 1, name: b"a.txt".to_vec(), ino: 2 });
+        s.apply(&Log::PutLock {
+            view: 1,
+            ino: 2,
+            owner: b"o".to_vec(),
+            rec: LockRec { kind: 1, lease_expiry: -7 },
+        });
+        s.apply(&Log::PutRef {
+            data_ref: b"1:4096:dev0".to_vec(),
+            rec: RefRec { count: 1, bytes: 4096 },
+        });
+        s.apply(&Log::PutKey {
+            key: KeyRec {
+                id: b"id".to_vec(),
+                label: b"l".to_vec(),
+                secret_hash: b"h".to_vec(),
+                created_at: 1,
+                last_used_at: 0,
+                revoked_at: 0,
+                view: b"alice".to_vec(),
+                ro: false,
+                owner: Vec::new(),
+                note: Vec::new(),
+                expires_at: 0,
+                created_by: Vec::new(),
+                secret_hint: Vec::new(),
+            },
+        });
+        s.apply(&Log::PutAudit {
+            row: AuditRec {
+                seq: 7,
+                ts: 1,
+                key_id: b"id".to_vec(),
+                method: Vec::new(),
+                tool: Vec::new(),
+                ok: true,
+                detail: Vec::new(),
+            },
+        });
+        s.apply(&Log::PutDef {
+            def: DefRec { name: b"n".to_vec(), kind: b"k".to_vec(), payload: b"p".to_vec(), updated_at: 1 },
+        });
+        s.apply(&Log::PutPlace { view: b"alice".to_vec(), instance: b"i1".to_vec() });
+        s
+    }
+
+    /// 「v2 与 v3 只差尾部三段」是迁移工具敢做读旧写新的全部依据。这条测试就
+    /// 是那个依据的可执行版本：前缀字节逐字节相同，旧布局能被迁移入口完整解回，
+    /// 而常规入口仍然拒收它。
+    #[test]
+    fn legacy_snapshot_decodes_from_the_same_prefix() {
+        let s = legacy_sample();
+        let mut w = W::new();
+        s.save_v2(&mut w).unwrap();
+        let mut raw = w.finish();
+        assert_eq!(State::snapshot_version(&raw).unwrap(), SNAP_LEGACY_VERSION);
+        raw.extend_from_slice(&4242u64.to_le_bytes());
+
+        let back = State::load_for_migration(&mut Rd::new(&raw)).unwrap();
+        assert_eq!(back, s, "v2 的正文必须被同一套解码吃下来");
+        assert!(
+            back.tables.is_empty() && back.rows.is_empty() && back.row_index.is_empty(),
+            "旧布局里没有表，解出来就该是两张空表而不是报错"
+        );
+
+        // 两代布局的前缀必须逐字节相同：不是「大致相同」，是同一个编码器
+        // 少跑了一个 `if`。这句话一旦不成立，迁移工具的「读旧写新」就得改写。
+        let mut w3 = W::new();
+        s.save(&mut w3);
+        let mut v3 = w3.finish();
+        let body_end = raw.len() - 8;
+        assert_eq!(
+            &v3[4..body_end],
+            &raw[4..body_end],
+            "两代布局只差版本位与尾部那几段，正文必须逐字节相同"
+        );
+        assert!(v3.len() > body_end, "v3 不写表那三段就等于没升版本");
+        // 当前布局走迁移入口也得能解（`--apply` 重跑第二次的幂等路径）。
+        v3.extend_from_slice(&4242u64.to_le_bytes());
+        assert_eq!(State::load_for_migration(&mut Rd::new(&v3)).unwrap(), s);
+
+        // 常规启动路径不开口子，但拒的时候要指出出路，不能只说「不支持」。
+        let err = State::load(&mut Rd::new(&raw)).unwrap_err().to_string();
+        assert!(err.contains("treedb-migrate"), "旧目录的出路要写在错里：{err}");
+
+        // 迁移入口按整个文件解：正文后面多一个字节就不是它自称的那个版本。
+        let mut extra = raw.clone();
+        extra.push(0);
+        assert!(State::load_for_migration(&mut Rd::new(&extra)).is_err());
+        assert!(State::load_for_migration(&mut Rd::new(&raw[..raw.len() - 8])).is_err());
+        // 版本位越老越不认：两代之前没有迁移路径。
+        let ancient = 1u32.to_le_bytes().to_vec();
+        assert_eq!(State::snapshot_version(&ancient).unwrap(), 1);
+        assert!(State::load_for_migration(&mut Rd::new(&ancient)).is_err());
+    }
+
+    /// 旧布局装不下表与行，所以下行写必须硬拒。这个闸存在的原因是：一旦
+    /// 有人拿它去做「导出成旧格式」，静默丢掉行就是掉用户的元数据。
+    #[test]
+    fn legacy_writer_refuses_to_drop_tables() {
+        let mut s = State::new();
+        s.apply(&Log::PutTable {
+            id: 3,
+            def: TableDef {
+                name: b"kv".to_vec(),
+                columns: vec![ColumnDef { name: b"a".to_vec(), flags: COL_UNIQUE }],
+            },
+        });
+        let mut w = W::new();
+        let err = s.save_v2(&mut w).unwrap_err().to_string();
+        assert!(err.contains("no place for them"), "要说清楚为什么不能写：{err}");
+        assert!(w.finish().is_empty(), "拒了就不该已经写出半截版本位");
     }
 }
