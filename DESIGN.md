@@ -1,18 +1,22 @@
 # treedb 设计文档
 
-**定位**：元数据引擎。单进程、epoll 事件循环（默认单线程；`--workers N` 开 N 条
-前端 worker 并行读，但写永远只有一个提交线程在定序）、自定义二进制线协议、自带
-WAL + 快照恢复。要解的问题形状是「万级并发视图 × 每视图多条活跃连接」，把这件事从
-PG 的 process-per-connection 成本模型里解放出来，同时不牺牲已 ack 写入的持久性。
+**定位**：元数据引擎。单进程、epoll 事件循环（前端 worker 默认按核数给
+`min(8, 核数/2)`，`--workers 1` 是单线程基线档；但写永远只有一个提交线程在定序）、
+自定义二进制线协议、自带 WAL + 快照恢复。要解的问题形状是「万级并发视图 ×
+每视图多条活跃连接」，把这件事从 PG 的 process-per-connection 成本模型里解放出来，
+同时不牺牲已 ack 写入的持久性。
 它**不绑某个客户端**：类型与语义按 POSIX 元数据定，为客户端服务的适配层留在客户端
 自己的仓里；本仓唯一与 PostgreSQL 有关的东西是默认关掉的 `postgres-compat` 脚手架，
 而这条约束有测试守着（`tests/independence.rs`，详见 §11 第 7 条）。
 
-**状态**：v0.3.0，引擎本体已落地并跑完五轴验收（§7.8 是 2026-11-19 的全轴复跑）；
-已建 git 仓推 `origin`(gitee) + `github` 两远端并打 tag `v0.3.0`。接入 spike 已在
-grovefs 实验分支 `exp/treedb-integration` 上**端到端跑通**（§10 阶段 B 末节：31 条
-e2e 断言全过，grovefs 默认档逐字节不变；treedb 在 grovefs 里是**按 tag 的 git 依赖**，
-不再依赖同级克隆）。
+**状态**：v0.3.1。引擎本体已落地并跑完五轴验收（§7.8 是 2026-11-19 的全轴复跑）；
+已建 git 仓推 `origin`(gitee) + `github` 两远端。0.3.0 之后的一批全在**读轴**上：
+量具口径对称化（§9.1 第 3 条）、默认前端 worker 按核数（§8 第 1 条）、目录项两层表
++ kind 冗余（§7.10）；**线协议、WAL 与快照的字节格式一个字节没动**（`SNAP_VERSION`
+仍是 2，本轮没升），旧数据目录直接升级。tag：`v0.3.0` 是引擎首版（e2bb51d），`v0.3.1` 是本轮
+定版。接入 spike 已在 grovefs 实验分支 `exp/treedb-integration` 上**端到端跑通**（§10
+阶段 B 末节：31 条 e2e 断言全过，grovefs 默认档逐字节不变；treedb 在 grovefs 里是
+**按 tag 的 git 依赖**，不再依赖同级克隆）。
 
 test 现在分两档报：默认档（纯引擎）`cargo test --release` = **73 passed**（28 lib +
 19 engine_crud + 9 net_protocol + 7 read_scaling + 6 crash_recovery + 3 independence +
@@ -859,7 +863,8 @@ bash benches/probe_srv.sh                       # 服务端吃了几核（/proc 
    后端并列）。落地时先写成 `path = "../treedb"`，实测扛不住：**可选的 path 依赖
    即使 feature 关掉也要解析**，旁边没有同级克隆的 checkout 任何 feature 组合都
    编不过。最终形态是按 tag 的 git 依赖
-   `treedb = { git = "https://github.com/TechWander/treedb.git", tag = "v0.3.0" }`
+   `treedb = { git = "https://github.com/TechWander/treedb.git", tag = "v0.3.1" }`
+   （tag 跟着定版前移，本轮从 `v0.3.0` 升到 `v0.3.1`，格式兼容所以升级只是改行）
    —— 故意用匿名 https，没有 SSH key 也 `cargo fetch` 得动。已拿一个**旁边没有
    treedb 的干净克隆**验证默认档与 `--features treedb` 都能编过。
 2. `remote/meta/server_ext.rs::StoreKind` 新增 `Treedb` variant，实现
@@ -932,7 +937,7 @@ spike 明确**没**做、也不在接入面上假装做的事 —— 一律返�
 | readdir 的属性 | N/64 次往返 | 协议该补 `ReadDirPlus`，见 §11 第 6 条 |
 | `view list` 的物理树 | 列不出来 | 控制面枚举器只看本地 db 文件 |
 | HA / 快照传送 | 启动即拒绝 | §8「无复制」这条限制本身 |
-| ~~path 依赖的分发方式~~ | 已定：按 tag 的 git 依赖 | 钉 `v0.3.0`，无同级克隆也能构建（实测） |
+| ~~path 依赖的分发方式~~ | 已定：按 tag 的 git 依赖 | 钉 `v0.3.1`（随定版前移），无同级克隆也能构建（实测） |
 
 ### 阶段 C（回归与灰度）
 1. ~~`test_pg.sh` 那套断言在 treedb 后端重跑~~ 已起头：新增 `.build-bin/test_treedb.sh`
