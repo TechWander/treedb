@@ -30,8 +30,10 @@
 //! - 只读 op 就地执行，于是读并行度和 syscall 并行度是同一个 N，不需要再单独
 //!   搞计算池。
 //! - group commit 不丢：committer 每轮把**所有**信箱一次排干再收口。
-//! - `workers = 1` 时根本不走这个文件，走 [`crate::net::server::serve_single`]，
-//!   代码路径与改造之前逐字一致，历史基线数字仍然可以直接对比。
+//! - `workers = 1` 时根本不走这个文件，走 [`crate::net::server::serve_single`]。但两档
+//!   **共用** `Conn`/`Slot`/帧编解码/`apply` 这层构件，所以单线程档的代码并非从未变过：
+//!   `Conn::rearm`、`Conn::push_frame`、读循环短读就 `break` 这几项两边都吃得到。拿
+//!   `workers=1` 的历史基线格子做差之前，先同格重跑一次 A/B。
 //!
 //! ## 同连接流内顺序（这个文件里最容易写错的东西）
 //!
@@ -355,7 +357,15 @@ fn worker_loop(
                                 eof = true;
                                 break;
                             }
-                            Ok(m) => c.rx.extend(&buf[..m]),
+                            // 同 serve_single：读不满整块就收工，省掉每 op 一次
+                            // 只能拿 EAGAIN 的 recvfrom（电平触发不会丢数据）。
+                            Ok(m) => {
+                                let full = m == buf.len();
+                                c.rx.extend(&buf[..m]);
+                                if !full {
+                                    break;
+                                }
+                            }
                             Err(e)
                                 if matches!(
                                     e.kind(),
@@ -451,7 +461,9 @@ fn worker_loop(
                             broken = Some(k);
                             break;
                         }
-                        c.out.push_back(Slot::Filled(reply_frame(&reply)));
+                        if !c.push_frame(&reply) {
+                            c.out.push_back(Slot::Filled(reply_frame(&reply)));
+                        }
                     }
                 }
                 if let Some(k) = broken {
@@ -471,7 +483,7 @@ fn worker_loop(
                         drop_conn(&mut conns, &mut by_id, ep, fd, cnt);
                         continue;
                     }
-                    epoll_set(ep, fd, c.want_write)?;
+                    c.rearm(ep)?;
                 }
             }
             if conns

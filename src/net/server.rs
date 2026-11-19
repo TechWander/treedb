@@ -52,7 +52,7 @@
 
 use crate::engine::codec::Rd;
 use crate::engine::mem::Log;
-use crate::engine::{reply_frame, Durability, Engine, Op, Reply, RxBuf};
+use crate::engine::{reply_frame, Durability, Engine, FRAME_HDR, Op, Reply, RxBuf};
 use crate::error::{Error, Result};
 use std::collections::{HashMap, VecDeque};
 use std::io::{ErrorKind, Read, Write};
@@ -162,6 +162,11 @@ pub(crate) struct Conn {
     pub(crate) tx_pos: usize,
     /// 还有没写完的东西 → 需要关心 EPOLLOUT。
     pub(crate) want_write: bool,
+    /// epoll 里当前真的挂着 EPOLLOUT 吗。与 `want_write` 相等时
+    /// [`Conn::rearm`] 直接返回，一个 syscall 都不付 —— 而 ping/lookup 这类
+    /// 小回包恰恰几乎永远相等（本轮就发完了），于是每 op 的 `epoll_ctl`
+    /// 从 2 次降到 0 次。
+    pub(crate) ep_out: bool,
 }
 
 impl Conn {
@@ -177,7 +182,23 @@ impl Conn {
             tx: Vec::new(),
             tx_pos: 0,
             want_write: false,
+            // accept 路径刚用 epoll_set(…, false) 注册过，掩码里没有 EPOLLOUT。
+            ep_out: false,
         }
+    }
+
+    /// 本轮活儿干完后把 epoll 掩码对齐到 `want_write`。
+    ///
+    /// 关键在于**对齐不等于下 syscall**：掩码已经对的时候（小回包一轮发完，
+    /// `want_write` 与 `ep_out` 都是 false）直接返回。实测单核 ping 每 op
+    /// 本来要付 2 次 `epoll_ctl`（ADD 撞 EEXIST + MOD），这里一次都不付。
+    pub(crate) fn rearm(&mut self, ep: i32) -> Result<()> {
+        if self.want_write == self.ep_out {
+            return Ok(());
+        }
+        epoll_mod(ep, self.fd, self.want_write)?;
+        self.ep_out = self.want_write;
+        Ok(())
     }
 
     /// 未发送字节（含已回填但未弹出的帧）——背压判据。
@@ -193,6 +214,34 @@ impl Conn {
                     Slot::Pending(_) | Slot::Await => 0,
                 })
                 .sum::<usize>()
+    }
+
+    /// 把一条应答**直接编进 `tx`**，帧长回填在最后一步。
+    ///
+    /// 老路是 `reply_frame` → `Slot::Filled(Vec<u8>)` → `pump` 再 `extend_from_slice`
+    /// 进 `tx`：一个 readdir 页（~4 KB）要在用户态被拷三遍、多付两次分配。直写
+    /// 之后只剩「编一次」。
+    ///
+    /// 返回 false 表示**不能**走这条快路：`out` 里还有已排队但未成品的槽
+    /// （写等 fsync、转发等 committer），此时新应答必须继续排到 `out` 后面，
+    /// 直接追到 `tx` 尾部会把字节插到那些尚未定序的答复之前。
+    pub(crate) fn push_frame(&mut self, reply: &Reply) -> bool {
+        if !self.out.is_empty() {
+            return false;
+        }
+        let at = self.tx.len();
+        let mut buf = std::mem::take(&mut self.tx);
+        buf.resize(at + FRAME_HDR, 0);
+        {
+            use crate::engine::codec::W;
+            let mut w = W(buf);
+            reply.encode(&mut w);
+            buf = w.0;
+        }
+        let n = (buf.len() - at - FRAME_HDR) as u32;
+        buf[at..at + FRAME_HDR].copy_from_slice(&n.to_le_bytes());
+        self.tx = buf;
+        true
     }
 
     /// 把队头连续的 `Filled` 帧搬进 `tx`。
@@ -241,6 +290,12 @@ pub(crate) fn epoll_create() -> Result<i32> {
 }
 
 /// 设置某个 fd 感兴趣的事件。首次 ADD、之后 MOD，统一先试 ADD。
+///
+/// **只给真正的「第一次注册」用**（监听 fd、accept 新连接、eventfd）：那条路径上
+/// ADD 会成功。每轮事件循环里对已连接的 fd 再走这个函数就是纯浪费 —— 实测
+/// 单核 `--workers 1` 每 op 因此多付 2 次 `epoll_ctl`（第一次 ADD 必然
+/// EEXIST，第二次才是真正要做的 MOD），占掉整个 op 系统调用预算的四成。
+/// 每 op 的重新武装请走 [`Conn::rearm`]。
 pub(crate) fn epoll_set(ep: i32, fd: i32, want_write: bool) -> Result<()> {
     let mut ev = unsafe { std::mem::zeroed::<libc::epoll_event>() };
     ev.events = libc::EPOLLIN as u32 | if want_write { libc::EPOLLOUT as u32 } else { 0 };
@@ -249,6 +304,17 @@ pub(crate) fn epoll_set(ep: i32, fd: i32, want_write: bool) -> Result<()> {
         if unsafe { libc::epoll_ctl(ep, libc::EPOLL_CTL_MOD, fd, &mut ev) } < 0 {
             return Err(Error::Io(format!("epoll_ctl(fd={fd}): {}", last_os())));
         }
+    }
+    Ok(())
+}
+
+/// 纯 MOD（fd 必须已注册）。与 `epoll_set` 的区别就是不拿 ADD 去撞 EEXIST。
+pub(crate) fn epoll_mod(ep: i32, fd: i32, want_write: bool) -> Result<()> {
+    let mut ev = unsafe { std::mem::zeroed::<libc::epoll_event>() };
+    ev.events = libc::EPOLLIN as u32 | if want_write { libc::EPOLLOUT as u32 } else { 0 };
+    ev.u64 = fd as u64;
+    if unsafe { libc::epoll_ctl(ep, libc::EPOLL_CTL_MOD, fd, &mut ev) } < 0 {
+        return Err(Error::Io(format!("epoll_ctl(MOD fd={fd}): {}", last_os())));
     }
     Ok(())
 }
@@ -425,7 +491,18 @@ pub(crate) fn serve_single(cfg: &ServerConfig, stop: &AtomicBool, live: &AtomicU
                                 eof = true;
                                 break;
                             }
-                            Ok(m) => c.rx.extend(&buf[..m]),
+                            // 读不满一个整块 = 对端这一刻没再发了，直接收工。
+                            // 不等于是把数据丢了：epoll 是电平触发，下一段到了
+                            // 还会再报一次 EPOLLIN。省下来的正是每 op 那一次
+                            // 只能拿到 EAGAIN 的 `recvfrom`（实测 ping 每 op
+                            // 2 次 recvfrom，其中恰好 1 次报错）。
+                            Ok(m) => {
+                                let full = m == buf.len();
+                                c.rx.extend(&buf[..m]);
+                                if !full {
+                                    break;
+                                }
+                            }
                             Err(e)
                                 if matches!(
                                     e.kind(),
@@ -511,7 +588,7 @@ pub(crate) fn serve_single(cfg: &ServerConfig, stop: &AtomicBool, live: &AtomicU
                             close_conn(&mut conns, ep, fd, live);
                             continue;
                         }
-                        epoll_set(ep, fd, c.want_write)?;
+                        c.rearm(ep)?;
                     }
                     None => continue,
                 }
@@ -576,7 +653,9 @@ pub(crate) fn serve_single(cfg: &ServerConfig, stop: &AtomicBool, live: &AtomicU
 /// 只读 op 的应答：立刻可发。
 fn push(conns: &mut HashMap<i32, Conn>, fd: i32, reply: &Reply) {
     if let Some(c) = conns.get_mut(&fd) {
-        c.out.push_back(Slot::Filled(reply_frame(reply)));
+        if !c.push_frame(reply) {
+            c.out.push_back(Slot::Filled(reply_frame(reply)));
+        }
     }
 }
 
@@ -603,7 +682,7 @@ pub(crate) fn flush_dirty(
                 }
                 continue;
             }
-            epoll_set(ep, *fd, c.want_write)?;
+            c.rearm(ep)?;
         }
     }
     Ok(closed)
