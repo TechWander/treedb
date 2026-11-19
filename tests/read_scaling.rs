@@ -18,7 +18,10 @@
 mod common;
 
 use common::Server;
-use treedb::engine::model::{errno, AuditRec, DefRec, KeyRec, Op, Reply};
+use treedb::engine::model::{
+    errno, AuditRec, ColumnDef, DefRec, KeyRec, Op, Reply, TableDef, COL_INDEX, COL_UNIQUE,
+    COND_NONE, ROW_PK,
+};
 use treedb::engine::{Durability, Engine};
 use treedb::net::client::Client;
 
@@ -69,9 +72,31 @@ fn create(c: &mut Client, view: u32, name: &str) {
     );
 }
 
-/// 37 个 op 变体的语料，每条都带能让它走到真实分支的参数（视图/文件名取自下面
-/// `seed` 播好的状态，所以视图 id 由调用方递进来）。加新 op 必须同时补这里 ——
-/// 最后两个计数断言就是报警器。
+/// 语料与用例共用的表形状：一列唯一、一列仅索引。
+fn tbl(name: &str) -> TableDef {
+    TableDef {
+        name: name.as_bytes().to_vec(),
+        columns: vec![
+            ColumnDef { name: b"a".to_vec(), flags: COL_UNIQUE },
+            ColumnDef { name: b"b".to_vec(), flags: COL_INDEX },
+        ],
+    }
+}
+
+fn rowput(table: &str, key: &str, val: &str, cond_col: u32, cond_val: &str) -> Op {
+    Op::RowPut {
+        table: table.as_bytes().to_vec(),
+        key: key.as_bytes().to_vec(),
+        cols: vec![val.as_bytes().to_vec(), b"x".to_vec()],
+        flags: 0,
+        cond_col,
+        cond_val: cond_val.as_bytes().to_vec(),
+    }
+}
+
+/// 47 个 op 变体的语料，每条都带能让它走到真实分支的参数（视图/文件名/表名
+/// 取自下面 `seed` 播好的状态，所以视图 id 由调用方递进来）。加新 op 必须同时
+/// 补这里 —— 最后两个计数断言就是报警器。
 fn corpus(v: u32) -> Vec<Op> {
     let name = |s: &str| s.as_bytes().to_vec();
     vec![
@@ -129,6 +154,18 @@ fn corpus(v: u32) -> Vec<Op> {
         Op::PlaceSet { view: name("seed-view"), instance: name("pg2") },
         Op::PlaceGet { view: name("seed-view") },
         Op::PlaceList,
+        // ---- 通用表 ----
+        Op::TableCreate { def: tbl("new-table") },
+        Op::TableDrop { name: name("seed-table") },
+        Op::TableGet { name: name("seed-table") },
+        Op::TableList,
+        Op::RowPut { table: name("seed-table"), key: name("r-new"), cols: vec![name("v-new"), name("x")], flags: 0, cond_col: COND_NONE, cond_val: Vec::new() },
+        Op::RowGet { table: name("seed-table"), key: name("r1") },
+        Op::RowList { table: name("seed-table"), column: ROW_PK, value: Vec::new(), from: Vec::new(), limit: 10 },
+        Op::RowDelete { table: name("seed-table"), key: name("r2"), flags: 0, cond_col: COND_NONE, cond_val: Vec::new() },
+        Op::RowCount { table: name("seed-table"), column: 1, value: name("x") },
+        // ---- readdir 带属性 ----
+        Op::ReadDirPlus { view: v, parent: 1, offset: 0, limit: 100 },
     ]
 }
 
@@ -164,6 +201,12 @@ fn seed(e: &mut Engine) -> u32 {
     })
     .unwrap();
     e.submit(&Op::PlaceSet { view: b"seed-view".to_vec(), instance: b"pg1".to_vec() }).unwrap();
+    // 通用表：不建表不灌行，五条只读表 op 两边都只会拼 ENOENT，分类断言
+    // 就只在测「查不存在的表不产日志」这一件废话。
+    e.submit(&Op::TableCreate { def: tbl("seed-table") }).unwrap();
+    for k in ["r1", "r2", "r3"] {
+        e.submit(&rowput("seed-table", k, &format!("v{k}"), COND_NONE, "")).unwrap();
+    }
     v
 }
 
@@ -192,9 +235,9 @@ fn readonly_classification_matches_translate() {
         }
     }
     let cs_len = cs.len();
-    assert_eq!(cs_len, 37, "op 语料必须覆盖全部变体");
-    assert_eq!(ro, 16, "只读 op 数变了：分派表、这里和 DESIGN.md §4.2 分组表要一起改");
-    assert_eq!(wr, 21, "非只读 op 数变了：同上");
+    assert_eq!(cs_len, 47, "op 语料必须覆盖全部变体");
+    assert_eq!(ro, 22, "只读 op 数变了：分派表、这里和 DESIGN.md §4.2 分组表要一起改");
+    assert_eq!(wr, 25, "非只读 op 数变了：同上");
 }
 
 /// 抹掉时间戳。两次独立运行的 `now_ms()` 必然不同，拿它们比“语义是否一致”
@@ -207,6 +250,23 @@ fn norm(r: Reply) -> Reply {
             n.ctime = 0;
             Reply::Node(n)
         }
+        // readdirplus 的属性里同样带着创建时刻：除时间之外的字段才是语义。
+        Reply::DirentsPlus { inos, kinds, names, attrs, next, end } => Reply::DirentsPlus {
+            inos,
+            kinds,
+            names,
+            attrs: attrs
+                .into_iter()
+                .map(|mut a| {
+                    a.atime = 0;
+                    a.mtime = 0;
+                    a.ctime = 0;
+                    a
+                })
+                .collect(),
+            next,
+            end,
+        },
         other => other,
     }
 }
@@ -224,11 +284,22 @@ fn worker_reads_answer_identically_to_inline_reads() {
         for k in 0..40 {
             create(&mut c, v, &format!("f{k}"));
         }
+        // 通用表：先建表灌行（这些写的答复不进 `out`），下面的只读才有东西可查。
+        ok(&mut c, &Op::TableCreate { def: tbl("parity") });
+        for k in 0..10 {
+            ok(&mut c, &rowput("parity", &format!("p{k}"), &format!("v{k}"), COND_NONE, ""));
+        }
         // 纯读批次：workers>1 时在 worker 线程就地算完并发出。
         let batch: Vec<Op> = (0..40)
             .map(|k| Op::Lookup { view: v, parent: 1, name: format!("f{k}").into_bytes() })
             .chain(std::iter::once(Op::ReadDir { view: v, parent: 1, offset: 0, limit: 100 }))
             .chain((0..10).map(|k| Op::Getattr { view: v, ino: 2 + k as u64 }))
+            .chain(std::iter::once(Op::ReadDirPlus { view: v, parent: 1, offset: 0, limit: 100 }))
+            .chain(std::iter::once(Op::TableGet { name: b"parity".to_vec() }))
+            .chain(std::iter::once(Op::TableList))
+            .chain((0..5).map(|k| Op::RowGet { table: b"parity".to_vec(), key: format!("p{k}").into_bytes() }))
+            .chain(std::iter::once(Op::RowList { table: b"parity".to_vec(), column: ROW_PK, value: Vec::new(), from: Vec::new(), limit: 4 }))
+            .chain(std::iter::once(Op::RowCount { table: b"parity".to_vec(), column: 1, value: b"x".to_vec() }))
             .collect();
         out.extend(c.pipeline(&batch).expect("pipeline reads"));
         // 混打批次：含写就整批交给提交线程，否则同连接顺序就不保了。
@@ -237,6 +308,11 @@ fn worker_reads_answer_identically_to_inline_reads() {
             Op::Create { view: v, parent: 1, name: b"later".to_vec(), mode: 0o644, uid: 1, gid: 1 },
             Op::Lookup { view: v, parent: 1, name: b"later".to_vec() },
             Op::ReadDir { view: v, parent: 1, offset: 0, limit: 100 },
+            // 表写夹在表读之间：CAS 的答复必须看到同批次前面的写。
+            Op::RowList { table: b"parity".to_vec(), column: ROW_PK, value: Vec::new(), from: Vec::new(), limit: 4 },
+            rowput("parity", "p0", "v0b", 0, "v0"),
+            Op::RowGet { table: b"parity".to_vec(), key: b"p0".to_vec() },
+            Op::RowCount { table: b"parity".to_vec(), column: 1, value: b"x".to_vec() },
         ];
         out.extend(c.pipeline(&mixed).expect("pipeline mixed"));
         got.push(out.into_iter().map(norm).collect());
@@ -246,7 +322,11 @@ fn worker_reads_answer_identically_to_inline_reads() {
     for (i, (a, b)) in got[0].iter().zip(got[1].iter()).enumerate() {
         assert_eq!(a, b, "第 {i} 条答复因 workers 而异：并行化改写了语义");
     }
-    assert_eq!(got[0].len(), 40 + 1 + 10 + 4, "负载条数对不上，用例本身写坏了");
+    assert_eq!(
+        got[0].len(),
+        40 + 1 + 10 + 1 + 2 + 5 + 2 + 8,
+        "负载条数对不上，用例本身写坏了"
+    );
 }
 
 /// 一条连接上 `[读, 写, 读, 写, 读]` 的流水线，答复必须严格按请求顺序，
@@ -378,19 +458,24 @@ fn acked_writes_survive_crash_with_workers_on() {
     let mut c = srv.client();
     let v = mk_view(&mut c, "crash");
     let n = 300;
+    ok(&mut c, &Op::TableCreate { def: tbl("crash") });
     for k in 0..n {
         create(&mut c, v, &format!("c{k}"));
+        // 表写与目录写同批交错，worker 与提交线程的交叠面要盖住通用表。
+        ok(&mut c, &rowput("crash", &format!("c{k}"), &format!("v{k}"), COND_NONE, ""));
         // 每几条插一批纯读，逼 worker 与写 fsync 交叠。
         if k % 20 == 0 {
             let _ = c.pipeline(&[
                 Op::ReadDir { view: v, parent: 1, offset: 0, limit: 500 },
                 Op::Getattr { view: v, ino: 2 },
                 Op::ListViews,
+                Op::ReadDirPlus { view: v, parent: 1, offset: 0, limit: 500 },
+                Op::RowList { table: b"crash".to_vec(), column: ROW_PK, value: Vec::new(), from: Vec::new(), limit: 500 },
             ]);
         }
     }
     let (tmp, dir) = srv.sigkill_and_take_dir();
-    let mut srv2 = Server::restart_at_workers(tmp, dir, "group", 8);
+    let srv2 = Server::restart_at_workers(tmp, dir, "group", 8);
     let mut c2 = srv2.client();
     match ok(&mut c2, &Op::ReadDir { view: v, parent: 1, offset: 0, limit: 100_000 }) {
         Reply::Dirents { names, .. } => {
@@ -398,6 +483,16 @@ fn acked_writes_survive_crash_with_workers_on() {
         }
         other => panic!("{other:?}"),
     }
+    match ok(&mut c2, &Op::RowCount { table: b"crash".to_vec(), column: ROW_PK, value: Vec::new() }) {
+        Reply::Count(m) => assert_eq!(m, n as u64, "崩溃后已 ack 的行不齐"),
+        other => panic!("{other:?}"),
+    }
+    // 二级索引不进 WAL 也不进快照：重开后它必须被重建出来，否则同一个唯一值
+    // 能插两行 —— 这是“可推字段不动磁盘格式”那个取舍的真实代价。
+    assert!(
+        matches!(c2.call(&rowput("crash", "dup", "v0", COND_NONE, "")), Ok(Reply::Err { code: errno::EEXIST, .. })),
+        "重启后唯一约束失效：索引没从行重推出来"
+    );
     let _ = srv2.graceful_shutdown();
 }
 

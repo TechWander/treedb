@@ -275,6 +275,197 @@ impl DefRec {
     }
 }
 
+// ------------------------------------------------------------ 通用表（§11 T2）
+//
+// 内核只给「字节列 + 主键 + 约束」这一层：列名由客户端起，列的含义引擎不解释。
+// 这一组类型存在的理由就是把「客户端的表形状」挡在内核之外 —— 引擎里再也没有
+// 任何一张按某个具体业务照抄的专用表。
+
+/// 通用表的一列定义。只有名字与约束位，**没有类型**：值一律是不透明字节，
+/// 比较只做字节相等，排序只按主键字节序。
+///
+/// 不给类型是刻意的：类型（时间戳、布尔、金额）一进内核，客户端的语义就会
+/// 顺着类型名漏进来，而引擎没法替所有人定义「什么是一个合法的过期时间」。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ColumnDef {
+    pub name: Vec<u8>,
+    pub flags: u32,
+}
+
+/// 该列取值全表唯一：跨行撞值 → `EEXIST`。隐含建索引。
+pub const COL_UNIQUE: u32 = 1 << 0;
+/// 为该列建二级索引，允许 `RowList` / `RowCount` 按等值列举（非唯一）。
+pub const COL_INDEX: u32 = 1 << 1;
+
+impl ColumnDef {
+    pub fn encode(&self, w: &mut W) {
+        w.bytes(&self.name);
+        w.u32(self.flags);
+    }
+    pub fn decode(r: &mut Rd) -> Result<Self> {
+        Ok(ColumnDef {
+            name: r.bytes()?,
+            flags: r.u32()?,
+        })
+    }
+    /// 是否需要维护二级索引（唯一列必然要）。
+    pub fn indexed(&self) -> bool {
+        self.flags & (COL_UNIQUE | COL_INDEX) != 0
+    }
+    pub fn unique(&self) -> bool {
+        self.flags & COL_UNIQUE != 0
+    }
+}
+
+/// 一张通用表的形状。表 id 由引擎单调分配（与 view id 同构）且**不进 def**：
+/// 客户端只用名字寻址，id 只是 WAL 记录与内部索引里的键。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TableDef {
+    pub name: Vec<u8>,
+    pub columns: Vec<ColumnDef>,
+}
+
+impl TableDef {
+    pub fn encode(&self, w: &mut W) {
+        w.bytes(&self.name);
+        w.u32(self.columns.len() as u32);
+        for c in &self.columns {
+            c.encode(w);
+        }
+    }
+    pub fn decode(r: &mut Rd) -> Result<Self> {
+        let name = r.bytes()?;
+        let n = r.u32()? as usize;
+        if n > MAX_COLUMNS {
+            return Err(Error::Codec(format!(
+                "table has {n} columns, over {MAX_COLUMNS}"
+            )));
+        }
+        let mut columns = Vec::with_capacity(n);
+        for _ in 0..n {
+            columns.push(ColumnDef::decode(r)?);
+        }
+        Ok(TableDef { name, columns })
+    }
+}
+
+/// 一行：主键 + 与 def 等长的列值。
+///
+/// 空 `Vec<u8>` 是一列的合法取值，所以约束与条件判定不能拿「空字节」当
+/// 「这一列没值」—— 要区分就得由客户端自己存一个非空哨兵。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RowRec {
+    pub key: Vec<u8>,
+    pub cols: Vec<Vec<u8>>,
+}
+
+impl RowRec {
+    pub fn encode(&self, w: &mut W) {
+        w.bytes(&self.key);
+        w.u32(self.cols.len() as u32);
+        for c in &self.cols {
+            w.bytes(c);
+        }
+    }
+    pub fn decode(r: &mut Rd) -> Result<Self> {
+        let key = r.bytes()?;
+        let n = r.u32()? as usize;
+        if n > MAX_COLUMNS {
+            return Err(Error::Codec(format!(
+                "row has {n} columns, over {MAX_COLUMNS}"
+            )));
+        }
+        let mut cols = Vec::with_capacity(n);
+        for _ in 0..n {
+            cols.push(r.bytes()?);
+        }
+        Ok(RowRec { key, cols })
+    }
+}
+
+/// 表名上限：与视图名那条 25 字节不同源（那条是对齐关系库既有约束留下的），
+/// 通用表的名字由客户端起，引擎只给它一个上界和「非空」这条底线。
+pub const TABLE_NAME_MAX: usize = 255;
+/// 主键上限。索引扫描按 `(表, 列, 值, 主键)` 排，主键参与比较，长度直接换算成
+/// 每次比较的字节数，所以这里比列值严一点；再长就该换定长摘要而不是放宽它。
+pub const ROW_KEY_MAX: usize = 4096;
+/// 一张表的列数上限。列是定长编码（按序号寻址），放宽等于把一行的
+/// 元数据成本摊给每一次 `RowPut`。
+pub const MAX_COLUMNS: usize = 64;
+/// 一个应答里能列出的表数 / 行数上限。帧长（`MAX_FRAME`）已经给了硬上限，
+/// 这一条是给解码侧的 `Vec::with_capacity` 用的：不能拿到一个敌意的计数
+/// 就预分配百亿元素。超限直接拒帧，不截断。
+pub const MAX_TABLE_ITEMS: usize = 1_000_000;
+
+/// `RowList` / `RowCount` 的 `column` 保留值：按主键序遍历全表，`value` 忽略。
+pub const ROW_PK: u32 = u32::MAX;
+/// `RowPut` / `RowDelete` 的 `cond_col` 保留值：不带条件。
+pub const COND_NONE: u32 = u32::MAX;
+
+/// `RowPut` 的 flags。两者同时给是客户端的错，按 `EINVAL` 拒。
+pub const PUT_IF_ABSENT: u32 = 1 << 0;
+pub const PUT_IF_EXISTS: u32 = 1 << 1;
+/// `RowDelete` 的 flags：不给则删不存在的行幂等成功。
+pub const DEL_IF_EXISTS: u32 = 1 << 0;
+
+/// `ReadDirPlus` 带回的属性：inode 里除 ino/kind/name 之外的那几列。
+///
+/// 为什么不直接复用 [`Node`]：ino/kind/name 在平行数组里已经各有一份，随每条
+/// 再拷一遍就是白付三份字节（`data_ref` 还是大头）；`parent` 同理多余（这一页
+/// 就是同一个 parent 的孩子），`link`（symlink 目标）要内容得走 `Readlink`。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct NodeAttr {
+    pub mode: u32,
+    pub uid: u32,
+    pub gid: u32,
+    pub size: u64,
+    pub nlink: u32,
+    pub atime: i64,
+    pub mtime: i64,
+    pub ctime: i64,
+    pub data_ref: DataRef,
+}
+
+impl NodeAttr {
+    pub fn of(n: &Node) -> Self {
+        NodeAttr {
+            mode: n.mode,
+            uid: n.uid,
+            gid: n.gid,
+            size: n.size,
+            nlink: n.nlink,
+            atime: n.atime,
+            mtime: n.mtime,
+            ctime: n.ctime,
+            data_ref: n.data_ref.clone(),
+        }
+    }
+    pub fn encode(&self, w: &mut W) {
+        w.u32(self.mode);
+        w.u32(self.uid);
+        w.u32(self.gid);
+        w.u64(self.size);
+        w.u32(self.nlink);
+        w.i64(self.atime);
+        w.i64(self.mtime);
+        w.i64(self.ctime);
+        w.bytes(&self.data_ref);
+    }
+    pub fn decode(r: &mut Rd) -> Result<Self> {
+        Ok(NodeAttr {
+            mode: r.u32()?,
+            uid: r.u32()?,
+            gid: r.u32()?,
+            size: r.u64()?,
+            nlink: r.u32()?,
+            atime: r.i64()?,
+            mtime: r.i64()?,
+            ctime: r.i64()?,
+            data_ref: r.bytes()?,
+        })
+    }
+}
+
 /// 单个视图的目录树游标：视图名 → id/根 ino/下一个可用 ino。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ViewMeta {
@@ -513,6 +704,77 @@ pub enum Op {
         view: Vec<u8>,
     },
     PlaceList,
+
+    // ---- 通用表：列名与语义由客户端定义，引擎不解释值 ----
+    /// 建表。重名 → `EEXIST`；无列/超列数上限/列名空或重复 → `EINVAL`。
+    TableCreate {
+        def: TableDef,
+    },
+    /// 删表，级联丢掉它的全部行与二级索引。表不存在 → `ENOENT`。
+    TableDrop {
+        name: Vec<u8>,
+    },
+    /// 读一张表的形状（没有则 `Reply::Table(None)`，不是错误）。
+    TableGet {
+        name: Vec<u8>,
+    },
+    TableList,
+    /// 写一行：键不存在则插入，存在则**整体覆盖**（不给列 = 该列被清成空字节）。
+    /// 列数与 def 不符 → `EINVAL`；唯一列撞值 → `EEXIST`；条件不命中 → `EAGAIN`。
+    RowPut {
+        table: Vec<u8>,
+        key: Vec<u8>,
+        cols: Vec<Vec<u8>>,
+        /// [`PUT_IF_ABSENT`] / [`PUT_IF_EXISTS`]。
+        flags: u32,
+        /// 与 `cond_val` 一起构成 CAS：要求现存行这一列恰等于给定字节。
+        cond_col: u32,
+        cond_val: Vec<u8>,
+    },
+    RowGet {
+        table: Vec<u8>,
+        key: Vec<u8>,
+    },
+    /// 按 `column` 等值列举；`column == `[`ROW_PK`] 时按主键序遍历全表、`value` 忽略。
+    ///
+    /// `from` 是「上一页最后一行的主键」（不含本身），空 = 从头。不用「已返回若
+    /// 干条」那种序号游标：BTreeMap 的 `skip(n)` 是 O(n)，翻到第 k 页就把
+    /// 前 k 页重走一遍；换成键游标后每页都从树上直接定位。
+    /// 列没建索引 → `EINVAL`。
+    RowList {
+        table: Vec<u8>,
+        column: u32,
+        value: Vec<u8>,
+        from: Vec<u8>,
+        limit: u32,
+    },
+    /// 删一行。默认幂等（删不存在的行也成功），[`DEL_IF_EXISTS`] 则回 `ENOENT`。
+    /// 条件不命中 → `EAGAIN`。
+    RowDelete {
+        table: Vec<u8>,
+        key: Vec<u8>,
+        flags: u32,
+        cond_col: u32,
+        cond_val: Vec<u8>,
+    },
+    /// 数行：按主键 = O(1)（表里存了多少行），按索引列 = O(命中数)。
+    RowCount {
+        table: Vec<u8>,
+        column: u32,
+        value: Vec<u8>,
+    },
+
+    // ---- readdir 带属性 ----
+    /// 与 [`Op::ReadDir`] 同一份目录页，只是每条目录项把属性一起带回。
+    ///
+    /// 存在的唯一理由：不带属性的话，客户端要一页 N 条就得回头逐条 `Getattr`
+    /// —— 往返次数从 1 变 N，目录列表在真实挂载上的成本全在那儿。
+    ReadDirPlus {
+        view: ViewId,
+        parent: Ino,
+        offset: u64,
+        limit: u32,
+    },
 }
 
 impl Op {
@@ -555,6 +817,16 @@ impl Op {
             Op::PlaceSet { .. } => 0x0060,
             Op::PlaceGet { .. } => 0x0061,
             Op::PlaceList => 0x0062,
+            Op::TableCreate { .. } => 0x0070,
+            Op::TableDrop { .. } => 0x0071,
+            Op::TableGet { .. } => 0x0072,
+            Op::TableList => 0x0073,
+            Op::RowPut { .. } => 0x0074,
+            Op::RowGet { .. } => 0x0075,
+            Op::RowList { .. } => 0x0076,
+            Op::RowDelete { .. } => 0x0077,
+            Op::RowCount { .. } => 0x0078,
+            Op::ReadDirPlus { .. } => 0x002b,
         }
     }
 
@@ -577,6 +849,7 @@ impl Op {
             | Op::Getattr { .. }
             | Op::Readlink { .. }
             | Op::ReadDir { .. }
+            | Op::ReadDirPlus { .. }
             | Op::RefLookup { .. }
             | Op::LockQuery { .. }
             | Op::KeyGet { .. }
@@ -586,7 +859,12 @@ impl Op {
             | Op::DefGet { .. }
             | Op::DefList { .. }
             | Op::PlaceGet { .. }
-            | Op::PlaceList => true,
+            | Op::PlaceList
+            | Op::TableGet { .. }
+            | Op::TableList
+            | Op::RowGet { .. }
+            | Op::RowList { .. }
+            | Op::RowCount { .. } => true,
             Op::Stats
             | Op::Checkpoint
             | Op::Shutdown
@@ -607,7 +885,11 @@ impl Op {
             | Op::AuditAppend { .. }
             | Op::DefPut { .. }
             | Op::DefDel { .. }
-            | Op::PlaceSet { .. } => false,
+            | Op::PlaceSet { .. }
+            | Op::TableCreate { .. }
+            | Op::TableDrop { .. }
+            | Op::RowPut { .. }
+            | Op::RowDelete { .. } => false,
         }
     }
 
@@ -620,7 +902,8 @@ impl Op {
             | Op::Shutdown
             | Op::ListViews
             | Op::KeyList
-            | Op::PlaceList => {}
+            | Op::PlaceList
+            | Op::TableList => {}
             Op::AuditList { limit } => w.u32(*limit),
             Op::CreateView { name } => w.bytes(name),
             Op::DropView { name } => w.bytes(name),
@@ -725,6 +1008,12 @@ impl Op {
                 parent,
                 offset,
                 limit,
+            }
+            | Op::ReadDirPlus {
+                view,
+                parent,
+                offset,
+                limit,
             } => {
                 w.u32(*view);
                 w.u64(*parent);
@@ -787,6 +1076,61 @@ impl Op {
                 w.bytes(instance);
             }
             Op::PlaceGet { view } => w.bytes(view),
+            Op::TableCreate { def } => def.encode(w),
+            Op::TableDrop { name } | Op::TableGet { name } => w.bytes(name),
+            Op::RowPut {
+                table,
+                key,
+                cols,
+                flags,
+                cond_col,
+                cond_val,
+            } => {
+                w.bytes(table);
+                w.bytes(key);
+                w.u32(cols.len() as u32);
+                for c in cols {
+                    w.bytes(c);
+                }
+                w.u32(*flags);
+                w.u32(*cond_col);
+                w.bytes(cond_val);
+            }
+            Op::RowGet { table, key } => {
+                w.bytes(table);
+                w.bytes(key);
+            }
+            Op::RowList {
+                table,
+                column,
+                value,
+                from,
+                limit,
+            } => {
+                w.bytes(table);
+                w.u32(*column);
+                w.bytes(value);
+                w.bytes(from);
+                w.u32(*limit);
+            }
+            Op::RowDelete {
+                table,
+                key,
+                flags,
+                cond_col,
+                cond_val,
+            } => {
+                w.bytes(table);
+                w.bytes(key);
+                w.u32(*flags);
+                w.u32(*cond_col);
+                w.bytes(cond_val);
+            }
+            Op::RowCount { table, column, value } => {
+                w.bytes(table);
+                w.u32(*column);
+                w.bytes(value);
+            }
         }
     }
 
@@ -874,6 +1218,12 @@ impl Op {
                 offset: r.u64()?,
                 limit: r.u32()?,
             },
+            0x002b => Op::ReadDirPlus {
+                view: r.u32()?,
+                parent: r.u64()?,
+                offset: r.u64()?,
+                limit: r.u32()?,
+            },
             0x0030 => Op::RefLookup { data_ref: r.bytes()? },
             0x0031 => Op::RefUp {
                 data_ref: r.bytes()?,
@@ -930,6 +1280,57 @@ impl Op {
             },
             0x0061 => Op::PlaceGet { view: r.bytes()? },
             0x0062 => Op::PlaceList,
+            0x0070 => Op::TableCreate {
+                def: TableDef::decode(r)?,
+            },
+            0x0071 => Op::TableDrop { name: r.bytes()? },
+            0x0072 => Op::TableGet { name: r.bytes()? },
+            0x0073 => Op::TableList,
+            0x0074 => {
+                let table = r.bytes()?;
+                let key = r.bytes()?;
+                let n = r.u32()? as usize;
+                if n > MAX_COLUMNS {
+                    return Err(Error::Codec(format!(
+                        "row has {n} columns, over {MAX_COLUMNS}"
+                    )));
+                }
+                let mut cols = Vec::with_capacity(n);
+                for _ in 0..n {
+                    cols.push(r.bytes()?);
+                }
+                Op::RowPut {
+                    table,
+                    key,
+                    cols,
+                    flags: r.u32()?,
+                    cond_col: r.u32()?,
+                    cond_val: r.bytes()?,
+                }
+            }
+            0x0075 => Op::RowGet {
+                table: r.bytes()?,
+                key: r.bytes()?,
+            },
+            0x0076 => Op::RowList {
+                table: r.bytes()?,
+                column: r.u32()?,
+                value: r.bytes()?,
+                from: r.bytes()?,
+                limit: r.u32()?,
+            },
+            0x0077 => Op::RowDelete {
+                table: r.bytes()?,
+                key: r.bytes()?,
+                flags: r.u32()?,
+                cond_col: r.u32()?,
+                cond_val: r.bytes()?,
+            },
+            0x0078 => Op::RowCount {
+                table: r.bytes()?,
+                column: r.u32()?,
+                value: r.bytes()?,
+            },
             x => return Err(Error::Codec(format!("unknown op tag 0x{x:04x}"))),
         };
         Ok(op)
@@ -1069,6 +1470,17 @@ pub enum Reply {
         next: u64,
         end: bool,
     },
+    /// [`Op::ReadDirPlus`] 的应答：与 [`Reply::Dirents`] 同序的平行数组，多一个
+    /// 与 `inos` 等长的属性数组。两个数组分开写是因为名字已经趟过一遍扁平缓冲，
+    /// 把属性也摊进同一个循环只会多一次结构体拷贝。
+    DirentsPlus {
+        inos: Vec<Ino>,
+        kinds: Vec<u8>,
+        names: Names,
+        attrs: Vec<NodeAttr>,
+        next: u64,
+        end: bool,
+    },
     Ref {
         count: u64,
         bytes: u64,
@@ -1088,6 +1500,20 @@ pub enum Reply {
     Defs(Vec<DefRec>),
     Place(Vec<u8>),
     Places(Vec<(Vec<u8>, Vec<u8>)>),
+    /// 一张通用表的形状：`None` = 没有这张表（不是错误，与 `DefGet` 同形）。
+    Table(Option<TableDef>),
+    Tables(Vec<TableDef>),
+    /// 一行：`None` = 没有这行。`RowPut` 成功时回存进去的那一行（与
+    /// `KeyCreate` 一样把成品给回去，免得调用方再读一次）。
+    Row(Option<RowRec>),
+    /// `RowList` 的一页。`end = false` 意味着还有：下一页把本页最后一行的
+    /// 键当 `from` 游标。
+    Rows {
+        rows: Vec<RowRec>,
+        end: bool,
+    },
+    /// `RowCount`。
+    Count(u64),
     Stats(Box<crate::engine::core::EngineStats>),
 }
 
@@ -1138,6 +1564,28 @@ impl Reply {
                     w.u64(inos[i]);
                     w.u8(kinds[i]);
                     w.bytes(name);
+                }
+                w.u64(*next);
+                w.bool(*end);
+            }
+            Reply::DirentsPlus {
+                inos,
+                kinds,
+                names,
+                attrs,
+                next,
+                end,
+            } => {
+                w.u16(0x0123);
+                let n = inos.len();
+                w.u32(n as u32);
+                for (i, name) in (0..n).zip(names.iter()) {
+                    w.u64(inos[i]);
+                    w.u8(kinds[i]);
+                    w.bytes(name);
+                    // 属性按同一下标紧挨名字写：读侧一个循环就能把四个平行数组
+                    // 全填完，不用先趟完名字再回头找属性。
+                    attrs[i].encode(w);
                 }
                 w.u64(*next);
                 w.bool(*end);
@@ -1219,6 +1667,45 @@ impl Reply {
                     w.bytes(inst);
                 }
             }
+            Reply::Table(t) => {
+                w.u16(0x0170);
+                match t {
+                    Some(x) => {
+                        w.u8(1);
+                        x.encode(w);
+                    }
+                    None => w.u8(0),
+                }
+            }
+            Reply::Tables(v) => {
+                w.u16(0x0171);
+                w.u32(v.len() as u32);
+                for t in v {
+                    t.encode(w);
+                }
+            }
+            Reply::Row(row) => {
+                w.u16(0x0172);
+                match row {
+                    Some(x) => {
+                        w.u8(1);
+                        x.encode(w);
+                    }
+                    None => w.u8(0),
+                }
+            }
+            Reply::Rows { rows, end } => {
+                w.u16(0x0173);
+                w.u32(rows.len() as u32);
+                for row in rows {
+                    row.encode(w);
+                }
+                w.bool(*end);
+            }
+            Reply::Count(n) => {
+                w.u16(0x0174);
+                w.u64(*n);
+            }
             Reply::Stats(s) => {
                 w.u16(0x0102);
                 s.encode(w);
@@ -1266,6 +1753,27 @@ impl Reply {
                     inos,
                     kinds,
                     names,
+                    next: r.u64()?,
+                    end: r.bool()?,
+                }
+            }
+            0x0123 => {
+                let n = r.u32()? as usize;
+                let mut inos = Vec::with_capacity(n.min(200_000));
+                let mut kinds = Vec::with_capacity(n.min(200_000));
+                let mut names = Names::new();
+                let mut attrs = Vec::with_capacity(n.min(200_000));
+                for _ in 0..n {
+                    inos.push(r.u64()?);
+                    kinds.push(r.u8()?);
+                    names.push(r.bytes_ref()?);
+                    attrs.push(NodeAttr::decode(r)?);
+                }
+                Reply::DirentsPlus {
+                    inos,
+                    kinds,
+                    names,
+                    attrs,
                     next: r.u64()?,
                     end: r.bool()?,
                 }
@@ -1330,6 +1838,50 @@ impl Reply {
                 }
                 Reply::Places(v)
             }
+            0x0170 => {
+                if r.u8()? == 0 {
+                    Reply::Table(None)
+                } else {
+                    Reply::Table(Some(TableDef::decode(r)?))
+                }
+            }
+            0x0171 => {
+                let n = r.u32()? as usize;
+                if n > MAX_TABLE_ITEMS {
+                    return Err(Error::Codec(format!(
+                        "reply lists {n} tables, over {MAX_TABLE_ITEMS}"
+                    )));
+                }
+                let mut v = Vec::with_capacity(n.min(4096));
+                for _ in 0..n {
+                    v.push(TableDef::decode(r)?);
+                }
+                Reply::Tables(v)
+            }
+            0x0172 => {
+                if r.u8()? == 0 {
+                    Reply::Row(None)
+                } else {
+                    Reply::Row(Some(RowRec::decode(r)?))
+                }
+            }
+            0x0173 => {
+                let n = r.u32()? as usize;
+                if n > MAX_TABLE_ITEMS {
+                    return Err(Error::Codec(format!(
+                        "reply lists {n} rows, over {MAX_TABLE_ITEMS}"
+                    )));
+                }
+                let mut rows = Vec::with_capacity(n.min(4096));
+                for _ in 0..n {
+                    rows.push(RowRec::decode(r)?);
+                }
+                Reply::Rows {
+                    rows,
+                    end: r.bool()?,
+                }
+            }
+            0x0174 => Reply::Count(r.u64()?),
             x => return Err(Error::Codec(format!("unknown reply tag 0x{x:04x}"))),
         };
         Ok(rep)
@@ -1531,6 +2083,55 @@ mod tests {
             },
             Op::PlaceGet { view: b"v".to_vec() },
             Op::PlaceList,
+            // ---- 通用表 ----
+            Op::TableCreate {
+                def: TableDef {
+                    name: b"kv".to_vec(),
+                    columns: vec![
+                        ColumnDef { name: b"a".to_vec(), flags: COL_UNIQUE },
+                        ColumnDef { name: b"b".to_vec(), flags: COL_INDEX },
+                        ColumnDef { name: b"c".to_vec(), flags: 0 },
+                    ],
+                },
+            },
+            Op::TableDrop { name: b"kv".to_vec() },
+            Op::TableGet { name: b"kv".to_vec() },
+            Op::TableList,
+            Op::RowPut {
+                table: b"kv".to_vec(),
+                key: b"k1".to_vec(),
+                cols: vec![b"v1".to_vec(), Vec::new(), b"".to_vec()],
+                flags: PUT_IF_ABSENT,
+                cond_col: 0,
+                cond_val: b"v0".to_vec(),
+            },
+            Op::RowGet { table: b"kv".to_vec(), key: b"k1".to_vec() },
+            Op::RowList {
+                table: b"kv".to_vec(),
+                column: 0,
+                value: b"v1".to_vec(),
+                from: b"k0".to_vec(),
+                limit: 100,
+            },
+            Op::RowDelete {
+                table: b"kv".to_vec(),
+                key: b"k1".to_vec(),
+                flags: DEL_IF_EXISTS,
+                cond_col: COND_NONE,
+                cond_val: Vec::new(),
+            },
+            Op::RowCount {
+                table: b"kv".to_vec(),
+                column: ROW_PK,
+                value: Vec::new(),
+            },
+            // ---- readdir 带属性 ----
+            Op::ReadDirPlus {
+                view: 3,
+                parent: 1,
+                offset: 10,
+                limit: 100,
+            },
         ];
         for op in ops {
             let mut w = W::new();
@@ -1616,6 +2217,52 @@ mod tests {
             }]),
             Reply::Place(b"inst".to_vec()),
             Reply::Places(vec![(b"v".to_vec(), b"i".to_vec())]),
+            Reply::Table(Some(TableDef {
+                name: b"kv".to_vec(),
+                columns: vec![
+                    ColumnDef { name: b"a".to_vec(), flags: COL_UNIQUE },
+                    ColumnDef { name: b"b".to_vec(), flags: 0 },
+                ],
+            })),
+            Reply::Table(None),
+            Reply::Tables(vec![TableDef {
+                name: b"kv".to_vec(),
+                columns: vec![ColumnDef { name: b"a".to_vec(), flags: COL_INDEX }],
+            }]),
+            Reply::Row(Some(RowRec {
+                key: b"k1".to_vec(),
+                cols: vec![b"v1".to_vec(), Vec::new()],
+            })),
+            Reply::Row(None),
+            Reply::Rows {
+                rows: vec![
+                    RowRec { key: b"k1".to_vec(), cols: vec![b"v1".to_vec()] },
+                    RowRec { key: b"k2".to_vec(), cols: vec![Vec::new()] },
+                ],
+                end: true,
+            },
+            Reply::Count(7),
+            Reply::DirentsPlus {
+                inos: vec![2, 3],
+                kinds: vec![0, 1],
+                names: Names::from_vec(&[b"a".to_vec(), b"b".to_vec()]),
+                attrs: vec![
+                    NodeAttr::default(),
+                    NodeAttr {
+                        mode: 0o755,
+                        uid: 1,
+                        gid: 2,
+                        size: 4096,
+                        nlink: 2,
+                        atime: -1,
+                        mtime: -2,
+                        ctime: -3,
+                        data_ref: b"r9".to_vec(),
+                    },
+                ],
+                next: 4,
+                end: false,
+            },
         ];
         for rep in replies {
             let mut w = W::new();

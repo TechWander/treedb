@@ -9,8 +9,9 @@
 use std::path::PathBuf;
 use tempfile::TempDir;
 use treedb::engine::model::{
-    errno, AuditRec, DefRec, KeyRec, Kind, Node, Op, Reply, RENAME_NOREPLACE, SA_DATA_REF, SA_MODE,
-    SA_SIZE,
+    errno, AuditRec, ColumnDef, DefRec, KeyRec, Kind, Node, NodeAttr, Op, Reply, TableDef,
+    DEL_IF_EXISTS, COL_INDEX, COL_UNIQUE, COND_NONE, PUT_IF_ABSENT, PUT_IF_EXISTS, ROW_KEY_MAX,
+    ROW_PK, RENAME_NOREPLACE, SA_DATA_REF, SA_GID, SA_MODE, SA_SIZE, SA_UID, TABLE_NAME_MAX,
 };
 use treedb::engine::{now_ms, Durability, Engine, Log, State};
 
@@ -1064,6 +1065,76 @@ fn build_state(e: &mut Engine) -> (u32, u64) {
         def: DefRec { name: b"ls".to_vec(), kind: b"tool".to_vec(), payload: b"x".to_vec(), updated_at: 0 },
     });
     ok(e, &Op::PlaceSet { view: b"v".to_vec(), instance: b"node-1".to_vec() });
+    // 通用表：让表/行/级联删除也进重放与快照这两条恢复路径。
+    ok(
+        e,
+        &Op::TableCreate {
+            def: TableDef {
+                name: b"t1".to_vec(),
+                columns: vec![
+                    ColumnDef { name: b"a".to_vec(), flags: COL_UNIQUE },
+                    ColumnDef { name: b"b".to_vec(), flags: COL_INDEX },
+                ],
+            },
+        },
+    );
+    for (k, a, b) in [("r1", "a1", "x"), ("r2", "a2", "x"), ("r3", "a3", "y")] {
+        ok(
+            e,
+            &Op::RowPut {
+                table: b"t1".to_vec(),
+                key: k.as_bytes().to_vec(),
+                cols: vec![a.as_bytes().to_vec(), b.as_bytes().to_vec()],
+                flags: 0,
+                cond_col: COND_NONE,
+                cond_val: Vec::new(),
+            },
+        );
+    }
+    // 覆盖写 + 删行：`PutRow` 的旧值必须从索引摘掉，`DelRow` 同样要重放。
+    ok(
+        e,
+        &Op::RowPut {
+            table: b"t1".to_vec(),
+            key: b"r2".to_vec(),
+            cols: vec![b"a2b".to_vec(), b"x".to_vec()],
+            flags: 0,
+            cond_col: COND_NONE,
+            cond_val: Vec::new(),
+        },
+    );
+    ok(
+        e,
+        &Op::RowDelete {
+            table: b"t1".to_vec(),
+            key: b"r3".to_vec(),
+            flags: 0,
+            cond_col: COND_NONE,
+            cond_val: Vec::new(),
+        },
+    );
+    // 一张用完就丢的表，让 `DelTable` 级联也走一遍重放。
+    ok(
+        e,
+        &Op::TableCreate {
+            def: TableDef {
+                name: b"t-gone".to_vec(),
+                columns: vec![ColumnDef { name: b"c".to_vec(), flags: COL_UNIQUE }],
+            },
+        },
+    );
+    ok(
+        e,
+        &Op::RowPut {
+            table: b"t-gone".to_vec(),
+            key: b"g".to_vec(),
+            cols: vec![b"v".to_vec()],
+            flags: 0,
+            cond_col: COND_NONE,
+            cond_val: Vec::new(),
+        },
+    );
+    ok(e, &Op::TableDrop { name: b"t-gone".to_vec() });
     (v, a.ino)
 }
 
@@ -1081,6 +1152,18 @@ fn assert_rich_state(s: &State, v: u32) {
     assert_eq!(s.defs.len(), 1);
     assert_eq!(s.placement.len(), 1);
     assert!(s.view_by_id.contains_key(&v));
+    // 通用表：级联后只剩一张活表，正向表同批摘掉；id 不回收。
+    assert_eq!(s.tables.len(), 1, "只剩 t1：{:?}", s.tables.keys().collect::<Vec<_>>());
+    assert_eq!(s.table_by_id.len(), 1);
+    assert_eq!(s.next_table_id, 2, "drop 掉的 id 不能重新发票（与 view id 同规）");
+    // `rows.len()` 是表数，`row_count()` 才是行数：3 写 1 删 = 2。
+    assert_eq!(s.rows.len(), 1);
+    assert_eq!(s.row_count(), 2);
+    // 索引项必须与行严格对齐：2 行 × 2 个索引列。覆盖写的旧值、级联删掉的行
+    // 若有一条残留，这里就会先响。
+    assert_eq!(s.row_index.len(), 4, "索引残留/漏建：{:?}", s.row_index.keys().collect::<Vec<_>>());
+    assert!(s.index_keys(0, 0, b"a2").is_empty(), "被覆盖的旧值必须从索引里摘掉");
+    assert_eq!(s.index_keys(1, 0, b"v"), Vec::<Vec<u8>>::new(), "删表的行不能留在索引");
 }
 
 #[test]
@@ -1289,4 +1372,419 @@ fn both_durable_tiers_fsync_once_per_round_not_per_group() {
             "{tier:?}: 一次 fsync 必须覆盖本轮所有组，一条不能少"
         );
     }
+}
+
+// ---------------------------------------------------------------- 通用表（§11 T2）
+
+fn col(name: &str, flags: u32) -> ColumnDef {
+    ColumnDef { name: name.as_bytes().to_vec(), flags }
+}
+
+/// 建一张 `(a 唯一, b 仅索引, c 无约束)` 的三列表，返回它的 def。
+fn mk_table(e: &mut Engine, name: &str) -> TableDef {
+    let def = TableDef {
+        name: name.as_bytes().to_vec(),
+        columns: vec![col("a", COL_UNIQUE), col("b", COL_INDEX), col("c", 0)],
+    };
+    match ok(e, &Op::TableCreate { def: def.clone() }) {
+        Reply::Table(Some(x)) => assert_eq!(x, def, "建表要把成品回给调用方"),
+        other => panic!("{other:?}"),
+    }
+    def
+}
+
+fn rowput_op(table: &str, key: &str, cols: &[&str], flags: u32, cond_col: u32, cond_val: &str) -> Op {
+    Op::RowPut {
+        table: table.as_bytes().to_vec(),
+        key: key.as_bytes().to_vec(),
+        cols: cols.iter().map(|s| s.as_bytes().to_vec()).collect(),
+        flags,
+        cond_col,
+        cond_val: cond_val.as_bytes().to_vec(),
+    }
+}
+
+fn put_row(e: &mut Engine, table: &str, key: &str, cols: &[&str], flags: u32, cond_col: u32, cond_val: &str) -> Reply {
+    ok(e, &rowput_op(table, key, cols, flags, cond_col, cond_val))
+}
+
+fn err_rowput(e: &mut Engine, table: &str, key: &str, cols: &[&str], flags: u32, cond_col: u32, cond_val: &str) -> u16 {
+    err_code(e, &rowput_op(table, key, cols, flags, cond_col, cond_val))
+}
+
+fn rowlist_op(table: &str, column: u32, value: &str, from: &str, limit: u32) -> Op {
+    Op::RowList {
+        table: table.as_bytes().to_vec(),
+        column,
+        value: value.as_bytes().to_vec(),
+        from: from.as_bytes().to_vec(),
+        limit,
+    }
+}
+
+fn err_rowlist(e: &mut Engine, table: &str, column: u32, value: &str) -> u16 {
+    err_code(e, &rowlist_op(table, column, value, "", 10))
+}
+
+fn row_count(e: &mut Engine, table: &str, column: u32, value: &str) -> u64 {
+    match ok(e, &Op::RowCount { table: table.as_bytes().to_vec(), column, value: value.as_bytes().to_vec() }) {
+        Reply::Count(n) => n,
+        other => panic!("{other:?}"),
+    }
+}
+
+fn row_keys(r: Reply) -> Vec<String> {
+    match r {
+        Reply::Rows { rows, .. } => rows
+            .iter()
+            .map(|x| String::from_utf8_lossy(&x.key).into_owned())
+            .collect(),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// 按游标翻完一段：每页 `page` 条，下一页的 `from` 就是本页最后一行的主键。
+/// 只靠「主键序」推游标是不够的，这里要把不重不漏当街声明。
+fn walk(e: &mut Engine, table: &str, column: u32, value: &str, page: u32) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut from = String::new();
+    for _ in 0..1000 {
+        let (keys, end) = match ok(e, &rowlist_op(table, column, value, &from, page)) {
+            Reply::Rows { rows, end } => {
+                if !end {
+                    assert_eq!(rows.len() as u32, page, "没到底的页必须装满");
+                }
+                (rows.iter().map(|x| String::from_utf8_lossy(&x.key).into_owned()).collect::<Vec<_>>(), end)
+            }
+            other => panic!("{other:?}"),
+        };
+        let Some(last) = keys.last().cloned() else {
+            assert!(end, "空页不能说「还没到底」");
+            break;
+        };
+        for k in keys {
+            assert!(!out.contains(&k), "翻页重复返回了 {k}");
+            out.push(k);
+        }
+        from = last;
+        if end {
+            break;
+        }
+    }
+    out
+}
+
+#[test]
+fn table_shape_is_validated_and_names_can_be_reclaimed() {
+    let d = Dir::new("tables");
+    let mut e = d.open();
+
+    // 形状校验先于一切：名字/列数/列名任一条不对都不配占一个表 id。
+    assert_eq!(err_code(&mut e, &Op::TableCreate { def: TableDef { name: Vec::new(), columns: vec![col("a", 0)] } }), errno::EINVAL);
+    assert_eq!(
+        err_code(&mut e, &Op::TableCreate { def: TableDef { name: vec![b'x'; TABLE_NAME_MAX + 1], columns: vec![col("a", 0)] } }),
+        errno::ENAMETOOLONG
+    );
+    assert_eq!(err_code(&mut e, &Op::TableCreate { def: TableDef { name: b"nocol".to_vec(), columns: Vec::new() } }), errno::EINVAL);
+    assert_eq!(err_code(&mut e, &Op::TableCreate { def: TableDef { name: b"dup".to_vec(), columns: vec![col("a", 0), col("a", COL_UNIQUE)] } }), errno::EINVAL);
+    assert_eq!(err_code(&mut e, &Op::TableCreate { def: TableDef { name: b"emptycol".to_vec(), columns: vec![col("", 0)] } }), errno::EINVAL);
+    assert_eq!(e.snapshot_stats().tables, 0, "被拒的 def 不能留下半张表");
+
+    mk_table(&mut e, "t");
+    // 重名 = EEXIST，不是覆盖：两份列数不同的形状同时存在，行就没法解释了。
+    assert_eq!(err_code(&mut e, &Op::TableCreate { def: TableDef { name: b"t".to_vec(), columns: vec![col("z", 0)] } }), errno::EEXIST);
+
+    // 查不存在的表不是错误：回 `Table(None)`，客户端一个 op 就能判存在性。
+    match ok(&mut e, &Op::TableGet { name: b"ghost".to_vec() }) {
+        Reply::Table(None) => {}
+        other => panic!("TableGet 缺表应回 Table(None)，实得 {other:?}"),
+    }
+    match ok(&mut e, &Op::TableList) {
+        Reply::Tables(v) => assert_eq!(v.len(), 1, "TableList 要把 def 原样回齐：{v:?}"),
+        other => panic!("{other:?}"),
+    }
+    // 不存在的表名在写侧也是 ENOENT，而不是凭空建一张。
+    assert_eq!(err_rowput(&mut e, "nope", "k", &["a"], 0, COND_NONE, ""), errno::ENOENT);
+    assert_eq!(err_code(&mut e, &Op::TableDrop { name: b"nope".to_vec() }), errno::ENOENT);
+    assert_eq!(err_rowlist(&mut e, "nope", ROW_PK, ""), errno::ENOENT);
+
+    put_row(&mut e, "t", "k1", &["a1", "x", "1"], 0, COND_NONE, "");
+    ok(&mut e, &Op::TableDrop { name: b"t".to_vec() });
+    // 表名可以回收（与视图名同理：名字是客户端的键，不是主键），但旧行不能跟着回来。
+    mk_table(&mut e, "t");
+    match ok(&mut e, &Op::RowGet { table: b"t".to_vec(), key: b"k1".to_vec() }) {
+        Reply::Row(None) => {}
+        other => panic!("重建的表不能带着旧行：{other:?}"),
+    }
+    assert_eq!(row_count(&mut e, "t", ROW_PK, ""), 0);
+}
+
+#[test]
+fn row_writes_respect_bounds_constraints_and_conditions() {
+    let d = Dir::new("rowwrite");
+    let mut e = d.open();
+    mk_table(&mut e, "t");
+
+    // 主键 1..=上限：空主键会让「从头」与「从空键起」两种意思撞在一个写法上。
+    assert_eq!(err_rowput(&mut e, "t", "", &["a1", "b1", "c1"], 0, COND_NONE, ""), errno::EINVAL);
+    assert_eq!(
+        err_rowput(&mut e, "t", &"k".repeat(ROW_KEY_MAX + 1), &["a1", "b1", "c1"], 0, COND_NONE, ""),
+        errno::EINVAL
+    );
+    // 列数与 def 严格相等：少一列不是「那列留空」，是形状不符。
+    assert_eq!(err_rowput(&mut e, "t", "k", &["a1"], 0, COND_NONE, ""), errno::EINVAL);
+    assert_eq!(err_rowput(&mut e, "t", "k", &["a1", "b1", "c1", "d1"], 0, COND_NONE, ""), errno::EINVAL);
+
+    put_row(&mut e, "t", "k1", &["a1", "x", "1"], 0, COND_NONE, "");
+    put_row(&mut e, "t", "k2", &["a2", "x", "2"], 0, COND_NONE, "");
+    // 唯一列撞值 → EEXIST；非唯一列（b 只索引）同值两行必须放行。
+    assert_eq!(err_rowput(&mut e, "t", "k3", &["a1", "y", "3"], 0, COND_NONE, ""), errno::EEXIST);
+    put_row(&mut e, "t", "k3", &["a3", "x", "3"], 0, COND_NONE, "");
+    assert!(
+        matches!(put_row(&mut e, "t", "k1", &["a1", "x", "9"], 0, COND_NONE, ""), Reply::Row(Some(_))),
+        "同值覆盖写不算撞约束"
+    );
+    // 空字节是一列的合法值：唯一列上两行都取空值也算撞。
+    put_row(&mut e, "t", "k4", &["", "x", ""], 0, COND_NONE, "");
+    assert_eq!(err_rowput(&mut e, "t", "k5", &["", "z", ""], 0, COND_NONE, ""), errno::EEXIST, "空值也是值");
+
+    // flags：两个互斥位同时给是客户端的错。
+    assert_eq!(err_rowput(&mut e, "t", "k1", &["a9", "x", "1"], PUT_IF_ABSENT, COND_NONE, ""), errno::EEXIST);
+    assert_eq!(err_rowput(&mut e, "t", "kk", &["a9", "x", "1"], PUT_IF_EXISTS, COND_NONE, ""), errno::ENOENT);
+    assert_eq!(
+        err_rowput(&mut e, "t", "kk", &["a9", "x", "1"], PUT_IF_ABSENT | PUT_IF_EXISTS, COND_NONE, ""),
+        errno::EINVAL
+    );
+
+    // CAS：命中才写，不命中一律 EAGAIN（行不存在也算不命中）；列号越界是 EINVAL。
+    assert_eq!(err_rowput(&mut e, "t", "k2", &["a2b", "x", "2"], 0, 0, "wrong"), errno::EAGAIN);
+    assert_eq!(err_rowput(&mut e, "t", "k2", &["a2b", "x", "2"], 0, 7, ""), errno::EINVAL);
+    assert_eq!(err_rowput(&mut e, "t", "knew", &["an", "x", "n"], 0, 0, "whatever"), errno::EAGAIN);
+    put_row(&mut e, "t", "k2", &["a2b", "x", "2"], 0, 0, "a2");
+    match ok(&mut e, &Op::RowGet { table: b"t".to_vec(), key: b"k2".to_vec() }) {
+        Reply::Row(Some(r)) => assert_eq!(
+            r.cols,
+            vec![b"a2b".to_vec(), b"x".to_vec(), b"2".to_vec()],
+            "CAS 命中就要写下去"
+        ),
+        other => panic!("{other:?}"),
+    }
+    match ok(&mut e, &Op::RowGet { table: b"t".to_vec(), key: b"no-k".to_vec() }) {
+        Reply::Row(None) => {}
+        other => panic!("RowGet 缺行应回 Row(None)，实得 {other:?}"),
+    }
+
+    // 删行：默认幂等（重发一个已成功的删除不该看到错误）。
+    let del = |key: &str, flags: u32, cond_col: u32, cond_val: &str| Op::RowDelete {
+        table: b"t".to_vec(),
+        key: key.as_bytes().to_vec(),
+        flags,
+        cond_col,
+        cond_val: cond_val.as_bytes().to_vec(),
+    };
+    assert!(matches!(ok(&mut e, &del("k4", 0, COND_NONE, "")), Reply::Ok));
+    assert!(matches!(ok(&mut e, &del("k4", 0, COND_NONE, "")), Reply::Ok), "幂等是默认");
+    assert_eq!(err_code(&mut e, &del("k4", DEL_IF_EXISTS, COND_NONE, "")), errno::ENOENT);
+    assert_eq!(err_code(&mut e, &del("k3", 0, 0, "not-a3")), errno::EAGAIN);
+    assert!(
+        matches!(ok(&mut e, &Op::RowGet { table: b"t".to_vec(), key: b"k3".to_vec() }), Reply::Row(Some(_))),
+        "条件不命中不能把行顺手删了"
+    );
+
+    // 删表之后行不能还在。
+    ok(&mut e, &Op::TableDrop { name: b"t".to_vec() });
+    assert_eq!(err_code(&mut e, &Op::RowGet { table: b"t".to_vec(), key: b"k1".to_vec() }), errno::ENOENT);
+}
+
+#[test]
+fn row_scans_page_by_key_cursor_without_gaps_or_repeats() {
+    let d = Dir::new("rowscan");
+    let mut e = d.open();
+    mk_table(&mut e, "t");
+    // 25 行，主键定宽补零：字节序 = 数字序，期望值才能直接写死。
+    for i in 0..25 {
+        let (k, a) = (format!("k{i:02}"), format!("a{i:02}"));
+        let b = if i % 2 == 0 { "even" } else { "odd" };
+        put_row(&mut e, "t", &k, &[&a, b, "c"], 0, COND_NONE, "");
+    }
+
+    let want: Vec<String> = (0..25).map(|i| format!("k{i:02}")).collect();
+    assert_eq!(walk(&mut e, "t", ROW_PK, "", 4), want, "主键游标翻页必须不重不漏");
+    assert_eq!(walk(&mut e, "t", ROW_PK, "", 25), want, "一页恰好装完也得说清到底了");
+    assert_eq!(walk(&mut e, "t", 1, "even", 4), (0..25).step_by(2).map(|i| format!("k{i:02}")).collect::<Vec<_>>());
+    assert_eq!(walk(&mut e, "t", 1, "odd", 3), (1..25).step_by(2).map(|i| format!("k{i:02}")).collect::<Vec<_>>());
+    // 主键当游标用在索引列上：同一值那一段里接着往下走。
+    let mut from_one = row_keys(ok(&mut e, &rowlist_op("t", 1, "even", "", 1)));
+    assert_eq!(from_one, vec!["k00".to_string()]);
+    from_one = row_keys(ok(&mut e, &rowlist_op("t", 1, "even", &from_one[0], 2)));
+    assert_eq!(from_one, vec!["k02".to_string(), "k04".to_string()]);
+
+    // 计数：主键 = 表里存了多少行，索引列 = 命中数。
+    assert_eq!(row_count(&mut e, "t", ROW_PK, ""), 25);
+    assert_eq!(row_count(&mut e, "t", 1, "even"), 13);
+    assert_eq!(row_count(&mut e, "t", 1, "none"), 0);
+
+    // 没建索引的列（c）与越界列号都是 EINVAL，而不是静默扫全表。
+    assert_eq!(err_rowlist(&mut e, "t", 2, "c"), errno::EINVAL);
+    assert_eq!(err_rowlist(&mut e, "t", 9, ""), errno::EINVAL);
+    assert_eq!(err_code(&mut e, &Op::RowCount { table: b"t".to_vec(), column: 2, value: b"c".to_vec() }), errno::EINVAL);
+
+    // `limit = 0` 走默认页宽（与 readdir 同一套路），不是「不限」。整表 25 行一页就到底。
+    assert_eq!(row_keys(ok(&mut e, &rowlist_op("t", ROW_PK, "", "", 0))).len(), 25);
+    // 空表与不存在的列值都是空页 + end=true，不能让调用方多跑一页空扫才发现到底。
+    match ok(&mut e, &rowlist_op("t", 1, "none", "", 10)) {
+        Reply::Rows { rows, end } => assert!(rows.is_empty() && end),
+        other => panic!("{other:?}"),
+    }
+    // 删到空：内层表不留，与 dentries 同规矩（否则 `rows.len()` 会谎报表数）。
+    for i in 0..25 {
+        let k = format!("k{i:02}");
+        ok(&mut e, &Op::RowDelete { table: b"t".to_vec(), key: k.into_bytes(), flags: 0, cond_col: COND_NONE, cond_val: Vec::new() });
+    }
+    let s = e.state_snapshot();
+    assert!(s.rows.is_empty(), "空内层表不能留在外层");
+    assert!(s.row_index.is_empty(), "删行必须同时摘掉索引项");
+}
+
+#[test]
+fn table_state_survives_checkpoint_and_reopen() {
+    let d = Dir::new("tblreopen");
+    let mut e = d.open();
+    mk_table(&mut e, "keep");
+    mk_table(&mut e, "gone");
+    put_row(&mut e, "keep", "k1", &["a1", "x", "1"], 0, COND_NONE, "");
+    put_row(&mut e, "gone", "g1", &["a2", "x", "2"], 0, COND_NONE, "");
+    ok(&mut e, &Op::TableDrop { name: b"gone".to_vec() });
+    // checkpoint 之后再写一条，逼「快照 + 增量 WAL」两段都带上表状态。
+    ok(&mut e, &Op::Checkpoint);
+    put_row(&mut e, "keep", "k2", &["a3", "y", "3"], 0, COND_NONE, "");
+    let before = e.state_snapshot();
+    drop(e);
+
+    let mut e2 = d.open();
+    assert_eq!(e2.state_snapshot(), before, "表/行/索引必须与关掉前逐字段相等");
+    match ok(&mut e2, &Op::TableList) {
+        Reply::Tables(v) => assert_eq!(
+            v.iter().map(|t| String::from_utf8_lossy(&t.name).into_owned()).collect::<Vec<_>>(),
+            vec!["keep".to_string()],
+            "drop 掉的表不能重放回来"
+        ),
+        other => panic!("{other:?}"),
+    }
+    match ok(&mut e2, &Op::TableGet { name: b"keep".to_vec() }) {
+        Reply::Table(Some(def)) => assert_eq!(def.columns.len(), 3, "def 要逐字段回来"),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(row_count(&mut e2, "keep", ROW_PK, ""), 2);
+    assert_eq!(row_keys(ok(&mut e2, &rowlist_op("keep", 1, "x", "", 10))), vec!["k1".to_string()]);
+    // 二级索引不存磁盘：重开后唯一约束得照样拦得住，否则就是索引没重建。
+    assert_eq!(err_rowput(&mut e2, "keep", "x1", &["a1", "z", "9"], 0, COND_NONE, ""), errno::EEXIST);
+}
+
+// ---------------------------------------------------------------- readdir 带属性（§11 #6）
+
+#[test]
+fn readdir_plus_answers_the_same_page_as_readdir_plus_getattr() {
+    let d = Dir::new("rdplus");
+    let mut e = d.open();
+    let v = mk_view(&mut e, "v");
+    let a = mk_file(&mut e, v, 1, "a");
+    let _dd = mk_dir(&mut e, v, 1, "d");
+    ok(&mut e, &Op::Symlink { view: v, parent: 1, name: b"l".to_vec(), target: b"a".to_vec(), uid: 3, gid: 4 });
+    // 把四条目录项拉成四种不同属性：改 mode/uid/gid/size、提交内容引用，
+    // 这样平行的属性数组不是四份全零。
+    ok(&mut e, &Op::Setattr {
+        view: v, ino: a.ino, valid: SA_MODE | SA_UID | SA_GID | SA_SIZE, mode: 0o640, uid: 7, gid: 8,
+        size: 4096, atime: 0, mtime: 0, data_ref: Vec::new(), ref_bytes: 0,
+    });
+    let f2 = mk_file(&mut e, v, 1, "f2");
+    ok(&mut e, &commit_ref(v, f2.ino, 100, 4096));
+
+    for (off, lim) in [(0u64, 100u32), (0, 2), (2, 2), (4, 2), (0, 1), (9, 10)] {
+        let (p_inos, p_kinds, p_names, p_next, p_end) = match ok(&mut e, &Op::ReadDir { view: v, parent: 1, offset: off, limit: lim }) {
+            Reply::Dirents { inos, kinds, names, next, end } => (inos, kinds, names.to_vec(), next, end),
+            other => panic!("{other:?}"),
+        };
+        let (q_inos, q_kinds, q_names, q_attrs, q_next, q_end) = match ok(
+            &mut e,
+            &Op::ReadDirPlus { view: v, parent: 1, offset: off, limit: lim },
+        ) {
+            Reply::DirentsPlus { inos, kinds, names, attrs, next, end } => {
+                assert_eq!(attrs.len(), inos.len(), "平行数组必须同长，少一项就是整页错位");
+                assert_eq!(kinds.len(), inos.len());
+                (inos, kinds, names.to_vec(), attrs, next, end)
+            }
+            other => panic!("{other:?}"),
+        };
+        let tag = format!("offset {off} limit {lim}");
+        assert_eq!(p_inos, q_inos, "{tag}: 目录页本身变了");
+        assert_eq!(p_kinds, q_kinds, "{tag}");
+        assert_eq!(p_names, q_names, "{tag}");
+        assert_eq!((p_next, p_end), (q_next, q_end), "{tag}: 分页游标与到底判定必须一致");
+        // 属性逐条与 Getattr 对齐：这就是这一页省下那 N 次往返的全部内容。
+        for (ino, attr) in q_inos.iter().zip(q_attrs.iter()) {
+            assert_eq!(*attr, NodeAttr::of(&getattr(&mut e, v, *ino)), "{tag}: ino {ino} 的属性与 Getattr 不符");
+        }
+    }
+
+    // 错误面与 readdir 同一条：多要属性不该看到不同的 errno。
+    assert_eq!(err_code(&mut e, &Op::ReadDirPlus { view: v, parent: a.ino, offset: 0, limit: 10 }), errno::ENOTDIR);
+    assert_eq!(err_code(&mut e, &Op::ReadDirPlus { view: 999, parent: 1, offset: 0, limit: 10 }), errno::ENODEV);
+    // 空目录（只有根本身时 dentries 里没这一项）：空页 + end，不是报错。
+    let sub = mk_dir(&mut e, v, 1, "sub");
+    match ok(&mut e, &Op::ReadDirPlus { view: v, parent: sub.ino, offset: 0, limit: 10 }) {
+        Reply::DirentsPlus { names, end, next, .. } => {
+            assert!(names.is_empty() && end, "空目录要一次就说到底");
+            assert_eq!(next, 0);
+        }
+        other => panic!("{other:?}"),
+    }
+    // 视图删了之后目录页也不该残留半条：与 readdir 一样回空。
+    ok(&mut e, &Op::DropView { name: b"v".to_vec() });
+    assert_eq!(err_code(&mut e, &Op::ReadDirPlus { view: v, parent: 1, offset: 0, limit: 10 }), errno::ENODEV);
+}
+
+// ---------------------------------------------------------------- Stats 的磁盘面（§11 #3）
+
+#[test]
+fn stats_reports_table_counts_and_both_disk_sizes() {
+    let d = Dir::new("stdisk");
+    let mut e = d.open();
+    let wal_path = d.path().join("treedb.wal");
+    let snap_path = d.path().join("state.snap");
+
+    let st0 = e.snapshot_stats();
+    assert_eq!(st0.proto_version, treedb::engine::PROTOCOL_VERSION, "Stats 要能报出对端协议版本");
+    assert_eq!((st0.tables, st0.rows), (0, 0));
+    assert_eq!(st0.snap_bytes, 0, "没做过 checkpoint 不该有快照长度");
+    assert_eq!(st0.wal_disk_bytes, std::fs::metadata(&wal_path).unwrap().len(), "磁盘长度就是 st_size");
+    // 两个数必须各说各的：预分配让文件比已写字节大，容量规划看大的那个。
+    assert!(st0.wal_disk_bytes >= st0.wal_bytes, "逻辑长度不可能超过磁盘长度");
+
+    mk_table(&mut e, "t");
+    for i in 0..7 {
+        let (k, a) = (format!("k{i}"), format!("a{i}"));
+        put_row(&mut e, "t", &k, &[&a, "b", "c"], 0, COND_NONE, "");
+    }
+    // 表数与行数分开报：`tables` 是一张，`rows` 是七行（不是「有行的表数」）。
+    let st = e.snapshot_stats();
+    assert_eq!((st.tables, st.rows), (1, 7));
+    assert!(st.wal_bytes > 0);
+
+    ok(&mut e, &Op::Checkpoint);
+    let st2 = e.snapshot_stats();
+    assert!(st2.snap_bytes > 0, "checkpoint 后快照长度必须可查，否则恢复时间算不出账");
+    assert_eq!(st2.snap_bytes, std::fs::metadata(&snap_path).unwrap().len());
+    assert!(st2.checkpoints >= 1);
+    // checkpoint 把 WAL 截断重写：逻辑长度回落，磁盘长度跟着文件走 ——
+    // 断言的是「两个数都仍然自洽」，不是谁一定更大。
+    let st3 = e.snapshot_stats();
+    assert_eq!(st3.wal_disk_bytes, std::fs::metadata(&wal_path).unwrap().len());
+    assert!(st3.wal_disk_bytes >= st3.wal_bytes);
+    // 重开后计数与磁盘长度都得重新算出来，不能靠旧内存里的残值。
+    drop(e);
+    let mut e4 = d.open();
+    let st4 = e4.snapshot_stats();
+    assert_eq!((st4.tables, st4.rows), (1, 7));
+    assert_eq!(st4.snap_bytes, std::fs::metadata(&snap_path).unwrap().len());
 }

@@ -78,6 +78,7 @@ pub struct EngineStats {
     pub seq: u64,
     /// 快照覆盖到的 seq（重放水位）。
     pub snap_seq: u64,
+    /// WAL 的**逻辑**长度（已写入的字节数），checkpoint 阈值按它算。
     pub wal_bytes: u64,
     pub ops_total: u64,
     pub writes_total: u64,
@@ -86,6 +87,18 @@ pub struct EngineStats {
     pub sync_us_total: u64,
     /// 累计 checkpoint 次数。
     pub checkpoints: u64,
+    /// 通用表数与总行数（§11 T2）。
+    pub tables: u64,
+    pub rows: u64,
+    /// WAL 文件的**磁盘**长度（st_size，含预分配空洞）。与 `wal_bytes` 是两个数：
+    /// 前者是写了多少，后者是占了多大。容量规划看这一个（§8 第 9 条）。
+    pub wal_disk_bytes: u64,
+    /// 快照文件长度（含尾部 8 字节 seq）。没有快照时为 0。
+    /// 恢复时间 = 读它 + 重放 `wal_bytes`，所以这两个数得并列才能算账。
+    pub snap_bytes: u64,
+    /// 线协议版本（[`crate::engine::PROTOCOL_VERSION`]）。拿它核对客户端与
+    /// 服务端是不是同一代字节布局。
+    pub proto_version: u16,
 }
 
 impl EngineStats {
@@ -105,6 +118,13 @@ impl EngineStats {
         w.u64(self.syncs_total);
         w.u64(self.sync_us_total);
         w.u64(self.checkpoints);
+        // 新字段一律加在尾部：这个结构体没有自己的版本位，前 15 个字的
+        // 位置就是它的 ABI，插中间会让旧客户端静默解错。
+        w.u64(self.tables);
+        w.u64(self.rows);
+        w.u64(self.wal_disk_bytes);
+        w.u64(self.snap_bytes);
+        w.u16(self.proto_version);
     }
     pub fn decode(r: &mut Rd) -> Result<Self> {
         Ok(EngineStats {
@@ -123,6 +143,11 @@ impl EngineStats {
             syncs_total: r.u64()?,
             sync_us_total: r.u64()?,
             checkpoints: r.u64()?,
+            tables: r.u64()?,
+            rows: r.u64()?,
+            wal_disk_bytes: r.u64()?,
+            snap_bytes: r.u64()?,
+            proto_version: r.u16()?,
         })
     }
 }
@@ -382,9 +407,10 @@ impl Engine {
 
     /// 当前 WAL 逻辑字节数。给事件循环的 auto-checkpoint 判断用。
     ///
-    /// 为什么单独开这个口而不是用 [`Engine::snapshot_stats`]：后者要把七张表
-    /// 各数一遍（其中 dentry 条数在两层表下是 O(目录数)），而 auto-checkpoint
-    /// 每轮只需要这一个数。默认档 64 MB 下那是每轮白付一次全表计数。
+    /// 为什么单独开这个口而不是用 [`Engine::snapshot_stats`]：后者要把那几张表
+    /// 各数一遍（其中 dentry 条数在两层表下是 O(目录数)、通用表行数要扫全部
+    /// 表），而 auto-checkpoint 每轮只需要这一个数。默认档 64 MB 下那是每轮
+    /// 白付一次全表计数。
     pub fn wal_bytes(&self) -> u64 {
         self.wal.logical_size().unwrap_or(0)
     }
@@ -433,7 +459,7 @@ impl Engine {
         self.stats.ops_total += self.external_ops.swap(0, Ordering::Relaxed);
         // 先把计数在 Guard 作古前抽出来：guard 借的是 `&self.state`，而下面
         // 要改 `self.stats`，不拆开就过不了借用检查。
-        let (views, nodes, dentries, locks, refs, keys, audit) = {
+        let (views, nodes, dentries, locks, refs, keys, audit, tables, rows) = {
             let s = read_of(&self.state);
             (
                 s.views.len() as u64,
@@ -444,6 +470,9 @@ impl Engine {
                 s.refs.len() as u64,
                 s.keys.len() as u64,
                 s.audit.len() as u64,
+                s.tables.len() as u64,
+                // 同理：`rows.len()` 是有行的表数。
+                s.row_count() as u64,
             )
         };
         self.stats.views = views;
@@ -453,9 +482,18 @@ impl Engine {
         self.stats.refs = refs;
         self.stats.keys = keys;
         self.stats.audit = audit;
+        self.stats.tables = tables;
+        self.stats.rows = rows;
         self.stats.seq = self.wal.durable_seq().max(self.stats.seq);
         self.stats.snap_seq = self.snap_seq;
         self.stats.wal_bytes = self.wal.logical_size().unwrap_or(0);
+        self.stats.wal_disk_bytes = self.wal.disk_size().unwrap_or(0);
+        // 快照大小直接 stat 文件，不重解内容：这个数只用于容量规划，
+        // 而读一遍快照等于把整个状态拷进内存再扫一次。
+        self.stats.snap_bytes = std::fs::metadata(self.dir.join(SNAP_FILE))
+            .map(|m| m.len())
+            .unwrap_or(0);
+        self.stats.proto_version = crate::engine::PROTOCOL_VERSION;
         self.stats.clone()
     }
 

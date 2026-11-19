@@ -16,7 +16,10 @@ use common::Server;
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use treedb::engine::model::{errno, AuditRec, DefRec, KeyRec, Kind, Node, Op, Reply, SA_DATA_REF, SA_SIZE};
+use treedb::engine::model::{
+    errno, AuditRec, ColumnDef, DefRec, KeyRec, Kind, Node, Op, Reply, TableDef, COL_INDEX,
+    COL_UNIQUE, COND_NONE, ROW_PK, SA_DATA_REF, SA_SIZE,
+};
 use treedb::net::client::Client;
 
 fn ok(c: &mut Client, op: &Op) -> Reply {
@@ -52,6 +55,18 @@ fn create(c: &mut Client, view: u32, name: &str) -> Node {
     ) {
         Reply::Node(n) => n,
         other => panic!("{other:?}"),
+    }
+}
+
+/// 通用表里的一行：两个字节列，没有条件。
+fn trow(table: &str, key: &str, a: &str, b: &str) -> Op {
+    Op::RowPut {
+        table: table.as_bytes().to_vec(),
+        key: key.as_bytes().to_vec(),
+        cols: vec![a.as_bytes().to_vec(), b.as_bytes().to_vec()],
+        flags: 0,
+        cond_col: COND_NONE,
+        cond_val: Vec::new(),
     }
 }
 
@@ -417,6 +432,41 @@ fn control_plane_survives_sigkill() {
         &mut c,
         &Op::LockSet { view: v, ino: renamed.ino, owner: b"owner-1".to_vec(), verb: 0, kind: 2, lease_expiry: 0 },
     );
+    // ---- 通用表：建表、灌行、覆盖写、级联删表，四条全部算「已 ack」
+    let ctl_tbl = TableDef {
+        name: b"ctl-tbl".to_vec(),
+        columns: vec![
+            ColumnDef { name: b"a".to_vec(), flags: COL_UNIQUE },
+            ColumnDef { name: b"b".to_vec(), flags: COL_INDEX },
+        ],
+    };
+    ok(&mut c, &Op::TableCreate { def: ctl_tbl });
+    for k in 0..20 {
+        let (key, a) = (format!("r{k:02}"), format!("v{k:02}"));
+        let b = if k % 2 == 0 { "even" } else { "odd" };
+        ok(&mut c, &trow("ctl-tbl", &key, &a, b));
+    }
+    // 覆盖写：旧唯一值必须从重放后的索引里消失，而不是留下一条幽灵。
+    ok(&mut c, &trow("ctl-tbl", "r03", "v03b", "odd"));
+    // 一张用完就丢的表：`TableDrop` 的级联同样得扛住 SIGKILL。
+    ok(
+        &mut c,
+        &Op::TableCreate {
+            def: TableDef { name: b"ctl-gone".to_vec(), columns: vec![ColumnDef { name: b"c".to_vec(), flags: 0 }] },
+        },
+    );
+    ok(
+        &mut c,
+        &Op::RowPut {
+            table: b"ctl-gone".to_vec(),
+            key: b"g".to_vec(),
+            cols: vec![b"x".to_vec()],
+            flags: 0,
+            cond_col: COND_NONE,
+            cond_val: Vec::new(),
+        },
+    );
+    ok(&mut c, &Op::TableDrop { name: b"ctl-gone".to_vec() });
     drop(c);
 
     let (tmp, dir) = srv.sigkill_and_take_dir();
@@ -490,6 +540,50 @@ fn control_plane_survives_sigkill() {
             assert_eq!(l.len(), 1, "崩后锁不对: {l:?}");
             assert_eq!((l[0].0.as_slice(), l[0].1, l[0].2), (b"owner-1".as_slice(), 2u8, 0i64));
         }
+        other => panic!("{other:?}"),
+    }
+
+    // ---- 通用表：20 行一行不能少，覆盖写要重放出新值
+    match ok(&mut c, &Op::RowCount { table: b"ctl-tbl".to_vec(), column: ROW_PK, value: Vec::new() }) {
+        Reply::Count(n) => assert_eq!(n, 20, "崩后行数不对"),
+        other => panic!("{other:?}"),
+    }
+    match ok(&mut c, &Op::RowGet { table: b"ctl-tbl".to_vec(), key: b"r03".to_vec() }) {
+        Reply::Row(Some(r)) => assert_eq!(r.cols, vec![b"v03b".to_vec(), b"odd".to_vec()], "覆盖写没重放出来"),
+        other => panic!("{other:?}"),
+    }
+    // 二级索引不进 WAL 也不进快照：崩后唯一约束仍然拦得住，才说明索引是从
+    // 行 + def 重推出来的，而不是靠某个落在磁盘上的副本。
+    assert_eq!(
+        match rep(&mut c, &trow("ctl-tbl", "ghost", "v00", "even")) {
+            Reply::Err { code, .. } => code,
+            other => panic!("重复的唯一值被接受了：{other:?}"),
+        },
+        errno::EEXIST
+    );
+    match ok(&mut c, &Op::RowList { table: b"ctl-tbl".to_vec(), column: 1, value: b"even".to_vec(), from: Vec::new(), limit: 100 }) {
+        Reply::Rows { rows, end } => {
+            assert_eq!(rows.len(), 10, "按索引列列举漏了：{rows:?}");
+            assert!(end);
+        }
+        other => panic!("{other:?}"),
+    }
+    // 级联删表不能只删定义留下行：重开后同名表必须是干净的。
+    assert_eq!(
+        match rep(&mut c, &Op::RowGet { table: b"ctl-gone".to_vec(), key: b"g".to_vec() }) {
+            Reply::Err { code, .. } => code,
+            other => panic!("删掉的表崩后又出现了：{other:?}"),
+        },
+        errno::ENOENT
+    );
+    ok(
+        &mut c,
+        &Op::TableCreate {
+            def: TableDef { name: b"ctl-gone".to_vec(), columns: vec![ColumnDef { name: b"c".to_vec(), flags: 0 }] },
+        },
+    );
+    match ok(&mut c, &Op::RowCount { table: b"ctl-gone".to_vec(), column: ROW_PK, value: Vec::new() }) {
+        Reply::Count(n) => assert_eq!(n, 0, "旧行跟着重建的表回来了"),
         other => panic!("{other:?}"),
     }
     srv2.graceful_shutdown();

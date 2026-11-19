@@ -14,11 +14,13 @@
 //! - `locks: (view, ino, owner) → LockRec`  ← `locks` 表
 //!
 //! `refs` 是跨视图共享的内容账本（对应那个独立的 refs schema）；
-//! `keys`/`audit`/`defs`/`placement` 是控制面（对应那个 control schema）。
+//! `keys`/`audit`/`defs`/`placement` 是历史遗留的控制面专用表；
+//! `tables`/`rows`/`row_index` 是通用表：列名与语义由客户端定，引擎不解释值。
 
 use crate::engine::codec::{Rd, W};
 use crate::engine::model::{
-    AuditRec, DataRef, DefRec, Ino, KeyRec, LockRec, Node, RefRec, ViewId, ViewMeta,
+    AuditRec, DataRef, DefRec, Ino, KeyRec, LockRec, Node, RefRec, RowRec, TableDef, ViewId,
+    ViewMeta, MAX_TABLE_ITEMS,
 };
 use crate::error::{Error, Result};
 use std::collections::BTreeMap;
@@ -30,7 +32,10 @@ use std::ops::Bound;
 /// `model::DataRef`）。inode 行与 `refs` 账本行的字段宽度跟着变，旧快照不能被
 /// 新代码重解 —— 不 +1 就会把旧文件的 8 字节整数当长度前缀读，CRC 保护不了
 /// 已经存好的 payload 之外的东西，于是“静默解错”而不是“报错拒收”。
-pub const SNAP_VERSION: u32 = 2;
+///
+/// v2 → v3：尾部多出通用表三段（`tables` / `next_table_id` / `rows`）。同样是
+/// “不升版本就会把零字节当长度读”那一类，旧快照必须被拒而不是被解错。
+pub const SNAP_VERSION: u32 = 3;
 
 /// 已提交（WAL 已 durable）的一条状态变更。重放 = 从头到尾 `apply`，
 /// 因此每条都必须是幂等的整行写入，不记 delta。
@@ -108,6 +113,26 @@ pub enum Log {
     DelPlace {
         view: Vec<u8>,
     },
+    /// 建一张通用表。`id` 由翻译层从 `next_table_id` 分配（与 view id 同构），
+    /// 进日志是为了重放时行与表能对上同一个 id。
+    PutTable {
+        id: u32,
+        def: TableDef,
+    },
+    DelTable {
+        id: u32,
+        name: Vec<u8>,
+    },
+    /// 整行覆盖写（幂等，重放不需要知道前值）。二级索引由本模块从
+    /// `rows` + def 就地维护，不进日志字节。
+    PutRow {
+        table: u32,
+        row: RowRec,
+    },
+    DelRow {
+        table: u32,
+        key: Vec<u8>,
+    },
 }
 
 const LOG_PUT_VIEW: u8 = 1;
@@ -128,6 +153,10 @@ const LOG_PUT_DEF: u8 = 15;
 const LOG_DEL_DEF: u8 = 16;
 const LOG_PUT_PLACE: u8 = 17;
 const LOG_DEL_PLACE: u8 = 18;
+const LOG_PUT_TABLE: u8 = 19;
+const LOG_DEL_TABLE: u8 = 20;
+const LOG_PUT_ROW: u8 = 21;
+const LOG_DEL_ROW: u8 = 22;
 
 impl Log {
     pub fn encode(&self, w: &mut W) {
@@ -230,6 +259,26 @@ impl Log {
                 w.u8(LOG_DEL_PLACE);
                 w.bytes(view);
             }
+            Log::PutTable { id, def } => {
+                w.u8(LOG_PUT_TABLE);
+                w.u32(*id);
+                def.encode(w);
+            }
+            Log::DelTable { id, name } => {
+                w.u8(LOG_DEL_TABLE);
+                w.u32(*id);
+                w.bytes(name);
+            }
+            Log::PutRow { table, row } => {
+                w.u8(LOG_PUT_ROW);
+                w.u32(*table);
+                row.encode(w);
+            }
+            Log::DelRow { table, key } => {
+                w.u8(LOG_DEL_ROW);
+                w.u32(*table);
+                w.bytes(key);
+            }
         }
     }
 
@@ -298,10 +347,36 @@ impl Log {
                 instance: r.bytes()?,
             },
             LOG_DEL_PLACE => Log::DelPlace { view: r.bytes()? },
+            LOG_PUT_TABLE => Log::PutTable {
+                id: r.u32()?,
+                def: TableDef::decode(r)?,
+            },
+            LOG_DEL_TABLE => Log::DelTable {
+                id: r.u32()?,
+                name: r.bytes()?,
+            },
+            LOG_PUT_ROW => Log::PutRow {
+                table: r.u32()?,
+                row: RowRec::decode(r)?,
+            },
+            LOG_DEL_ROW => Log::DelRow {
+                table: r.u32()?,
+                key: r.bytes()?,
+            },
             x => return Err(Error::Codec(format!("unknown log tag {x}"))),
         };
         Ok(log)
     }
+}
+
+/// 一张通用表在状态里的落地：引擎分配的 id + 客户端给的 def。
+///
+/// id 不放进 [`TableDef`]：def 是客户端写的东西（也是应答的一部分），
+/// 给它加一个引擎才关心的字段等于把内部编号透到接口上。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TableMeta {
+    pub id: u32,
+    pub def: TableDef,
 }
 
 /// `dentries` 内层 value。
@@ -349,6 +424,22 @@ pub struct State {
     pub audit: BTreeMap<u64, AuditRec>,
     pub defs: BTreeMap<Vec<u8>, DefRec>,
     pub placement: BTreeMap<Vec<u8>, Vec<u8>>,
+    /// 通用表（§11 T2）：名字 → id/def。与 `views`/`view_by_id` 同构，
+    /// 因为同样的理由：行与索引只带 id，反查名字不能扫全表。
+    pub tables: BTreeMap<Vec<u8>, TableMeta>,
+    pub table_by_id: BTreeMap<u32, Vec<u8>>,
+    /// 下一个可分配的 table id（从 0 起，与 view id 同一套路）。
+    pub next_table_id: u32,
+    /// 表 id → (主键 → 行)。分两层同样是为了拿 `&[u8]` 借位查不复制主键
+    /// （与 [`State::dentries`] 同一个理由）。
+    pub rows: BTreeMap<u32, BTreeMap<Vec<u8>, RowRec>>,
+    /// 二级索引：`(表, 列, 值, 主键)` 一张扁平表，值占位。
+    ///
+    /// 为什么不分层：等值列举要的就是「(表,列,值) 前缀下按主键有序的一段」，
+    /// 一层 `range` 直接命中；唯一性检查是同一段的非空判定，不需要另一份结构。
+    /// 它**不进 WAL 也不进快照** —— 完全由 `rows` + def 推出，与 [`Dent::kind`]
+    /// 同一个取舍（冗余可推字段不动磁盘格式）。
+    pub row_index: BTreeMap<(u32, u32, Vec<u8>, Vec<u8>), ()>,
     /// 下一个可分配的 audit seq。
     pub next_audit_seq: u64,
 }
@@ -459,6 +550,64 @@ impl State {
             Log::DelPlace { view } => {
                 self.placement.remove(view);
             }
+            Log::PutTable { id, def } => {
+                self.table_by_id.insert(*id, def.name.clone());
+                if *id >= self.next_table_id {
+                    self.next_table_id = id + 1;
+                }
+                self.tables.insert(
+                    def.name.clone(),
+                    TableMeta {
+                        id: *id,
+                        def: def.clone(),
+                    },
+                );
+            }
+            Log::DelTable { id, name } => {
+                // 级联：行与索引都跟着走。`indexed_cols` 必须在表名映射还在
+                // 的时候取（先摘后就拿不到 def，索引项会永久泄漏）。
+                let cols = self.indexed_cols(*id);
+                self.tables.remove(name);
+                self.table_by_id.remove(id);
+                if let Some(m) = self.rows.remove(id) {
+                    for row in m.values() {
+                        self.unindex_row(*id, row, &cols);
+                    }
+                }
+            }
+            Log::PutRow { table, row } => {
+                let cols = self.indexed_cols(*table);
+                let old = self
+                    .rows
+                    .get(table)
+                    .and_then(|m| m.get(&row.key))
+                    .cloned();
+                if let Some(old) = old {
+                    self.unindex_row(*table, &old, &cols);
+                }
+                self.rows
+                    .entry(*table)
+                    .or_default()
+                    .insert(row.key.clone(), row.clone());
+                self.index_row(*table, row, &cols);
+            }
+            Log::DelRow { table, key } => {
+                let old = self
+                    .rows
+                    .get(table)
+                    .and_then(|m| m.get(key))
+                    .cloned();
+                let Some(old) = old else { return };
+                let cols = self.indexed_cols(*table);
+                self.unindex_row(*table, &old, &cols);
+                if let Some(m) = self.rows.get_mut(table) {
+                    m.remove(key);
+                }
+                // 空内层表不留，与 `dentries` 同规矩（否则 `rows.len()` 会谎报表数）。
+                if self.rows.get(table).map(|m| m.is_empty()).unwrap_or(false) {
+                    self.rows.remove(table);
+                }
+            }
         }
     }
 
@@ -491,6 +640,95 @@ impl State {
             self.locks.remove(&k);
         }
         self.view_by_id.remove(&view);
+    }
+
+    /// 某表需要维护二级索引的列序号（按 def 顺序）。表已被删则空。
+    pub fn indexed_cols(&self, tid: u32) -> Vec<u32> {
+        let Some(name) = self.table_by_id.get(&tid) else {
+            return Vec::new();
+        };
+        let Some(t) = self.tables.get(name.as_slice()) else {
+            return Vec::new();
+        };
+        t.def
+            .columns
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.indexed())
+            .map(|(i, _)| i as u32)
+            .collect()
+    }
+
+    fn index_row(&mut self, tid: u32, row: &RowRec, cols: &[u32]) {
+        for &c in cols {
+            // 列数比 def 少时该列不入索：写入侧本应在翻译层就拒掉 EINVAL，
+            // 这里的处理只是不让重放 panic。
+            if let Some(v) = row.cols.get(c as usize) {
+                self.row_index
+                    .insert((tid, c, v.clone(), row.key.clone()), ());
+            }
+        }
+    }
+
+    fn unindex_row(&mut self, tid: u32, row: &RowRec, cols: &[u32]) {
+        for &c in cols {
+            if let Some(v) = row.cols.get(c as usize) {
+                self.row_index.remove(&(tid, c, v.clone(), row.key.clone()));
+            }
+        }
+    }
+
+    /// `(表, 列, 值)` 前缀下的全部主键，按主键序。唯一性检查就是它的非空判定。
+    pub fn index_keys(&self, tid: u32, col: u32, value: &[u8]) -> Vec<Vec<u8>> {
+        self.row_index
+            .range((
+                Bound::Included((tid, col, value.to_vec(), Vec::new())),
+                Bound::Unbounded,
+            ))
+            .take_while(|(k, _)| k.0 == tid && k.1 == col && k.2 == value)
+            .map(|(k, _)| k.3.clone())
+            .collect()
+    }
+
+    /// 某表的主键升序页：`after` 之后的至多 `limit` 行，并说清到底没。
+    ///
+    /// `after` 是「上一页最后一行的主键」（不含本身），空 = 从头。与
+    /// [`read_dir`](Self::read_dir) 同一个游标语义，也与主键不得为空那条校验
+    /// 相配 —— 否则「从头」与「从空键起」两种意思会撞在一个写法上。
+    pub fn row_page(&self, tid: u32, after: &[u8], limit: usize) -> (Vec<RowRec>, bool) {
+        let Some(m) = self.rows.get(&tid) else {
+            return (Vec::new(), true);
+        };
+        let lo = if after.is_empty() {
+            Bound::Included(after)
+        } else {
+            Bound::Excluded(after)
+        };
+        let mut it = m.range::<[u8], _>((lo, Bound::Unbounded));
+        let rows: Vec<RowRec> = it.by_ref().take(limit).map(|(_, r)| r.clone()).collect();
+        let end = it.next().is_none();
+        (rows, end)
+    }
+
+    /// 按索引列等值取一页。游标语义与 [`row_page`](Self::row_page) 一致（同一列、
+    /// 同一个值内按主键继续）。
+    pub fn index_page(
+        &self,
+        tid: u32,
+        col: u32,
+        value: &[u8],
+        after: &[u8],
+        limit: usize,
+    ) -> (Vec<RowRec>, bool) {
+        let lo = (tid, col, value.to_vec(), after.to_vec());
+        let mut it = self
+            .row_index
+            .range((Bound::Excluded(lo), Bound::Unbounded))
+            .take_while(move |(k, _)| k.0 == tid && k.1 == col && k.2 == *value)
+            .filter_map(move |(k, _)| self.rows.get(&tid).and_then(|m| m.get(&k.3)).cloned());
+        let rows: Vec<RowRec> = it.by_ref().take(limit).collect();
+        let end = it.next().is_none();
+        (rows, end)
     }
 
     /// `(view, parent, *)` 区间内、`after` 之后的至多 `limit` 条 dentry。
@@ -547,6 +785,11 @@ impl State {
         self.views.len()
     }
 
+    /// 通用表的总行数（`rows.len()` 是表数，不是行数）。
+    pub fn row_count(&self) -> usize {
+        self.rows.values().map(|m| m.len()).sum()
+    }
+
     // ---- 快照 ----
 
     pub fn save(&self, w: &mut W) {
@@ -601,6 +844,24 @@ impl State {
             w.bytes(view);
             w.bytes(inst);
         }
+        // ---- v3：通用表 ----
+        w.u32(self.tables.len() as u32);
+        for t in self.tables.values() {
+            w.u32(t.id);
+            t.def.encode(w);
+        }
+        w.u32(self.next_table_id);
+        // 行数要先扫一遍才能写计数段：`rows` 是分层的，`len()` 是表数不是行数
+        //（与上面 `dentry_count()` 同一个坑）。
+        w.u32(self.row_count() as u32);
+        for (tid, m) in &self.rows {
+            for row in m.values() {
+                w.u32(*tid);
+                row.encode(w);
+            }
+        }
+        // `row_index` 不写：它由 `rows` + def 在载入时重建，写进磁盘格式就等于
+        // 多一份可以互相矛盾的权威（与 `Dent::kind` 同一条理由）。
     }
 
     pub fn load(r: &mut Rd) -> Result<State> {
@@ -675,6 +936,38 @@ impl State {
             let inst = r.bytes()?;
             s.placement.insert(view, inst);
         }
+        let n = r.u32()? as usize;
+        if n > MAX_TABLE_ITEMS {
+            return Err(Error::Config(format!(
+                "snapshot lists {n} tables, over {MAX_TABLE_ITEMS}"
+            )));
+        }
+        // 计数上限只为拒敌意输入；BTreeMap 没有预留容量这回事，逐项插进去就行。
+        for _ in 0..n {
+            let id = r.u32()?;
+            let def = TableDef::decode(r)?;
+            s.table_by_id.insert(id, def.name.clone());
+            if id >= s.next_table_id {
+                s.next_table_id = id + 1;
+            }
+            s.tables.insert(def.name.clone(), TableMeta { id, def });
+        }
+        // 取两个值的较大者：旧快照里 next_table_id 写得比实际 id 小也不能
+        // 让重号发生（与 `Log::PutTable` 那条 `>=` 同一个守口）。
+        s.next_table_id = s.next_table_id.max(r.u32()?);
+        let n = r.u32()? as usize;
+        if n > MAX_TABLE_ITEMS {
+            return Err(Error::Config(format!(
+                "snapshot lists {n} rows, over {MAX_TABLE_ITEMS}"
+            )));
+        }
+        for _ in 0..n {
+            let tid = r.u32()?;
+            let row = RowRec::decode(r)?;
+            let cols = s.indexed_cols(tid);
+            s.index_row(tid, &row, &cols);
+            s.rows.entry(tid).or_default().insert(row.key.clone(), row);
+        }
         Ok(s)
     }
 }
@@ -682,7 +975,7 @@ impl State {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::model::Kind;
+    use crate::engine::model::{ColumnDef, Kind, COL_INDEX, COL_UNIQUE};
 
     fn node(ino: u64, parent: u64, name: &[u8], kind: Kind) -> Node {
         Node {
@@ -800,6 +1093,22 @@ mod tests {
                 instance: b"i".to_vec(),
             },
             Log::DelPlace { view: b"v".to_vec() },
+            Log::PutTable {
+                id: 4,
+                def: TableDef {
+                    name: b"kv".to_vec(),
+                    columns: vec![
+                        ColumnDef { name: b"a".to_vec(), flags: COL_UNIQUE },
+                        ColumnDef { name: b"b".to_vec(), flags: 0 },
+                    ],
+                },
+            },
+            Log::DelTable { id: 4, name: b"kv".to_vec() },
+            Log::PutRow {
+                table: 4,
+                row: RowRec { key: b"k1".to_vec(), cols: vec![b"v1".to_vec(), Vec::new()] },
+            },
+            Log::DelRow { table: 4, key: b"k1".to_vec() },
         ];
         for log in &logs {
             let mut w = W::new();
@@ -1032,5 +1341,88 @@ mod tests {
         assert_eq!(s.dentry_count(), 0);
         assert!(s.dentries.is_empty(), "空内层表不能留在外层");
         assert!(s.dir_empty(1, 1));
+    }
+
+    fn page_keys(rows: &[RowRec]) -> Vec<Vec<u8>> {
+        rows.iter().map(|r| r.key.clone()).collect()
+    }
+
+    /// 通用表的五条契约：id 正向表同批维护、二级索引随覆盖写更新、游标翻页
+    /// 不重不漏、索引不占快照字节、删表级联不留残留。
+    #[test]
+    fn generic_tables_keep_rows_and_rebuild_indexes() {
+        let mut s = State::new();
+        s.apply(&Log::PutTable {
+            id: 0,
+            def: TableDef {
+                name: b"kv".to_vec(),
+                columns: vec![
+                    ColumnDef { name: b"a".to_vec(), flags: COL_UNIQUE },
+                    ColumnDef { name: b"b".to_vec(), flags: COL_INDEX },
+                ],
+            },
+        });
+        assert_eq!(
+            s.table_by_id.get(&0).map(|n| n.as_slice()),
+            Some(&b"kv"[..]),
+            "行与索引只带 id，正向表必须同批建起来"
+        );
+        assert_eq!(s.next_table_id, 1, "id 分配也要从日志里推回来");
+        assert_eq!(s.indexed_cols(0), vec![0, 1]);
+
+        for (key, va, vb) in [
+            (b"k1".as_slice(), b"v1".as_slice(), b"x".as_slice()),
+            (b"k2", b"v2", b"x"),
+            (b"k3", b"v3", b"y"),
+        ] {
+            s.apply(&Log::PutRow {
+                table: 0,
+                row: RowRec { key: key.to_vec(), cols: vec![va.to_vec(), vb.to_vec()] },
+            });
+        }
+        // `rows.len()` 是表数，`row_count()` 才是行数 —— 与 dentries 同一个坑。
+        assert_eq!(s.rows.len(), 1);
+        assert_eq!(s.row_count(), 3);
+        assert_eq!(s.index_keys(0, 0, b"v2"), vec![b"k2".to_vec()]);
+        assert_eq!(
+            s.index_keys(0, 1, b"x"),
+            vec![b"k1".to_vec(), b"k2".to_vec()],
+            "同值多行按主键序"
+        );
+        assert!(s.index_keys(0, 1, b"zz").is_empty());
+
+        // 覆盖写：旧值必须从索引里摘掉，否则唯一列会同时挂着两个主键。
+        s.apply(&Log::PutRow {
+            table: 0,
+            row: RowRec { key: b"k2".to_vec(), cols: vec![b"v9".to_vec(), b"x".to_vec()] },
+        });
+        assert!(s.index_keys(0, 0, b"v2").is_empty(), "旧值没摘干净");
+        assert_eq!(s.index_keys(0, 0, b"v9"), vec![b"k2".to_vec()]);
+
+        // 游标 = 上一页最后一行的主键，不含本身：翻完所有页既不重也不漏。
+        let (p1, end1) = s.row_page(0, &[], 2);
+        assert_eq!(page_keys(&p1), vec![b"k1".to_vec(), b"k2".to_vec()]);
+        assert!(!end1);
+        let (p2, end2) = s.row_page(0, &p1.last().unwrap().key, 2);
+        assert_eq!(page_keys(&p2), vec![b"k3".to_vec()]);
+        assert!(end2);
+        let (ix, iend) = s.index_page(0, 1, b"x", &[], 10);
+        assert_eq!(page_keys(&ix), vec![b"k1".to_vec(), b"k2".to_vec()]);
+        assert!(iend);
+
+        // 索引不进快照：往返后整个 State 逐字段相等，就等于它是被原样重推出来的。
+        let mut w = W::new();
+        s.save(&mut w);
+        let bytes = w.finish();
+        let mut r = Rd::new(&bytes);
+        let back = State::load(&mut r).unwrap();
+        assert_eq!(r.remaining(), 0);
+        assert_eq!(back, s, "表/行/next_table_id 必须全回来，索引必须重推成同一个");
+
+        // 删表级联：行、索引项、正向表一条不留。
+        s.apply(&Log::DelTable { id: 0, name: b"kv".to_vec() });
+        assert!(s.tables.is_empty() && s.table_by_id.is_empty() && s.rows.is_empty());
+        assert!(s.row_index.is_empty(), "删表后残留索引项 = 永久泄漏");
+        assert_eq!(s.indexed_cols(0), Vec::<u32>::new());
     }
 }

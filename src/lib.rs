@@ -11,7 +11,10 @@
 //! ## 三层能力
 //!
 //! 1. **引擎本体** `engine`：内存状态机 + CRC32 WAL + 快照 checkpoint + 崩溃重放；
-//!    POSIX 语义的 create/lookup/getattr/setattr/rename/readdir 与锁、内容引用账本。
+//!    POSIX 语义的 create/lookup/getattr/setattr/rename/readdir（含一页直接带属性的
+//!    readdirplus）与锁、内容引用账本。另有一面**通用表**：列为不透明字节，可标
+//!    唯一/索引列，写可带条件与 CAS —— 接入方的表形用它表达，而不是把业务列名
+//!    搬进内核（引擎不解释任何一列）。
 //! 2. **连接层** `net`：默认单线程 `epoll` 事件循环（1 fd/conn，万级连接每连接
 //!    半 KiB RSS）；`--workers N` 起 N 条前端并行读，写永远由唯一提交线程定序。
 //! 3. **过渡档**（feature `postgres-compat`，**默认关**）：`pool` / `store` / `persist`

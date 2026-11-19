@@ -366,6 +366,18 @@ impl Wal {
     pub fn logical_size(&self) -> Result<u64> {
         Ok(self.end)
     }
+
+    /// WAL 在磁盘上占了多少字节（含预分配空洞）。与 [`logical_size`](Self::logical_size)
+    /// 是两个数，容量规划要看后一个：预分配是倍增的，`du` 看到的可以比
+    /// 逻辑长度大一截。取不到真实长度时退回 `allocated`（那个就是上一次
+    /// 成功预分配到的位置）。
+    pub fn disk_size(&self) -> Result<u64> {
+        Ok(self
+            .file
+            .metadata()
+            .map(|m| m.len())
+            .unwrap_or(self.allocated))
+    }
 }
 
 /// 把 `f` 的真实长度抬到 `target` 并保证那段空间可读为 0。

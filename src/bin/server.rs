@@ -12,7 +12,7 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use treedb::engine::{Durability, Op, Reply};
+use treedb::engine::{Durability, Op, Reply, PROTOCOL_VERSION};
 use treedb::net::client::Client;
 use treedb::net::server::{serve, ServerConfig};
 
@@ -42,8 +42,16 @@ fn print_stats(addr: &str) -> Result<(), String> {
             println!("refs       = {}", s.refs);
             println!("keys       = {}", s.keys);
             println!("audit      = {}", s.audit);
+            println!("tables     = {} (rows {})", s.tables, s.rows);
             println!("seq        = {} (snapshot {})", s.seq, s.snap_seq);
-            println!("wal        = {} B", s.wal_bytes);
+            // 两个长度各说一件事：逻辑长度决定 checkpoint 何时触发，磁盘长度
+            // 决定这块盘被占了多少（预分配的空洞差一个数量级）。
+            println!(
+                "wal        = {} B logical, {} B on disk",
+                s.wal_bytes, s.wal_disk_bytes
+            );
+            println!("snapshot   = {} B", s.snap_bytes);
+            println!("protocol   = {}", s.proto_version);
             println!(
                 "ops        = {} (writes {}, syncs {}, avg fsync {} us)",
                 s.ops_total, s.writes_total, s.syncs_total,
@@ -148,10 +156,13 @@ fn main() {
         workers,
     };
     eprintln!(
-        "treedb-server pid={} listen={} dir={} durability={} backlog={} workers={}",
+        // 帧里没有版本位（§4.1），升级顺序又是硬约束，所以 banner 一开就把它摆出来：
+        // 运维在两端对不上时第一眼就该看见。
+        "treedb-server pid={} listen={} dir={} protocol={} durability={} backlog={} workers={}",
         std::process::id(),
         addr,
         dir.display(),
+        PROTOCOL_VERSION,
         durability,
         backlog,
         workers
@@ -203,6 +214,7 @@ treedb-server — 元数据引擎服务端（POSIX 元数据语义，客户端�
   --sync-ms N                事件循环空闲唤醒间隔，默认 20
   --auto-checkpoint-mb N     WAL 超此大小自动快照，默认 64（0 = 关闭）
   --pid-file PATH            启动后写入 pid，便于测试脚本 kill -9
-  --stats                    不启服务，连上去打印状态后退出
+  --stats                    不启服务，连上去打印状态后退出（含表的行数、WAL 的
+                             逻辑与磁盘两个长度、快照长度与协议版本）
   --shutdown                 通知运行中的实例优雅停服
 ";

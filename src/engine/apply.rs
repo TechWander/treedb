@@ -7,12 +7,14 @@
 //!
 //! 约定：`logs.is_empty()` 等价于「本 op 是只读的」。
 
-use crate::engine::mem::{DENT_KIND_UNKNOWN, Log, State};
+use crate::engine::mem::{DENT_KIND_UNKNOWN, Log, State, TableMeta};
 use std::collections::BTreeMap;
 use std::ops::Bound;
 use crate::engine::model::{
-    errno, AuditRec, DataRef, DefRec, Ino, LockRec, Names, Node, RefRec, Reply, ViewId, ViewMeta,
-    Kind, Op, RENAME_NOREPLACE, SA_ATIME, SA_DATA_REF, SA_GID, SA_MODE, SA_MTIME, SA_SIZE, SA_UID,
+    errno, AuditRec, DataRef, DefRec, Ino, LockRec, Names, Node, NodeAttr, RefRec, Reply, RowRec,
+    TableDef, ViewId, ViewMeta, Kind, Op, MAX_COLUMNS, PUT_IF_ABSENT, PUT_IF_EXISTS,
+    DEL_IF_EXISTS, COND_NONE, RENAME_NOREPLACE, ROW_KEY_MAX, ROW_PK, SA_ATIME, SA_DATA_REF,
+    SA_GID, SA_MODE, SA_MTIME, SA_SIZE, SA_UID, TABLE_NAME_MAX,
 };
 
 /// 名字合法性：POSIX 255 字节上限 + 不允许 `/` 和空。
@@ -42,6 +44,96 @@ fn no_view(view: ViewId) -> Reply {
 /// 误判成「这个 inode 查不中」而只失效一个 dentry。
 fn dead_view(s: &State, view: ViewId) -> bool {
     view_meta(s, view).is_none()
+}
+
+/// 通用表的 def 合法性。返回一条 `Reply::Err` 就代表不合法，调用方直接回。
+///
+/// 这里只查**形状**：名字非空、长度有上界、列数在 1..=上限、列名不重。
+/// 列里存什么、怎么算合法值，引擎一概不管。
+fn bad_def(def: &TableDef) -> Option<Reply> {
+    if def.name.is_empty() {
+        return Some(Reply::err(errno::EINVAL, "empty table name"));
+    }
+    if def.name.len() > TABLE_NAME_MAX {
+        return Some(Reply::err(
+            errno::ENAMETOOLONG,
+            format!("table name over {TABLE_NAME_MAX} bytes"),
+        ));
+    }
+    if def.columns.is_empty() || def.columns.len() > MAX_COLUMNS {
+        return Some(Reply::err(
+            errno::EINVAL,
+            format!("table needs 1..={MAX_COLUMNS} columns"),
+        ));
+    }
+    // 列名重复不破坏按序号寻址，但应答里两份同名列 = 客户端没法解释，
+    // 所以宁可在建表时就拒。
+    let mut seen: Vec<&[u8]> = Vec::with_capacity(def.columns.len());
+    for c in &def.columns {
+        if c.name.is_empty() {
+            return Some(Reply::err(errno::EINVAL, "empty column name"));
+        }
+        if c.name.len() > TABLE_NAME_MAX {
+            return Some(Reply::err(
+                errno::ENAMETOOLONG,
+                format!("column name over {TABLE_NAME_MAX} bytes"),
+            ));
+        }
+        if seen.contains(&c.name.as_slice()) {
+            return Some(Reply::err(
+                errno::EINVAL,
+                format!("duplicate column name {}", String::from_utf8_lossy(&c.name)),
+            ));
+        }
+        seen.push(&c.name);
+    }
+    None
+}
+
+fn no_table(name: &[u8]) -> Reply {
+    Reply::err(
+        errno::ENOENT,
+        format!("no such table {}", String::from_utf8_lossy(name)),
+    )
+}
+
+/// `column` 能不能用来列举：[`ROW_PK`] 恒可，否则必须是建了索引的那一列。
+fn bad_column(t: &TableMeta, column: u32) -> Option<Reply> {
+    if column == ROW_PK {
+        return None;
+    }
+    match t.def.columns.get(column as usize) {
+        None => Some(Reply::err(
+            errno::EINVAL,
+            format!("table {} has no column {column}", String::from_utf8_lossy(&t.def.name)),
+        )),
+        Some(c) if !c.indexed() => Some(Reply::err(
+            errno::EINVAL,
+            format!(
+                "column {} is not indexed",
+                String::from_utf8_lossy(&c.name)
+            ),
+        )),
+        Some(_) => None,
+    }
+}
+
+/// CAS 条件不命中就返回一条 `EAGAIN`。调用方必须先把 `cond_col` 的范围
+/// 检查做完，这里只比较值。
+///
+/// 行不存在也算不命中：「我以为它是这个值」这句话对一行不存在的行不成立，
+/// 让客户端拿到 `ENOENT` 还是 `EAGAIN` 都会误导重试策略。
+fn cond_miss(row: Option<&RowRec>, cond_col: u32, cond_val: &[u8]) -> Option<Reply> {
+    if cond_col == COND_NONE {
+        return None;
+    }
+    let Some(r) = row else {
+        return Some(Reply::err(errno::EAGAIN, "condition needs an existing row"));
+    };
+    match r.cols.get(cond_col as usize) {
+        Some(v) if v == cond_val => None,
+        _ => Some(Reply::err(errno::EAGAIN, "condition not met")),
+    }
 }
 
 fn node_of(s: &State, view: ViewId, ino: Ino) -> Option<Node> {
@@ -339,6 +431,81 @@ pub fn translate(s: &State, now: i64, op: &Op) -> (Vec<Log>, Reply) {
             // 不能让调用方多跑一页空 readdir 才发现到底（O(1) 换语义确定）。
             let end = it.next().is_none();
             (vec![], Reply::Dirents { inos, kinds, names, next, end })
+        }
+        Op::ReadDirPlus {
+            view,
+            parent,
+            offset,
+            limit,
+        } => {
+            // 目录页本身与 `ReadDir` 一模一样；多的只是每条一次 `nodes` 下钻。
+            // 这一刀省的不是服务端的时间，是客户端那一页 N 次往返。
+            let (_, meta) = match view_meta(s, *view) {
+                Some(x) => x,
+                None => return (vec![], no_view(*view)),
+            };
+            if let Some(n) = node_of(s, *view, *parent) {
+                if n.kind != Kind::Dir {
+                    return (vec![], Reply::err(errno::ENOTDIR, "not a directory"));
+                }
+            } else if *parent != meta.root {
+                return (vec![], Reply::err(errno::ENOENT, "no such directory"));
+            }
+            let lim = if *limit == 0 { 1000 } else { *limit as usize };
+            let off = *offset as usize;
+            let dir = match s.dentries.get(&(*view, *parent)) {
+                Some(m) => m,
+                None => {
+                    return (
+                        vec![],
+                        Reply::DirentsPlus {
+                            inos: Vec::new(),
+                            kinds: Vec::new(),
+                            names: Names::new(),
+                            attrs: Vec::new(),
+                            next: *offset,
+                            end: true,
+                        },
+                    )
+                }
+            };
+            let mut inos = Vec::with_capacity(lim.min(4096));
+            let mut kinds = Vec::with_capacity(lim.min(4096));
+            let mut attrs = Vec::with_capacity(lim.min(4096));
+            let mut names = Names::with_capacity(lim.min(4096), lim.min(4096) * 32);
+            let mut it = dir.iter().skip(off);
+            for (name, d) in it.by_ref().take(lim) {
+                let node = s.nodes.get(&(*view, d.ino));
+                let kind = match node {
+                    Some(n) => n.kind.code(),
+                    None => {
+                        if d.kind == DENT_KIND_UNKNOWN {
+                            kind_of(s, *view, d.ino)
+                        } else {
+                            d.kind
+                        }
+                    }
+                };
+                inos.push(d.ino);
+                kinds.push(kind);
+                names.push(name);
+                // inode 缺失（日志顺序异常）时回零值而不是丢这一条：四个平行
+                // 数组必须同长，少一项就是整页错位，那比一个零属性糟得多。
+                attrs.push(node.map(NodeAttr::of).unwrap_or_default());
+            }
+            let next = (off + inos.len()) as u64;
+            let end = it.next().is_none();
+            (
+                vec![],
+                Reply::DirentsPlus {
+                    inos,
+                    kinds,
+                    names,
+                    attrs,
+                    next,
+                    end,
+                },
+            )
         }
         Op::LockQuery { view, ino } => {
             let v: Vec<(Vec<u8>, u8, i64)> = s
@@ -839,6 +1006,60 @@ pub fn translate(s: &State, now: i64, op: &Op) -> (Vec<Log>, Reply) {
             ),
         ),
 
+        // ---- 通用表：只读 ----
+        Op::TableGet { name } => (
+            vec![],
+            Reply::Table(s.tables.get(name).map(|t| t.def.clone())),
+        ),
+        Op::TableList => (
+            vec![],
+            Reply::Tables(s.tables.values().map(|t| t.def.clone()).collect()),
+        ),
+        Op::RowGet { table, key } => match s.tables.get(table) {
+            None => (vec![], no_table(table)),
+            Some(t) => (
+                vec![],
+                Reply::Row(s.rows.get(&t.id).and_then(|m| m.get(key)).cloned()),
+            ),
+        },
+        Op::RowList {
+            table,
+            column,
+            value,
+            from,
+            limit,
+        } => {
+            let Some(t) = s.tables.get(table) else {
+                return (vec![], no_table(table));
+            };
+            if let Some(r) = bad_column(t, *column) {
+                return (vec![], r);
+            }
+            let lim = if *limit == 0 { 1000 } else { *limit as usize };
+            let (rows, end) = if *column == ROW_PK {
+                s.row_page(t.id, from, lim)
+            } else {
+                s.index_page(t.id, *column, value, from, lim)
+            };
+            (vec![], Reply::Rows { rows, end })
+        }
+        Op::RowCount { table, column, value } => {
+            let Some(t) = s.tables.get(table) else {
+                return (vec![], no_table(table));
+            };
+            if let Some(r) = bad_column(t, *column) {
+                return (vec![], r);
+            }
+            // 主键计数 O(1)；按索引列数 = 扫那一段，O(命中数)。没有计数器：
+            // 任何「每列一个总数」都要在写侧维护，而写侧的列值本来就在动。
+            let n = if *column == ROW_PK {
+                s.rows.get(&t.id).map(|m| m.len()).unwrap_or(0)
+            } else {
+                s.index_keys(t.id, *column, value).len()
+            };
+            (vec![], Reply::Count(n as u64))
+        }
+
         // ---- 控制面：写 ----
         Op::KeyCreate { key } => {
             if s.keys.contains_key(&key.id) {
@@ -902,6 +1123,163 @@ pub fn translate(s: &State, now: i64, op: &Op) -> (Vec<Log>, Reply) {
             }],
             Reply::Ok,
         ),
+
+        // ---- 通用表：写 ----
+        Op::TableCreate { def } => {
+            if let Some(r) = bad_def(def) {
+                return (vec![], r);
+            }
+            if s.tables.contains_key(&def.name) {
+                return (
+                    vec![],
+                    Reply::err(
+                        errno::EEXIST,
+                        format!("table {} exists", String::from_utf8_lossy(&def.name)),
+                    ),
+                );
+            }
+            // id 在这里分配而不是在 `State::apply` 里：应答与日志必须拿到同一个
+            // id，而 translate 对状态只读（那正是单写者流水线能成立的前提）。
+            let id = s.next_table_id;
+            (
+                vec![Log::PutTable {
+                    id,
+                    def: def.clone(),
+                }],
+                Reply::Table(Some(def.clone())),
+            )
+        }
+        Op::TableDrop { name } => match s.tables.get(name) {
+            None => (vec![], no_table(name)),
+            Some(t) => (
+                vec![Log::DelTable {
+                    id: t.id,
+                    name: name.clone(),
+                }],
+                Reply::Ok,
+            ),
+        },
+        Op::RowPut {
+            table,
+            key,
+            cols,
+            flags,
+            cond_col,
+            cond_val,
+        } => {
+            let Some(t) = s.tables.get(table) else {
+                return (vec![], no_table(table));
+            };
+            if key.is_empty() || key.len() > ROW_KEY_MAX {
+                return (
+                    vec![],
+                    Reply::err(errno::EINVAL, format!("row key must be 1..={ROW_KEY_MAX} bytes")),
+                );
+            }
+            if cols.len() != t.def.columns.len() {
+                return (
+                    vec![],
+                    Reply::err(
+                        errno::EINVAL,
+                        format!(
+                            "row has {} columns, table {} has {}",
+                            cols.len(),
+                            String::from_utf8_lossy(&t.def.name),
+                            t.def.columns.len()
+                        ),
+                    ),
+                );
+            }
+            if *flags & (PUT_IF_ABSENT | PUT_IF_EXISTS) == (PUT_IF_ABSENT | PUT_IF_EXISTS) {
+                return (
+                    vec![],
+                    Reply::err(errno::EINVAL, "PUT_IF_ABSENT and PUT_IF_EXISTS contradict"),
+                );
+            }
+            if *cond_col != COND_NONE && t.def.columns.get(*cond_col as usize).is_none() {
+                return (
+                    vec![],
+                    Reply::err(errno::EINVAL, format!("condition names no such column {cond_col}")),
+                );
+            }
+            let old = s.rows.get(&t.id).and_then(|m| m.get(key));
+            if *flags & PUT_IF_ABSENT != 0 && old.is_some() {
+                return (vec![], Reply::err(errno::EEXIST, "row exists"));
+            }
+            if *flags & PUT_IF_EXISTS != 0 && old.is_none() {
+                return (vec![], Reply::err(errno::ENOENT, "no such row"));
+            }
+            if let Some(r) = cond_miss(old, *cond_col, cond_val) {
+                return (vec![], r);
+            }
+            // 唯一约束：撞值的必须是这一行自己（覆盖写不算撞）。不看 `cols` 而
+            // 先看索引：索引上「相同值的不同主键」就是要拒的那种碰撞。
+            for (i, c) in t.def.columns.iter().enumerate() {
+                if !c.unique() {
+                    continue;
+                }
+                for k in s.index_keys(t.id, i as u32, &cols[i]) {
+                    if k != *key {
+                        return (
+                            vec![],
+                            Reply::err(
+                                errno::EEXIST,
+                                format!(
+                                    "column {} must stay unique",
+                                    String::from_utf8_lossy(&c.name)
+                                ),
+                            ),
+                        );
+                    }
+                }
+            }
+            let row = RowRec {
+                key: key.clone(),
+                cols: cols.clone(),
+            };
+            (
+                vec![Log::PutRow {
+                    table: t.id,
+                    row: row.clone(),
+                }],
+                Reply::Row(Some(row)),
+            )
+        }
+        Op::RowDelete {
+            table,
+            key,
+            flags,
+            cond_col,
+            cond_val,
+        } => {
+            let Some(t) = s.tables.get(table) else {
+                return (vec![], no_table(table));
+            };
+            if *cond_col != COND_NONE && t.def.columns.get(*cond_col as usize).is_none() {
+                return (
+                    vec![],
+                    Reply::err(errno::EINVAL, format!("condition names no such column {cond_col}")),
+                );
+            }
+            let old = s.rows.get(&t.id).and_then(|m| m.get(key));
+            if old.is_none() {
+                // 幂等是默认：客户端重发一个已经成功的删除不该看到错误。
+                if *flags & DEL_IF_EXISTS != 0 {
+                    return (vec![], Reply::err(errno::ENOENT, "no such row"));
+                }
+                return (vec![], Reply::Ok);
+            }
+            if let Some(r) = cond_miss(old, *cond_col, cond_val) {
+                return (vec![], r);
+            }
+            (
+                vec![Log::DelRow {
+                    table: t.id,
+                    key: key.clone(),
+                }],
+                Reply::Ok,
+            )
+        }
 
         // 由 Engine 直接应答的控制 op 不落到这里。
         Op::Ping | Op::Stats | Op::Checkpoint | Op::Shutdown => (vec![], Reply::Pong),

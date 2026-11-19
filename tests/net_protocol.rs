@@ -11,7 +11,9 @@ mod common;
 use common::Server;
 use std::io::{Read, Write};
 use std::net::TcpStream;
-use treedb::engine::model::{errno, Kind, Node, Op, Reply};
+use treedb::engine::model::{
+    errno, ColumnDef, Op, Reply, TableDef, COL_INDEX, COL_UNIQUE, COND_NONE, Kind, Node, ROW_PK,
+};
 use treedb::engine::{encode_frame, RxBuf, FRAME_HDR, MAX_FRAME};
 use treedb::net::client::Client;
 
@@ -402,6 +404,11 @@ fn ops_stats_checkpoint_shutdown_over_tcp() {
                 "stats.wal_bytes 要落在 (0, 磁盘长度 {disk_len}] 内，实得 {}",
                 s.wal_bytes
             );
+            // §11 #3：两个长度并列报出，磁盘那个必须就是 st_size（运维拿它算空间）。
+            assert_eq!(s.wal_disk_bytes, disk_len, "wal_disk_bytes 就是 st_size");
+            assert_eq!(s.snap_bytes, 0, "没 checkpoint 过不该有快照长度");
+            assert_eq!((s.tables, s.rows), (0, 0), "没建过通用表");
+            assert_eq!(s.proto_version, treedb::engine::PROTOCOL_VERSION, "协议版本要能隔着 TCP 查到");
             assert!(s.seq >= s.snap_seq, "seq 水位不能落后于快照");
             s.wal_bytes
         }
@@ -411,10 +418,14 @@ fn ops_stats_checkpoint_shutdown_over_tcp() {
     assert_eq!(ok(&mut c, &Op::Checkpoint), Reply::Ok);
     // 快照落盘后日志被截成空文件：逻辑长度归零（磁盘上余下的全是预留空洞）。
     match ok(&mut c, &Op::Stats) {
-        Reply::Stats(s) => assert_eq!(
-            s.wal_bytes, 0,
-            "checkpoint 后 WAL 逻辑长度应归零（截断前 {wal_before}）"
-        ),
+        Reply::Stats(s) => {
+            assert_eq!(s.wal_bytes, 0, "checkpoint 后 WAL 逻辑长度应归零（截断前 {wal_before}）");
+            assert_eq!(
+                s.snap_bytes,
+                std::fs::metadata(srv.dir().join("state.snap")).unwrap().len(),
+                "恢复时间 = 读快照 + 重放增量，两个数都得报"
+            );
+        }
         other => panic!("{other:?}"),
     }
     assert!(srv.dir().join("state.snap").exists(), "快照文件必须落盘");
@@ -473,4 +484,159 @@ fn max_frame_constant_is_sane() {
     let f = encode_frame(&[7u8; 5]);
     assert_eq!(f.len(), 9);
     assert_eq!(&f[..4], &5u32.to_le_bytes());
+}
+
+/// 通用表与 readdirplus 走真 TCP。它们在 `engine_crud` 里验的是语义，这里验
+/// 的是那几条新 tag 的帧编解码、分页游标与大应答背压。
+#[test]
+fn generic_table_and_readdir_plus_over_tcp() {
+    let srv = Server::start("group");
+    let mut c = srv.client();
+    let v = mk_view(&mut c, "tbl");
+
+    let def = TableDef {
+        name: b"t".to_vec(),
+        columns: vec![
+            ColumnDef { name: b"a".to_vec(), flags: COL_UNIQUE },
+            ColumnDef { name: b"b".to_vec(), flags: COL_INDEX },
+        ],
+    };
+    match ok(&mut c, &Op::TableCreate { def: def.clone() }) {
+        Reply::Table(Some(x)) => assert_eq!(x, def, "def 要帧往返无损"),
+        other => panic!("{other:?}"),
+    }
+    let val = |k: usize| Op::RowPut {
+        table: b"t".to_vec(),
+        key: format!("k{k:05}").into_bytes(),
+        cols: vec![format!("a{k:05}").into_bytes(), if k % 2 == 0 { b"even".to_vec() } else { b"odd".to_vec() }],
+        flags: 0,
+        cond_col: COND_NONE,
+        cond_val: Vec::new(),
+    };
+    const N: usize = 1000;
+    let mut ops: Vec<Op> = Vec::new();
+    for k in 0..N {
+        ops.push(val(k));
+        if ops.len() == 200 {
+            let reps = c.pipeline(&ops).expect("rowput pipeline");
+            assert!(reps.iter().all(|r| matches!(r, Reply::Row(Some(_)))), "行写经网络失败");
+            ops.clear();
+        }
+    }
+    assert!(ops.is_empty(), "批量没切干净");
+
+    // 唯一约束经网络也必须拦得住：客户端不能只信自己手里那份索引。
+    match c.call(&Op::RowPut {
+        table: b"t".to_vec(),
+        key: b"dup".to_vec(),
+        cols: vec![b"a00000".to_vec(), b"x".to_vec()],
+        flags: 0,
+        cond_col: COND_NONE,
+        cond_val: Vec::new(),
+    }) {
+        Ok(Reply::Err { code: errno::EEXIST, .. }) => {}
+        other => panic!("唯一约束经网络失效：{other:?}"),
+    }
+    // CAS 不命中：EAGAIN 是一条 errno，不是丢帧。
+    match c.call(&Op::RowPut {
+        table: b"t".to_vec(),
+        key: b"k00001".to_vec(),
+        cols: vec![b"zz".to_vec(), b"odd".to_vec()],
+        flags: 0,
+        cond_col: 0,
+        cond_val: b"not-a00001".to_vec(),
+    }) {
+        Ok(Reply::Err { code: errno::EAGAIN, .. }) => {}
+        other => panic!("CAS 条件经网络失效：{other:?}"),
+    }
+
+    // 主键游标翻页：每页 37 条翻到底，不重不漏（37 不整除 1000，尾页能推住）。
+    let mut seen: Vec<String> = Vec::new();
+    let mut from: Vec<u8> = Vec::new();
+    loop {
+        match ok(&mut c, &Op::RowList { table: b"t".to_vec(), column: ROW_PK, value: Vec::new(), from, limit: 37 }) {
+            Reply::Rows { rows, end } => {
+                if end {
+                    assert!(rows.len() <= 37);
+                } else {
+                    assert_eq!(rows.len(), 37, "没到底的页必须装满");
+                }
+                let last = rows.last().map(|r| r.key.clone()).unwrap_or_default();
+                for r in &rows {
+                    let k = String::from_utf8_lossy(&r.key).into_owned();
+                    assert!(!seen.contains(&k), "翻页经网络重复返回了 {k}");
+                    seen.push(k);
+                }
+                if end {
+                    break;
+                }
+                from = last;
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+    assert_eq!(seen.len(), N, "翻页经网络漏了行");
+    assert_eq!(seen.first().unwrap(), "k00000");
+    assert_eq!(seen.last().unwrap(), &format!("k{:05}", N - 1));
+    // 索引列等值列举与计数。
+    match ok(&mut c, &Op::RowCount { table: b"t".to_vec(), column: 1, value: b"even".to_vec() }) {
+        Reply::Count(n) => assert_eq!(n as usize, N / 2),
+        other => panic!("{other:?}"),
+    }
+
+    // 大应答：1000 行一页取完远大于两个套接字缓冲，客户端读侧必须自己接回来。
+    let raw = TcpStream::connect(&srv.addr).expect("connect");
+    shrink_rcvbuf(&raw, 8 * 1024);
+    let mut slow = Client::from_stream(raw);
+    let reps = slow
+        .pipeline(&[Op::RowList {
+            table: b"t".to_vec(), column: ROW_PK, value: Vec::new(), from: Vec::new(), limit: N as u32,
+        }])
+        .expect("big rowlist");
+    match &reps[0] {
+        Reply::Rows { rows, end } => {
+            assert_eq!(rows.len(), N, "大应答被截断了");
+            assert!(*end);
+            assert_eq!(rows[0].cols, vec![b"a00000".to_vec(), b"even".to_vec()]);
+        }
+        other => panic!("expected Rows, got {other:?}"),
+    }
+    assert_eq!(call(&mut slow, &Op::Ping), Reply::Pong, "被背压拖过的连接之后还能干活");
+
+    // readdirplus：与 readdir 同一页，只是属性随条目一起过线。
+    let mut ops: Vec<Op> = Vec::new();
+    for k in 0..500 {
+        ops.push(Op::Create {
+            view: v,
+            parent: 1,
+            name: format!("n{k:03}").into_bytes(),
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+        });
+    }
+    let reps = c.pipeline(&ops).expect("create pipeline");
+    assert_eq!(reps.len(), 500);
+    let plain = match ok(&mut c, &Op::ReadDir { view: v, parent: 1, offset: 0, limit: 500 }) {
+        Reply::Dirents { inos, kinds, names, next, end } => (inos, kinds, names.to_vec(), next, end),
+        other => panic!("{other:?}"),
+    };
+    let plus = match ok(&mut c, &Op::ReadDirPlus { view: v, parent: 1, offset: 0, limit: 500 }) {
+        Reply::DirentsPlus { inos, kinds, names, attrs, next, end } => {
+            assert_eq!(attrs.len(), inos.len(), "平行数组经网络错位了");
+            (inos, kinds, names.to_vec(), attrs, next, end)
+        }
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(plain.0, plus.0);
+    assert_eq!(plain.1, plus.1);
+    assert_eq!(plain.2, plus.2);
+    assert_eq!((plain.3, plain.4), (plus.4, plus.5));
+    assert!(
+        plus.3.iter().all(|a| a.mode == 0o644 && a.uid == 0 && a.nlink == 1),
+        "属性经网络丢了字段：{:?}",
+        plus.3[0]
+    );
+    assert_eq!(plus.2[0], b"n000".to_vec());
+    let _ = srv.graceful_shutdown();
 }
