@@ -16,15 +16,30 @@ cargo build --release                                   # 默认档：依赖只�
 ./target/release/treedb-server --dir /var/lib/treedb --listen 127.0.0.1:7777
 ./target/release/treedb-bench --op lookup --conns 64 --pipeline 32 --secs 3
 
-cargo test --release                                    # 默认档 83 passed（引擎本体）
-cargo test --release --features postgres-compat         # 114 passed（含 PG 过渡档）
+cargo test --release                                    # 默认档 96 passed（引擎本体）
+cargo test --release --features postgres-compat         # 127 passed（含 PG 过渡档）
 bash benches/throughput_matrix.sh 3 1 2 3 4 5           # 五轴复现，输出进 benches/results/
 bash benches/sync_ratio.sh 3                           # 写路径机制：一次 fsync 摊了多少写
 bash benches/ab_layout.sh <基线 rev>                     # 受控 A/B：只换服务端二进制比引擎改动
 bash benches/default_check.sh                           # 零旗标默认档同格跑 5 次，验默认值真的生效
 bash benches/ab_durability.sh <基线 rev>                  # 写轴 A/B：只换服务端二进制比持久化档
+bash benches/rehearse_migrate.sh v0.3.2                 # 快照升级真机彩排：旧 tag 的二进制 → 迁移 → 回滚
 ./target/release/treedb-micro --items 32000             # 纯计算档（不经网络/不写 WAL）+ 分配计数
 ```
+
+数据目录是从旧快照布局（`SNAP_VERSION` 2）上来的，新二进制会拒收 —— 那不是 bug，
+而是不静默按错布局解字节的故意选择。出路随包安装：
+
+```sh
+./target/release/treedb-migrate --dir /var/lib/treedb          # 只看，不写；exit 10 = 需要迁移
+./target/release/treedb-migrate --dir /var/lib/treedb --apply  # 只重写 state.snap，WAL 不动
+```
+
+回滚是把自动落下的 `state.snap.v2.bak` 拷回去再跑旧二进制 —— 但无损只维持到新二进制
+做过第一次 checkpoint 之前（checkpoint 会 `wal.reset()`，把上一代日志物理抹掉）。
+四条承诺、回滚窗口与为什么不在启动路径上开「自动兼容读」的口子，见
+[DESIGN.md](DESIGN.md) §6.5；`bash benches/rehearse_migrate.sh v0.3.2` 拿真旧二进制
+把整条链（造旧目录 → 迁移 → 开门 → 回滚）复算一遍。
 
 `--workers N` 把只读 op 摊到 N 条前端线程上并行；写永远由唯一提交线程定序，
 group commit 不丢。默认按核数给：`min(8, 核数/2)`（1–3 核机器算出来仍是 1，与旧
@@ -65,7 +80,7 @@ DESIGN.md §7（含 §7.8 那次全五轴复跑）。
   `PUT_IF_ABSENT`/`PUT_IF_EXISTS` 与按列 CAS。存在理由：接入方的表形（密钥、审计、
   定义……）不该被搬进引擎内核，内核只给机制。列名、过期规则、权限语义全部由
   客户端定义；引擎不解释任何一列，也不做 JOIN、排序、范围谓词（§5.3）。
-- **运维面**：`Ping`/`Stats`/`Checkpoint`/`Shutdown`。`Stats` 同时报 WAL 的逻辑长度与
+- **运维面**：`Ping`/`Stats`/`Checkpoint`/`Shutdown`，加上命令行侧的 `treedb-migrate`。`Stats` 同时报 WAL 的逻辑长度与
   磁盘长度、快照长度与协议版本 —— 帧里没有版本位，`proto_version` 是线上唯一能
   查到对端协议版本的通道（§4.1）。
 
@@ -88,8 +103,8 @@ DESIGN.md §7（含 §7.8 那次全五轴复跑）。
 | `src/engine/` | 线协议类型（`model.rs`，47 个 op / 26 个 Reply）、帧编码（`codec.rs`）、状态机（`mem.rs`）、应用与定序（`apply.rs`）、WAL/快照（`wal.rs`）、核心（`core.rs`） |
 | `src/net/` | 单线程事件循环（`server.rs`）、多前端 worker + 唯一提交线程（`multi.rs`）、跨线程信箱（`mail.rs`）、阻塞客户端（`client.rs`） |
 | `src/{pool,store,persist,schema,probe}.rs` | `postgres-compat` 过渡档 |
-| `src/bin/` | `treedb-server` / `treedb-bench` / `treedb-pgbench`（对照工具）/ `treedb-micro`（纯计算 + 分配计数）/ `treedb-demo` |
-| `tests/` | `engine_crud` `net_protocol` `read_scaling` `crash_recovery` `scale_connections` `independence`（默认档全部要跑）；`concurrency` 属过渡档 |
+| `src/bin/` | `treedb-server` / `treedb-bench` / `treedb-pgbench`（对照工具）/ `treedb-micro`（纯计算 + 分配计数）/ `treedb-migrate`（快照升级）/ `treedb-demo` |
+| `tests/` | `engine_crud` `net_protocol` `read_scaling` `crash_recovery` `migrate` `scale_connections` `independence`（默认档全部要跑）；`concurrency` 属过渡档 |
 | `benches/` | 五轴矩阵脚本与历史/复跑原始输出 |
 | `DESIGN.md` | 选型判据、协议字节布局、语义边界、五轴实测、已知限制、接入路径与下一步 |
 

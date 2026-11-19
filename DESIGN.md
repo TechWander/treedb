@@ -9,7 +9,7 @@
 自己的仓里；本仓唯一与 PostgreSQL 有关的东西是默认关掉的 `postgres-compat` 脚手架，
 而这条约束有测试守着（`tests/independence.rs`，详见 §11 第 7 条）。
 
-**状态**：v0.3.3。引擎本体已落地并跑完五轴验收（§7.8 是 2026-11-19 的全轴复跑）；
+**状态**：v0.3.4。引擎本体已落地并跑完五轴验收（§7.8 是 2026-11-19 的全轴复跑）；
 已建 git 仓推 `origin`(gitee) + `github` 两远端。0.3.0 之后的一批全在**读轴**上：
 量具口径对称化（§9.1 第 3 条）、默认前端 worker 按核数（§8 第 1 条）、目录项两层表
 + kind 冗余（§7.10）；那一批**线协议、WAL 与快照的字节格式一个字节没动**（当时
@@ -30,10 +30,21 @@ dirents 直接带属性，`Stats` 补上 WAL 磁盘长度、快照长度与协�
 旧快照被版本号闸门拒收而不是静默解错。定版 `v0.3.3`；grovefs 侧仍钉 `v0.3.2`，升级
 面见 §10。
 
-test 现在分两档报：默认档（纯引擎）`cargo test --release` = **83 passed**（30 lib +
-26 engine_crud + 10 net_protocol + 7 read_scaling + 6 crash_recovery + 3 independence +
-1 scale_connections，10k 那条仍 `#[ignore]`）；`--features postgres-compat` =
-**114 passed**，多出的 31 条 = 过渡档自己的 30 条单测 + `concurrency.rs` 里那条
+`v0.3.3` 之后落的是 §11 第 10 条前半那个断点：**快照迁移工具**。上一轮把
+`SNAP_VERSION` 推到 3 的代价是旧数据目录在新二进制前起不来，而「升级等于元数据
+重建」这句话不能当作上线依据。现在有了 `treedb-migrate`：把 v2 布局读成内存
+`State`、再按 v3 布局写回，**WAL 一个字节不动**，尾巴上的 seq 水位照搬，动手前自动
+落一份 `state.snap.v2.bak`，于是回滚只是把备份拷回去再跑旧二进制。常规启动路径
+仍然严格拒收旧版本 —— 不给「静默兼容」开口子，只是错误消息现在会给出命令（§6.5）。
+这一轮**没有再动字节格式**：`PROTOCOL_VERSION` 与 `SNAP_VERSION` 都仍是 3，加上的只是
+一个新命令（`treedb-migrate`）、一对迁移专用的读写入口（`State::load_for_migration` /
+`State::save_v2`）与两个离线 API（`probe_snapshot` / `migrate_snapshot`）。定版 `v0.3.4`。
+
+test 现在分两档报：默认档（纯引擎）`cargo test --release` = **96 passed**（32 lib +
+26 engine_crud + 11 migrate + 10 net_protocol + 7 read_scaling + 6 crash_recovery +
+3 independence + 1 scale_connections，10k 那条仍 `#[ignore]`）；
+`--features postgres-compat` = **127 passed**，多出的 31 条 = 过渡档自己的 30 条单测 +
+`concurrency.rs` 里那条
 不需要 PG 的拨号用例（剩下 6 条要真 PG，默认 `#[ignore]`，不计入 passed）。即 PG 只出现在
 `postgres-compat` 后面的 `src/pool`、`src/store`、
 `src/persist`、`src/schema`、`src/probe.rs` 里，以及性能对照器 `src/bin/pgbench.rs`
@@ -170,6 +181,7 @@ test 现在分两档报：默认档（纯引擎）`cargo test --release` = **83 
                                   │  src/engine/mem.rs    State：BTreeMap 状态机 + Log（含表与行）
                                   ▼
                             /data/…/treedb.wal + state.snap
+                            （快照换代时：src/bin/migrate.rs 只重写 state.snap，WAL 不动，§6.5）
 
   过渡档（PG 后端，不参与引擎路径）：
      src/pool/shared.rs   实例级共享连接池（search_path 化）
@@ -181,16 +193,17 @@ test 现在分两档报：默认档（纯引擎）`cargo test --release` = **83 
 | 文件 | 行 | 职责 |
 |------|----|------|
 | `src/engine/wal.rs` | 682 | WAL 帧格式、CRC32、预分配、group commit、扫描/重放、`reset` |
-| `src/engine/core.rs` | 505 | `Engine`：op 入口、durability 分档、checkpoint、`Stats`、只读入口 `exec_read` |
-| `src/engine/mem.rs` | 1428 | `State`（views/nodes/dentries/locks/refs/keys/audit/defs/place/tables/rows/row_index）+ `Log` |
+| `src/engine/core.rs` | 792 | `Engine`：op 入口、durability 分档、checkpoint、`Stats`、只读入口 `exec_read`；外加快照探测与迁移（`probe_snapshot`/`migrate_snapshot`，§6.5） |
+| `src/engine/mem.rs` | 1637 | `State`（views/nodes/dentries/locks/refs/keys/audit/defs/place/tables/rows/row_index）+ `Log`；快照的版本闸门与两代读入口（`load` / `load_for_migration`） |
 | `src/engine/apply.rs` | 1287 | 47 个 op 的具体语义：环检测、nlink、租约过滤、分页游标、表形状校验与约束 |
 | `src/engine/model.rs` | 2310 | `Op`/`Reply` 定义与 codec 实现 |
 | `src/net/server.rs` | 758 | `workers=1` 的 epoll 循环、连接生命周期、写回背压、周期任务；兼作两条路径共用的 `Conn`/`Slot` 构件 |
 | `src/net/multi.rs` | 834 | `workers>1`：N 条前端 worker + 唯一提交线程（路由闸门、按连接号回程、停机收尾） |
 | `src/net/mail.rs` | 114 | 两者之间那条能被 `epoll` 唤醒的信箱（`Mutex<VecDeque>` + eventfd） |
 | `src/net/client.rs` | 115 | 同步客户端 + pipeline |
-| `src/bin/{server,bench,pgbench,demo}.rs` | 1200 | 可执行入口；`pgbench` 是 PG 对照器 |
+| `src/bin/{server,bench,pgbench,micro,migrate,demo}.rs` | 1718 | 可执行入口；`pgbench` 是 PG 对照器，`migrate` 是快照升级工具（§6.5） |
 | `benches/throughput_matrix.sh` | 188 | 五轴吞吐矩阵（§7 的数据来源） |
+| `benches/rehearse_migrate.sh` | 147 | 快照升级的真机彩排：旧 tag → 当前树，逐格核四条承诺与回滚窗口（§6.5 的外部效度） |
 
 行是 `wc -l`，含各文件自己的 `mod tests`（旧版这张表是历史快照，已与代码脱开的
 那几个文件本轮按实测回填）。
@@ -282,7 +295,9 @@ GC 拿它当唯一依据。
 这种字符串（PG 侧列类型 `TEXT`），`u64` 要接它只有两条路 —— 哈希（碰撞 = 两个文件的
 字节互相顶掉）或在 provider 里养一张 `String ↔ u64` 映射表（表本身得持久化，崩溃后
 查不到映射就读不到数据）。字节作键零碰撞、零映射表，且与 PG 后端同形。磁盘格式跟
-着变了，所以 `SNAP_VERSION` 1 → 2，旧快照会被版本号闸门拒收而不是静默解错。）
+着变了，所以 `SNAP_VERSION` 1 → 2，旧快照会被版本号闸门拒收而不是静默解错。
+顺带记下另一面：v2 → v3 那次升版本只动了尾部（多了表与行三段），正文逐字节一致，
+所以那一代是**可迁移**的 —— 工具与它的四条承诺见 §6.5。）
 
 **通用表（§11 T2）**。引擎不再只有那四张照搬某个客户端表形的专用表
 （`keys`/`audit`/`defs`/`place`）：`tables` 存形状（名字 + 列定义），
@@ -446,6 +461,77 @@ checkpoint 之后 WAL 被 `reset` 成空文件，`fast_forward(snap_seq)` 把发
 `acked_writes_survive_crash_with_workers_on`（`tests/read_scaling.rs`，`workers=8`）：
 300 次目录写与 300 次表写逐条交错，每几条夹一批纯读逼 worker 与提交 fsync 重叠，
 崩后行数与索引重推都要对上。「已 ack 的写一条不丢」这句承诺不因为开并行而缩面。
+
+### 6.5 快照升级（v2 → v3，`treedb-migrate`）
+
+版本号闸门把旧目录挡在门外是对的选择（静默按新布局解旧字节 = 把 8 字节整数当
+长度前缀读），但它必须有一条出路，否则「升级到 `v0.3.3`」这句话就等于「元数据
+重建」。出路是 `treedb-migrate`：把旧文件读成内存 `State`，再按当前布局写回。
+它能成立只靠一个事实 —— **v2 与 v3 的正文逐字节相同**，v3 只在尾部多了
+`tables` / `next_table_id` / `rows` 三段。这条事实由 lib 用例
+`legacy_snapshot_decodes_from_the_same_prefix` 直接比对两代字节序列的前缀钉住：
+以后谁改了正文又没同步改 v2 的写出侧，测试会先红。
+
+四条承诺，逐条有用例守（`tests/migrate.rs`，11 条）：
+
+| 承诺 | 含义 | 守它的用例 |
+|------|------|-----------|
+| **WAL 一个字节不动** | 迁移不打开 WAL，只重写 `state.snap`。于是「已 ack 的写不会因为迁移而丢」不用重新论证，回滚也只是把备份文件拷回去再跑旧二进制 | `migration_preserves_every_field_and_leaves_the_wal_alone`（直接比迁移前后 WAL 文件字节） |
+| **seq 水位照搬** | 文件尾那 8 字节是「这份快照覆盖到哪个 seq」，原样搬过去；重算一次就是自己发明一个水位，下次启动按它跳记录就会丢写 | `seq_watermark_survives_the_migration_and_numbering_continues` |
+| **只认上一代** | 版本位不是 2 也不是 3 就拒；正文与版本位不吻合（尾巴多于 8 字节）也拒 —— 宁可不改也不猜布局 | `unknown_version_is_refused_without_touching_anything`、`body_that_does_not_match_its_version_is_refused` |
+| **拒动时零改动，干完可幂等重跑** | 自检不等 / 哨兵发现并发写者 / 已有备份又没给 `--force` —— 三条失败路径上原文件一个字节没改过；同目录再跑一次是 `AlreadyCurrent` 而不是重写 | `existing_backup_is_not_clobbered_without_force`、`migration_is_idempotent_and_leaves_a_current_dir_untouched` |
+
+写回顺序照搬 `Engine::checkpoint` 那一套：`.tmp` → `fsync` → `rename` → `fsync(目录)`。
+动手前还有两道：先把要写的字节用**严格入口** `State::load` 解一遍并与手上状态逐字段
+比对（等于先问一遍「新二进制明天能不能开这个门」），再落一份 `state.snap.v2.bak` 备份；
+改写前后各读一次源文件比对。任一环节失败要么什么都没改，要么只留下一个没被
+`rename` 的 `.tmp`，不影响任何启动路径。
+
+为什么不用更省事的「`Engine::open` 读旧快照 + 立刻 checkpoint」：`wal.reset()` 会把
+上一代记录**物理抹掉**（§6.2），那份备份就失去回滚价值；而迁移中途崩掉时，那些已 ack
+却还没被旧快照覆盖的写就只剩一份未验证的新文件 —— 拿持久性换省事，不划算。
+
+常规启动路径继续不开兼容口子：`Engine::open` 只用 `State::load`，遇 v2 直接报错，
+错误消息里把命令写出来；`load_for_migration` 只被离线工具调用。这是刻意的两面：
+闸门守住「不静默解错」，工具守住「不是死路」。
+
+**迁移前必须停服务端**。本工具不 flock（服务端自己也没持文件锁，锁不住任何东西），
+那两次重读是 best-effort 哨兵而不是互斥 —— 不要把「没报错」当成「与并发安全」。
+
+**回滚有个真实长度的窗口**：把 `state.snap.v2.bak` 拷回去跑旧二进制，只要新二进制
+**还没做过第一次 checkpoint** 就是无损的 —— 迁移之后新二进制吸收的那些写还在 WAL 里，
+而 WAL 是两边都能读的（`Log` 标签 1..=18 在这两代之间没动）。一旦 checkpoint 过，
+`wal.reset()` 把上一代记录物理抹掉，那些写就只剩 v3 快照一份，旧二进制读不了：
+此时回滚 = 丢掉「第一次 checkpoint 之后的全部写」。注意优雅停服那一次收尾
+checkpoint 也算数，所以「先升、跑一段、发现不行再拷回去」这个顺序本身就是错的。
+`treedb-migrate --apply` 把这句话直接印在 `rollback =` 那一行里，
+`tests/migrate.rs` 钉住了它。
+
+v1 → v2 **没有**迁移路径：那一代改的是既有字段的宽度（`data_ref` 从 `u64` 变成不透明
+字节，§5.1），没有「读旧写新」的稳妥路子。所以工具只认上一代：认识两代之前的布局
+等于把「格式变更要 +1 并给出门」这条规矩变成「格式变更可以攒着」。
+
+```sh
+treedb-migrate --dir /var/lib/treedb                  # 只报告，一个字节都不写
+treedb-migrate --dir /var/lib/treedb --apply           # 真执行：先落备份再原子重写
+treedb-migrate --dir /var/lib/treedb --apply --force   # 连既有备份一起换掉
+```
+
+退出码：`0` = 已是当前布局或迁移完成；`1` = 出错（包括拒动）；`2` = 参数错；
+`10` = 需要迁移但没给 `--apply`（给脚本用：先探一下再决定动不动手）。输出是
+`key = value` 风格、字段名对齐 `treedb-server --stats`，其中 `wal = … untouched …` 那行
+就是上面第一条承诺的可验证据，不是装饰。
+
+**外部效度由 `benches/rehearse_migrate.sh` 补**。上面那些用例里的 v2 样本是
+`save_v2()` 写的，而 `save_v2()` 与迁移工具是同一轮加的 —— 它只证明代码自洽，不证明
+真能接住 `v0.3.2` 落盘的那种文件（万一两边字段顺序、某个计数或尾巴位置不一致，
+单测会全绿而线上开门就崩）。彩排脚本 `git archive` 一个真 tag、真编译旧二进制、
+造目录 → 迁移 → 开门 → 回滚，逐格核对六件事：版本位真是 2、WAL 的 sha256 迁移前后
+相同、备份的 sha256 等于原件、快照尺寸增量**恰好 12 B**（尾部三段各一个 u32 计数，
+正文一个字节没重排）、迁移前后 `--stats` 的 views/nodes/dentries 与文件尾 seq 逐字段
+相同、以及上面那个回滚窗口的两面（最近一次实测：WAL 完好时 41 512 → 41 512 无损；
+checkpoint 之后 64 888 → 41 512 有损）。最近一次原始输出在
+`benches/results/rehearse_migrate.log`。
 
 ---
 
@@ -1037,15 +1123,22 @@ O(目录数)）另开了 `Engine::wal_bytes()`（`src/engine/core.rs`）：auto-
     单连接下 `always` 自然退化为每 op 一次 fsync）；② 写扩展仍付「单提交线程 +
     每轮一次阻塞 fsync」的代价（机械盘 ≈ 3.8 ms/轮），要再进一层得把 flush 从提交
     线程挪出去，见 §11 第 8 条。
+12. **快照迁移只认上一代，而且不做互斥**（§6.5）：`treedb-migrate` 只接受
+    `SNAP_LEGACY_VERSION`（= 2）那一个版本位，两代之前的目录仍然只有「重建」这一条
+    路 —— 这是规矩不是遗漏，攒多代 decode 分支会把「格式变更要 +1 并给出门」变成
+    「可以攒着」。另一条：它不 flock，只在改写前后各读一次源文件比对，服务端没停就
+    动手只能靠这个哨兵赌输。迁移本身是「全量读进内存 `State` 再全量写出」，成本
+    正比于快照大小与 §8 第 2 条同源，没有增量路径。
 
 ---
 
 ## 9. 测试清单
 
 ```sh
-cargo test --release                            # 默认档（纯引擎），83 条
-cargo test --release --features postgres-compat # 加上过渡档，114 条
+cargo test --release                            # 默认档（纯引擎），96 条
+cargo test --release --features postgres-compat # 加上过渡档，127 条
 cargo test --release --lib                      # 只看引擎单测
+cargo test --release --test migrate              # 快照升级：8 条走 API + 3 条真进程跑 CLI（§6.5）
 cargo test --release --test scale_connections -- --ignored   # 万级连接重压（§7.6）
 bash benches/throughput_matrix.sh 3             # 五轴吞吐矩阵（默认只跑 1–4）
 bash benches/default_check.sh                   # 零旗标默认档同格重跑 5 次（§7.5）
@@ -1053,6 +1146,7 @@ bash benches/ab_layout.sh <基线 rev>            # 受控 A/B：只换服务端
 bash benches/sync_ratio.sh 3                    # 一次 fsync 摊了几次写（§7.9）
 bash benches/ab_durability.sh <基线 rev>        # 写轴 A/B：持久化档的吞吐与尾延迟（§7.9 第 3 条）
 bash benches/probe_srv.sh                       # 服务端吃了几核（/proc 计数，§7.5）
+bash benches/rehearse_migrate.sh v0.3.2         # 快照升级真机彩排：旧 tag 编的二进制 → 迁移 → 回滚（§6.5）
 bash benches/sc_ops.sh 3 3                      # 单核四臂：t1/p1/pf/t8，逐格记实测核数（§7.5 末）
 bash benches/sc_ops.sh 3 1 readdir              # 只跑同一格的受控 A/B（配 SKIP_PG=1 与 RUN=…）
 bash benches/strace_attr.sh ping                # 每 op 几次 syscall（分母取测量窗口 ops）
@@ -1062,14 +1156,15 @@ gcc -O2 -pthread -o /tmp/lb_floor benches/lb_floor.c && /tmp/lb_floor 1 64 3   #
 ```
 
 这几条测量脚本都不进回归板（它们要几秒到十几分钟，且数字依赖机器），但它们
-输出的每一格都已被本文引用过 —— 引用了就要能复算。
+输出的每一格都已被本文引用过 —— 引用了就要能复算。`rehearse_migrate.sh` 是其里
+唯一不量性能、只核正确性的那条，但它必须拿两个真二进制跑，所以也不进回归板。
 
 两档都跑完才是全量：`--features postgres-compat` 多出的 31 条 = 过渡档自己的 30 条
 单测 + `concurrency.rs` 里那条不需要 PG 的拨号用例。
 
 | 目标 | 数量 | 覆盖 |
 |------|------|------|
-| `--lib` | **30**（+30 属 `postgres-compat`） | codec round-trip（全 tag：47 op / 26 reply）、**`Log` 全变体 round-trip**（含本轮四条表日志）、CRC 已知向量、碎帧/超长帧、WAL 帧与截断重放、**预分配空洞重开**（`prealloc_padding_reopens_cleanly`）、**大批次不跳写**（`huge_batch_writes_every_record`）、**seq 跳号硬错**、状态快照保留 node key、**两层 dentry 与 kind 冗余过快照不坏**（`dentries_are_two_level_and_kind_survives_snapshot`，§7.10）、**通用表行与索引过快照不坏**（`generic_tables_keep_rows_and_rebuild_indexes`，§5.1）、缓冲压缩、租约过期边界、`default_workers` 上下界 |
+| `--lib` | **32**（+30 属 `postgres-compat`） | codec round-trip（全 tag：47 op / 26 reply）、**`Log` 全变体 round-trip**（含本轮四条表日志）、CRC 已知向量、碎帧/超长帧、WAL 帧与截断重放、**预分配空洞重开**（`prealloc_padding_reopens_cleanly`）、**大批次不跳写**（`huge_batch_writes_every_record`）、**两代快照正文逐字节相同**（`legacy_snapshot_decodes_from_the_same_prefix`，§6.5 的前提）、**旧布局写回不能默默丢表**（`legacy_writer_refuses_to_drop_tables`）、**seq 跳号硬错**、状态快照保留 node key、**两层 dentry 与 kind 冗余过快照不坏**（`dentries_are_two_level_and_kind_survives_snapshot`，§7.10）、**通用表行与索引过快照不坏**（`generic_tables_keep_rows_and_rebuild_indexes`，§5.1）、缓冲压缩、租约过期边界、`default_workers` 上下界 |
 | `tests/engine_crud.rs` | **26** | §5.2 全部 POSIX 语义（含 GC 线索与 NOREPLACE）+ 控制面（密钥/审计/定义/放置）+ checkpoint 后重开 + 坏尾截断；本轮新增 6 条：4 条盖通用表（表形状校验与表名回收、行写边界/约束/CAS/flags、主键与索引列游标翻页、表状态过 checkpoint+重开），1 条盖 `ReadDirPlus` 与 `ReadDir`+`Getattr` 逐字段对齐，1 条盖 `Stats` 新字段 |
 | `tests/net_protocol.rs` | **10** | TCP 端到端：CRUD、碎帧、pipeline 保序、并发连接不串扰、超长帧只杀违规者、大回包流式读完、`--stats`/`--checkpoint`/`--shutdown`（含两个磁盘长度与协议版本）、优雅停服后同地址立刻重绑、**通用表 + readdirplus 走 TCP**（1000 行 pipeline、错误帧经网络回真实 errno、8 KiB 收缓冲下大应答完整接回） |
 | `tests/crash_recovery.rs` | **6** | §6.4 |
@@ -1077,6 +1172,7 @@ gcc -O2 -pthread -o /tmp/lb_floor benches/lb_floor.c && /tmp/lb_floor 1 64 3   #
 | `tests/concurrency.rs` | 0（+7，整文件 feature 门控） | T1 之后整个文件在 `postgres-compat` 后面：无 PG 时跑「拨号失败不漏 live」（1 条，要 feature），其余 6 条 `#[ignore]` 需真实 PG。**它测的是共享池，不是引擎并发**（§7.8）|
 | `tests/scale_connections.rs` | 1（+1 ignored） | 1 000 连接 fd/RSS 断言每次跑；万级（`TREEDB_CONNS`，含 25 000）手动 |
 | `tests/independence.rs` | **3** | 独立性三把门：内核目录（`src/engine`、`src/net`）不出现客户端名字；`[dependencies]` 非 optional 项只能是 `libc` + `thiserror`；`postgres-compat` 不得进 `default`（§11 第 7 条） |
+| `tests/migrate.rs` | **11** | §6.5 那四条承诺。8 条直接打 API：v2 样本迁移后 `State` 逐字段相等且 WAL 文件字节不变、重开后每个语义面都能读到（密钥/审计/定义/放置/锁/引用）、尾巴 seq 照搬且发号接着走、幂等重跑不动当前目录、未知版本与「正文配不上版本位」都拒动且零改动、既有备份不被覆盖、迁完的目录能直接用通用表。3 条用 `env!("CARGO_BIN_EXE_treedb-migrate")` 起**真进程**钉退出码（10 / 1 / 0）与输出里的命令、备份路径、回滚步骤 |
 
 上一轮（读轴/写轴）新加或改写的回归锁，本轮仍然全绿：
 `dentries_are_two_level_and_kind_survives_snapshot`（两层表形状 + kind 冷启动后
@@ -1085,7 +1181,7 @@ gcc -O2 -pthread -o /tmp/lb_floor benches/lb_floor.c && /tmp/lb_floor 1 64 3   #
 `torn_wal_tail_is_discarded_not_fatal` 与 `replay_skips_torn_tail`（坏尾必须注入到
 **逻辑末尾**，不是文件 EOF —— 预分配后两者差着一大片零，注错地方就等于什么都没测）。
 
-本轮（能力面）新加的回归锁：
+上一轮（能力面，`v0.3.3`）新加的回归锁：
 `generic_tables_keep_rows_and_rebuild_indexes`（lib：`row_index` 不进快照，必须由
 `rows` + def 重推得逐字相等；`row_page`/`index_page` 游标不重不漏；`DelTable` 后
 `row_index.is_empty()`）、
@@ -1101,7 +1197,7 @@ gcc -O2 -pthread -o /tmp/lb_floor benches/lb_floor.c && /tmp/lb_floor 1 64 3   #
 `stats_reports_table_counts_and_both_disk_sizes`（两个 WAL 长度与 `snap_bytes` 的
 「没 checkpoint 就是 0」口径）、
 `generic_table_and_readdir_plus_over_tcp`、
-`ops_stats_checkpoint_shutdown_over_tcp`（本轮补：`wal_disk_bytes == st_size`、
+`ops_stats_checkpoint_shutdown_over_tcp`（那一轮补：`wal_disk_bytes == st_size`、
 checkpoint 前 `snap_bytes == 0`、`proto_version == PROTOCOL_VERSION`）。
 
 同一轮里被「改写」而不只是「新增」的两条：`readonly_classification_matches_translate`
@@ -1109,6 +1205,16 @@ checkpoint 前 `snap_bytes == 0`、`proto_version == PROTOCOL_VERSION`）。
 `acked_writes_survive_crash_with_workers_on` 把通用表纳入「已 ack 的写一条不丢」与
 「索引必须被重推」的验收面。`seed` 现在也建表灌行 —— 不然五条只读表 op 的
 「不产 logs」只在测「查不存在的表」那种废话（§4.2）。
+
+本轮（快照迁移）新加的回归锁：
+`legacy_snapshot_decodes_from_the_same_prefix`（lib，§6.5 的地基：同一状态按两代布局
+各写一遍，比前缀必须逐字节相同 —— 正文漂了就得把 v2 写出侧一起改，不然迁移工具
+在说谎）、
+`legacy_writer_refuses_to_drop_tables`（lib：表非空时禁止写 v2 快照，而失败必须发生
+在**一个字节都没写出去**之前）、
+`migration_preserves_every_field_and_leaves_the_wal_alone`（集成：用
+`downgrade_to_v2` 造样本 —— checkpoint 后按 v2 重写快照文件，而不是手工拼一个假文件，
+这样「旧布局」永远与代码里的写出侧同步）。
 
 ### 9.1 四条被作废的测量（记录过程，防止有人复用假数据）
 
@@ -1194,13 +1300,23 @@ checkpoint 前 `snap_bytes == 0`、`proto_version == PROTOCOL_VERSION`）。
 `to_vec()` 兼容层：后者能让 grovefs 一行不改地编过，但它会把刚刚消掉的那 100 次
 `malloc` 原封不动放回客户端侧 —— 用静默的性能回退换编译兼容，不如把断点摆在明处。
 
-② **本轮（`v0.3.3`）同时动了磁盘格式与线协议 tag**，这一处不是编译期能兼容的：
+② **`v0.3.3` 那一轮同时动了磁盘格式与线协议 tag**，这一处不是编译期能兼容的：
 `SNAP_VERSION` 2 → 3，旧 `state.snap` 会被版本号闸门**拒收而不是静默解错**（与
-`data_ref` 改字节键那次同一个选择）。后果：任何已经在用 treedb 跑过元数据的
-数据目录，升级到 `v0.3.3` 二进制后**起不来**，而引擎目前没有快照迁移工具
-（grovefs 侧的 `view export`/`import` 在 treedb 档仍是拒绝的，§10 缺口表）。灰度前
-必须先定这一条：要么保留旧二进制直到有迁移工具（§11 第 10 条），要么接受元数据
-重建。`PROTOCOL_VERSION` 2 → 3 叠加了升级顺序硬约束（§4.1）：**先升服务端、后升
+`data_ref` 改字节键那次同一个选择）。后果曾经是「任何已经在用 treedb 跑过元数据
+的数据目录，升级后**起不来**」—— 这一句在 `v0.3.4` 已改写：闸门仍严，但有了
+出路 `treedb-migrate`（§6.5，只重写 `state.snap`，不动 WAL）。grovefs 侧的
+`view export`/`import` 在 treedb 档仍是拒绝的（缺口表），所以升级数据目录只这一条路：
+
+```sh
+treedb-server --listen 127.0.0.1:7777 --shutdown             # 先停：本工具不做互斥
+treedb-migrate --dir /var/lib/treedb                         # 只看：exit 10 = 需要迁移
+treedb-migrate --dir /var/lib/treedb --apply                 # 再动：先落 state.snap.v2.bak
+treedb-server --dir /var/lib/treedb --listen 127.0.0.1:7777  # 新二进制现在能开门
+# 回滚：停服务端，把 state.snap.v2.bak 拷回 state.snap，再跑旧二进制（WAL 没被动过）
+#      但这一手只在新二进制做过第一次 checkpoint 之前无损：checkpoint 会 reset WAL（§6.5）
+```
+
+`PROTOCOL_VERSION` 2 → 3 叠加了升级顺序硬约束（§4.1）：**先升服务端、后升
 客户端**，反过来旧客户端会静默丢掉新应答的尾部字段。grovefs 现在钉 `v0.3.2`，两端
 一起动才涉及这两条，按既有做法拿临时
 `[patch."https://github.com/TechWander/treedb.git"]` 跑一次
@@ -1304,7 +1420,8 @@ spike 明确**没**做、也不在接入面上假装做的事 —— 一律返�
    treedb 此前只接了「树」，定义/密钥/账户还在本地 SQLite，要么先接受这个分裂上线，
    要么先把下面第 7 条的通用表能力补进引擎再一次性切（注意：是补「通用表」，不是把
    grovefs 的表搬进去）—— **第 7 条的 T2 本轮已完成**，所以现在只剩选择本身；切过去
-   之前还得先算清 §10「bump tag 前必读的两处破坏面」里第 ② 条那个数据目录升级问题。
+   之前还得先算清 §10「bump tag 前必读的两处破坏面」里第 ② 条那个数据目录升级问题 ——
+   现在它已经有答案了（`treedb-migrate`，§6.5），剩下的只是执行顺序。
 6. ~~**`ReadDirPlus`**~~ **协议面已完成**：接进去才发现 readdir 一页要付 `1 + N/64` 次
    往返 —— 目录列表本身不带属性，provider 只能回头逐条 `Getattr`。现在
    `Reply::DirentsPlus` 在一页里直接带上与 `Getattr` 同源的 `NodeAttr`：四个平行数组
@@ -1363,8 +1480,8 @@ spike 明确**没**做、也不在接入面上假装做的事 —— 一律返�
      里非 optional 项只能是 `libc` + `thiserror`；`postgres-compat` 不得进 `default`。
      关键词是拼出来的，文件也不扫 `tests/`，否则门会把自己拦下来。**反向验过**：
      往 `src/engine/` 丢一个含该名字的探针文件，门 1 立刻 FAILED，删掉又绿 —— 门不是装饰。
-     跑法：默认档 `cargo test --release` = **83 passed / 0 failed**（含三把门），
-     `--features postgres-compat` = **114 passed / 0 failed**（数字跟 §9 同步，三把门
+     跑法：默认档 `cargo test --release` = **96 passed / 0 failed**（含三把门），
+     `--features postgres-compat` = **127 passed / 0 failed**（数字跟 §9 同步，三把门
      在两档都跑）。本轮加通用表时它们一条没红 —— 新 op 没带进客户端名字，
      门 1 测的就是这条线。
 
@@ -1387,11 +1504,16 @@ spike 明确**没**做、也不在接入面上假装做的事 —— 一律返�
    往调用方给的 `&mut Vec<u8>` 直接写，而不是先造一个 `Vec<Vec<u8>>`。收益只能
    估（100 次 alloc ≈ 每页 2–3 µs，没实测），所以它排在第 2 条之后（第 6 条已闭合）：
    默认档读轴已经领先 PG 2.9×，这里不再是短板。
-10. **两件收尾的活，都是本轮主动留下的**：
-    - **快照迁移工具**：`SNAP_VERSION` 2 → 3 把旧数据目录挡在门外，而引擎现在没有
-      导出/导入等价物（§10 bump tag 必读 ②）。得有一能把旧快照读成当前形状的东西 ——
-      或者一条明说的 `treedb-server --migrate <dir>`，代价是要在内核里养住若干代旧快照
-      的 decode 分支。这一条在灰度之前必须有人接，不接就是「升级等于重建」。
+10. **两件收尾的活，前一件已完成，后一件仍是本轮主动留下的**：
+    - ~~**快照迁移工具**~~ **已完成**（`v0.3.4`，§6.5）：`SNAP_VERSION` 2 → 3 把旧数据
+      目录挡在门外那句「升级等于重建」现在有出路了 —— `treedb-migrate` 读旧布局、
+      按新布局写回，WAL 不碰。当时列的两条备选里选了一条更窄的那条：**没有**做
+      `treedb-server --migrate <dir>`，也没有在内核里养若干代旧快照的 decode 分支 ——
+      只多认一代，且只在离线工具里认（启动路径依旧拒），兼顾「可用」与「不在
+      内核里堆历史」。回滚窗口另有一段要紧的真实边界写在 §6.5：无损只维持到新二进制
+      第一次 checkpoint 之前，`benches/rehearse_migrate.sh` 拿 `v0.3.2` 真编译的旧二进制
+      把这一面与那一面都量过。剩下没做的：v1 → v2 仍无路径（字段宽度变了），而两代之前的
+      目录要不要管，得等到真有人从那里升级时再说。
     - **把 `Key*`/`Audit*`/`Def*`/`Place*` 四组专用 op 从内核拆掉**（T2 剩下的那一半）：
       顺序只能是先在 grovefs 侧用通用表拼出等价语义、跑过端到端，再删 op；先删后补
       会把 spike 分支直接弄坏。拆完之后 L1 那档才从「仍违反」改成「不违反」，
