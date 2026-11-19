@@ -5,9 +5,11 @@
 自带 WAL + 快照恢复。目标是把「万级并发视图 × 每视图多条活跃连接」这件事从 PG 的
 process-per-connection 成本模型里解放出来，同时不牺牲已 ack 写入的持久性。
 
-**状态**：v0.3.0，引擎本体已落地并跑完五轴验收；接入 spike 已在 grovefs 实验分支
+**状态**：v0.3.0，引擎本体已落地并跑完五轴验收；已建 git 仓推 `origin`(gitee)
++ `github` 两远端并打 tag `v0.3.0`。接入 spike 已在 grovefs 实验分支
 `exp/treedb-integration` 上**端到端跑通**（§10 阶段 B 末节：31 条 e2e 断言全过，
-grovefs 默认档逐字节不变）。`cargo test` 99 条全绿（56 lib +
+grovefs 默认档逐字节不变；treedb 在 grovefs 里是**按 tag 的 git 依赖**，不再依赖
+同级克隆）。`cargo test` 99 条全绿（56 lib +
 19 engine_crud + 9 net_protocol + 6 crash_recovery + 7 read_scaling + 1 concurrency +
 1 scale_connections）。PG 只出现在
 过渡档模块（`src/pool`、`src/store`、`src/persist`）和性能对照器（`src/bin/pgbench.rs`）里，
@@ -615,10 +617,13 @@ bash benches/throughput_matrix.sh 3        # 五轴吞吐矩阵（默认只跑 1
 引擎 + 协议 + 事件循环 + 五轴验收成文。**grovefs 目录零改动。**
 
 ### 阶段 B（接入服务端）
-1. `grovefs/Cargo.toml` 加 `treedb = { path = "../treedb", optional = true }`，
-   挂在 `native` 之下，与现有 `pg` 后端并列，默认关（新 feature `treedb`）。
-   ⚠ path 依赖即使 feature 关也必须能解析：旁边没有 `../treedb` 的克隆任何
-   feature 组合都编不过。**入库前先定分发方式**（vendored / workspace / registry）。
+1. `grovefs/Cargo.toml` 加可选依赖，挂一个新 feature `treedb`（默认关，与现有 `pg`
+   后端并列）。落地时先写成 `path = "../treedb"`，实测扛不住：**可选的 path 依赖
+   即使 feature 关掉也要解析**，旁边没有同级克隆的 checkout 任何 feature 组合都
+   编不过。最终形态是按 tag 的 git 依赖
+   `treedb = { git = "https://github.com/TechWander/treedb.git", tag = "v0.3.0" }`
+   —— 故意用匿名 https，没有 SSH key 也 `cargo fetch` 得动。已拿一个**旁边没有
+   treedb 的干净克隆**验证默认档与 `--features treedb` 都能编过。
 2. `remote/meta/server_ext.rs::StoreKind` 新增 `Treedb` variant，实现
    `MetaProvider`：把 FUSE 侧调用逐一映射到 §4.2 的 op。**不做 SQL 翻译层**，
    语义按 §5.2 的边界划分：fd/open 状态留在 grovefs 侧。
@@ -662,11 +667,15 @@ bash benches/throughput_matrix.sh 3        # 五轴吞吐矩阵（默认只跑 1
 代价是反过来的：板子上的 build 步骤是默认档，所以**从板子上跑时永远 SKIP 掉
 这一节** —— treedb 路径的回归必须显式 `cargo build --release --features treedb`
 之后单独跑 `.build-bin/test_treedb.sh`。spike 阶段接受这个不对称（默认档是
-必须守住的，实验档是自己守的）；要让它真正进板，得先定 §11 第 5 条里那个
-path 依赖分发方式（vendored / workspace / registry）。
+必须守住的，实验档是自己守的）；现在依赖已经钉到 tag，剩下的只是要不要给板子
+加一步带 feature 的 build，不再卡在分发方式上。
 
-提交：grovefs `exp/treedb-integration` @ 53306a0（8 文件 +1221/-21），**master
-未动**（e18b3d4，与 origin/github 一致）。测试脚本在 `.build-bin/`，按本仓
+提交与入库：treedb 本身已建 git 仓并推两远端（`origin`=gitee.com:techwanderer/treedb、
+`github`=github.com/TechWander/treedb，均为 e2bb51d，tag `v0.3.0`）；`.pgref/`
+那个 1.9 G 的对照用 PG 私有集群与 `target/` 不入库，`Cargo.lock` **入库**（交付
+的是要部署的二进制）。grovefs 侧两笔：`exp/treedb-integration` @ 53306a0（接入，
+8 文件 +1221/-21）+ 1459a60（依赖换成 tag，+隔离克隆验证），**master 仍未动**
+（e18b3d4，与 origin/github 一致）。测试脚本在 grovefs 的 `.build-bin/`，按该仓
 `.gitignore` 的 `/.*/` 边界不入库。
 
 spike 明确**没**做、也不在接入面上假装做的事 —— 一律返回拒绝，绝不返回空值
@@ -683,7 +692,7 @@ spike 明确**没**做、也不在接入面上假装做的事 —— 一律返�
 | readdir 的属性 | N/64 次往返 | 协议该补 `ReadDirPlus`，见 §11 第 6 条 |
 | `view list` 的物理树 | 列不出来 | 控制面枚举器只看本地 db 文件 |
 | HA / 快照传送 | 启动即拒绝 | §8「无复制」这条限制本身 |
-| path 依赖的分发方式 | 未定 | 决定能否入库的唯一分叉 |
+| ~~path 依赖的分发方式~~ | 已定：按 tag 的 git 依赖 | 钉 `v0.3.0`，无同级克隆也能构建（实测） |
 
 ### 阶段 C（回归与灰度）
 1. ~~`test_pg.sh` 那套断言在 treedb 后端重跑~~ 已起头：新增 `.build-bin/test_treedb.sh`
@@ -712,8 +721,11 @@ spike 明确**没**做、也不在接入面上假装做的事 —— 一律返�
    末节。与本节原写法有两处偏离，原因已写进 §10：CLI 入口用
    `--meta-store treedb://host:port` 而不是新旗标；写接入代码前先把 `data_ref` 改成
    不透明字节、给 `Unlink`/`Rmdir`/`Rename` 补上 GC 线索与 `RENAME_NOREPLACE`。
-   **仍不推 master**：spike 只在实验分支上，且卡在 path 依赖的分发方式这个分叉上
-   （vendored / workspace / registry 三选一，决定后才能真正入库）。
+   原先卡住的「分发方式」已定：本仓推到 gitee+github 并打 `v0.3.0`，grovefs 改成
+   按 tag 的 git 依赖，拿没有同级克隆的干净仓验证过默认档与 `--features treedb`
+   均绿。**仍未推 master**：推不推是下一轮的决定，而且 treedb 现在只接了「树」，
+   定义/密钥/账户还在本地 SQLite —— 要么先接受这个分裂上线，要么等 §11 把这些表
+   补进引擎再一次性切。
 6. **`ReadDirPlus`**：接进去才发现 readdir 一页要付 `1 + N/64` 次往返 —— 目录列表
    本身不带属性，provider 只能回头逐条 `Getattr`。这是 §7.5 那条读轴在 grovefs 形状上
    的真实成本，补一个带属性的 dirents 应答即可打平 PG 档的一条 SQL。
