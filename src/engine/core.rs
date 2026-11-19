@@ -392,6 +392,15 @@ impl Engine {
         Ok(())
     }
 
+    /// 当前 WAL 逻辑字节数。给事件循环的 auto-checkpoint 判断用。
+    ///
+    /// 为什么单独开这个口而不是用 [`Engine::snapshot_stats`]：后者要把七张表
+    /// 各数一遍（其中 dentry 条数在两层表下是 O(目录数)），而 auto-checkpoint
+    /// 每轮只需要这一个数。默认档 64 MB 下那是每轮白付一次全表计数。
+    pub fn wal_bytes(&self) -> u64 {
+        self.wal.logical_size().unwrap_or(0)
+    }
+
     /// 全量快照 + WAL 重置。
     ///
     /// 顺序：state.save → tmp → fsync(tmp) → rename → fsync(dir) → wal.reset。
@@ -441,7 +450,8 @@ impl Engine {
             (
                 s.views.len() as u64,
                 s.nodes.len() as u64,
-                s.dentries.len() as u64,
+                // 两层表的 len() 是目录数，报数要的是 dentry 条数。
+                s.dentry_count() as u64,
                 s.locks.len() as u64,
                 s.refs.len() as u64,
                 s.keys.len() as u64,

@@ -1,0 +1,13 @@
+# treedb-micro tag=mid_noClone items=32000 ops=100000 readdir_limit=100
+op                 ns/op  allocs/op   bytes/op
+ping                 8.1       0.00        0.0
+lookup             403.0       2.00        9.5
+lookup-miss        446.8       2.00       13.7
+getattr            166.6       1.00        4.7
+readdir          10484.7     104.00     3883.0
+setattr            565.9       9.00      975.9
+create            1360.1      11.32     1370.9
+unlink             891.7       5.00      489.7
+# scaling check @ items=96000
+lookup             461.4       3.00       16.2
+readdir           7934.8     104.00     3883.0

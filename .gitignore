@@ -13,3 +13,6 @@
 
 # 服务端 CPU 探针（benches/probe_srv.sh）的临时数据目录
 /.probe
+
+# git commit -F 用的提交消息草稿
+/.cmsg*.txt

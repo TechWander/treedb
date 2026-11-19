@@ -1,7 +1,8 @@
 //! 引擎数据模型与协议语义类型。
 //!
 //! 概念对齐「把元数据存进关系库」的那张表形状（`pg_store` 这类实现），但去掉 SQL：
-//! - `node` 表 → [`Node`]（inode）+ `dentries`（`(view,parent,name) → ino`）；
+//! - `node` 表 → [`Node`]（inode）+ `dentries`（`(view,parent,name) → ino`，
+//!   内存里按 `(view,parent)` 分两层存，见 [`crate::engine::mem::State`]）；
 //! - `locks` 表 → [`LockRec`]（`(view,ino,owner) → kind,lease`）；
 //! - 内容引用账本 → [`RefRec`]（`data_ref → count,size`，跨视图共享）；
 //! - 控制面「命名密钥 + 调用审计」两张表 → [`KeyRec`] / [`AuditRec`]。

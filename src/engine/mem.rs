@@ -8,8 +8,9 @@
 //!
 //! 三张核心索引，形状与关系库版的三张表一致：
 //! - `nodes: (view, ino) → Node`            ← `node` 表主键
-//! - `dentries: (view, parent, name) → ino` ← `node(parent_id,name)` 唯一索引
-//!   （key 的字典序 = 同目录内 name 的字节序，readdir 顺序天然稳定）
+//! - `dentries: (view, parent) → { name → (ino, kind) }`
+//!   ← `node(parent_id,name)` 唯一索引（内层 key 的字典序 = 同目录内 name 的
+//!   字节序，readdir 顺序天然稳定；分两层是为了查找不用复制 name，见字段注释）
 //! - `locks: (view, ino, owner) → LockRec`  ← `locks` 表
 //!
 //! `refs` 是跨视图共享的内容账本（对应那个独立的 refs schema）；
@@ -303,6 +304,23 @@ impl Log {
     }
 }
 
+/// `dentries` 内层 value。
+///
+/// `kind` 是从 `nodes` **冗余**过来的：readdir 一页 100 条，若每条回一次 inode 表，
+/// 32k 目录规模下就是 100 次 BTreeMap 下钻、几乎全是 cache miss —— `treedb-micro`
+/// 量到这一步占掉一页计算成本的九成（9.8 µs/页）。inode 的 kind 终身不变，冗余
+/// 不会失真；它也不进 WAL 与快照字节（两处都能就地推出），故格式与版本都没动。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Dent {
+    pub ino: Ino,
+    /// `Kind::code()`；`DENT_KIND_UNKNOWN` 表示写这条 dentry 时 inode 还没落地。
+    pub kind: u8,
+}
+
+/// `Dent::kind` 的「不知道」哨兵。真实 kind 只有 0/1/2（见 `model::Kind::code`），
+/// 故 `u8::MAX` 可安全占用；命中它说明日志顺序异常，读侧回表兜底。
+pub const DENT_KIND_UNKNOWN: u8 = u8::MAX;
+
 /// 引擎全量状态。单写者事件循环独占，无锁。
 ///
 /// `PartialEq` 是给崩溃恢复测试用的：`snapshot + WAL 重放` 后的状态必须与
@@ -316,7 +334,15 @@ pub struct State {
     /// 下一个可分配的 view id。
     pub next_view_id: ViewId,
     pub nodes: BTreeMap<(ViewId, Ino), Node>,
-    pub dentries: BTreeMap<(ViewId, Ino, Vec<u8>), Ino>,
+    /// 目录项两层表：外层按 `(view, parent)` 定位目录，内层按 name 字节序。
+    ///
+    /// 为什么不分层成一个 `(ViewId, Ino, Vec<u8>)` 扁平 key：`BTreeMap::get` 按
+    /// key 的 `Ord` 逐字段比，含 `Vec<u8>` 的元组没法用 `&[u8]` 借位查（`Borrow`
+    /// 只能整体换一次），于是每次 lookup 都要先 `name.clone()` 一个 `Vec`。分两层
+    /// 后 `Vec<u8>: Borrow<[u8]>` 在内层这一维成立，查找与删除全程零分配。
+    /// 遍历顺序不变（外层 `(view, parent)` 升序 + 内层 name 升序 = 原三元组字典序），
+    /// 所以快照字节序列也与改造前逐字节一致。
+    pub dentries: BTreeMap<(ViewId, Ino), BTreeMap<Vec<u8>, Dent>>,
     pub locks: BTreeMap<(ViewId, Ino, Vec<u8>), LockRec>,
     pub refs: BTreeMap<DataRef, RefRec>,
     pub keys: BTreeMap<Vec<u8>, KeyRec>,
@@ -357,10 +383,25 @@ impl State {
                 name,
                 ino,
             } => {
-                self.dentries.insert((*view, *parent, name.clone()), *ino);
+                let kind = self.node_kind(*view, *ino);
+                self.dentries
+                    .entry((*view, *parent))
+                    .or_default()
+                    .insert(name.clone(), Dent { ino: *ino, kind });
             }
             Log::DelDentry { view, parent, name } => {
-                self.dentries.remove(&(*view, *parent, name.clone()));
+                let empty = match self.dentries.get_mut(&(*view, *parent)) {
+                    Some(m) => {
+                        m.remove(name);
+                        m.is_empty()
+                    }
+                    None => false,
+                };
+                // 空内层表必须收掉：否则 `dentries.len()` 混进越来越多零条目录项的
+                // 目录，而它同时是 stats 与快照里的 dentry 计数依据。
+                if empty {
+                    self.dentries.remove(&(*view, *parent));
+                }
             }
             Log::PutLock {
                 view,
@@ -430,17 +471,15 @@ impl State {
         for k in dead_nodes {
             self.nodes.remove(&k);
         }
-        // 前缀扫的上界不能造「最大名字」（`vec![0xff; usize::MAX]` 会
-        // capacity overflow 直接 panic），改用 Unbounded + take_while：
-        // key 以 view 打头，遇到下一个 view 就停，复杂度与命中行数成正比。
-        let dead_dent: Vec<(u32, u64, Vec<u8>)> = self
+        // dentries 外层 key 就是 `(view, parent)`，前缀扫直接命中，不用再把
+        // 每条 key 克隆出来（旧写法在十万条目录项的视图上要拷十万个 Vec）。
+        let dead_dirs: Vec<u64> = self
             .dentries
-            .range((Bound::Included((view, u64::MIN, Vec::new())), Bound::Unbounded))
-            .take_while(move |(k, _)| k.0 == view)
-            .map(|(k, _)| k.clone())
+            .range((view, u64::MIN)..=(view, u64::MAX))
+            .map(|(k, _)| k.1)
             .collect();
-        for k in dead_dent {
-            self.dentries.remove(&k);
+        for p in dead_dirs {
+            self.dentries.remove(&(view, p));
         }
         let dead_locks: Vec<(u32, u64, Vec<u8>)> = self
             .locks
@@ -455,31 +494,53 @@ impl State {
     }
 
     /// `(view, parent, *)` 区间内、`after` 之后的至多 `limit` 条 dentry。
-    /// key 的字典序即 name 的字节序：`(view, parent, name)` 元组比较
-    /// 与 `(parent, name)` 目录内排序等价。`after` 为空 = 从头开始。
+    /// 内层 key 的字节序即 name 的字节序。`after` 为空 = 从头开始。
     pub fn read_dir(&self, view: ViewId, parent: Ino, after: &[u8], limit: usize) -> Vec<(Vec<u8>, Ino)> {
-        let start = (view, parent, after.to_vec());
+        let Some(m) = self.dentries.get(&(view, parent)) else {
+            return Vec::new();
+        };
         // after 是「上一页最后一个名字」，用 Excluded 跳过它本身。
         let lo = if after.is_empty() {
-            Bound::Included(start.clone())
+            Bound::Included(after)
         } else {
-            Bound::Excluded(start)
+            Bound::Excluded(after)
         };
-        self.dentries
-            .range((lo, Bound::Unbounded))
-            .take_while(move |k| k.0 .0 == view && k.0 .1 == parent)
+        m.range::<[u8], _>((lo, Bound::Unbounded))
             .take(limit)
-            .map(|(k, ino)| (k.2.clone(), *ino))
+            .map(|(n, d)| (n.clone(), d.ino))
             .collect()
     }
 
     /// 某目录是否为空（readdir 不含 `.`/`..`，故只看子 dentry）。
     pub fn dir_empty(&self, view: ViewId, parent: Ino) -> bool {
         self.dentries
-            .range((Bound::Included((view, parent, Vec::new())), Bound::Unbounded))
-            .take_while(|k| k.0 .0 == view && k.0 .1 == parent)
-            .next()
-            .is_none()
+            .get(&(view, parent))
+            .map_or(true, |m| m.is_empty())
+    }
+
+    /// 零分配 dentry 查找：内层 `BTreeMap<Vec<u8>, _>` 可以拿 `&[u8]` 借位查。
+    #[inline]
+    pub fn dentry(&self, view: ViewId, parent: Ino, name: &[u8]) -> Option<Dent> {
+        self.dentries
+            .get(&(view, parent))
+            .and_then(|m| m.get(name))
+            .copied()
+    }
+
+    /// 某 inode 的 kind 码，没有则 [`DENT_KIND_UNKNOWN`]。
+    #[inline]
+    fn node_kind(&self, view: ViewId, ino: Ino) -> u8 {
+        self.nodes
+            .get(&(view, ino))
+            .map(|n| n.kind.code())
+            .unwrap_or(DENT_KIND_UNKNOWN)
+    }
+
+    /// dentry 总条数。**O(目录数)**，只能用在诊断与 checkpoint 路径上，
+    /// 不要放进事件循环的每轮。注意 `dentries.len()` 是**有子项的目录数**，
+    /// 不是条数。
+    pub fn dentry_count(&self) -> usize {
+        self.dentries.values().map(|m| m.len()).sum()
     }
 
     pub fn live_view_count(&self) -> usize {
@@ -501,12 +562,14 @@ impl State {
             w.u32(*view);
             node.encode(w);
         }
-        w.u32(self.dentries.len() as u32);
-        for ((view, parent, name), ino) in &self.dentries {
-            w.u32(*view);
-            w.u64(*parent);
-            w.bytes(name);
-            w.u64(*ino);
+        w.u32(self.dentry_count() as u32);
+        for ((view, parent), m) in &self.dentries {
+            for (name, d) in m {
+                w.u32(*view);
+                w.u64(*parent);
+                w.bytes(name);
+                w.u64(d.ino);
+            }
         }
         w.u32(self.locks.len() as u32);
         for ((view, ino, owner), rec) in &self.locks {
@@ -569,7 +632,12 @@ impl State {
             let parent = r.u64()?;
             let name = r.bytes()?;
             let ino = r.u64()?;
-            s.dentries.insert((view, parent, name), ino);
+            // nodes 段先于本段载入，故 kind 就地可推；推不出来留哨兵，读侧兜底。
+            let kind = s.node_kind(view, ino);
+            s.dentries
+                .entry((view, parent))
+                .or_default()
+                .insert(name, Dent { ino, kind });
         }
         let n = r.u32()?;
         for _ in 0..n {
@@ -913,5 +981,56 @@ mod tests {
         assert!(back.nodes.contains_key(&(2, 7)));
         assert!(back.nodes.contains_key(&(2, 8)));
         assert_eq!(back.views, s.views);
+    }
+
+    /// 两层 dentry 表的四条契约：条数与目录数分开、借位零分配查找、
+    /// kind 冗余不进快照字节、清空后的目录不留外层空表。
+    #[test]
+    fn dentries_are_two_level_and_kind_survives_snapshot() {
+        let mut s = State::new();
+        s.apply(&Log::PutView {
+            name: b"v".to_vec(),
+            meta: ViewMeta { id: 1, root: 1, next_ino: 9 },
+        });
+        for (ino, name, kind) in [(2u64, b"a".as_slice(), Kind::File), (3, b"d", Kind::Dir)] {
+            s.apply(&Log::PutNode { view: 1, node: node(ino, 1, name, kind) });
+            s.apply(&Log::PutDentry {
+                view: 1,
+                parent: 1,
+                name: name.to_vec(),
+                ino,
+            });
+        }
+        // `.len()` 是目录数，`dentry_count()` 才是条数：两者混用会把 stats
+        // 与快照计数写成 1。
+        assert_eq!(s.dentries.len(), 1);
+        assert_eq!(s.dentry_count(), 2);
+        // 借位查找：调用方手里只有 &[u8]，查一次表不用复制名字。
+        assert_eq!(
+            s.dentry(1, 1, b"a"),
+            Some(Dent { ino: 2, kind: Kind::File.code() })
+        );
+        assert_eq!(
+            s.dentry(1, 1, b"d"),
+            Some(Dent { ino: 3, kind: Kind::Dir.code() })
+        );
+        assert_eq!(s.dentry(1, 1, b"zz"), None);
+
+        // kind 是推出来的冗余字段，不占快照一个字节：往返后必须从 nodes
+        // 重新推出同样的值——否则就是快照格式被改了却没升 SNAPSHOT_VERSION。
+        let mut w = W::new();
+        s.save(&mut w);
+        let b = w.finish();
+        let mut r = Rd::new(&b);
+        let back = State::load(&mut r).unwrap();
+        assert_eq!(r.remaining(), 0);
+        assert_eq!(back, s, "快照往返必须逐字段相等（含冗余的 kind）");
+
+        for name in [b"a".as_slice(), b"d"] {
+            s.apply(&Log::DelDentry { view: 1, parent: 1, name: name.to_vec() });
+        }
+        assert_eq!(s.dentry_count(), 0);
+        assert!(s.dentries.is_empty(), "空内层表不能留在外层");
+        assert!(s.dir_empty(1, 1));
     }
 }

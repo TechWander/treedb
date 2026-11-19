@@ -1070,8 +1070,9 @@ fn build_state(e: &mut Engine) -> (u32, u64) {
 fn assert_rich_state(s: &State, v: u32) {
     assert_eq!(s.views.len(), 1);
     // 根 + a + d + b + c + l = 6 个 inode，5 条 dentry（根没有 entry）。
+    // 条数走 `dentry_count()`：`dentries` 是两层表，`.len()` 是目录数。
     assert_eq!(s.nodes.len(), 6, "nodes: {:?}", s.nodes.keys().collect::<Vec<_>>());
-    assert_eq!(s.dentries.len(), 5);
+    assert_eq!(s.dentry_count(), 5);
     assert_eq!(s.refs.len(), 1);
     assert_eq!(s.refs[&blk(100)], treedb::engine::model::RefRec { count: 2, bytes: 5120 });
     assert_eq!(s.locks.len(), 1);
@@ -1102,14 +1103,14 @@ fn reopen_replays_wal_into_identical_state() {
         mk_file(&mut e, tmp, 1, "junk");
         ok(&mut e, &Op::DropView { name: b"tmp".to_vec() });
         before = e.state_snapshot();
-        assert!(!before.dentries.contains_key(&(v, 1, b"c".to_vec())));
+        assert!(before.dentry(v, 1, b"c").is_none());
         assert!(!before.views.contains_key(b"tmp".as_slice()));
     } // 这里 Engine 离开作用域就是普通 close，没有 checkpoint —— 全靠 WAL 重放。
 
     let mut e2 = d.open();
     assert_eq!(e2.state_snapshot(), before, "重放后的状态必须与崩溃前逐字段相等");
     // 基线 6 个 inode 减掉 unlink 的 c；dentry 5 减 1；PurgeView 不能留残留。
-    assert_eq!((e2.state_snapshot().nodes.len(), e2.state_snapshot().dentries.len()), (5, 4));
+    assert_eq!((e2.state_snapshot().nodes.len(), e2.state_snapshot().dentry_count()), (5, 4));
     assert_eq!(e2.state_snapshot().views.len(), 1, "临时视图不能重放回来");
     assert!(e2.state_snapshot().locks.is_empty(), "释放锁必须从重放里体现");
     assert!(e2.state_snapshot().view_by_id.len() == 1, "反查表要跟着清");

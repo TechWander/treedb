@@ -29,6 +29,12 @@ name = "treedb-pgbench"
 path = "src/bin/pgbench.rs"
 required-features = ["postgres-compat"]
 
+# 计算侧微基准：不经网络、不写 WAL，只量状态机本身的 ns/op 与 allocs/op。
+# 吞吐矩阵落后 PG 的格子先在这里复现，才知道该改索引还是该改线程模型。
+[[bin]]
+name = "treedb-micro"
+path = "src/bin/micro.rs"
+
 [features]
 # 显式写成一行：`tests/independence.rs` 门 3 就在测这个键没把过渡档拖进默认档。
 default = []

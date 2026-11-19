@@ -252,7 +252,21 @@ impl Wal {
         Ok(())
     }
 
+    /// 把已写出的记录刷到稳定介质。
+    ///
+    /// 没有新记录就直接返回：`durable_seq + 1 == next_seq` 意味着自上次 sync 以来
+    /// 一个字节都没追加过，此时这次 `sync_data` 在语义上是空转。Never 档的事件
+    /// 循环每 `sync_ms` 无条件调一次本函数，所以这个守卫让“纯读不碰盘”这个
+    /// 说法在代码层成立。
+    ///
+    /// 但**别把它当优化**：实测（`benches/probe_srv.sh`，WAL 在 161 TB 机械 XFS
+    /// 上，64 并发 readdir，`never` 档）加这道守卫前后是 50 622 → 49 856 ops/s，
+    /// 完全在噪声里 —— 内核对着无脏页的文件做 `sync_data` 根本不往下发 IO。
+    /// “空转 fsync 拖慢了读档”这个猜测已被证伪，见 DESIGN.md §7.10 末段。
     pub fn sync(&mut self) -> Result<()> {
+        if self.durable_seq + 1 == self.next_seq {
+            return Ok(());
+        }
         self.file.sync_data()?;
         self.durable_seq = self.next_seq - 1;
         Ok(())

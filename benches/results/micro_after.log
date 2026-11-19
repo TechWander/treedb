@@ -1,0 +1,13 @@
+# treedb-micro tag=after_nest items=32000 ops=100000 readdir_limit=100
+op                 ns/op  allocs/op   bytes/op
+ping                 8.2       0.00        0.0
+lookup             370.5       1.00        4.7
+lookup-miss        301.1       1.00        6.0
+getattr            173.0       1.00        4.7
+readdir           4399.9     104.00     3883.0
+setattr            448.3       9.00      975.9
+create            1340.0      10.32     1350.9
+unlink             781.8       3.00      476.8
+# scaling check @ items=96000
+lookup             432.8       2.00       11.5
+readdir           4842.5     104.00     3883.0

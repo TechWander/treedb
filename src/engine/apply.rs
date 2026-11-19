@@ -7,7 +7,7 @@
 //!
 //! 约定：`logs.is_empty()` 等价于「本 op 是只读的」。
 
-use crate::engine::mem::{Log, State};
+use crate::engine::mem::{DENT_KIND_UNKNOWN, Log, State};
 use std::collections::BTreeMap;
 use std::ops::Bound;
 use crate::engine::model::{
@@ -28,10 +28,10 @@ fn name_err(n: &[u8]) -> Option<Reply> {
     }
 }
 
-fn view_meta(s: &State, view: ViewId) -> Option<(Vec<u8>, ViewMeta)> {
-    let name = s.view_by_id.get(&view)?.clone();
-    let meta = s.views.get(&name)?.clone();
-    Some((name, meta))
+fn view_meta(s: &State, view: ViewId) -> Option<(&[u8], &ViewMeta)> {
+    let name = s.view_by_id.get(&view)?;
+    let meta = s.views.get(name.as_slice())?;
+    Some((name.as_slice(), meta))
 }
 
 fn no_view(view: ViewId) -> Reply {
@@ -46,6 +46,13 @@ fn dead_view(s: &State, view: ViewId) -> bool {
 
 fn node_of(s: &State, view: ViewId, ino: Ino) -> Option<Node> {
     s.nodes.get(&(view, ino)).cloned()
+}
+
+/// 只要 kind，不要整个 inode。readdir 一页 100 条，走 [`node_of`] 就是 100 次
+/// `Node` 克隆（含 `data_ref`/`link` 两个 Vec）—— micro 量到这一项占了一页
+/// 计算成本的八成。
+fn kind_of(s: &State, view: ViewId, ino: Ino) -> u8 {
+    s.nodes.get(&(view, ino)).map(|n| n.kind.code()).unwrap_or(0)
 }
 
 /// `child` 是否落在 `anc` 的子树内（含自身）。rename 用来挡目录成环。
@@ -244,8 +251,8 @@ pub fn translate(s: &State, now: i64, op: &Op) -> (Vec<Log>, Reply) {
             if let Some(r) = name_err(name) {
                 return (vec![], r);
             }
-            let ino = match s.dentries.get(&(*view, *parent, name.clone())) {
-                Some(i) => *i,
+            let ino = match s.dentry(*view, *parent, name) {
+                Some(d) => d.ino,
                 None => return (vec![], Reply::err(errno::ENOENT, "lookup")),
             };
             match node_of(s, *view, ino) {
@@ -289,26 +296,41 @@ pub fn translate(s: &State, now: i64, op: &Op) -> (Vec<Log>, Reply) {
             } else if *parent != meta.root {
                 return (vec![], Reply::err(errno::ENOENT, "no such directory"));
             }
-            // offset 是「已返回的条目数」：直接在 BTreeMap 迭代器上 skip，
+            // offset 是「已返回的条目数」：直接在内层表上 skip，
             // 不先把整目录物化（千级目录也不能每页拷一份）。
             let lim = if *limit == 0 { 1000 } else { *limit as usize };
             let off = *offset as usize;
+            let dir = match s.dentries.get(&(*view, *parent)) {
+                Some(m) => m,
+                None => {
+                    return (
+                        vec![],
+                        Reply::Dirents {
+                            inos: Vec::new(),
+                            kinds: Vec::new(),
+                            names: Vec::new(),
+                            next: *offset,
+                            end: true,
+                        },
+                    )
+                }
+            };
             let mut inos = Vec::with_capacity(lim.min(4096));
             let mut kinds = Vec::with_capacity(lim.min(4096));
             let mut names = Vec::with_capacity(lim.min(4096));
-            let mut it = s
-                .dentries
-                .range((
-                    Bound::Included((*view, *parent, Vec::new())),
-                    Bound::Unbounded,
-                ))
-                .take_while(move |x| x.0 .0 == *view && x.0 .1 == *parent)
-                .skip(off);
-            for (k, ino) in it.by_ref().take(lim) {
-                let kind = node_of(s, *view, *ino).map(|x| x.kind.code()).unwrap_or(0);
-                inos.push(*ino);
+            let mut it = dir.iter().skip(off);
+            for (name, d) in it.by_ref().take(lim) {
+                // kind 存在 dentry 里，这一页不用回 `nodes` 表下钻（那是
+                // 一页 100 次 cache miss）；只有日志顺序异常导致 kind 未知时
+                // 才对那一条回表。
+                let kind = if d.kind == DENT_KIND_UNKNOWN {
+                    kind_of(s, *view, d.ino)
+                } else {
+                    d.kind
+                };
+                inos.push(d.ino);
                 kinds.push(kind);
-                names.push(k.2.clone());
+                names.push(name.clone());
             }
             let next = (off + inos.len()) as u64;
             // `end` 要说真话：整页恰好装满时再探一项就知道后面还有没有，
@@ -374,11 +396,12 @@ pub fn translate(s: &State, now: i64, op: &Op) -> (Vec<Log>, Reply) {
             let mut logs = Vec::new();
             let mut book = RefBook::default();
             // Create/Mkdir 遇同名 EEXIST；Symlink 按 POSIX 覆盖旧项。
-            if let Some(old_ino) = s.dentries.get(&(*view, *parent, name.clone())) {
+            if let Some(d) = s.dentry(*view, *parent, name) {
                 if kind != Kind::Symlink {
                     return (vec![], Reply::err(errno::EEXIST, "file exists"));
                 }
-                let old = match node_of(s, *view, *old_ino) {
+                let old_ino = d.ino;
+                let old = match node_of(s, *view, old_ino) {
                     Some(o) => o,
                     None => return (vec![], Reply::err(errno::ESTALE, "dangling dentry")),
                 };
@@ -386,7 +409,7 @@ pub fn translate(s: &State, now: i64, op: &Op) -> (Vec<Log>, Reply) {
                     return (
                         vec![],
                         Reply::err(
-                            if dir_empty(s, *view, *old_ino) {
+                            if dir_empty(s, *view, old_ino) {
                                 errno::EISDIR
                             } else {
                                 errno::ENOTEMPTY
@@ -397,7 +420,7 @@ pub fn translate(s: &State, now: i64, op: &Op) -> (Vec<Log>, Reply) {
                 }
                 logs.push(Log::DelNode {
                     view: *view,
-                    ino: *old_ino,
+                    ino: old_ino,
                 });
                 if !old.data_ref.is_empty() {
                     book.down(&old.data_ref, old.size);
@@ -408,7 +431,7 @@ pub fn translate(s: &State, now: i64, op: &Op) -> (Vec<Log>, Reply) {
                 Some(_) => return (vec![], Reply::err(errno::ENOTDIR, "parent is not a dir")),
                 None => return (vec![], Reply::err(errno::ENOENT, "no such parent")),
             };
-            let (ino, bump) = alloc_ino(&vname, &meta);
+            let (ino, bump) = alloc_ino(vname, meta);
             let mut node = new_node(ino, *parent, name, kind, mode, uid, gid, now);
             node.link = link;
             if kind == Kind::Symlink {
@@ -447,8 +470,8 @@ pub fn translate(s: &State, now: i64, op: &Op) -> (Vec<Log>, Reply) {
             if let Some(r) = name_err(name) {
                 return (vec![], r);
             }
-            let ino = match s.dentries.get(&(*view, *parent, name.clone())) {
-                Some(i) => *i,
+            let ino = match s.dentry(*view, *parent, name) {
+                Some(d) => d.ino,
                 None => return (vec![], Reply::err(errno::ENOENT, "no such entry")),
             };
             let node = match node_of(s, *view, ino) {
@@ -597,8 +620,8 @@ pub fn translate(s: &State, now: i64, op: &Op) -> (Vec<Log>, Reply) {
                     None => return (vec![], Reply::err(errno::ENOENT, "no such parent")),
                 }
             }
-            let ino = match s.dentries.get(&(*view, *old_parent, old_name.clone())) {
-                Some(i) => *i,
+            let ino = match s.dentry(*view, *old_parent, old_name) {
+                Some(d) => d.ino,
                 None => return (vec![], Reply::err(errno::ENOENT, "no such entry")),
             };
             let mut node = match node_of(s, *view, ino) {
@@ -622,11 +645,12 @@ pub fn translate(s: &State, now: i64, op: &Op) -> (Vec<Log>, Reply) {
             let mut book = RefBook::default();
             // 被覆盖目标的内容键：只有它失去最后一个持有者时才需要带回给 GC。
             let mut over: DataRef = Vec::new();
-            if let Some(tino) = s.dentries.get(&(*view, *new_parent, new_name.clone())) {
+            if let Some(t) = s.dentry(*view, *new_parent, new_name) {
+                let tino = t.ino;
                 if noreplace {
                     return (vec![], Reply::err(errno::EEXIST, "target exists and NOREPLACE"));
                 }
-                let t = match node_of(s, *view, *tino) {
+                let t = match node_of(s, *view, tino) {
                     Some(t) => t,
                     None => return (vec![], Reply::err(errno::ESTALE, "dangling target")),
                 };
@@ -636,7 +660,7 @@ pub fn translate(s: &State, now: i64, op: &Op) -> (Vec<Log>, Reply) {
                 if t.kind != Kind::Dir && node.kind == Kind::Dir {
                     return (vec![], Reply::err(errno::EISDIR, "target is not a dir"));
                 }
-                if t.kind == Kind::Dir && !dir_empty(s, *view, *tino) {
+                if t.kind == Kind::Dir && !dir_empty(s, *view, tino) {
                     return (vec![], Reply::err(errno::ENOTEMPTY, "target dir not empty"));
                 }
                 if t.ino == meta.root {
@@ -644,7 +668,7 @@ pub fn translate(s: &State, now: i64, op: &Op) -> (Vec<Log>, Reply) {
                 }
                 logs.push(Log::DelNode {
                     view: *view,
-                    ino: *tino,
+                    ino: tino,
                 });
                 if !t.data_ref.is_empty() {
                     book.down(&t.data_ref, t.size);
