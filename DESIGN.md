@@ -542,6 +542,9 @@ GC 拿它当唯一依据。
   打包成一个批次）实现的，不是靠 BEGIN/COMMIT。
 - **硬链接**：没有 `Link` op，一个 inode 只有一条目录项路径，`nlink` 只在目录意义上
   活动（2 + 子目录数）。grovefs `MetaProvider::link_node` 接过来只能回 `EPERM`。
+  这个缺口的价码已实测：grovefs 的 POSIX/e2e 断言矩阵在 treedb 后端重放时，
+  唯一不能成立的就是硬链接那一节 10 条，它们记成 `SKIP`（问不了）而不是 `FAIL`
+  （跑坏了）——§10 阶段 C 1。
 - **字节区间锁**：锁的 key 是 `(view, ino, owner)`，没有 `(start, end, pid)`。POSIX 记录锁
   要的是按区间合并/拆分的那套语义，这里给不了 —— provider 只能拒，不能假装支持。
 - **通用表只给 §4.2 那九条 op 的形状**（状态与定型见 §5.1）：没有类型、没有 JOIN 与跨表条件、没有范围/前缀
@@ -1895,11 +1898,13 @@ treedb-server --dir /var/lib/treedb --listen 127.0.0.1:7777  # 新二进制现�
 拒绝，不能用 `--help` 判，帮助文本在所有 build 里都提 treedb），所以它在板上
 永远记 PASS，不会把一个没有 treedb 的 checkout 弄红。
 
-代价是反过来的：板子上的 build 步骤是默认档，所以**从板子上跑时永远 SKIP 掉
-这一节** —— treedb 路径的回归必须显式 `cargo build --release --features treedb`
-之后单独跑 `.build-bin/test_treedb.sh`。spike 阶段接受这个不对称（默认档是
-必须守住的，实验档是自己守的）；现在依赖已经钉到 tag，剩下的只是要不要给板子
-加一步带 feature 的 build，不再卡在分发方式上。
+代价是反过来的：板子上的 build 步骤是默认档，所以**不加开关时从板子上跑永远 SKIP
+这一节** —— treedb 路径的回归要么手工 `cargo build --release --features treedb`
+之后单独跑 `.build-bin/test_treedb.sh`，要么走板子但带上 `FEATURES_TREEDB=1
+bash .build-bin/run_all.sh treedb treedbmatrix`（2026-11-20 加的这一档让 build 步骤
+补 `--features treedb`，实测三段 `build PASS / treedb PASS / treedbmatrix PASS`，
+RESULT: GREEN）。spike 阶段接受那个不对称（默认档是必须守住的，实验档是自己守的）；
+现在依赖钉到了 tag，两条路都通。
 
 提交与入库：treedb 本身已建 git 仓并推两远端（`origin`=gitee.com:techwanderer/treedb、
 `github`=github.com/TechWander/treedb，均为 e2bb51d，tag `v0.3.0`）；`.pgref/`
@@ -1920,16 +1925,42 @@ spike 明确**没**做、也不在接入面上假装做的事 —— 一律返�
 | `view export` / `view import` | 拒绝 | dump reader 是 SQL 形状的，treedb 无等价物 |
 | `refs rebuild` | 拒绝 | 持有者计数在引擎内同 op 维护，没有独立账本可重算 |
 | `gc` 审计 | 拒绝 | 没有聚合的 ledger 视图，回空集等于判所有对象为孤儿 |
-| readdir 的属性 | 仍是 N/64 次往返 | **协议面已闭合**（`ReadDirPlus` 进了 `v0.3.3`，§11 第 6 条），断的是接入侧：provider 还没改用它，而且 grovefs 钉的是 `v0.3.2`。改造前这个缺口真实存在，不能因为 op 进了协议就算完成 |
+| readdir 的属性 | 仍是 N/64 次往返 | **协议面已闭合**（`ReadDirPlus` 进了 `v0.3.3`，§11 第 6 条），断的是接入侧：provider 还没改用它，而且 grovefs 钉 tag 的升级只带来 op 可用、没带来调用（实测 `src/treedb_store.rs` 里 `ReadDirPlus` 只出现在注释里）。改造前这个缺口真实存在，不能因为 op 进了协议就算完成 |
 | 定义/密钥/账户 | 还在本地 SQLite | 引擎侧的通用表本轮已可用（§11 第 7 条 T2），但 grovefs 未拿它拼过语义；`Key*`/`Audit*` 那三个专用 op 仍是业务形状，不能当接入面（上文第 4 步） |
 | `view list` 的物理树 | 列不出来 | 控制面枚举器只看本地 db 文件 |
 | HA / 快照传送 | 启动即拒绝 | 接入面用不上它：§8 限制 6 现在是「有异步只读副本、无同步复制」，而 grovefs 要的是「主挂了切副本」—— 那一步没有提升路径（§11 第 4 条③） |
-| ~~path 依赖的分发方式~~ | 已定：按 tag 的 git 依赖 | 钉 `v0.3.2`（随定版前移），无同级克隆也能构建（实测） |
+| ~~path 依赖的分发方式~~ | 已定：按 tag 的 git 依赖 | 钉 `v0.3.6`（随定版前移），无同级克隆也能构建（实测） |
 
 ### 阶段 C（回归与灰度）
-1. ~~`test_pg.sh` 那套断言在 treedb 后端重跑~~ 已起头：新增 `.build-bin/test_treedb.sh`
-   一节 treedb 专属断言（31 条），默认档不变。它钉的是**形状**而不是面积：
-   `posix`/`e2e` 那种全量断言矩阵还没在 treedb 上跑过，本节上面那张缺口表也还是缺口表。
+1. ~~`posix`/`e2e` 那种全量断言矩阵还没在 treedb 上跑过~~ **已跑**（2026-11-20，
+   grovefs 侧新配方 `.build-bin/test_treedb_matrix.sh`，板上一行 `treedbmatrix`）。
+   对账要精确到条：两套在默认档的基线实测是 **posix 16 + e2e 21 = 37 条**，这里按
+   标签重放 **36 条**（唯一没搬的是 `e2e §7` 那格要 PTY 的「tty 默认日志」），另加
+   6 条钉「拒绝得看得见」与引擎计数器、7 条夹具与旁证，合计 **49 条**。在 grovefs
+   `ce44fbe` 的干净 worktree（`--features treedb` release）上独立跑了四次，逐条
+   对账一致：头两次是两计数器版本（`pass=39 fail=10`，那 10 条全落在 `[posix C]`），
+   后两次是现在的三计数器版本（`pass=39 fail=0 skip=10`）：一次直接跑脚本、
+   一次走板子 `FEATURES_TREEDB=1 bash .build-bin/run_all.sh treedb treedbmatrix`，
+   得 `build PASS / treedb PASS / treedbmatrix PASS`。
+   **为什么改成三个计数器**：硬链接那一节 `[posix C]` 的 10 条不是「这一跑坏了」
+   （FAIL），而是「这个后端问不了」（没有第二个名字，断言的主语不存在）；把两者
+   混在一个数里，缺口要么把板子永久考红，要么被一句「已知不通过」洗成沉默。
+   反过来，`SKIP` 也不是垃圾桶：夹具起不来走 `abort`（直接 FAIL 退出），只有「主语
+   在本后端不可能存在」这一类才能计 skip。草稿阶段付过两次学费：一次是
+   `stat -c %i` 在一个名字存在时也答「1」，把「一个 inode 两个名字」抬成了绿；
+   一次是数据面异步释放对象，两条 refcount GC 断言靠同一次延迟双双变绿。
+   现在靠 `settle`（1.5 s）与依赖守卫钉住。
+   除硬链接之外每一格都过：视图隔离、append/rename/rm、4 MiB md5 逐字节、
+   孤儿对象回收、symlink 四形态、`df`、`touch -d` 的 mtime、`chmod` 两档、`mkfifo`
+   干净拒绝、detached mount 的整套守护进程契约。
+   `[posix C*]` 那两条钉的是**缺口的形状**：`ln` 必须回 EPERM 而不是造出半个名字，
+   且挂载点必须活着。缺口本身可以接受，静默的半链接不行。
+   板上这一行**按实测三元组门控而不是按零门控**：`pass=39 fail=0 skip=10` 记 PASS，
+   三元组只要动一下都记红 —— 多一条 FAIL（回归）、少一条断言（脚本退化）、
+   skip 变小（缺口自己合上了，得重读文档再改契约）都会让这一行变红。一个永远红的
+   格子等于没有格子；默认构建（没开 feature）落 INFO，不拉低 GREEN。
+   仍然没定价的：`Link` op（要动协议，§4.1 只能尾部追加 tag）、字节区间锁
+   （`locks` 那一套没重放）、以及 `edge`/`errors`/`concurrent` 等其余套件。
 2. 万级视图 mount + create + readdir 混打，对照 `pg_stat_activity`（旧）与
    `--stats`（新）两条路径的连接数、RSS、p99。
 3. 容灾演练：`kill -9` → 重启 → 已 ack 写全在（§6.4 已在 crate 内自动化，
