@@ -19,7 +19,7 @@ use treedb::engine::model::{
     errno, AuditRec, ColumnDef, DefRec, KeyRec, Node, Op, Reply, TableDef, COND_NONE, COL_INDEX,
     COL_UNIQUE, SA_DATA_REF,
 };
-use treedb::engine::{Durability, Engine, W, SNAP_LEGACY_VERSION, SNAP_VERSION};
+use treedb::engine::{Durability, Engine, W, SNAP_LEGACY_VERSION, SNAP_MAGIC, SNAP_TRAIL, SNAP_TRAIL_LEGACY, SNAP_VERSION};
 
 // ---------------------------------------------------------------- 脚手架
 
@@ -221,15 +221,19 @@ fn migration_preserves_every_field_and_leaves_the_wal_alone() {
     // 备份 = 原件逐字节，回滚因此只是一次 copy。
     assert_eq!(d.bytes(&backup), raw_v2);
     // 增量必须恰好 12 字节 = 尾部三段各一个 u32 计数（tables / next_table_id /
-    // rows），正文一个字节没重排。这条是 §6.5「两代正文逐字节相同」那个前提的
-    // 数值版：哪天正文动了而 v2 写出侧没跟着动，这里会先炸。
+    // rows），正文一个字节没重排；再加尾巴从 8 字节长到 16 字节（crc32 尾巴，
+    // 2026-11-20 补）。这条是 §6.5「两代正文逐字节相同」那个前提的数值版：
+    // 哪天正文动了而 v2 写出侧没跟着动，这里会先炸。
     assert_eq!(
         after.bytes as usize,
-        raw_v2.len() + 12,
-        "v3 只该比 v2 多尾部三段计数：{} -> {}",
+        raw_v2.len() + 12 + (SNAP_TRAIL - SNAP_TRAIL_LEGACY),
+        "v3 只该比 v2 多三段计数与新尾巴：{} -> {}",
         raw_v2.len(),
         after.bytes
     );
+    // 迁移写出来的是**带 crc 的新尾巴**，而不是旧 8 字节尾巴的替身。
+    let migrated = d.bytes(&d.snap());
+    assert_eq!(&migrated[migrated.len() - 4..], &SNAP_MAGIC.to_le_bytes());
 
     // 重开走严格入口：能开门本身就是「新版能接这个目录」的判据。
     let mut e2 = d.open();
@@ -593,4 +597,87 @@ fn cli_help_and_fresh_dir_exit_zero() {
     let (code, text) = cli(&d.path(), &["--apply"]);
     assert_eq!(code, 0, "{text}");
     assert!(text.contains("nothing to migrate"), "{text}");
+}
+
+// ---- 2026-11-20：快照尾巴补上 crc32（问题清单 F1）----------------------------
+//
+// 这三条钉住的是「快照坏了要在开门那一步大声失败」，以及「旧目录不必迁移
+// 就能开」。它们不必走迁移工具，但属于同一件事：磁盘上的字节与它自称的
+// 版本必须能被对上账。
+
+/// checkpoint 之后快照带 16 字节尾巴：magic 在最后 4 字节，水位与前缀都在。
+#[test]
+fn checkpoint_writes_a_crc_trailer_and_reopens_cleanly() {
+    let d = Dir::new();
+    let mut e = d.open();
+    seed(&mut e);
+    let seq = e.checkpoint().expect("checkpoint");
+    let snap = d.bytes(&d.snap());
+    assert_eq!(&snap[snap.len() - 4..], &SNAP_MAGIC.to_le_bytes(), "新尾巴必须自报家门");
+    assert_eq!(
+        u64::from_le_bytes(snap[snap.len() - 12..snap.len() - 4].try_into().unwrap()),
+        seq,
+        "尾巴里的水位必须就是 checkpoint 报的那个"
+    );
+    drop(e);
+    // 能重开 = crc 也验过了（open 的第一步就是 split）。
+    let mut e2 = d.open();
+    assert_eq!(e2.snapshot_stats().snap_seq, seq);
+}
+
+/// 正文任何一个比特被写坏：开门必须失败，且错误消息里写的是 crc 而不是
+/// 「解码失败」——运维看到前者会去查盘，看到后者会去查版本。
+#[test]
+fn corrupted_snapshot_body_is_refused_at_open() {
+    let d = Dir::new();
+    let mut e = d.open();
+    seed(&mut e);
+    e.checkpoint().expect("checkpoint");
+    drop(e);
+
+    let mut snap = d.bytes(&d.snap());
+    let at = snap.len() / 2;
+    snap[at] ^= 0x10;
+    d.write(&d.snap(), &snap);
+
+    let err = Engine::open(&d.path(), Durability::Always)
+        .err()
+        .expect("坏快照不该能开")
+        .to_string();
+    assert!(err.contains("crc32"), "要说清是校验不过：{err}");
+    // 只读体检也要照同一个判据说，而且不许报"可迁移"。
+    let info = probe_snapshot(&d.path()).unwrap();
+    assert!(!info.decodable && !info.needs_migration());
+    assert!(info.note.unwrap_or_default().contains("crc32"));
+}
+
+/// 旧尾巴（8 字节，没有 crc）照样能开：正文布局一个字节没变，所以这条
+/// 补丁不需要迁移工具。下一次 checkpoint 会把它换成新尾巴。
+#[test]
+fn legacy_eight_byte_trailer_still_opens() {
+    let d = Dir::new();
+    let mut e = d.open();
+    let (view, _) = seed(&mut e);
+    let seq = e.checkpoint().expect("checkpoint");
+    drop(e);
+
+    // 把 16 字节尾巴降回 8 字节：正文 + seq，一个 crc 都不留。
+    let snap = d.bytes(&d.snap());
+    let body = &snap[..snap.len() - SNAP_TRAIL];
+    let mut legacy = body.to_vec();
+    legacy.extend_from_slice(&seq.to_le_bytes());
+    d.write(&d.snap(), &legacy);
+
+    let mut e2 = d.open();
+    assert_eq!(e2.snapshot_stats().snap_seq, seq);
+    // 状态真的在（不是"能开但空的"）：视图还在，文件还在。
+    assert_eq!(e2.snapshot_stats().views, 1);
+    match e2.submit(&Op::Lookup { view, parent: 1, name: b"a.txt".to_vec() }) {
+        Ok(Reply::Node(n)) => assert_eq!(n.name, b"a.txt".to_vec()),
+        other => panic!("legacy 尾巴重开后查不到文件：{other:?}"),
+    }
+    // 再 checkpoint 一次就该长回 16 字节。
+    e2.checkpoint().expect("second checkpoint");
+    let snap2 = d.bytes(&d.snap());
+    assert_eq!(&snap2[snap2.len() - 4..], &SNAP_MAGIC.to_le_bytes());
 }

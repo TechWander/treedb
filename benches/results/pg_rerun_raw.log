@@ -1,0 +1,49 @@
+setup 1 个视图 schema 耗时 31.3 ms（每视图 31.3 ms，不进 op QPS）
+pg	lookup	c=1  p=1      4710 ops/s p50=209     p99=432     errs=0
+setup 1 个视图 schema 耗时 42.4 ms（每视图 42.4 ms，不进 op QPS）
+pg	lookup	c=1  p=32     7415 ops/s p50=128     p99=260     errs=0
+setup 8 个视图 schema 耗时 309.6 ms（每视图 38.7 ms，不进 op QPS）
+pg	lookup	c=8  p=1     36420 ops/s p50=210     p99=452     errs=0
+setup 8 个视图 schema 耗时 499.8 ms（每视图 62.5 ms，不进 op QPS）
+pg	lookup	c=8  p=32    57813 ops/s p50=127     p99=271     errs=0
+setup 64 个视图 schema 耗时 3372.5 ms（每视图 52.7 ms，不进 op QPS）
+pg	lookup	c=64 p=1    214606 ops/s p50=299     p99=397     errs=0
+setup 64 个视图 schema 耗时 2997.8 ms（每视图 46.8 ms，不进 op QPS）
+pg	lookup	c=64 p=32   308636 ops/s p50=206     p99=253     errs=0
+setup 1 个视图 schema 耗时 68.2 ms（每视图 68.2 ms，不进 op QPS）
+pg	readdir	c=1  p=1      2898 ops/s p50=323     p99=723     errs=0
+setup 1 个视图 schema 耗时 29.8 ms（每视图 29.8 ms，不进 op QPS）
+pg	readdir	c=1  p=32     3972 ops/s p50=245     p99=451     errs=0
+setup 8 个视图 schema 耗时 484.3 ms（每视图 60.5 ms，不进 op QPS）
+pg	readdir	c=8  p=1     23628 ops/s p50=322     p99=642     errs=0
+setup 8 个视图 schema 耗时 476.8 ms（每视图 59.6 ms，不进 op QPS）
+pg	readdir	c=8  p=32    31768 ops/s p50=246     p99=405     errs=0
+setup 64 个视图 schema 耗时 3439.0 ms（每视图 53.7 ms，不进 op QPS）
+pg	readdir	c=64 p=1    147572 ops/s p50=427     p99=602     errs=0
+setup 64 个视图 schema 耗时 3089.5 ms（每视图 48.3 ms，不进 op QPS）
+pg	readdir	c=64 p=32   186909 ops/s p50=340     p99=424     errs=0
+setup 1 个视图 schema 耗时 24.1 ms（每视图 24.1 ms，不进 op QPS）
+pg	create	c=1  p=1       483 ops/s p50=605     p99=36241   errs=0
+setup 1 个视图 schema 耗时 44.3 ms（每视图 44.3 ms，不进 op QPS）
+pg	create	c=1  p=32     1543 ops/s p50=597     p99=1496    errs=0
+setup 8 个视图 schema 耗时 351.1 ms（每视图 43.9 ms，不进 op QPS）
+pg	create	c=8  p=1       854 ops/s p50=1629    p99=47357   errs=0
+setup 8 个视图 schema 耗时 475.5 ms（每视图 59.4 ms，不进 op QPS）
+pg	create	c=8  p=32     6727 ops/s p50=1072    p99=2048    errs=0
+setup 64 个视图 schema 耗时 3617.4 ms（每视图 56.5 ms，不进 op QPS）
+pg	create	c=64 p=1      1881 ops/s p50=33547   p99=67800   errs=0
+setup 64 个视图 schema 耗时 3607.0 ms（每视图 56.4 ms，不进 op QPS）
+pg	create	c=64 p=32    32857 ops/s p50=1943    p99=3025    errs=0
+setup 1 个视图 schema 耗时 74.7 ms（每视图 74.7 ms，不进 op QPS）
+pg	write	c=1  p=1       512 ops/s p50=777     p99=21600   errs=0
+setup 1 个视图 schema 耗时 60.0 ms（每视图 60.0 ms，不进 op QPS）
+pg	write	c=1  p=32     1346 ops/s p50=658     p99=1563    errs=0
+setup 8 个视图 schema 耗时 497.8 ms（每视图 62.2 ms，不进 op QPS）
+pg	write	c=8  p=1       847 ops/s p50=1786    p99=43967   errs=0
+setup 8 个视图 schema 耗时 427.1 ms（每视图 53.4 ms，不进 op QPS）
+pg	write	c=8  p=32     5246 ops/s p50=1298    p99=3901    errs=0
+setup 64 个视图 schema 耗时 3583.8 ms（每视图 56.0 ms，不进 op QPS）
+pg	write	c=64 p=1      1052 ops/s p50=33857   p99=894142  errs=0
+setup 64 个视图 schema 耗时 3387.6 ms（每视图 52.9 ms，不进 op QPS）
+pg	write	c=64 p=32    10626 ops/s p50=1970    p99=84594   errs=0
+# 完成 2026-11-20T15:47:30+00:00

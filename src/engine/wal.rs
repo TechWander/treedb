@@ -70,12 +70,20 @@ fn crc_table() -> &'static [u32; 256] {
 /// 标准 CRC32（IEEE，反射式）。引擎本体只依赖 libc + thiserror，
 /// 所以这里自带查表实现，不引 crc crate。
 pub fn crc32(buf: &[u8]) -> u32 {
+    !crc32_update(0xFFFF_FFFF, buf)
+}
+
+/// CRC32 的**增量**形式：从 `0xFFFF_FFFF` 开局，逐段喂，最后取反。
+///
+/// 存在的理由：快照的 crc 要覆盖「正文 ‖ seq」两段相邻但不同类型的数据，
+/// 而正文可能有几百 MB —— 为了拼一个连续 buffer 再算一遍，就是白白多一份
+/// 全量拷贝的内存峰值。分两段算与一次算完逐位相同。
+pub fn crc32_update(mut c: u32, buf: &[u8]) -> u32 {
     let t = crc_table();
-    let mut c = 0xFFFF_FFFFu32;
     for &b in buf {
         c = t[((c ^ b as u32) & 0xFF) as usize] ^ (c >> 8);
     }
-    !c
+    c
 }
 
 /// 把一条 `Log` 序列化成 payload 字节。

@@ -564,7 +564,13 @@ pub fn translate(s: &State, now: i64, op: &Op) -> (Vec<Log>, Reply) {
             };
             let mut logs = Vec::new();
             let mut book = RefBook::default();
-            // Create/Mkdir 遇同名 EEXIST；Symlink 按 POSIX 覆盖旧项。
+            // Create/Mkdir 遇同名 EEXIST；Symlink 走 upsert：同名**非目录**项被
+            // 原子替换，目录项不覆盖（空 → EISDIR，非空 → ENOTEMPTY）。
+            //
+            // 这里**不是** `symlink(2)` 的语义（它遇任何已存在项都回 EEXIST）：
+            // 覆盖是给调用方的 create-or-replace 入口留的，删掉它就得多一次
+            // Unlink+Symlink 两步，中间留一个“名字不存在”的窗口。目录不
+            // 覆盖则是硬约束：替换一个目录意味着递归删掉它的孩子。
             if let Some(d) = s.dentry(*view, *parent, name) {
                 if kind != Kind::Symlink {
                     return (vec![], Reply::err(errno::EEXIST, "file exists"));
@@ -638,6 +644,15 @@ pub fn translate(s: &State, now: i64, op: &Op) -> (Vec<Log>, Reply) {
             };
             if let Some(r) = name_err(name) {
                 return (vec![], r);
+            }
+            // 先验父目录再查 dentry：与 `Rename` 同一条口径。POSIX 里「路径
+            // 前缀不是目录」（ENOTDIR）优先于「名字查不到」（ENOENT），
+            // 以前这里直接查 dentry，`unlink(file/child)` 回的是 ENOENT ——
+            // 同一个坏父 inode，rename 与 unlink 给出两个不同的 errno。
+            match node_of(s, *view, *parent) {
+                Some(d) if d.kind == Kind::Dir => {}
+                Some(_) => return (vec![], Reply::err(errno::ENOTDIR, "parent is not a dir")),
+                None => return (vec![], Reply::err(errno::ENOENT, "no such parent")),
             }
             let ino = match s.dentry(*view, *parent, name) {
                 Some(d) => d.ino,

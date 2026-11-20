@@ -22,3 +22,8 @@
 
 # git commit -F 用的提交消息草稿
 /.cmsg*.txt
+
+# 活体验证的临时数据目录（问题清单 F1/F3/F5 的往返）与连接/编译探针
+/.live
+/.connprobe
+/.sqlbuild.log

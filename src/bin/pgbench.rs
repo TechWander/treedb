@@ -186,6 +186,15 @@ fn warmup(client: &mut postgres::Client, table: &str) {
             &[],
         )
         .unwrap_or_else(|e| panic!("warmup {table}: {e}"));
+    // 必须 ANALYZE：空表统计信息写着 rows≈0，灌完 500 行不刷新的话，
+    // `WHERE parent_id=1 ORDER BY name LIMIT 100` 会被估成「命中 2 行」，
+    // 于是走 Bitmap Heap Scan + top-N Sort（实测 1.5 ms）而不是
+    // `nn_(parent_id,name)` 的有序索引扫描（~0.2 ms）。这不是 PG 慢，
+    // 是量具没给它统计信息 —— 生产里 autovacuum 会自动 ANALYZE。
+    // 2026-11-20 修：readdir 64/1 那一格因此从 67 k 变成 250 k ops/s。
+    client
+        .batch_execute(&format!("ANALYZE {table}.node"))
+        .unwrap_or_else(|e| panic!("analyze {table}: {e}"));
 }
 
 /// 本次运行的唯一标识：同一集群上重跑时避开 `create` / `key` 的主键冲突。

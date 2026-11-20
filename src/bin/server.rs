@@ -26,10 +26,30 @@ extern "C" fn on_signal(_sig: libc::c_int) {
 }
 
 fn parse_durability(s: &str) -> Durability {
-    match s {
-        "always" => Durability::Always,
-        "never" => Durability::Never,
-        _ => Durability::Group,
+    // 解析器在引擎里（副本二进制共用同一份）：拼错不再是"静默降级成 group"，
+    // 而是退出码 2。
+    match Durability::parse(s) {
+        Ok(d) => d,
+        Err(e) => die(&e.to_string()),
+    }
+}
+
+/// 参数错误一律退出码 2（POSIX 的 usage error），与运行期 FATAL 的 1 分开。
+fn die(msg: &str) -> ! {
+    eprintln!("{msg}\n\n{HELP}");
+    std::process::exit(2);
+}
+
+/// 数值参数：缺值/不是数/越界都是启动错误。
+/// 以前是 `.parse().unwrap_or(默认值)`，于是 `--workers abc` 会默默跑成 auto，
+/// `--sync-ms 0` 与不给完全是两件事（前者关掉周期 sync），都不该靠猜。
+fn num<T: std::str::FromStr>(flag: &str, raw: &str, default: T) -> T {
+    if raw.is_empty() {
+        return default;
+    }
+    match raw.parse() {
+        Ok(v) => v,
+        Err(_) => die(&format!("bad {flag} {raw:?}: expected a number")),
     }
 }
 
@@ -100,10 +120,12 @@ fn main() {
             "--dir" => dir = PathBuf::from(next(&mut i)),
             "--listen" => listen = next(&mut i),
             "--durability" => durability = next(&mut i),
-            "--sync-ms" => sync_ms = next(&mut i).parse().unwrap_or(20),
-            "--auto-checkpoint-mb" => auto_ckpt_mb = next(&mut i).parse().unwrap_or(64),
-            "--backlog" => backlog = next(&mut i).parse().unwrap_or(4096),
-            "--workers" => workers = next(&mut i).parse().unwrap_or(0),
+            "--sync-ms" => sync_ms = num("--sync-ms", &next(&mut i), sync_ms),
+            "--auto-checkpoint-mb" => {
+                auto_ckpt_mb = num("--auto-checkpoint-mb", &next(&mut i), auto_ckpt_mb)
+            }
+            "--backlog" => backlog = num("--backlog", &next(&mut i), backlog),
+            "--workers" => workers = num("--workers", &next(&mut i), workers),
             "--pid-file" => pid_file = Some(PathBuf::from(next(&mut i))),
             "--auth-key-file" => auth_key_file = Some(PathBuf::from(next(&mut i))),
             "--stats" => stats_only = true,
@@ -118,6 +140,12 @@ fn main() {
             }
         }
         i += 1;
+    }
+
+    // 缺值（`--dir` 后面没东西）也是错误：`next()` 会回空串，不能让
+    // `--dir` 空着跑成默认目录。
+    if dir.as_os_str().is_empty() {
+        die("empty --dir");
     }
 
     // 0 = auto，与 [`ServerConfig::new`] 同一个解析函数：两处各写一套

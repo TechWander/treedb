@@ -28,7 +28,7 @@ pub use core::{
     migrate_snapshot, now_ms, probe_snapshot, Durability, Engine, EngineStats, MigrationOutcome,
     SnapshotInfo,
 };
-pub use mem::{Log, State, SNAP_LEGACY_VERSION, SNAP_VERSION};
+pub use mem::{Log, State, SNAP_LEGACY_VERSION, SNAP_MAGIC, SNAP_TRAIL, SNAP_TRAIL_LEGACY, SNAP_VERSION};
 pub use model::{Names, Op, Reply, NONCE_LEN};
 pub use wal::Wal;
 

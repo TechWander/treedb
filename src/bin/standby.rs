@@ -59,13 +59,15 @@ fn main() {
             "--dir" => dir = PathBuf::from(next(&mut i)),
             "--listen" => listen = next(&mut i),
             "--durability" => durability = next(&mut i),
-            "--interval-ms" => interval_ms = next(&mut i).parse().unwrap_or(20),
-            "--fetch-bytes" => fetch_bytes = next(&mut i).parse().unwrap_or(1 << 20),
-            "--timeout-ms" => timeout_ms = next(&mut i).parse().unwrap_or(5_000),
-            "--sync-ms" => sync_ms = next(&mut i).parse().unwrap_or(20),
-            "--auto-checkpoint-mb" => auto_ckpt_mb = next(&mut i).parse().unwrap_or(64),
-            "--backlog" => backlog = next(&mut i).parse().unwrap_or(4096),
-            "--workers" => workers = next(&mut i).parse().unwrap_or(0),
+            "--interval-ms" => interval_ms = num("--interval-ms", &next(&mut i), interval_ms),
+            "--fetch-bytes" => fetch_bytes = num("--fetch-bytes", &next(&mut i), fetch_bytes),
+            "--timeout-ms" => timeout_ms = num("--timeout-ms", &next(&mut i), timeout_ms),
+            "--sync-ms" => sync_ms = num("--sync-ms", &next(&mut i), sync_ms),
+            "--auto-checkpoint-mb" => {
+                auto_ckpt_mb = num("--auto-checkpoint-mb", &next(&mut i), auto_ckpt_mb)
+            }
+            "--backlog" => backlog = num("--backlog", &next(&mut i), backlog),
+            "--workers" => workers = num("--workers", &next(&mut i), workers),
             "--pid-file" => pid_file = Some(PathBuf::from(next(&mut i))),
             "--auth-key-file" => auth_key_file = Some(PathBuf::from(next(&mut i))),
             "-h" | "--help" => {
@@ -195,12 +197,31 @@ fn main() {
     }
 }
 
+/// 数值参数：缺值/不是数都是启动错误。以前是 `.parse().unwrap_or(默认值)`，
+/// 于是 `--workers abc` 会默默跑成 auto —— 副本的并行度不是运维以为的那个值，
+/// 而日志里一个字都不会提。
+fn num<T: std::str::FromStr>(flag: &str, raw: &str, default: T) -> T {
+    if raw.is_empty() {
+        return default;
+    }
+    match raw.parse() {
+        Ok(v) => v,
+        Err(_) => {
+            eprintln!("bad {flag} {raw:?}: expected a number\n\n{HELP}");
+            std::process::exit(2);
+        }
+    }
+}
+
 fn parse_durability(s: &str) -> treedb::engine::Durability {
+    // 与 treedb-server 共用引擎里的解析器：拼错不静默降级。
     use treedb::engine::Durability;
-    match s {
-        "always" => Durability::Always,
-        "never" => Durability::Never,
-        _ => Durability::Group,
+    match Durability::parse(s) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("{e}\n\n{HELP}");
+            std::process::exit(2);
+        }
     }
 }
 

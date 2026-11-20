@@ -1,6 +1,6 @@
 [package]
 name = "treedb"
-version = "0.3.6"
+version = "0.3.7"
 edition = "2021"
 description = "元数据引擎：单进程事件循环 + 自定义二进制协议 + WAL/checkpoint（POSIX 元数据语义，客户端无关）"
 license = "Apache-2.0"
@@ -39,6 +39,14 @@ path = "src/bin/bench.rs"
 [[bin]]
 name = "treedb-pgbench"
 path = "src/bin/pgbench.rs"
+required-features = ["postgres-compat"]
+
+# 第二个母分母：同一套 op 打到 SQLite3（页缓存 + WAL + synchronous=FULL）。
+# 只有 PG 一个分母时，「treedb 快」里混着「PG 的进程模型重」这层归因；
+# SQLite 落在两者之间，三臂齐了才分得开引擎效率与进程模型。
+[[bin]]
+name = "treedb-sqlitebench"
+path = "src/bin/sqlitebench.rs"
 required-features = ["postgres-compat"]
 
 # 计算侧微基准：不经网络、不写 WAL，只量状态机本身的 ns/op 与 allocs/op。

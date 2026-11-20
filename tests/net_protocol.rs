@@ -295,6 +295,88 @@ fn large_readdir_response_streams_out_fully() {
     srv.graceful_shutdown();
 }
 
+/// 服务端进程累计的 CPU 时间（utime + stime），单位秒。
+fn cpu_seconds(pid: u32) -> f64 {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).expect("/proc/<pid>/stat");
+    // `comm` 里可能有空格和括号（“treedb-server” 目前没有，但不靠这个），
+    // 字段一律从最后一个右括号之后开始数：下标 0 是 state（即字段 3）。
+    let rest = &stat[stat.rfind(')').expect("comm") + 1..];
+    let f: Vec<&str> = rest.split_whitespace().collect();
+    let ticks = f[11].parse::<u64>().expect("utime") + f[12].parse::<u64>().expect("stime");
+    let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    ticks as f64 / hz as f64
+}
+
+/// 背压期间不许空转。
+///
+/// 电平触发的 `epoll` 里，只要 `EPOLLIN` 还挂着、连接又不读了，而写又发不
+/// 出去，`epoll_wait` 每轮立即返回同一个 fd，循环就变成忙等：一条读者打噎
+/// 的连接足以把 worker 绕到 100% CPU。摘掉 `EPOLLIN`、等 `tx` 排到半水位
+/// 以下再挂回去，才是真正的电平触发背压。
+///
+/// 关键在于造出“socket 里有没被读走的请求 + 没写完的应答”这个组合：先
+/// 用大应答把 backlog 顶过 `MAX_BACKLOG`，再补一批小请求，它会稳稳地躺在
+/// 内核 接收队列里。没有这次修正，这批小请求就是每秒几十万次 `epoll_wait`
+/// 的引信。
+///
+/// 判据是“CPU 秒数”而不是“某个函数没被调用”：真忙等的话，0.6 s 墙钟会烧
+/// 掉近 0.6 s CPU（单 worker），修好后只剩 epoll 定时唤醒的零头。
+#[test]
+fn backpressure_does_not_spin_the_worker() {
+    let srv = Server::start_workers("group", 1);
+    let mut c = srv.client();
+    let v = mk_view(&mut c, "spin");
+
+    const N: usize = 400;
+    let ops: Vec<Op> = (0..N)
+        .map(|k| Op::Create {
+            view: v,
+            parent: 1,
+            name: format!("file-{k:04}").into(),
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+        })
+        .collect();
+    assert!(c.pipeline(&ops).expect("seed").iter().all(|r| matches!(r, Reply::Node(_))));
+
+    // 只写不读：一条 readdir 应答近 6 KiB，2500 条远超 4 MiB 的 `MAX_BACKLOG`，
+    // 而接收窗只有 4 KiB —— 服务端迟早得把应答堆在内存里（挂上 EPOLLOUT）。
+    let mut raw = TcpStream::connect(&srv.addr).expect("connect");
+    shrink_rcvbuf(&raw, 4 * 1024);
+    let mut blob: Vec<u8> = Vec::new();
+    for _ in 0..2500 {
+        let mut w = treedb::engine::W::new();
+        Op::ReadDir { view: v, parent: 1, offset: 0, limit: N as u32 }.encode(&mut w);
+        blob.extend_from_slice(&encode_frame(&w.finish()));
+    }
+    // 写也不阻塞：能塞多少塞多少，塞不下的那部分本来也不需要。
+    raw.set_nonblocking(true).expect("nonblocking");
+    let _ = raw.write_all(&blob);
+    std::thread::sleep(std::time::Duration::from_millis(400));
+
+    // 现在再补一批小请求：它们在 backlog 已经满之后到达，服务端这一轮只会
+    // 读完一个块就停下，剩下的就留在内核队列里等下一轮。
+    let mut extra: Vec<u8> = Vec::new();
+    for _ in 0..8000 {
+        let mut w = treedb::engine::W::new();
+        Op::Ping.encode(&mut w);
+        extra.extend_from_slice(&encode_frame(&w.finish()));
+    }
+    let _ = raw.write_all(&extra);
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    let t0 = cpu_seconds(srv.pid());
+    std::thread::sleep(std::time::Duration::from_millis(600));
+    let burned = cpu_seconds(srv.pid()) - t0;
+    assert!(burned < 0.2, "背压期间在空转：0.6 s 墙钟烧了 {burned:.3} s CPU");
+
+    // 这条连接被丢下之后服务端还得活着，并且新连接照常干活。
+    drop(raw);
+    assert_eq!(call(&mut c, &Op::Ping), Reply::Pong);
+    srv.graceful_shutdown();
+}
+
 /// 坏帧（长度越上限）只能打死违规的那条连接，其他连接与服务端本体不受影响。
 #[test]
 fn oversized_frame_kills_only_the_offender() {

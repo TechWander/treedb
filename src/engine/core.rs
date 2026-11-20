@@ -25,9 +25,10 @@ use crate::engine::wal::{log_payload, Wal};
 use crate::error::{Error, Result};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
+use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// 取读锁。poison 只可能来自 worker 线程 panic（它们只读，不会把状态改成
@@ -59,10 +60,32 @@ pub enum Durability {
     Never,
 }
 
+impl Durability {
+    /// 解析启动参数里的名字。
+    ///
+    /// **拼错不许静默降级**：以前这里是个 `_ => Group`，于是
+    /// `--durability alway`（少一个 s）会默默跑成 group，而
+    /// `--durability nevr`（本该是 never）也会跑成 group —— 后者会让
+    /// “never 档的上限”被测成一个多付 fsync 的数，两种都让数字失去意义。
+    /// 只认三个字面量，其余一律回错误由 bin 以退出码 2 挡下来。
+    pub fn parse(s: &str) -> Result<Durability> {
+        match s {
+            "always" => Ok(Durability::Always),
+            "group" => Ok(Durability::Group),
+            "never" => Ok(Durability::Never),
+            other => Err(Error::Config(format!(
+                "unknown --durability {other:?}: expected one of always | group | never"
+            ))),
+        }
+    }
+}
+
 /// 快照文件名（WAL 同目录）。
 pub const SNAP_FILE: &str = "state.snap";
 /// WAL 文件名。
 pub const WAL_FILE: &str = "treedb.wal";
+/// 数据目录互斥锁文件名（[`DirLock`]）。
+pub const LOCK_FILE: &str = ".lock";
 /// 上一代快照的备份文件名（迁移工具写，见 [`migrate_snapshot`]）。
 pub const SNAP_BACKUP: &str = "state.snap.v2.bak";
 
@@ -190,6 +213,103 @@ pub fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+/// 数据目录的进程间互斥。
+///
+/// 两个进程开同一个目录不会看到任何报错，只会各自重放同一份 WAL、各自
+/// checkpoint、各自 `wal.reset`：谁后 rename 谁赢，先那个以为自己的写已落盘。
+/// 这种损坏事后无法区分于“盘坏了”，所以拿 `flock` 在开门时就把它变成
+/// 一个启动错误。
+///
+/// 锁是 `LOCK_EX | LOCK_NB`，落在目录里的 `.lock` 上：非阻塞是因为“等另一个
+/// 实例退出”不是运维想要的语义（他会以为是卡住），而锁跟着 fd 走，进程怎么
+/// 死的（包括 `kill -9`）都自动释放。
+struct DirLock {
+    /// 只为持有 fd：`flock` 锁在 open file description 上，关掉即释放。
+    _file: File,
+    /// 注册表里的键，`Drop` 时据此摘除。
+    key: PathBuf,
+}
+
+/// 本进程当前持锁的目录（规范化路径）。
+///
+/// `flock` 认的是 open file description，而同进程两次 `open` 就是两份
+/// description，互相冲突；更麻烦的是 `Command::spawn` fork 出的子进程在
+/// exec 之前会短暂继承同一份拷贝——这期间父进程 `close` 并不真正解锁。
+/// 只靠 `flock` 判「同进程重复打开」会得到时有时无的假冲突（测试串行必过、
+/// 并行随机失败）。注册表把这条判据变成本进程内的确定性事实，`flock` 只负责
+/// 跨进程那一半。
+static HELD: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+/// fork 窗口的重试预算：5 ms × 20 ≈ 100 ms。子进程 exec 通常在一毫秒内完
+/// 成，但要给满负载下的调度留余量；真正被别的进程占着的目录仍会立刻报错
+/// （pid 对不上就不重试）。
+const FORK_WAIT_TRIES: u32 = 20;
+
+impl Drop for DirLock {
+    fn drop(&mut self) {
+        HELD.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|p| p != &self.key);
+    }
+}
+
+impl DirLock {
+    fn acquire(dir: &Path) -> Result<DirLock> {
+        // 规范化后再比：`./x`、`x`、软链指向的同一目录必须算同一个目录。
+        let key = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+        if HELD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&key)
+        {
+            return Err(Error::Config(format!(
+                "data dir {} is already locked by this process (pid {}): two engines on one \
+                 directory would each replay the same WAL and overwrite each other's snapshots",
+                dir.display(),
+                std::process::id(),
+            )));
+        }
+        let path = dir.join(LOCK_FILE);
+        let mut f = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .map_err(|e| Error::Io(format!("open {}: {e}", path.display())))?;
+        let mut tries = 0;
+        loop {
+            if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+                break;
+            }
+            let e = std::io::Error::last_os_error();
+            let pid = std::fs::read_to_string(&path).unwrap_or_default();
+            let pid = pid.trim();
+            // pid 是本进程却不占注册表席位，只可能是 fork 出来的子进程还没
+            // exec 掉继承来的 fd：等它，而不是把一次正常重启判成目录被占。
+            if !pid.is_empty() && pid == std::process::id().to_string() && tries < FORK_WAIT_TRIES {
+                tries += 1;
+                std::thread::sleep(std::time::Duration::from_millis(5));
+                continue;
+            }
+            let who = if pid.is_empty() { "unknown" } else { pid };
+            return Err(Error::Config(format!(
+                "data dir {} is already locked ({e}): pid {who} holds it; two engines on one \
+                 directory would each replay the same WAL and overwrite each other's snapshots",
+                dir.display(),
+            )));
+        }
+        // 把 pid 写进去：拿到 EWOULDBLOCK 的人第一个问题就是“谁占的”。
+        // 写失败不影响互斥本身（锁已拿到），故不把错误上抛。
+        f.set_len(0).ok();
+        let _ = f.write_all(format!("{}\n", std::process::id()).as_bytes());
+        HELD.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(key.clone());
+        Ok(DirLock { _file: f, key })
+    }
+}
+
 /// 启动时崩溃恢复的度量，bin 负者打印它来证明“重放了多少条”不是空话。
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Recovery {
@@ -225,6 +345,8 @@ pub struct Engine {
     replica: bool,
     /// 主最近一次 `WalBatch` 报上来的 durable 水位，只为算 `replica_lag`。
     replica_primary: u64,
+    /// 数据目录的进程间互斥。字段只为活着（drop = 解锁）。
+    _lock: DirLock,
 }
 
 impl Engine {
@@ -235,18 +357,19 @@ impl Engine {
     pub fn open(dir: &Path, durability: Durability) -> Result<Engine> {
         let t0 = std::time::Instant::now();
         std::fs::create_dir_all(dir)?;
+        // 先拿锁再读一个字节：与另一个实例抢同一份 WAL 的重放是这里唯一
+        // 会真把数据弄坏的行为。
+        let lock = DirLock::acquire(dir)?;
         let snap_path = dir.join(SNAP_FILE);
         let mut state = State::new();
         let mut snap_seq = 0u64;
         if snap_path.exists() {
             let raw = std::fs::read(&snap_path)?;
-            let mut r = Rd::new(&raw);
-            state = State::load(&mut r)?;
-            // 快照尾 8 字节是写快照时的 seq 水位。
-            if raw.len() < 8 {
-                return Err(Error::Codec("snapshot truncated".into()));
-            }
-            snap_seq = u64::from_le_bytes(raw[raw.len() - 8..].try_into().unwrap());
+            // 先切尾巴：新版尾巴带 crc32，验不过就是坏文件，连解都不该解。
+            // 尾巴之前的字节才是正文，多一个都不行（`State::load` 末尾查）。
+            let (body, seq) = State::snapshot_split(&raw)?;
+            state = State::load(&mut Rd::new(body))?;
+            snap_seq = seq;
         }
         let replayed = Wal::replay(&dir.join(WAL_FILE), snap_seq)?;
         for l in &replayed {
@@ -283,6 +406,7 @@ impl Engine {
                 durable_seq: last_seq,
                 elapsed_ms: t0.elapsed().as_millis() as u64,
             },
+            _lock: lock,
         };
         // Stats 反映本进程服务量，故不把恢复期的重放计入 ops/writes；
         // 但 seq 水位必须对齐磁盘，否则重启后第一次 Stats 会回退。
@@ -516,10 +640,12 @@ impl Engine {
         {
             // 快照只需要一个一致的时间切面：读锁挡住写者 apply 就够了，不需要
             // 挡 fsync/网络。大状态机下这是唯一会被拉长的读临界区。
-            read_of(&self.state).save(&mut w);
+            //
+            // 尾巴（crc32 + seq）在同一个函数里写完：正文与它覆盖的水位
+            // 必须是一起算出来的，分两处拼就有一段可以被别人改。
+            read_of(&self.state).save_with_trailer(&mut w, seq);
         }
-        let mut buf = w.finish();
-        buf.extend_from_slice(&seq.to_le_bytes());
+        let buf = w.finish();
         let tmp = self.dir.join(format!("{SNAP_FILE}.tmp"));
         {
             let mut f = OpenOptions::new()
@@ -658,20 +784,16 @@ impl Engine {
     /// 拒绝水位回退：`seq < 本地 snap_seq` 等于把已有的更新状态换成旧的。主的
     /// 快照水位只前进不回退，看到回退只能是把两代拼错了，宁可报错。
     pub fn install_snapshot(&mut self, bytes: &[u8]) -> Result<u64> {
-        if bytes.len() < 8 {
-            return Err(Error::Codec(
-                "snapshot shorter than its 8-byte seq trailer".into(),
-            ));
-        }
-        let seq = u64::from_le_bytes(bytes[bytes.len() - 8..].try_into().unwrap());
+        // 先切尾巴（顺带验主的 crc32）：传输层保的是“字节到了”，不保“字节没
+        // 被改”；这里错一个比特比整份重下来贵得多，宁可在入库口就拒。
+        let (body, seq) = State::snapshot_split(bytes)?;
         if seq < self.snap_seq {
             return Err(Error::Io(format!(
                 "snapshot generation {seq} is behind the local watermark {}; refusing to rewind",
                 self.snap_seq
             )));
         }
-        let mut r = Rd::new(bytes);
-        let fresh = State::load(&mut r)?;
+        let fresh = State::load(&mut Rd::new(body))?;
         *write_of(&self.state) = fresh;
         let tmp = self.dir.join(format!("{SNAP_FILE}.tmp"));
         {
@@ -848,7 +970,8 @@ pub struct SnapshotInfo {
     /// 且不应当被引用。
     pub decodable: bool,
     pub note: Option<String>,
-    /// 快照尾 8 字节：这份快照覆盖到哪个 seq。
+    /// 快照尾里的 seq：这份快照覆盖到哪个水位。两种尾巴形状都认（见
+    /// [`State::snapshot_split`]）。
     pub snap_seq: u64,
     pub bytes: u64,
     /// WAL 文件的磁盘长度（st_size）。迁移不碰 WAL，所以这个数在迁移前后必须
@@ -911,12 +1034,15 @@ pub fn probe_snapshot(dir: &Path) -> Result<SnapshotInfo> {
         ));
         return Ok(info);
     }
-    // 走迁移专用的严格解码：整个文件必须正好被布局吃完（尾巴只剩 8 字节 seq）。
+    // 走迁移专用的严格解码：整个文件必须正好被布局吃完（尾巴已由
+    // `snapshot_split` 切掉，剩下的正文一个字节也不能多）。
     // 用它而不是 [`State::load`] 是为了让只读体检在 v2 目录上也能报出计数。
-    match State::load_for_migration(&mut Rd::new(&raw)) {
-        Ok(s) => {
+    match State::snapshot_split(&raw).and_then(|(body, seq)| {
+        State::load_for_migration(&mut Rd::new(body)).map(|s| (s, seq))
+    }) {
+        Ok((s, seq)) => {
             info.decodable = true;
-            info.snap_seq = u64::from_le_bytes(raw[raw.len() - 8..].try_into().unwrap());
+            info.snap_seq = seq;
             info.views = s.views.len() as u64;
             info.nodes = s.nodes.len() as u64;
             info.dentries = s.dentry_count() as u64;
@@ -974,9 +1100,10 @@ pub enum MigrationOutcome {
 /// `force` 只影响一件事：已存在备份文件时要不要覆盖。默认不覆盖，因为那份
 /// 备份可能是上一轮唯一可回滚的原件。
 ///
-/// **前提：服务端已停**。本函数不 flock（服务端也没持文件锁，锁不住任何东西），
-/// 只在写回前再读一次原文件与手上的字节比对：并发写者会在这里露馅。那是
-/// best-effort 的哨兵，不是互斥，不要把「没报错」当成「与并发安全」。
+/// **前提：服务端已停**。这个前提现在由 [`LOCK_FILE`] 上的 `flock` 真兑现：
+/// 服务端开门/迁移工具都拿同一把锁，两个进程不会再同时改一个目录（旧版注释里
+/// 写的「服务端也没持文件锁」已成历史）。写回前再读一次原文件与手上的字节比对
+/// 保留作第二道哨兵 —— 锁拦的是本仓的两个入口，拦不住手搓脚本。
 pub fn migrate_snapshot(dir: &Path, force: bool) -> Result<MigrationOutcome> {
     let t0 = std::time::Instant::now();
     let before = probe_snapshot(dir)?;
@@ -1002,26 +1129,19 @@ pub fn migrate_snapshot(dir: &Path, force: bool) -> Result<MigrationOutcome> {
     }
 
     let raw = std::fs::read(&before.path).map_err(|e| Error::Io(format!("read {}: {e}", before.path.display())))?;
-    if raw.len() < 12 {
-        return Err(Error::Codec(format!(
-            "snapshot {} is {} bytes, too short to hold a body plus the seq trailer",
-            before.path.display(),
-            raw.len()
-        )));
-    }
-    let state = State::load_for_migration(&mut Rd::new(&raw))?;
-    // 尾巴照搬：这个数是「快照覆盖到哪个 seq」，重算一次就是自己发明一个水位，
-    // 下次启动按它跳记录就会丢写。
-    let trailer: [u8; 8] = raw[raw.len() - 8..].try_into().unwrap();
-    let seq = u64::from_le_bytes(trailer);
+    // 动手之前拿锁：服务端还在跑的话这里就报错，而不是写完才发现两边在
+    // 抢同一个目录。锁跟着本函数的栈帧走，返回即释放。
+    let _lock = DirLock::acquire(dir)?;
+    let (body, seq) = State::snapshot_split(&raw)?;
+    let state = State::load_for_migration(&mut Rd::new(body))?;
 
-    // 动手前的自检：编 → 解 → 逐字段比。这里用的解法是严格入口（不是迁移入口），
-    // 等于把「新二进制明天能不能开门」先问一遍。
+    // 动手前的自检：编 → 解 → 逐字段比。这里用的解法是严格入口（不是迁移入口） ，
+    // 等于把「新二进制明天能不能开门」先问一遍。尾巴按当前布局重写（带 crc）。
     let mut w = W::new();
-    state.save(&mut w);
-    let mut out = w.finish();
-    out.extend_from_slice(&trailer);
-    let check = State::load(&mut Rd::new(&out))
+    state.save_with_trailer(&mut w, seq);
+    let out = w.finish();
+    let check = State::snapshot_split(&out)
+        .and_then(|(body, _)| State::load(&mut Rd::new(body)))
         .map_err(|e| Error::Codec(format!("the rewritten snapshot does not reload: {e}")))?;
     if check != state {
         return Err(Error::Codec(

@@ -215,6 +215,17 @@ pub(crate) struct Conn {
     /// 这条连接的握手进度（§4.4）。`Stage::Off` 时所有数据 op 直通，
     /// 判据只有一次 `matches!`。
     pub(crate) auth: Gate,
+    /// 背压把读端从 epoll 掩码里摘下来时置位。
+    ///
+    /// 为什么必须摘：epoll 是**电平触发**的，而背压时我们主动不读 socket ——
+    /// 只要不把 EPOLLIN 拿掉，`epoll_wait` 就会每轮立刻返回同一个 fd，事件
+    /// 循环 100% 空转，别的连接跟着饿死。摘掉之后由 `backlog` 排空到一半以下
+    /// 自动恢复（`flush` 末尾判）。EPOLLHUP/EPOLLERR 不受掩码影响，对端死了
+    /// 照样能醒。
+    pub(crate) read_hold: bool,
+    /// epoll 掩码里当前真的没挂 EPOLLIN 吗。与 `read_hold` 相等时
+    /// [`Conn::rearm`] 不为它下一 syscall。
+    pub(crate) ep_hold: bool,
 }
 
 impl Conn {
@@ -234,22 +245,38 @@ impl Conn {
             want_write: false,
             // accept 路径刚用 epoll_set(…, false) 注册过，掩码里没有 EPOLLOUT。
             ep_out: false,
+            read_hold: false,
+            ep_hold: false,
             auth: Gate::new(auth_required),
         }
     }
 
-    /// 本轮活儿干完后把 epoll 掩码对齐到 `want_write`。
+    /// 本轮活儿干完后把 epoll 掩码对齐到「`want_write` + 是否允许读」。
     ///
     /// 关键在于**对齐不等于下 syscall**：掩码已经对的时候（小回包一轮发完，
-    /// `want_write` 与 `ep_out` 都是 false）直接返回。实测单核 ping 每 op
-    /// 本来要付 2 次 `epoll_ctl`（ADD 撞 EEXIST + MOD），这里一次都不付。
+    /// `want_write` 与 `ep_out` 都是 false、又没有背压）直接返回。实测单核 ping
+    /// 每 op 本来要付 2 次 `epoll_ctl`（ADD 撞 EEXIST + MOD），这里一次都不付。
     pub(crate) fn rearm(&mut self, ep: i32) -> Result<()> {
-        if self.want_write == self.ep_out {
+        if self.want_write == self.ep_out && self.read_hold == self.ep_hold {
             return Ok(());
         }
-        epoll_mod(ep, self.fd, self.want_write)?;
+        epoll_mod(ep, self.fd, self.want_write, !self.read_hold)?;
         self.ep_out = self.want_write;
+        self.ep_hold = self.read_hold;
         Ok(())
+    }
+
+    /// 背压满档：把读端从掩码里摘下来（真正落地的 syscall 在 [`Conn::rearm`] 里）。
+    pub(crate) fn hold_read(&mut self) {
+        self.read_hold = true;
+    }
+
+    /// 积压排到一半以下才恢复读：贴着上限恢复会让每轮都在「摘/恢复」之间抖，
+    /// 每轮付两次 `epoll_ctl`。
+    fn resume_read_if_drained(&mut self) {
+        if self.read_hold && self.backlog() < MAX_BACKLOG / 2 {
+            self.read_hold = false;
+        }
     }
 
     /// 未发送字节（含已回填但未弹出的帧）——背压判据。
@@ -328,6 +355,9 @@ impl Conn {
             self.tx_pos = 0;
         }
         self.want_write = !self.out.is_empty() || !self.tx.is_empty();
+        // 积压真排下去了就把读端挂回去：这一判必须在 `want_write` 算完之后，
+        // 否则刚写的字节还没算进 backlog，会被误判成已排空。
+        self.resume_read_if_drained();
         Ok(())
     }
 }
@@ -360,9 +390,14 @@ pub(crate) fn epoll_set(ep: i32, fd: i32, want_write: bool) -> Result<()> {
 }
 
 /// 纯 MOD（fd 必须已注册）。与 `epoll_set` 的区别就是不拿 ADD 去撞 EEXIST。
-pub(crate) fn epoll_mod(ep: i32, fd: i32, want_write: bool) -> Result<()> {
+///
+/// `want_read = false` 只出现在背压路径（见 [`Conn::read_hold`]）：把 EPOLLIN
+/// 从掩码里拿掉，电平触发的 socket 才不会把事件循环烧成一个忙等。`EPOLLHUP` /
+/// `EPOLLERR` 永远会报，所以摘掉读端不会让我们错过对端断开。
+pub(crate) fn epoll_mod(ep: i32, fd: i32, want_write: bool, want_read: bool) -> Result<()> {
     let mut ev = unsafe { std::mem::zeroed::<libc::epoll_event>() };
-    ev.events = libc::EPOLLIN as u32 | if want_write { libc::EPOLLOUT as u32 } else { 0 };
+    ev.events = if want_read { libc::EPOLLIN as u32 } else { 0 }
+        | if want_write { libc::EPOLLOUT as u32 } else { 0 };
     ev.u64 = fd as u64;
     if unsafe { libc::epoll_ctl(ep, libc::EPOLL_CTL_MOD, fd, &mut ev) } < 0 {
         return Err(Error::Io(format!("epoll_ctl(MOD fd={fd}): {}", last_os())));
@@ -544,6 +579,13 @@ pub(crate) fn serve_single(cfg: &ServerConfig, stop: &AtomicBool, live: &AtomicU
                         .map(|c| c.backlog() < MAX_BACKLOG)
                         .unwrap_or(false);
                     if !room {
+                        // 背压：数据还在 socket 里，但我们暂时不读。电平触发的
+                        // EPOLLIN 不摘掉，下一轮 `epoll_wait` 会立刻把同一个 fd
+                        // 再报上来 —— 那就是 100% CPU 的空转。摘下来，等
+                        // `flush` 把积压排到一半以下再挂回去。
+                        if let Some(c) = conns.get_mut(&fd) {
+                            c.hold_read();
+                        }
                         break;
                     }
                     match conns.get_mut(&fd) {
@@ -708,8 +750,13 @@ pub(crate) fn serve_single(cfg: &ServerConfig, stop: &AtomicBool, live: &AtomicU
     }
 
     // 优雅退出：落一次快照，把下次重启的重放窗口压到最短。
-    let _ = engine.sync_now();
-    let _ = engine.checkpoint();
+    //
+    // **不吞错**：checkpoint/fsync 失败说明这次的磁盘状态不是我们以为的那个，
+    // 退出码必须反映它 —— 吞掉等于告诉运维“干净退出”，而实际上下次启动要
+    // 重放整个 WAL（或者下次 checkpoint 才炸的 EIO）。清理先做完，最后再抛。
+    let shutdown = engine
+        .sync_now()
+        .and_then(|_| engine.checkpoint().map(|_| ()));
     let s = engine.snapshot_stats();
     rep.ops = s.ops_total;
     rep.writes = s.writes_total;
@@ -731,6 +778,7 @@ pub(crate) fn serve_single(cfg: &ServerConfig, stop: &AtomicBool, live: &AtomicU
         close_conn(&mut conns, ep, fd, live);
     }
     unsafe { libc::close(ep) };
+    shutdown?;
     Ok(rep)
 }
 

@@ -1246,6 +1246,9 @@ fn checkpoint_then_reopen_survives_wal_truncation() {
     }
     assert_rich_state(&e2.state_snapshot(), v);
     // 快照后的增量不能因重放两次而翻倍：再开一次仍等价。
+    // 先 drop 掉 e2：一个目录同时只能有一个活着的 `Engine`（`.lock` 上的 flock），
+    // 而「再开一次」本来就是在模拟重启。
+    drop(e2);
     assert_eq!(d.open().state_snapshot(), before);
 }
 
@@ -1787,4 +1790,64 @@ fn stats_reports_table_counts_and_both_disk_sizes() {
     let st4 = e4.snapshot_stats();
     assert_eq!((st4.tables, st4.rows), (1, 7));
     assert_eq!(st4.snap_bytes, std::fs::metadata(&snap_path).unwrap().len());
+}
+
+// ---- 2026-11-20：问题清单 F3 / F8 -------------------------------------------
+
+/// 一个数据目录同时只能被一个 `Engine` 打开。
+///
+/// 没有这道闸时两个实例会各自重放同一份 WAL、各自 checkpoint、各自
+/// `wal.reset`：谁后 rename 谁赢，先那个以为自己的写已落盘。锁是 `.lock`
+/// 上的 `flock`，进程怎么死的都自动释放，所以这里第二段"重开能过"也是
+/// 锁真放掉了的证据。
+#[test]
+fn a_data_dir_refuses_a_second_engine() {
+    let d = Dir::new("lock_one_owner");
+    let first = d.open();
+    let err = Engine::open(&d.path(), Durability::Always)
+        .err()
+        .expect("同一目录的第二个实例必须被拒")
+        .to_string();
+    assert!(err.contains("already locked"), "{err}");
+    assert!(
+        err.contains(&std::process::id().to_string()),
+        "错误里要带持锁 pid，运维才知道去找谁：{err}"
+    );
+
+    // 锁跟着 Engine 的生命周期走：drop 之后立刻可开。
+    drop(first);
+    let _again = d.open();
+}
+
+/// `unlink`/`rmdir` 与 `rename` 对"父 inode 不是目录"给同一个 errno。
+///
+/// POSIX 里路径前缀不是目录是 `ENOTDIR`，而且优先于"名字查不到"
+/// （`ENOENT`）。改之前 unlink 直接查 dentry，于是 `unlink(file/child)` 回
+/// `ENOENT` —— 同一个坏父 inode，rename 与 unlink 给出两个不同的答案。
+#[test]
+fn unlink_and_rmdir_report_enotdir_for_a_non_dir_parent() {
+    let d = Dir::new("unlink_parent_kind");
+    let mut e = d.open();
+    let v = mk_view(&mut e, "alice");
+    let file = node(ok(
+        &mut e,
+        &Op::Create { view: v, parent: 1, name: b"f".to_vec(), mode: 0o644, uid: 0, gid: 0 },
+    ))
+    .ino;
+
+    assert_eq!(
+        err_code(&mut e, &Op::Unlink { view: v, parent: file, name: b"x".to_vec() }),
+        errno::ENOTDIR
+    );
+    assert_eq!(
+        err_code(&mut e, &Op::Rmdir { view: v, parent: file, name: b"x".to_vec() }),
+        errno::ENOTDIR
+    );
+    // 父 inode 根本不存在：仍然是 ENOENT（不是 ENOTDIR —— 没有东西可判类型）。
+    assert_eq!(
+        err_code(&mut e, &Op::Unlink { view: v, parent: 9_999, name: b"x".to_vec() }),
+        errno::ENOENT
+    );
+    // 正常的 unlink 不受影响。
+    ok(&mut e, &Op::Unlink { view: v, parent: 1, name: b"f".to_vec() });
 }

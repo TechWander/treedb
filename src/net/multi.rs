@@ -359,6 +359,11 @@ fn worker_loop(
                         .map(|c| c.backlog() < MAX_BACKLOG)
                         .unwrap_or(false);
                     if !room {
+                        // 背压：把读端从 epoll 掩码里摘掉，否则电平触发的
+                        // EPOLLIN 会让 worker 线程每轮空转（同 serve_single）。
+                        if let Some(c) = conns.get_mut(&fd) {
+                            c.hold_read();
+                        }
                         break;
                     }
                     match conns.get_mut(&fd) {
@@ -820,8 +825,10 @@ fn committer(
     pend.flush(engine, outs)?;
 
     // 优雅退出：落一次快照，把下次重启的重放窗口压到最短。
-    let _ = engine.sync_now();
-    let _ = engine.checkpoint();
+    // 与单线程路径同一条口径：不吞错，退出码要反映磁盘是不是真的干净。
+    let shutdown = engine
+        .sync_now()
+        .and_then(|_| engine.checkpoint().map(|_| ()));
     let s = engine.snapshot_stats();
     rep.ops = s.ops_total;
     rep.writes = s.writes_total;
@@ -839,6 +846,7 @@ fn committer(
     rep.replica_errors = s.replica_errors;
     live_out.store(cnt.live.load(Ordering::Relaxed), Ordering::Relaxed);
     unsafe { libc::close(ep) };
+    shutdown?;
     Ok(rep)
 }
 

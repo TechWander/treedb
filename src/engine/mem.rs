@@ -47,6 +47,32 @@ pub const SNAP_VERSION: u32 = 3;
 /// 「格式变更要 +1 并给出门」这条规矩变成「格式变更可以攒着」。
 pub const SNAP_LEGACY_VERSION: u32 = 2;
 
+/// 快照文件尾巴的两种形状，靠 magic 自描述（不占版本位，因而不用迁移）：
+///
+/// ```text
+/// 新版 16 字节：crc32(正文 ‖ seq) u32 | seq u64 | SNAP_MAGIC u32
+/// 旧版  8 字节：seq u64                                  （v0.3.6 及更早）
+/// ```
+///
+/// crc 把 **seq 也算进去**：seq 决定重放从哪里开始，它被写坏（偏大）就会
+/// 静默跳过一批记录 —— 那正是「看起来启动成功、实际丢了写」那种事故。
+///
+/// 旧尾巴没有校验和 —— 这正是补上它的原因：正文里一个比特翻转只要不越界，
+/// 解码器就会把它当成合法的 ino / nlink / size 收下，然后把这份错状态当真。
+/// 用 magic 而不是「版本位 +1」来区分，是为了让已有的 v3 目录不必迁移就能
+/// 再开一次门：正文布局一个字节没变，变的只是它后面跟了几个字节。
+pub const SNAP_MAGIC: u32 = 0x3153_4254; // "TBS1"
+/// 带 crc 的尾巴长度。
+pub const SNAP_TRAIL: usize = 16;
+/// 旧尾巴长度：只有 seq，没有校验和。
+pub const SNAP_TRAIL_LEGACY: usize = 8;
+
+/// 快照尾巴的 crc32：覆盖「正文 ‖ seq」，不插分隔字节。
+fn snapshot_crc(body: &[u8], seq: u64) -> u32 {
+    let c = crate::engine::wal::crc32_update(0xFFFF_FFFF, body);
+    !crate::engine::wal::crc32_update(c, &seq.to_le_bytes())
+}
+
 /// 已提交（WAL 已 durable）的一条状态变更。重放 = 从头到尾 `apply`，
 /// 因此每条都必须是幂等的整行写入，不记 delta。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -806,6 +832,57 @@ impl State {
         self.save_versioned(w, SNAP_VERSION);
     }
 
+    /// 写「正文 + 尾巴」，即一个完整的 `state.snap` 文件。
+    ///
+    /// 尾巴里的 seq 必须由调用方从 WAL 的 durable 水位取（[`Engine::checkpoint`]
+    /// 用的是 `wal.durable_seq()`），本函数只负责把它连同正文的 crc 一起编进去：
+    /// 自己发明一个水位，下次启动按它跳记录就是丢写。
+    pub fn save_with_trailer(&self, w: &mut W, seq: u64) {
+        self.save(w);
+        let mut buf = std::mem::take(&mut w.0);
+        let crc = snapshot_crc(&buf, seq);
+        buf.extend_from_slice(&crc.to_le_bytes());
+        buf.extend_from_slice(&seq.to_le_bytes());
+        buf.extend_from_slice(&SNAP_MAGIC.to_le_bytes());
+        w.0 = buf;
+    }
+
+    /// 把整份快照文件切成「正文 + 水位」，新版尾巴顺带验 crc32。
+    ///
+    /// 两代尾巴都认：8 字节的没有校验和，只能照收（它写的时候还没有 crc）；
+    /// 16 字节的先验 crc 再交正文 —— 校验不过就到此为止，绝不让解码器去
+    /// 解释一份已知是坏的字节。magic 被写坏的情形会退化成「旧尾巴」解释，
+    /// 于是正文末尾多出 8 字节，由 `State::load` 的「正文必须刚好吃完」拒掉。
+    pub fn snapshot_split(raw: &[u8]) -> Result<(&[u8], u64)> {
+        if raw.len() < SNAP_TRAIL_LEGACY {
+            return Err(Error::Codec(format!(
+                "snapshot is {} bytes, shorter than its {SNAP_TRAIL_LEGACY}-byte seq trailer",
+                raw.len()
+            )));
+        }
+        let at = raw.len() - SNAP_TRAIL_LEGACY;
+        let seq = u64::from_le_bytes(raw[at..].try_into().unwrap());
+        if raw.len() >= SNAP_TRAIL {
+            let at = raw.len() - SNAP_TRAIL;
+            let crc = u32::from_le_bytes(raw[at..at + 4].try_into().unwrap());
+            let magic = u32::from_le_bytes(raw[at + 12..at + 16].try_into().unwrap());
+            if magic == SNAP_MAGIC {
+                let body = &raw[..at];
+                let seq = u64::from_le_bytes(raw[at + 4..at + 12].try_into().unwrap());
+                let want = snapshot_crc(body, seq);
+                if crc != want {
+                    return Err(Error::Codec(format!(
+                        "snapshot body/trailer fails its crc32: stored {crc:#010x}, computed \
+                         {want:#010x} over {} body bytes at seq {seq}",
+                        body.len()
+                    )));
+                }
+                return Ok((body, seq));
+            }
+        }
+        Ok((&raw[..at], seq))
+    }
+
     /// 按上一代布局写快照：版本位写 [`SNAP_LEGACY_VERSION`]，尾部三段不写。
     ///
     /// 它存在的唯一理由是**让测试能造出真 v2 文件**（`tests/migrate.rs` 与下面的
@@ -907,9 +984,10 @@ impl State {
 
     /// 迁移工具专用的载入：额外接受 [`SNAP_LEGACY_VERSION`]。
     ///
-    /// 与 [`State::load`] 的两点差别都为了「动手之前先把输入看清楚」：只多认
-    /// 一代，且 buffer 必须是**整个快照文件** —— 正文之后只能剩那 8 字节 seq
-    /// 尾巴，多一个字节都说明这文件不是它自称的那个版本，宁可不改也不猜。
+    /// 与 [`State::load`] 的唯一差别就是为了「动手之前先把输入看清楚」：只多认
+    /// 一代。buffer 是**正文**（尾巴已由 [`State::snapshot_split`] 切掉），
+    /// 正文必须被布局刚好吃完，多一个字节都说明这文件不是它自称的那个版本，
+    /// 宁可不改也不猜。
     /// 解出来的 `State` 与解 v3 文件得到的完全同形（表与行两张空表、派生结构
     /// 为空），所以迁移只是换个布局写回去，中间不发生任何语义翻译。
     pub fn load_for_migration(r: &mut Rd) -> Result<State> {
@@ -1044,13 +1122,14 @@ impl State {
                 s.rows.entry(tid).or_default().insert(row.key.clone(), row);
             }
         }
-        // `allow_legacy` 只可能来自 [`State::load_for_migration`]，而它按整个文件解：
-        // 正文之后必须正好只剩 seq 尾巴。多出来的字节要么是更新的版本，要么
-        // 是坏文件，两种都不能当成「可以改写它」。
-        if allow_legacy && r.remaining() != 8 {
+        // 正文必须被布局**刚好**吃完。尾巴（crc + seq）由调用方先用
+        // [`State::snapshot_split`] 切掉，所以这里剩下任何一个字节都说明
+        // 这文件不是它自称的那个版本 —— 要么是更新的布局，要么是坏文件。
+        // 常规启动路径同样走这条检查：以前只有迁移入口查，于是「正文后面
+        // 挂了尾巴」的目录能被静默开起来。
+        if r.remaining() != 0 {
             return Err(Error::Codec(format!(
-                "snapshot body does not match its version {ver}: {} byte(s) trail the payload, \
-                 expected only the 8-byte seq trailer",
+                "snapshot body does not match its version {ver}: {} byte(s) trail the payload",
                 r.remaining()
             )));
         }
@@ -1579,7 +1658,10 @@ mod tests {
         assert_eq!(State::snapshot_version(&raw).unwrap(), SNAP_LEGACY_VERSION);
         raw.extend_from_slice(&4242u64.to_le_bytes());
 
-        let back = State::load_for_migration(&mut Rd::new(&raw)).unwrap();
+        // 尾巴先切掉再解：crc/seq 不属于正文布局。
+        let (body, seq) = State::snapshot_split(&raw).unwrap();
+        assert_eq!(seq, 4242);
+        let back = State::load_for_migration(&mut Rd::new(body)).unwrap();
         assert_eq!(back, s, "v2 的正文必须被同一套解码吃下来");
         assert!(
             back.tables.is_empty() && back.rows.is_empty() && back.row_index.is_empty(),
@@ -1599,22 +1681,67 @@ mod tests {
         );
         assert!(v3.len() > body_end, "v3 不写表那三段就等于没升版本");
         // 当前布局走迁移入口也得能解（`--apply` 重跑第二次的幂等路径）。
-        v3.extend_from_slice(&4242u64.to_le_bytes());
+        // 这里传的是正文（v3 是 `save` 的输出，尾巴由调用方拼）。
         assert_eq!(State::load_for_migration(&mut Rd::new(&v3)).unwrap(), s);
 
         // 常规启动路径不开口子，但拒的时候要指出出路，不能只说「不支持」。
         let err = State::load(&mut Rd::new(&raw)).unwrap_err().to_string();
         assert!(err.contains("treedb-migrate"), "旧目录的出路要写在错里：{err}");
 
-        // 迁移入口按整个文件解：正文后面多一个字节就不是它自称的那个版本。
+        // 迁移入口按正文解：正文后面多一个字节就不是它自称的那个版本。
         let mut extra = raw.clone();
         extra.push(0);
-        assert!(State::load_for_migration(&mut Rd::new(&extra)).is_err());
-        assert!(State::load_for_migration(&mut Rd::new(&raw[..raw.len() - 8])).is_err());
+        let (body, _) = State::snapshot_split(&extra).unwrap();
+        assert!(State::load_for_migration(&mut Rd::new(body)).is_err());
+        // 连 8 字节 seq 尾巴都放不下的文件，不是快照。
+        assert!(State::snapshot_split(&raw[..4]).is_err());
         // 版本位越老越不认：两代之前没有迁移路径。
         let ancient = 1u32.to_le_bytes().to_vec();
         assert_eq!(State::snapshot_version(&ancient).unwrap(), 1);
         assert!(State::load_for_migration(&mut Rd::new(&ancient)).is_err());
+    }
+
+    /// 尾巴自描述：16 字节带 crc（覆盖面是「正文 ‖ seq」），8 字节照收。
+    ///
+    /// 两代共存是设计不是过渡期残留：旧目录不改一个字节就能开，下一次
+    /// checkpoint 自己换成新尾巴。而 crc 覆盖 seq 是为了堵住一个很难查的
+    /// 事故：水位被写大 → 启动时直接跳过一批 WAL 记录，状态“干净但少了”。
+    #[test]
+    fn snapshot_trailer_carries_crc_and_accepts_the_legacy_shape() {
+        let s = legacy_sample();
+        let mut w = W::new();
+        s.save_with_trailer(&mut w, 77);
+        let raw = w.finish();
+
+        let (body, seq) = State::snapshot_split(&raw).unwrap();
+        assert_eq!(seq, 77);
+        assert_eq!(raw.len(), body.len() + SNAP_TRAIL);
+        assert_eq!(State::load(&mut Rd::new(body)).unwrap(), s, "正文能被严格入口解回来");
+
+        // 正文里翻一个比特：必须在切尾巴这一步就被拒，不能交给解码器。
+        let mut flipped = raw.clone();
+        flipped[body.len() / 2] ^= 0x40;
+        let err = State::snapshot_split(&flipped).unwrap_err().to_string();
+        assert!(err.contains("crc32"), "{err}");
+
+        // 尾巴里的 seq 被写坏同样要拒：它在 crc 的覆盖面里。
+        let mut bad_seq = raw.clone();
+        let at = raw.len() - 12;
+        bad_seq[at] ^= 0x01;
+        assert!(
+            State::snapshot_split(&bad_seq).is_err(),
+            "seq 写坏会让重放跳记录，必须在开门时就拒"
+        );
+
+        // 旧尾巴（只有 seq）：照收，正文与水位都取对。
+        let mut w2 = W::new();
+        s.save(&mut w2);
+        let mut legacy = w2.finish();
+        assert_eq!(legacy.len(), body.len());
+        legacy.extend_from_slice(&77u64.to_le_bytes());
+        let (b2, seq2) = State::snapshot_split(&legacy).unwrap();
+        assert_eq!((b2, seq2), (body, 77));
+        assert_eq!(State::load(&mut Rd::new(b2)).unwrap(), s);
     }
 
     /// 旧布局装不下表与行，所以下行写必须硬拒。这个闸存在的原因是：一旦
