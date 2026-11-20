@@ -9,7 +9,7 @@
 自己的仓里；本仓唯一与 PostgreSQL 有关的东西是默认关掉的 `postgres-compat` 脚手架，
 而这条约束有测试守着（`tests/independence.rs`，详见 §11 第 7 条）。
 
-**状态**：v0.3.5。引擎本体已落地并跑完五轴验收（§7.8 是 2026-11-19 的全轴复跑）；
+**状态**：v0.3.6。引擎本体已落地并跑完五轴验收（§7.8 是 2026-11-19 的全轴复跑）；
 已建 git 仓推 `origin`(gitee) + `github` 两远端。0.3.0 之后的一批全在**读轴**上：
 量具口径对称化（§9.1 第 3 条）、默认前端 worker 按核数（§8 第 1 条）、目录项两层表
 + kind 冗余（§7.10）；那一批**线协议、WAL 与快照的字节格式一个字节没动**（当时
@@ -47,10 +47,20 @@ op（`WalFetch` 读 WAL 帧、`SnapFetch` 切快照文件）、一个只读实�
 而 `SNAP_VERSION` 仍是 3 —— 副本装的就是主的快照原件，格式一变就得先给副本出一条
 迁移路径，所以快照布局本轮刻意不动。落盘的旧目录与新二进制之间没有任何新闸门。定版 `v0.3.5`。
 
-test 现在分两档报：默认档（纯引擎）`cargo test --release` = **112 passed**（38 lib +
-26 engine_crud + 11 migrate + 10 net_protocol + 9 replication + 8 read_scaling +
-6 crash_recovery + 3 independence + 1 scale_connections，10k 那条仍 `#[ignore]`）；
-`--features postgres-compat` = **143 passed**，多出的 31 条 = 过渡档自己的 30 条单测 +
+`v0.3.5` 之后先是一批**纯取证**（连接上限、多用户、网络、备份四个能力面，`src/`
+一个字节没动，故不另起 tag）；本轮是**接入面认证**（§4.4）：两条新 op
+（`AuthBegin` / `AuthFinish`）与两个新 reply tag（`Challenge` 0x0190 / `AuthOk` 0x0191），
+一次共享密钥的双向挑战握手，三个入口（`server` / `standby` / `bench`）共用一个
+`--auth-key-file`，**默认关**。`PROTOCOL_VERSION` 4 → 5（51 op / 30 reply），但这次是
+**纯追加**：既有帧一个字节未动、`EngineStats` 也没加长，所以一个 v4 客户端对 v5
+服务端的每一格读写与对 v4 逐字相同（连 §4.1 那句「静默丢尾部字段」都不存在）；
+`SNAP_VERSION` 仍 3 —— 握手不落盘，不碰任何磁盘形状。代价实测见 §4.4 末表。
+定版 `v0.3.6`。
+
+test 现在分两档报：默认档（纯引擎）`cargo test --release` = **134 passed**（54 lib +
+26 engine_crud + 11 migrate + 10 net_protocol + 10 replication + 8 read_scaling +
+6 crash_recovery + 5 auth + 3 independence + 1 scale_connections，10k 那条仍 `#[ignore]`）；
+`--features postgres-compat` = **165 passed**，多出的 31 条 = 过渡档自己的 30 条单测 +
 `concurrency.rs` 里那条
 不需要 PG 的拨号用例（剩下 6 条要真 PG，默认 `#[ignore]`，不计入 passed）。即 PG 只出现在
 `postgres-compat` 后面的 `src/pool`、`src/store`、
@@ -180,7 +190,7 @@ test 现在分两档报：默认档（纯引擎）`cargo test --release` = **112
                                   │            src/net/mail.rs     纯读批次就地算完直接回；
                                   │           （eventfd 信箱）     含写批次整批 ──► 唯一提交线程
                                   │                                 （只有它持 Engine/WAL/stats）
-                                  │  Op/Reply（src/engine/model.rs，49 op / 28 reply）
+                                  │  Op/Reply（src/engine/model.rs，51 op / 30 reply）
                                   ▼
                                   src/engine/core.rs   Engine：apply → WAL → 持久化 → 回包
                                   │  src/engine/apply.rs  语义实现（rename/锁/账本/分页/表约束）
@@ -207,18 +217,21 @@ test 现在分两档报：默认档（纯引擎）`cargo test --release` = **112
 | `src/engine/wal.rs` | 1062 | WAL 帧格式、CRC32、预分配、group commit、扫描/重放、`reset`，外加面向副本的只读交付入口 `deliver`（§6.6） |
 | `src/engine/core.rs` | 1111 | `Engine`：op 入口、durability 分档、checkpoint、`Stats`、只读入口 `exec_read`、副本侧的 `install_snapshot`/`replicate_records`；外加快照探测与迁移（`probe_snapshot`/`migrate_snapshot`，§6.5） |
 | `src/engine/mem.rs` | 1637 | `State`（views/nodes/dentries/locks/refs/keys/audit/defs/place/tables/rows/row_index）+ `Log`；快照的版本闸门与两代读入口（`load` / `load_for_migration`） |
-| `src/engine/apply.rs` | 1292 | 49 个 op 的具体语义：环检测、nlink、租约过滤、分页游标、表形状校验与约束、副本拒写 |
-| `src/engine/model.rs` | 2575 | `Op`/`Reply` 定义与 codec 实现 |
-| `src/net/server.rs` | 803 | `workers=1` 的 epoll 循环、连接生命周期、写回背压、周期任务（含追平 tick）；兼作两条路径共用的 `Conn`/`Slot` 构件 |
-| `src/net/multi.rs` | 850 | `workers>1`：N 条前端 worker + 唯一提交线程（路由闸门、按连接号回程、停机收尾） |
-| `src/net/replicate.rs` | 379 | 副本侧跟踪器 `Follower`：拉快照 → 追 WAL → gap 重装，连不上主退避重连（§6.6） |
+| `src/engine/apply.rs` | 1300 | 51 个 op 里那 49 个的具体语义：环检测、nlink、租约过滤、分页游标、表形状校验与约束、副本拒写（两条握手 op 不进引擎，§4.4；这里只留一道 `EINVAL` 兜底） |
+| `src/engine/model.rs` | 2715 | `Op`/`Reply` 定义与 codec 实现 |
+| `src/engine/sha256.rs` | 365 | 自写的 SHA-256 / HMAC-SHA256 / 常数时间比对 —— 依赖门逼出来的（§11 第 7 条），正确性钉在 FIPS 180-4 与 RFC 4231 的已知向量上（§4.4） |
+| `src/net/server.rs` | 839 | `workers=1` 的 epoll 循环、连接生命周期、写回背压、周期任务（含追平 tick）；兼作两条路径共用的 `Conn`/`Slot` 构件 |
+| `src/net/multi.rs` | 923 | `workers>1`：N 条前端 worker + 唯一提交线程（路由闸门、按连接号回程、停机收尾） |
+| `src/net/auth.rs` | 505 | 接入认证：`Key`（读密钥 + MAC 派生）与 `Gate`（每连接一份的握手闸门），两条事件循环共用（§4.4） |
+| `src/net/replicate.rs` | 403 | 副本侧跟踪器 `Follower`：拉快照 → 追 WAL → gap 重装，连不上主退避重连（§6.6）；开认证时对主先握手 |
 | `src/net/mail.rs` | 114 | 两者之间那条能被 `epoll` 唤醒的信箱（`Mutex<VecDeque>` + eventfd） |
-| `src/net/client.rs` | 115 | 同步客户端 + pipeline |
-| `src/bin/{server,bench,pgbench,micro,migrate,standby,demo}.rs` | 1946 | 可执行入口；`pgbench` 是 PG 对照器，`migrate` 是快照升级工具（§6.5），`standby` 是只读副本（§6.6） |
+| `src/net/client.rs` | 145 | 同步客户端 + pipeline；带密钥时建连后先走一次握手，拿不到 `authed: true` 就 fail-closed（§4.4） |
+| `src/bin/{server,bench,pgbench,micro,migrate,standby,demo}.rs` | 2047 | 可执行入口；`pgbench` 是 PG 对照器，`migrate` 是快照升级工具（§6.5），`standby` 是只读副本（§6.6）；三个面向网络的入口共用 `--auth-key-file` |
 | `benches/throughput_matrix.sh` | 188 | 五轴吞吐矩阵（§7 的数据来源） |
 | `benches/rehearse_migrate.sh` | 147 | 快照升级的真机彩排：旧 tag → 当前树，逐格核四条承诺与回滚窗口（§6.5 的外部效度） |
 | `benches/single_conn.sh` | 99 | 单连接与并发档对标（§7.11）：treedb 默认档 vs 私有 PG 集群，`$PIPE` 选一问一答还是批量、`$CONNS`/`$WORKERS` 选形状，逐格附带引擎自计的 fsync 计数 |
 | `benches/backup_probe.sh` | 133 | 备份/还原三形状实测（§6.7）：冷拷贝、写入进行中的热拷贝、副本目录当还原点，逐档拿 `--stats` 的数据面四行对拍 |
+| `benches/handshake_cost.sh` | 126 | 接入握手的代价（§4.4 末表）：同一轮里 off/on 两臂交替跑 N 条建连，取 bench 自报的 `connected` 时间 + 那一刻的服务端 RSS + 稳态 `ping`/`create`，并校验两臂实际连上的条数一致 |
 
 行是 `wc -l`，含各文件自己的 `mod tests`（旧版这张表是历史快照，已与代码脱开的
 那几个文件本轮按实测回填）。
@@ -243,7 +256,7 @@ payload = tag: u16 | 字段…            （Op / Reply 各自的 tag 空间，R
 - 错误：`Reply::Err { code: u16, msg }`，`code` 就是 POSIX `errno`。
 - **帧里没有版本位**（v1 定形时就没给，现在也不能塞 —— 塞进去就把旧客户端的
   整个 payload 偏移挪了两位）。版本只能靠 `Stats.proto_version` 在第一次握手后
-  查到，当前 `PROTOCOL_VERSION = 4`。升级顺序因此是硬约束：**先升服务端，后升客户端**。
+  查到，当前 `PROTOCOL_VERSION = 5`。升级顺序因此是硬约束：**先升服务端，后升客户端**。
   新客户端解旧服务端的帧会短读报错（能看见），旧客户端解新服务端的帧会**静默丢掉
   尾部字段**（看不见）—— 后者正是 `SNAP_VERSION` 那道闸门在磁盘上防的事，线上没有
   等价物，只能靠顺序。
@@ -254,13 +267,19 @@ payload = tag: u16 | 字段…            （Op / Reply 各自的 tag 空间，R
   `remaining() == 0`），所以 v3 的 `--stats` 拿到 v4 的应答只会少印那六个数，不报错。
   反过来不行：v3 服务端会把 `WalFetch` 的 tag 当未知 op 拒掉，副本就此追不动 ——
   所以副本与主必须同代，而升级顺序照旧（先服务端后客户端）。
+  `4 → 5`（§4.4）只加两个 op tag（`AuthBegin` 0x0090 / `AuthFinish` 0x0091）与两个
+  reply tag（`Challenge` 0x0190 / `AuthOk` 0x0191），**既有帧一个字节没动、
+  `EngineStats` 也没加长** —— 所以这次连“静默丢尾部字段”都不存在：一个 v4 客户端
+  只要不去发那两条新 op（它也不知道这两个 tag），它对 v5 服务端的每一格读写都
+  与对 v4 服务端逐字相同。开关默认关正是为此（§4.4）。
 
-### 4.2 op 分组（49 个）
+### 4.2 op 分组（51 个）
 
 | 组 | op |
 |----|----|
 | 运维 | `Ping` `Stats` `Checkpoint` `Shutdown` |
 | 日志传送 | `WalFetch` `SnapFetch` |
+| 接入认证 | `AuthBegin` `AuthFinish` |
 | 视图 | `CreateView` `DropView` `ListViews` |
 | 名字/属性 | `Lookup` `Getattr` `Setattr` `ReadDir` `ReadDirPlus` |
 | 增删 | `Create` `Mkdir` `Symlink` `Readlink` `Unlink` `Rmdir` `Rename` |
@@ -271,7 +290,7 @@ payload = tag: u16 | 字段…            （Op / Reply 各自的 tag 空间，R
 | 定义/放置 | `DefPut` `DefGet` `DefList` `DefDel` `PlaceSet` `PlaceGet` `PlaceList` |
 | 通用表 | `TableCreate` `TableDrop` `TableGet` `TableList` `RowPut` `RowGet` `RowList` `RowDelete` `RowCount` |
 
-49 个 op 分**三档**，两个布尔判据（`is_readonly` / `is_control`）恰好切出三块，
+51 个 op 分**三档**，两个布尔判据（`is_readonly` / `is_control`）恰好切出三块，
 两两不交、并起来是全集：
 
 - **只读 22 个 = worker 可就地执行集**：`Ping` `ListViews` `Lookup` `Getattr`
@@ -279,18 +298,23 @@ payload = tag: u16 | 字段…            （Op / Reply 各自的 tag 空间，R
   `AuditList` `DefGet` `DefList` `PlaceGet` `PlaceList` `TableGet` `TableList` `RowGet`
   `RowList` `RowCount`；
 - **真写 22 个**：`!is_readonly() && !is_control()`，全部要过 WAL；
-- **控制面 5 个**：`Stats` `Checkpoint` `Shutdown` `WalFetch` `SnapFetch`。
+- **控制面 7 个**：`Stats` `Checkpoint` `Shutdown` `WalFetch` `SnapFetch` `AuthBegin`
+  `AuthFinish`。
 
 前两档是语义分档，第三档是**执行位置**分档：控制面既不改状态也不产出 logs，
 但它必须在提交线程上跑 —— `Stats` 要读只有提交线程碰得到的计数器，
 `Checkpoint`/`Shutdown` 要动 WAL，而 `WalFetch`/`SnapFetch` 要的是**磁盘上的日志与
-快照**，`translate(&State, ..)` 根本拿不到它们需要的东西。三档的现值由
-`tests/read_scaling.rs::ops_partition_into_three_classes` 钉住（22/22/5）。
+快照**，`translate(&State, ..)` 根本拿不到它们需要的东西。两条握手 op 是个例外，
+它归进控制面的理由是「它不是数据面 op」而不是「它要在提交线程上跑」—— 实际执行
+位置在事件循环，比提交线程还靠前一层（§4.4）；把它归进只读档会更贴近「不碰状态」
+这句字面意思，但那会让 worker 以为可以在自己手里就地算它，而它必须**串行于同连接
+的状态机进度**（`Gate` 是每连接一份的可变状态）。三档的现值由
+`tests/read_scaling.rs::ops_partition_into_three_classes` 钉住（22/22/7）。
 
 - 只读那一档的划分不只是优化提示，**它是语义地基**：`Op::is_readonly()` 判错一条，
   就是把一次应当被确认的写丢在 worker 手里。`readonly_classification_matches_translate`
-  拿 49 个 op 的语料逐条跑 `translate`，断言「判为只读 ⇒ logs 必空」，同时钉住
-  49/22/27 这三个数 —— 加 op、改分派表，这里和测试必须一起动。语料里每条只读 op 都要
+  拿 51 个 op 的语料逐条跑 `translate`，断言「判为只读 ⇒ logs 必空」，同时钉住
+  51/22/29 这三个数 —— 加 op、改分派表，这里和测试必须一起动。语料里每条只读 op 都要
   真查到东西（`seed` 因此也建表灌行），否则「不产 logs」这句只在测「查不存在的表
   不产 logs」那种废话。
 - `Stats` 刻意**不在**只读集里：它不写 WAL，但它读的是 `Engine` 手里的计数器，而那些
@@ -316,6 +340,129 @@ pipeline=32 看起来像 1 ms 级，那是骗人。
 条连接，按 fd 回填等于把上一任的答复塞进新任的队头。
 覆盖用例：`read_write_stream_keeps_per_connection_order`、
 `concurrent_reads_do_not_obey_stale_or_torn_writes`、`conn_id_reuse_does_not_misroute_acks`。
+
+### 4.4 接入认证（v5 新增，默认关）
+
+一次共享密钥的双向挑战握手（CHAP），跑在既有的帧协议上。**它不是 TLS 的
+简化版**，它只建立身份，不建立机密性（下面「防不住什么」四条是这个节的全部
+边界）。实现一侧在 `src/net/auth.rs`，原语（自写的 SHA-256 / HMAC-SHA256）在
+`src/engine/sha256.rs` —— 自写不是选择，是依赖门逼出来的：`[dependencies]` 非 optional
+项只允许 `libc` + `thiserror`（§11 第 7 条），所以 `ring`/`rustls` 这类东西进不来，
+于是正确性只能拿 FIPS 180-4 / RFC 4231 的已知向量钉住。
+
+```
+客户端  ── AuthBegin { client_nonce } ────────────►   tag 0x0090
+        ◄── Challenge { server_nonce, proto } ─────   tag 0x0190   服务端现取一个 server_nonce
+客户端  ── AuthFinish { mac } ───────────────────►   tag 0x0091   客户端算 HMAC(key, cn‖sn)
+        ◄── AuthOk { server_mac, authed } ────────   tag 0x0191   服务端交出对 sn‖cn 的签名
+```
+
+- **密钥从不上线**，两个方向各自交出「我知道密钥」的证明。MAC 输入是
+  `ctx ‖ PROTOCOL_VERSION_LE ‖ a ‖ b`：客户端方向 `ctx = "treedb-auth-v1-cli"`、
+  `a = client_nonce, b = server_nonce`；服务端方向 `ctx = "treedb-auth-v1-srv"`、
+  **两个随机数顺序相反**。两条域分隔串不同 + 顺序相反，一份证明搬不到另一个
+  方向去用（`macs_are_directional_and_nonce_bound`）。版本绑进 MAC 是免费的，
+  但不做会留坑：同一份密钥在两个协议版本之间不应当能互相顶替。
+- **重放失效**：每次 `AuthBegin` 都现取一个新的 `server_nonce`，所以抓下来的
+  `AuthFinish` 换一条连接、甚至同一条连接重拿一次挑战，都必然算不中。钉它的
+  用例是 `wrong_key_is_rejected_and_a_replay_does_not_work`：连「用对密钥但算给
+  旧挑战」的 MAC 也不能过。
+- **错 MAC 不关连接也不锁死**：回到「还没握手」那一步，可以换个密钥重头再来
+  （运维换密钥时不需要重连）。但这一拍的挑战值作废。
+- **双向**：`AuthOk { server_mac, authed }` 里带回服务端对 `sn‖cn` 的签名，客户端
+  验不过就报错。不然一台假服务端可以只靠明文的 `server_nonce` 骗客户端先把
+  自己的证明交出去。
+- **随机数取不到就当服务坏了**：`getrandom(2)` 失败回 `EAGAIN`，既不静默放行，
+  也不拿时间戳、fd 号这种可猜值当挑战。
+- **密钥文件只认两种形状**（`Key::load`）：32 原始字节，或 64 个十六进制字符。
+  尾随换行只在十六进制那一档容忍；原始字节那一档**一个字节都不剔** —— 随机密钥
+  的末尾字节有 1/64 的概率正好是个 ASCII 空白，先剔空白再比长度就等于每隔一阵
+  子有一把合法密钥报「长度不对」（本轮那 20 000 条建连的跑批就是这么踩上的）。
+  全零与全空白都拒（多半是没填的模板）。`hunter2` 补零到 32 字节这种
+  形状直接 `Config` 错退出 —— 不这么做就是把「不防字典攻击」从「不付成本」
+  变成「真能被人离线爆破」。
+- **`Debug` 只印长度**：`Key` 会跟着 `ServerConfig` 进 panic 文案与日志，把字节
+  带出去等于把密钥写进运维日志。
+
+**它落在哪一层**：握手**不进引擎**。两条事件循环（`workers = 1` 的 `server.rs`、
+`workers > 1` 的 `multi.rs`）在把 op 交给路由/提交线程之前就地答完，共用同一个
+`Gate`；`apply.rs` 里只留一条大声的 `EINVAL "handshake op reached the engine"` 做
+兜底报警 —— 它正常永远不该被执行，被执行的代价是测试里立刻可见而不是默默错答。
+这个落点不是为了整洁：写进引擎就要占提交线程，而提交线程是写路径的唯一串行点
+（§8 第 1 条第 ③ 项）—— 一个「每条连接都要跑一次」的东西挤进去，等于给
+写扩展加一个与连接数成正比的项。它也直接决定了下面那个代价表里「稳态两行应当同
+量级」这条判据。
+
+**默认关，而且关掉就是「这笔改动不存在」**：没配密钥时 `AuthBegin` 一次往返直接
+回 `AuthOk { authed: false }`（不是错误 —— 老服务端不认这个 tag 才会报错，而 v5
+服务端认），数据面一个字节不变；客户端 `key = None` 时**不发送任何新字节**。
+这两句合起来就是「v5 服务端 + v4 客户端逐字同构」的依据（§4.1 的 `4 → 5` 条目）。
+反向则刻意不行：带了密钥的客户端收到 `authed: false` 一律报错退出，**不静默降级**
+—— 否则一个中间人只回一句「这里没事」就把认证整个摘了（用例
+`a_keyed_client_refuses_to_downgrade_against_an_open_server`）。同理 `Challenge.proto`
+与本端不一致也报错：MAC 里本就有版本会算不中，但「版本不符」比「MAC 不对」是
+准确得多的诊断。
+
+**多 worker 下多一条次序规矩**（它是 §4.3 那条保序的直接推论）：一批帧里只要
+夹着握手 op，就不能「握手就地答 + 数据转路由」—— 两条出口的回话次序对不上
+请求次序（协议里没有 request id）。所以切点定在**最后一条握手 op 之后**：切点
+之前一律就地答（握手正常答；夹在中间的数据 op 回 `EAGAIN "op shares a batch
+with a handshake"`，它根本没被碰过，重发即可），切点之后要么整批交路由（已
+认证）要么整批 `EADV`（未认证）。两个文案都在 `Gate` 上共用，两条事件循环不得
+各写一份。这段代码里最阴的一个坑是 `continue`：就地答完就跳下一轮会漏掉 EPOLLOUT
+登记与 `mark_dirty`，那一帧答案永远送不出去。用例：
+`a_straddled_batch_keeps_the_reply_order`、`data_ops_need_a_handshake_on_both_worker_shapes`。
+
+**副本这一侧**：`treedb-standby --auth-key-file` 一个 flag 管两头 —— 对主发起握手，
+并且要求连上来的读者也握手。建连失败与握手失败同一档处理（退避重试，日志
+`unreachable` / `unusable` 分开），否则一次密钥轮换能把副本变成无限重连风暴。
+用例：`a_replica_hands_shakes_with_an_authenticated_primary`。
+
+**代价**（`benches/handshake_cost.sh 20000`，release，loopback，同轮两臂 A/B、
+独立跑 3 次，逐格原始输出 `benches/results/handshake_cost.log`）：
+
+| 量 | 认证关 | 认证开 | 差 |
+|----|--------|--------|----|
+| 建 20 000 条连接（ms） | 8 712 / 6 840 / 7 001 | 8 944 / 8 658 / 8 886 | +232 / +1 818 / +1 885 ⇒ 中位 **+90.9 µs/conn** |
+| 服务端 RSS/conn | 439 / 439 / 439 B | 535 / 532 / 532 B | **+93 ~ +96 B/conn**（总 +1 824 ~ 1 888 KiB） |
+| 稳态 `ping` ops/s | 1 074 381 / 1 147 239 / 1 158 602 | 1 163 503 / 1 093 574 / 1 148 689 | 中位 1 147 239 → 1 148 689（**+0.1 %**） |
+| 稳态 `create` ops/s | 69 018 / 67 123 / 67 414 | 64 122 / 63 796 / 66 652 | 中位 67 414 → 64 122（−4.9 %） |
+
+三句话读这张表：
+
+- **建连那一列才是握手的代价**，每条连接多两次往返 + 两次 HMAC。但这一列的
+  噪声比效应还大：`off` 臂自己三次就是 8 712 / 6 840 / 7 001 ms（摆幅 27 %），
+  所以**任何单次读数都不成立**，只能报中位与区间；这也正是脚本必须两臂同轮
+  交替、并且把 bench 自报的 `connected N conns in M ms` 与 `opened` 计数都校验
+  一遍的原因 —— 分母不同时这个差毫无意义。
+- **RSS 那一列是固定布局的开销**：每连接 `Conn.auth`（一个 `Gate` + 两个 nonce）
+  握手做完也不还回来。它极可复现（`off` 三次全是 439 B），所以要靠连接数放大
+  才量得出 —— 折到单连接就是 +96 B / +21 %，放到万级连接上是 +0.9 MiB 量级。
+  说不上免费，但也不是会让人改架构的数字（§7.6 那一节的绝对值比它大得多）。
+- **稳态两列与认证无关**（握手不进引擎、不占提交线程，所以 group commit 的
+  合并度一字不变），`create` 那 −4.9 % 落在同一臂自身的散布里（`off` 臂三次
+  差 2.8 %、`on` 臂三次差 4.5 %），因此**不能宣称回归也不能宣称变快**，只能写
+  「与噪声同量级」。要判数据面有没有被这轮改动碰到，用的是两臂都不开认证的
+  受控 A/B：`benches/ab_layout.sh v0.3.5` → `benches/results/ab_layout_v0.3.6.log`。
+  八格（`readdir`/`lookup` × warm 500/16000 × `workers` 1/8）里**没有一格变慢超过
+  1 %**（最差一格 −0.90 %），其余是 +0.0 ~ +6.0 % 的向上抖动（最大那格
+  `warm=500 w=8` 的 `readdir` 803 203 → 851 094）—— 方向与量级都是单轮 3 s 采样
+  的本底噪声，没有一个数字可以被当成“认证改动让读变快了”的证据。
+
+未开认证时这一整套代码等于不存在：`Gate::new(false)` 之后 `allows_data()` 恒真，
+握手 op 只在被显式发出时才会走到，数据路径上多出来的判断是一次 `match` 分支。
+
+**它防不住什么**（写清楚而不是等使用者自己发现；与 `src/net/auth.rs` 模块头同源）：
+
+1. **不防窃听**。握手之后的每一个字节仍是明文，CRC32 只判损坏。抓包的人拿不到
+   密钥，但拿得到全部数据，也随时能 RST 掉这条连接。
+2. **不做授权**。过了握手的连接与今天一样拥有全部 51 个 op，包括 `Shutdown`。
+   它是「一把钥匙开整扇门」，不是租户模型 —— 多租户、配额、审计归属仍在引擎
+   之外（§8 第 13 条）。
+3. **不防字典攻击**。密钥必须是 32 字节随机值；从口令派生的话，抓一次握手就能
+   离线试口令（所以 `Key::load` 在长度上不留余地）。
+4. **不证明「是当前那个主」**。它只证明对端持有密钥；脑裂后旧主同样持有密钥，
+   照样能应答握手。fencing token 仍然欠着（§11 第 4 条②③）。
 
 ---
 
@@ -647,9 +794,11 @@ committer，`workers = 1` 时是轮末周期任务）。两档跑的是同一份
 1. **异步，不保证读到已确认的写**。副本能读到多少取决于上一次 tick 到哪。要
    「读己之写」的客户端必须继续读主，或者自己等 `lag == 0`（这一手很弱，因为
    `lag` 是上次往返的快照而不是未来承诺）。
-2. **没有主身份认证与 fence**。`install_snapshot` 拒绝水位回退只能挡住「连到了一
-   个更旧的主」这一种错配，挡不住「两个同代但互不知情的主各自被一个副本跟着」。
-   定序仍然只在单主上成立，切主必须先把旧主真停掉。
+2. **有主身份认证（§4.4，可选），但没有 fence**。开了 `--auth-key-file` 之后，副本至少
+   能证明「我对面这个端口后面的人持有集群密钥」；但脑裂后的旧主同样持有密钥，
+   `install_snapshot` 拒绝水位回退也只能挡住「连到了一个更旧的主」这一种错配，挡不住
+   「两个同代但互不知情的主各自被一个副本跟着」。定序仍然只在单主上成立，切主必须
+   先把旧主真停掉。
 3. **`SnapFetch` 把整个元数据状态交出去**，`WalFetch` 交出全部尚未截进的写。引擎
    本来就假定这个端口在受控网络内（任何客户端都能 `ListViews`/`RowList`），所以
    这不新增一类暴露面 —— 但它把「端口只能对内」这条部署约束的重要性抬高了。
@@ -686,8 +835,12 @@ committer，`workers = 1` 时是轮末周期任务）。两档跑的是同一份
 ## 7. 性能实测（五轴）
 
 口径提醒：本节各节里的「本轮」指**它所记录的那一轮**（v0.3.1 读轴、v0.3.2 写轴），
-不是本文开头那句 v0.3.5 —— 从 v0.3.3 起那三批（能力面、快照迁移、日志传送）都没动
-性能，所以本节数字一个没重跑；**唯一的例外是 §7.11**，那是 `v0.3.5` 上重测的单连接格。
+不是本文开头那句 v0.3.6 —— 从 v0.3.3 起那四批（能力面、快照迁移、日志传送、接入
+认证）都没改过数据面，所以本节数字一个没重跑；**唯一的例外是 §7.11**，那是
+`v0.3.5` 上重测的单连接格。本轮新量的那两列（握手开/关）不混进本节，它们单独落在
+§4.4 末表与 `benches/results/handshake_cost.log`；与本轮同批跑的受控 A/B
+（`benches/results/ab_layout_v0.3.6.log`，两臂都不带密钥）只用来回答一个问题：
+这 2 op / 2 reply 的改动有没有碰到未开认证时的读路径 —— 八格里最差一格 −0.90 %，没有。
 
 复现：`benches/throughput_matrix.sh [每格秒数=3] [轴…]`，原始逐格输出在
 `benches/results/matrix.log`。下面只报表格化的结论。注意脚本默认只跑轴 1–4，
@@ -1373,7 +1526,8 @@ checkpoint 之后首次改页的 full-page write 会让一次 commit 写的字�
 5. **无跨视图原子 op、无用户可见事务**（§5.3）。
 6. **有异步只读副本，无同步复制**（§6.6）：`refs` 账本和 WAL 仍是单主，副本只是
    同一份日志的第二个消费者。三条具体边界：① 副本**不保证读到已确认的写**，
-   要「读己之写」的客户端仍得读主；② 没有主身份认证也没有 fence，`install_snapshot`
+   要「读己之写」的客户端仍得读主；② 主身份认证只能证明「对端持有这把密钥」（§4.4，
+   且默认关），没有 fence，`install_snapshot`
    只拒绝「水位往回走」这一种错配，切主必须先把旧主真停掉；③ 没有自动故障
    转移 —— 主没了副本只是继续答读，不会把自己提上去。写扩展也不因副本而变
    （第 1 条第 ③ 项那句仍成立）。HA 要拿上层继续用 PG 做权威仍是另一条路（过渡档现状）。
@@ -1404,11 +1558,15 @@ checkpoint 之后首次改页的 full-page write 会让一次 commit 写的字�
     「可以攒着」。另一条：它不 flock，只在改写前后各读一次源文件比对，服务端没停就
     动手只能靠这个哨兵赌输。迁移本身是「全量读进内存 `State` 再全量写出」，成本
     正比于快照大小与 §8 第 2 条同源，没有增量路径。
-13. **接入面没有认证、没有授权、没有传输加密**。这条以前只在第 6 条记了「副本对
-    主」那一侧，而客户端这一侧更常用，故单独钉住：线协议是裸 TCP + 长度前缀 +
-    CRC32，而 CRC32 只判损坏，不防篡改也不提供身份；`Client::connect` 连上就拿到全部
-    49 个 op 的权限，包括 `Shutdown` 与 `Checkpoint`。所以「谁能连到这个端口」=
-    「谁能改整个状态」：多租户、配额、审计归属都得在**引擎之外**做（grovefs 的
+13. **接入面：认证是可选的，而且只管身份；没有授权、没有传输加密**。这条以前写的是
+    「根本没有认证」，v5 之后要改成「补了一小块、剩下的仍然没有」（§4.4）。剩下的
+    具体是四条：① **默认仍关** —— `--auth-key-file` 不给就是裸 TCP + 长度前缀 +
+    CRC32，`Client::connect` 连上就拿到全部 51 个 op 的权限，包括 `Shutdown` 与
+    `Checkpoint`；② **开了也是「一把钥匙开整扇门」** —— 过了握手的连接与其他连接
+    权限完全相同，无租户、无配额、无按 op 分组；③ **不加密** —— 握手之后仍是
+    明文，CRC32 只判损坏，抓包的人读得到全部数据也随时能 RST；④ **不证明「是当前
+    那个主」**（第 6 条②③）。所以「谁能连到这个端口 + 谁持有这把密钥」还是等于
+    「谁能改整个状态」：多租户、配额、审计归属仍得在**引擎之外**做（grovefs 的
     apikey 与网关白名单就是这一层的现状），或者把端口锁在本机回环/私有网段里 ——
     `--listen` 默认就是 `127.0.0.1:7777`。也没有 TLS，没有 Unix socket 选项。视图名
     25 字节那道墙（第 8 条）只是命名空间隔离，不是访问控制。
@@ -1423,8 +1581,8 @@ checkpoint 之后首次改页的 full-page write 会让一次 commit 写的字�
 ## 9. 测试清单
 
 ```sh
-cargo test --release                            # 默认档（纯引擎），112 条（+1 ignored）
-cargo test --release --features postgres-compat # 加上过渡档，143 条（+7 ignored）
+cargo test --release                            # 默认档（纯引擎），134 条（+1 ignored）
+cargo test --release --features postgres-compat # 加上过渡档，165 条（+7 ignored）
 cargo test --release --lib                      # 只看引擎单测
 cargo test --release --test migrate              # 快照升级：8 条走 API + 3 条真进程跑 CLI（§6.5）
 cargo test --release --test scale_connections -- --ignored   # 万级连接重压（§7.6）；并发数由 TREEDB_CONNS 控制，本机到 25 000 为限（再高是客户端源端口不够）
@@ -1432,6 +1590,7 @@ bash benches/backup_probe.sh 2                  # 备份/还原三形状：冷�
 bash benches/throughput_matrix.sh 3             # 五轴吞吐矩阵（默认只跑 1–4）
 bash benches/default_check.sh                   # 零旗标默认档同格重跑 5 次（§7.5）
 bash benches/ab_layout.sh <基线 rev>            # 受控 A/B：只换服务端二进制（§7.10）
+bash benches/handshake_cost.sh 20000            # 接入认证的代价：建连风暴 + 稳态两臂（§4.4）
 bash benches/sync_ratio.sh 3                    # 一次 fsync 摊了几次写（§7.9）
 bash benches/ab_durability.sh <基线 rev>        # 写轴 A/B：持久化档的吞吐与尾延迟（§7.9 第 3 条）
 bash benches/probe_srv.sh                       # 服务端吃了几核（/proc 计数，§7.5）
@@ -1453,12 +1612,13 @@ gcc -O2 -pthread -o /tmp/lb_floor benches/lb_floor.c && /tmp/lb_floor 1 64 3   #
 
 | 目标 | 数量 | 覆盖 |
 |------|------|------|
-| `--lib` | **38**（+30 属 `postgres-compat`） | codec round-trip（全 tag：49 op / 28 reply）、**fetch 应答的两条长度/计数上限在 decode 处兼得**（`fetch_reply_bounds_are_enforced_on_decode`，§6.6）、**`Log` 全变体 round-trip**（含本轮四条表日志）、CRC 已知向量、碎帧/超长帧、WAL 帧与截断重放、**预分配空洞重开**（`prealloc_padding_reopens_cleanly`）、**大批次不跳写**（`huge_batch_writes_every_record`）、**交付只到 durable 水位**（`deliver_stops_at_the_durable_watermark_not_the_logical_end`，§6.6 第一条口径）、**hint 命中与退回全扫**（`deliver_streams_forward_with_the_returned_hint` / `deliver_ignores_a_stale_or_absent_hint_and_still_lands_right`）、**跨滑动窗口不丢记录**、**max_bytes 是软上限**（至少给一条 + 逐轮恰好吃完整批）、**两代快照正文逐字节相同**（`legacy_snapshot_decodes_from_the_same_prefix`，§6.5 的前提）、**旧布局写回不能默默丢表**（`legacy_writer_refuses_to_drop_tables`）、**seq 跳号硬错**、状态快照保留 node key、**两层 dentry 与 kind 冗余过快照不坏**（`dentries_are_two_level_and_kind_survives_snapshot`，§7.10）、**通用表行与索引过快照不坏**（`generic_tables_keep_rows_and_rebuild_indexes`，§5.1）、缓冲压缩、租约过期边界、`default_workers` 上下界 |
+| `--lib` | **54**（+30 属 `postgres-compat`） | codec round-trip（全 tag：51 op / 30 reply）、**fetch 应答的两条长度/计数上限在 decode 处兼得**（`fetch_reply_bounds_are_enforced_on_decode`，§6.6）、**`Log` 全变体 round-trip**、**握手两条 op 的定长字段多一字节少一字节都拒**（`handshake_fixed_fields_reject_wrong_length`，§4.4）、**自写 SHA-256/HMAC 的已知向量 10 条**（FIPS 180-4 与 RFC 4231 逐条对表 + `ct_eq` 长度严格，`src/engine/sha256.rs`）、**`Key::load` 收哪三种形状拒哪三种**（`key_load_is_strict`：32 原始字节**一个字节都不剔**、hex 档忽略尾随换行、全空白与全零拒 —— 那条「不剔」是拿真密钥踩出来的，随机密钥末位正好是 ASCII 空白的概率是 1/64，§4.4）、**`Gate` 的四档进度与双向 MAC**（`gate_gates`、`gate_without_key_is_open`、`macs_are_directional_and_nonce_bound`、`key_debug_does_not_leak_bytes`）、CRC 已知向量、碎帧/超长帧、WAL 帧与截断重放、**预分配空洞重开**（`prealloc_padding_reopens_cleanly`）、**大批次不跳写**（`huge_batch_writes_every_record`）、**交付只到 durable 水位**（`deliver_stops_at_the_durable_watermark_not_the_logical_end`，§6.6 第一条口径）、**hint 命中与退回全扫**（`deliver_streams_forward_with_the_returned_hint` / `deliver_ignores_a_stale_or_absent_hint_and_still_lands_right`）、**跨滑动窗口不丢记录**、**max_bytes 是软上限**（至少给一条 + 逐轮恰好吃完整批）、**两代快照正文逐字节相同**（`legacy_snapshot_decodes_from_the_same_prefix`，§6.5 的前提）、**旧布局写回不能默默丢表**（`legacy_writer_refuses_to_drop_tables`）、**seq 跳号硬错**、状态快照保留 node key、**两层 dentry 与 kind 冗余过快照不坏**（`dentries_are_two_level_and_kind_survives_snapshot`，§7.10）、**通用表行与索引过快照不坏**（`generic_tables_keep_rows_and_rebuild_indexes`，§5.1）、缓冲压缩、租约过期边界、`default_workers` 上下界 |
 | `tests/engine_crud.rs` | **26** | §5.2 全部 POSIX 语义（含 GC 线索与 NOREPLACE）+ 控制面（密钥/审计/定义/放置）+ checkpoint 后重开 + 坏尾截断；本轮新增 6 条：4 条盖通用表（表形状校验与表名回收、行写边界/约束/CAS/flags、主键与索引列游标翻页、表状态过 checkpoint+重开），1 条盖 `ReadDirPlus` 与 `ReadDir`+`Getattr` 逐字段对齐，1 条盖 `Stats` 新字段 |
 | `tests/net_protocol.rs` | **10** | TCP 端到端：CRUD、碎帧、pipeline 保序、并发连接不串扰、超长帧只杀违规者、大回包流式读完、`--stats`/`--checkpoint`/`--shutdown`（含两个磁盘长度与协议版本）、优雅停服后同地址立刻重绑、**通用表 + readdirplus 走 TCP**（1000 行 pipeline、错误帧经网络回真实 errno、8 KiB 收缓冲下大应答完整接回） |
 | `tests/crash_recovery.rs` | **6** | §6.4 |
-| `tests/read_scaling.rs` | **8** | 只读分派表逐条对 `translate`（判错一条就是丢写；语料 49 条全变体，钉住 49/22/27 三个数）、**三档划分穷举且两两不交**（`ops_partition_into_three_classes`，22/22/5，§4.2 与副本拒写的判据同源）、`workers=1/8` 答复逐条相同（负载含表读与 `ReadDirPlus`，混合批里把 CAS 写夹在读之间）、每连接流内顺序、一写多读不读到半截状态、`ops_total` 记上 worker 就地算的读、并行档下 `kill -9` 已 ack 的写全在（目录写与表写逐条交错）、**fd 复用不会把上一任的应答塞给新任** |
-| `tests/replication.rs` | **9** | §6.6 的八件事（九条用例，端到端那一件两档各一条；主是真进程，副本是测试里的 `Engine` + `Follower`，只有最后三条起真 `treedb-standby`）：主写逐条收敛（ino/属性/readdir 与主对齐）、**主被 `kill -9` 后副本仍答读且不退出**（`replica_errors` 抬、`connected` 落 true→false）、**gap 触发分块重装快照**（4 KiB 块下 ≥ 2 块，且副本落盘的 `state.snap` 与主的逐字节相同）、**副本拒写在引擎层**（五个形状不同的写真 op 全 `EROFS` 且零 logs、零水位推进，而 `ListViews`/`Stats`/`Checkpoint` 放行）、**lag 中途为正、追平归零**（2 KiB/轮 喂不饱一批）、**副本重启靠自己的日志接上**（`resyncs == 0`，快照+尾巴那条恢复路径）、端到端两档事件循环同一份断言（`workers=1`/`2`：线上 `EROFS`、`Stats` 新字段过线、追平后读到主的新写）、启动参数三道门（缺 `--primary` / 自己拉自己 / `--fetch-bytes 0` 均退出码 2） |
+| `tests/read_scaling.rs` | **8** | 只读分派表逐条对 `translate`（判错一条就是丢写；语料 51 条全变体，钉住 51/22/29 三个数）、**三档划分穷举且两两不交**（`ops_partition_into_three_classes`，22/22/7，§4.2 与副本拒写的判据同源）、`workers=1/8` 答复逐条相同（负载含表读与 `ReadDirPlus`，混合批里把 CAS 写夹在读之间）、每连接流内顺序、一写多读不读到半截状态、`ops_total` 记上 worker 就地算的读、并行档下 `kill -9` 已 ack 的写全在（目录写与表写逐条交错）、**fd 复用不会把上一任的应答塞给新任** |
+| `tests/auth.rs` | **5** | §4.4 在线协议上的握手形状（MAC 的数学性质与闸门四档在 lib 单测里，不重复）：未握手的连接一个数据 op 也拿不到（**两种 worker 形状各一跑，两条路径拦截点不是同一处代码**）、错密钥被拒但不锁死 + 旧 MAC 重放不上 + 换对密钥能过、带密钥的客户端拒绝降级、未配密钥的服务端一次往返回 `authed: false`（这是 v5 客户端连 v4 形状不卡死的依据）、握手与数据 op 挤同批时**应答次序不能被打乱** |
+| `tests/replication.rs` | **10** | §6.6 的九件事（十条用例，端到端那一件两档各一条；主是真进程，副本是测试里的 `Engine` + `Follower`，只有最后三条起真 `treedb-standby`）：主写逐条收敛（ino/属性/readdir 与主对齐）、**主被 `kill -9` 后副本仍答读且不退出**（`replica_errors` 抬、`connected` 落 true→false）、**gap 触发分块重装快照**（4 KiB 块下 ≥ 2 块，且副本落盘的 `state.snap` 与主的逐字节相同）、**副本拒写在引擎层**（五个形状不同的写真 op 全 `EROFS` 且零 logs、零水位推进，而 `ListViews`/`Stats`/`Checkpoint` 放行）、**lag 中途为正、追平归零**（2 KiB/轮 喂不饱一批）、**副本重启靠自己的日志接上**（`resyncs == 0`，快照+尾巴那条恢复路径）、端到端两档事件循环同一份断言（`workers=1`/`2`：线上 `EROFS`、`Stats` 新字段过线、追平后读到主的新写）、启动参数三道门（缺 `--primary` / 自己拉自己 / `--fetch-bytes 0` 均退出码 2）、**开了认证的主只有握得上手的副本追得动**（对密钥逐条收敛、错密钥不收敛） |
 | `tests/concurrency.rs` | 0（+7，整文件 feature 门控） | T1 之后整个文件在 `postgres-compat` 后面：无 PG 时跑「拨号失败不漏 live」（1 条，要 feature），其余 6 条 `#[ignore]` 需真实 PG。**它测的是共享池，不是引擎并发**（§7.8）|
 | `tests/scale_connections.rs` | 1（+1 ignored） | 1 000 连接 fd/RSS 断言每次跑；万级（`TREEDB_CONNS`，含 25 000）手动 |
 | `tests/independence.rs` | **3** | 独立性三把门：内核目录（`src/engine`、`src/net`）不出现客户端名字；`[dependencies]` 非 optional 项只能是 `libc` + `thiserror`；`postgres-compat` 不得进 `default`（§11 第 7 条） |
@@ -1506,7 +1666,7 @@ checkpoint 前 `snap_bytes == 0`、`proto_version == PROTOCOL_VERSION`）。
 `downgrade_to_v2` 造样本 —— checkpoint 后按 v2 重写快照文件，而不是手工拼一个假文件，
 这样「旧布局」永远与代码里的写出侧同步）。
 
-本轮（日志传送/只读副本）新加的回归锁。
+上一轮（日志传送/只读副本，`v0.3.5`）新加的回归锁。
 lib 侧六条全部压在「传送口径」的四条句子上：
 `fetch_reply_bounds_are_enforced_on_decode`（越上限的 `WalBatch` 必须在 **decode**
 处拒帧，不能先按对端自报的计数分配再去索引一个更短的 body；反之 `SnapFetch` 的
@@ -1537,8 +1697,70 @@ lib 侧六条全部压在「传送口径」的四条句子上：
 并新增 `ops_partition_into_three_classes`。理由是副本拒写用的是**同一条三档判据**
 （`!is_readonly() && !is_control()`）—— 判据一改，副本的读写面跟着改，所以它必须和
 分派表钉在同一个穷举下（§4.2）。`op_codec_round_trip_all_tags` /
-`reply_codec_round_trip` 也从「逐 tag 列名」改成按 49 / 28 计数，新增两条 op 与两个
-reply tag 自动进语料。
+`reply_codec_round_trip` 也从「逐 tag 列名」改成逐条枚举全部变体（49 / 28 那两个
+数字只出现在注释里，带数字的断言在 `tests/read_scaling.rs`，本轮在 §9 末修正了
+这一点），新增两条 op 与两个 reply tag 自动进语料。
+
+本轮（接入认证，`v0.3.6`）新加的回归锁 —— **22 条，且上一轮的 112 条一条没删**。
+这句不是估计：`git worktree add … v0.3.5` 单独编一份旧二进制实跑 `cargo test --release`
+得 112 passed / 1 ignored（lib 38），本轮是 134 / 1（lib 54），两边测试名 `comm` 逐条
+对出来是 **22 新增、0 删除**。密码学那部分没有可「信任的库」可用（§11 第 7 条那道
+依赖门），所以回归面的重心全部压在「已知向量 + 语义形状」上。
+
+lib 侧 16 条分三处。`src/engine/sha256.rs` 十条是自写原语的唯一防线：FIPS 180-4 的
+`""`/`"abc"`/两分组三条标准摘要，加上 `sha256_padding_boundary`（55 / 56 / 64 三个长度
+必须落进**不同的填充分支**且摘要互不相同，再拿 7 字节一次地调 `update` 与一次
+`sha256` 交叉验证 —— 分块喂数据的路径不能只有自己骗自己）；HMAC 那五条是 RFC 4231
+的 case 1/2/3/6/7 加上 `hmac_key_between_digest_and_block`（50 字节密钥：大于一份
+摘要、小于一个分组，上面那些标准样本全部跳不出这个区间，而阈值误取成
+`> DIGEST_LEN` 恰好只在这里露馅，期望值是本轮拿 `python3 -c "import hmac,hashlib"`
+逐字对出来的）。`ct_eq_matches_but_is_length_strict` 钉住常数时间比对**不隐藏长度
+差** —— 这是 `Key::load` 在长度上零容忍的同一口径。
+
+`src/net/auth.rs` 五条压握手语义本身：`macs_are_directional_and_nonce_bound`（换方向、
+换任一 nonce、换密钥都必须换结果 —— 三个都是握手能成立的必要条件）、`gate_gates`
+（四档逐条走：未握手拦数据但不断连、没有待决挑战就交 MAC 同样拒、错 MAC 回到
+`Needed` 而不是锁死、**上一拍的 MAC 因 challenge 已被新的替换而重放不上**、放行后
+`on_op` 返回 `None`）、`gate_without_key_is_open`（没密钥时握手是一次空转而不是错误 ——
+「默认关 = 这笔改动不存在」的可执行版本，也是 `tests/auth.rs` 那条「总握手的客户端
+能连老服务端」的依据）、`key_load_is_strict`、`key_debug_does_not_leak_bytes`。
+`src/engine/model.rs` 那条 `handshake_fixed_fields_reject_wrong_length` 在 codec 层：
+nonce 与 MAC 都是定长，decode 必须按长度硬拒 —— 少了它，一个短帧会解出一条「字段
+错位」的握手 op，而错位后的 MAC 永远对不上任何东西，看起来就像「密钥错了」。
+
+集成侧六条 = `tests/auth.rs` 五条 + `tests/replication.rs` 的
+`a_replica_hands_shakes_with_an_authenticated_primary`（对密钥逐条收敛、错密钥不收敛 ——
+副本一头最容易被测到的假象是「连上了」，断言得写在数据收敛上而不是
+连接成功上）。`tests/auth.rs`
+里两条的形状是写到才发现非这样不可：`data_ops_need_a_handshake_on_both_worker_shapes`
+必须 `workers=1/8` 各跑一遍（单线程循环与多 worker 循环的拦截点是**两处代码**，
+只测一档等于另一档裸奔）；`a_straddled_batch_keeps_the_reply_order` 是 §4.4 那条次序
+规矩的唯一防线，它只能挂在 `out` 队列上数应答顺序（协议里没有 request id，
+可观测的只有 FIFO）。
+
+同一轮里被**改写**而不只是新增的四个报警器：`op_codec_round_trip_all_tags` 与
+`reply_codec_round_trip` 的语料各加两条（两条握手 op、`Challenge` 与 `AuthOk`）。**得修正
+上一段的一句话**：那两条测试**没有**计数断言 —— 本轮核代码时才发现「改成按 49 / 28
+计数」这句写错了，它们逐条枚举变体并断言 round-trip 与 `remaining() == 0`，数字只在
+注释里。真正钉住数字的是 `tests/read_scaling.rs` 那两条：`readonly_classification_matches_translate`
+的语料 49 → 51、计数 49/22/27 → **51/22/29**，`ops_partition_into_three_classes` 的三档
+**(22, 22, 5) → (22, 22, 7)** —— 后一条改动就是 §4.2 里那段「握手为何归控制面」的
+理由被钉住的地方：它一旦被人改回只读档，worker 就会以为可以在自己手里串行化一条
+每连接的可变状态。换句话说：**枚举式的语料本身不是闸门**，闸门是那两个带数字的断言。
+`tests/common/mod.rs` 不算回归锁，但它是本轮一个真实的形状变化：`Server` 现在存着
+自己的 `Option<Key>`，因为 `wait_ready` 与 `client()` 都要按它决定要不要握手 ——
+不带这个字段时，开了认证的实例在**探活那一步**就永远不 ready，而报出来的错是
+「服务端没起来」，这是本轮调试里最误事的一个假诊断。
+
+`key_load_is_strict` 里那个**尾部空白**循环（`\n` / 空格 / `\t` / `\r` 四种末位字节
+都必须原样收下）不是设计出来的，是被真密钥踩出来的：`head -c 32 /dev/urandom`
+写出的密钥每 64 把就有 1 把末位正好是 ASCII 空白，而 `Key::load` 原先先剔尾随
+空白再比长度，于是它报 `got 31` 并以退出码 2 拒绝启动 —— 一次 20 000 条建连的
+跑批跑到一半才爆。先当脚本坏了查，才对上这是产品 bug。修法是「32 原始字节那一档
+一个字节都不剔」，并把全空白单独拒掉（它长度合法，新规则保不住它，而它强度为零）。
+选在 20 000 条建连那一轮里才重现，是因为它取决于随机数据：这个依赖形状（只在
+读密钥那一刻拒启、概率 1/64、报错文案看起来像用户手抖）是本轮最值得记下来的
+一个坑。
 
 ### 9.1 四条被作废的测量（记录过程，防止有人复用假数据）
 
@@ -1738,7 +1960,9 @@ spike 明确**没**做、也不在接入面上假装做的事 —— 一律返�
    副本确实开了只读容量，但写扩展仍在单提交线程上（§8 第 1 条第 ③ 项）。
    接下去要动的三项，按价值排序：① 传送吞吐与它对主 p99 的影响都没实测（现在
    手里只有算术上界），要的是冷启动下载速率、稳态追平速率、每 tick 占住提交线程
-   多久这三格；② 没有主身份认证与 fence，多主错配只能靠部署挡住；③ 没有提升
+   多久这三格；② ~~没有主身份认证~~ **已补一半**（§4.4）：共享密钥双向握手能证明
+   「对端持有这把密钥」，但**仍没有 fence**，脑裂后的旧主同样持有密钥、照样能应答
+   握手，多主错配还是只能靠部署挡住；③ 没有提升
    路径（`--promote`），副本坏了只能新起一个主重拉。
 5. ~~**接入 spike**~~ **已完成并端到端跑通**（grovefs 实验分支
    `exp/treedb-integration`，用户 2026-11-19 授权），结果与缺口清单见 §10 阶段 B

@@ -1288,5 +1288,13 @@ pub fn translate(s: &State, now: i64, op: &Op) -> (Vec<Log>, Reply) {
         | Op::Shutdown
         | Op::WalFetch { .. }
         | Op::SnapFetch { .. } => (vec![], Reply::Pong),
+
+        // 握手 op 在事件循环里就被处置掉了（§4.4）：它既不读状态也不写状态，
+        // 进引擎没有任何意义。落到这里说明分派漏了一层 —— 大声报错而不是
+        // 像上面那组一样回个看上去正常的 Pong。
+        Op::AuthBegin { .. } | Op::AuthFinish { .. } => (
+            vec![],
+            Reply::err(errno::EINVAL, "handshake op reached the engine (§4.4)"),
+        ),
     }
 }

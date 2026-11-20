@@ -10,6 +10,7 @@
 //! | [`mem`] | 权威内存状态 + 幂等 `Log` + 快照编解码 | [`codec`] |
 //! | [`wal`] | CRC 记录帧 + group commit + 崩溃重放 | [`codec`] |
 //! | [`model`] / [`codec`] | 协议契约与字节原语 | 无 |
+//! | [`sha256`] | 握手用的 SHA-256 / HMAC-SHA256（§4.4） | 无 |
 //!
 //! 引擎本体只依赖 `libc` + `thiserror` + 标准库；`postgres` / `rusqlite`
 //! 只出现在过渡档（[`crate::pool`] / [`crate::store`] / [`crate::persist`]）。
@@ -19,6 +20,7 @@ pub mod codec;
 pub mod core;
 pub mod mem;
 pub mod model;
+pub mod sha256;
 pub mod wal;
 
 pub use codec::{Rd, W};
@@ -27,7 +29,7 @@ pub use core::{
     SnapshotInfo,
 };
 pub use mem::{Log, State, SNAP_LEGACY_VERSION, SNAP_VERSION};
-pub use model::{Names, Op, Reply};
+pub use model::{Names, Op, Reply, NONCE_LEN};
 pub use wal::Wal;
 
 /// 线协议单帧 payload 上限。目录 readdir 一次 10 万条也够；再大直接拒，
@@ -47,7 +49,12 @@ pub const MAX_FRAME: u32 = 8 * 1024 * 1024;
 /// 并给 `EngineStats` 尾部追加副本水位那几个字段。tag 空间依旧只追加不改旧值，
 /// 所以 v3 认识的字节在 v4 里一字未动；但 `Stats` 的尾部多长出一截 —— 上面那
 /// 条「旧客户端静默少一个字段」的兼容缺口，v4 正正好踩在 `Stats` 这一个口上。
-pub const PROTOCOL_VERSION: u16 = 4;
+///
+/// v5 加接入认证那两条握手 op（`AuthBegin` / `AuthFinish`）与两条应答
+/// （`Challenge` / `AuthOk`），见 §4.4。同样是只追加不改旧值，而且**服务端没启用
+/// 认证时一个握手 op 也不会发**，所以 v4 客户端对 v5 服务端逐字照旧 ——
+/// 这一版的兼容缺口比 v4 那条窄：`Stats` 的字段布局没动。
+pub const PROTOCOL_VERSION: u16 = 5;
 /// 帧头长度：payload 字节数（u32 小端，不含头）。
 pub const FRAME_HDR: usize = 4;
 

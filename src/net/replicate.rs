@@ -21,8 +21,10 @@
 use crate::engine::model::{errno, Op, Reply, WAL_FETCH_MAX, WAL_HINT_NONE};
 use crate::engine::Engine;
 use crate::error::{Error, Result};
+use crate::net::auth::Key;
 use crate::net::client::Client;
 use std::net::{SocketAddr, TcpStream};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// 副本的追平参数。`ServerConfig::replication` 里出现它，本实例就是副本。
@@ -37,6 +39,12 @@ pub struct ReplicaCfg {
     pub max_bytes: u32,
     /// 一次往来的读写超时。事件循环里跑，不能没有上限。
     pub timeout_ms: u64,
+    /// 主启用了接入认证时的共享密钥（§4.4）。`None` = 不握手。
+    ///
+    /// 副本与主之间跑的仍是同一套握手，没有专门身份。注意它只证明
+    /// 「对端持有这把密钥」：脑裂后的旧主同样持有，照样能应答握手 ——
+    /// fencing token 仍然欠着（§11 第 4 条②③）。
+    pub auth: Option<Arc<Key>>,
 }
 
 impl ReplicaCfg {
@@ -50,6 +58,7 @@ impl ReplicaCfg {
             // 但一次 tick 占住循环的时间得压得住；真要快点追就让 interval 小。
             max_bytes: 1 << 20,
             timeout_ms: 5_000,
+            auth: None,
         }
     }
 }
@@ -132,20 +141,35 @@ impl Follower {
     /// 建连。用 `connect_timeout` 而不是 `Client::connect`：后者只给读写设超时，
     /// 一个不可达的地址会把 SYN 重传的全程（默认几分钟）付在监听线程上；
     /// 而只管建连不设读写超时，一个接受连接却不答话的对端同样能把循环钉住。
+    ///
+    /// 握手失败归入与连不上同一档：它意味着这台副本的密钥与主对不上，
+    /// 重试不会自己变好，但也不能把追平循环钉死 —— 继续用已有状态答读、
+    /// 同时指数退避重试，是这里唯一不偷工的走法（错误得在 `Stats` 里看得见）。
     fn connect(&mut self, eng: &mut Engine) -> bool {
         let dur = Duration::from_millis(self.cfg.timeout_ms.max(1));
-        match TcpStream::connect_timeout(&self.cfg.primary, dur) {
+        // 一个 `std::result::Result<Client, String>`：建连与握手的失败在这里同
+        // 档，但错误文本必须保留各自的形状（“连不上”与“密钥不对”是完全不同的
+        // 运维动作）。不用 crate 的 `Result` 别名：它的错型是 `Error`，装不下
+        // 两种来源。
+        let sock = TcpStream::connect_timeout(&self.cfg.primary, dur);
+        let built: std::result::Result<Client, String> = match sock {
+            Err(e) => Err(format!("connect: {e}")),
             Ok(s) => {
                 let _ = s.set_nodelay(true);
                 let _ = s.set_read_timeout(Some(dur));
                 let _ = s.set_write_timeout(Some(dur));
-                self.client = Some(Client::from_stream(s));
+                Client::from_stream_auth(s, self.cfg.auth.as_deref()).map_err(|e| e.to_string())
+            }
+        };
+        match built {
+            Ok(c) => {
+                self.client = Some(c);
                 true
             }
             Err(e) => {
                 eng.note_replica_error();
                 if self.backoff_ms == self.cfg.interval_ms.max(1) {
-                    eprintln!("treedb-standby: primary {} unreachable: {e}", self.cfg.primary);
+                    eprintln!("treedb-standby: primary {} unusable: {e}", self.cfg.primary);
                 }
                 self.backoff_ms = (self.backoff_ms * 2).min(BACKOFF_MAX_MS);
                 false

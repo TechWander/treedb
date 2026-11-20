@@ -1,0 +1,18 @@
+构建基线 v0.3.5 → /tmp/treedb-ab.kTii9V
+    Finished `release` profile [optimized] target(s) in 18.76s
+old  warm=500    w=1   readdir → 91294 ops/s over 3.00s | p50=655 us
+old  warm=500    w=1   lookup → 135229 ops/s over 3.00s | p50=453 us
+new  warm=500    w=1   readdir → 94325 ops/s over 3.00s | p50=654 us
+new  warm=500    w=1   lookup → 134016 ops/s over 3.00s | p50=463 us
+old  warm=500    w=8   readdir → 803203 ops/s over 3.00s | p50=69 us
+old  warm=500    w=8   lookup → 1029855 ops/s over 3.00s | p50=54 us
+new  warm=500    w=8   readdir → 851094 ops/s over 3.00s | p50=68 us
+new  warm=500    w=8   lookup → 1063026 ops/s over 3.00s | p50=55 us
+old  warm=16000  w=1   readdir → 86513 ops/s over 3.00s | p50=707 us
+old  warm=16000  w=1   lookup → 123714 ops/s over 3.00s | p50=499 us
+new  warm=16000  w=1   readdir → 85965 ops/s over 3.00s | p50=713 us
+new  warm=16000  w=1   lookup → 128986 ops/s over 3.00s | p50=487 us
+old  warm=16000  w=8   readdir → 865043 ops/s over 3.00s | p50=63 us
+old  warm=16000  w=8   lookup → 990950 ops/s over 3.00s | p50=59 us
+new  warm=16000  w=8   readdir → 859383 ops/s over 3.00s | p50=66 us
+new  warm=16000  w=8   lookup → 989068 ops/s over 3.00s | p50=60 us

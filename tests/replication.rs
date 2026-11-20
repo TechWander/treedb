@@ -14,14 +14,16 @@
 #[path = "common/mod.rs"]
 mod common;
 
-use common::{free_addr, Server};
+use common::{free_addr, test_key, Server};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 use treedb::engine::core::SNAP_FILE;
 use treedb::engine::model::{errno, Kind, Node, Op, Reply};
 use treedb::engine::{Durability, Engine};
+use treedb::net::auth::Key;
 use treedb::net::client::Client;
 use treedb::net::replicate::{Follower, FollowerProgress, ReplicaCfg};
 
@@ -224,6 +226,51 @@ fn primary_writes_converge_at_the_replica() {
     let p = converge(&mut f, &mut eng, &srv.log_text());
     assert_eq!(lookup(&mut eng, vid, "late").uid, 7);
     assert_eq!(p.lag, 0);
+}
+
+/// 主开了接入认证时，副本必须握得上手才追得动（§4.4）。
+///
+/// 两个方向都要钉：带对密钥的副本收敛得与非认证拓扑一模一样；带错密钥的
+/// 副本**永不收敛但也不退出**，而且失败必须落在可观测的计数里 —— 一个
+/// 静默不追的副本比一个会报错的副本更坏，运维看 `--stats` 就该看见它坏了。
+#[test]
+fn a_replica_hands_shakes_with_an_authenticated_primary() {
+    let srv = Server::start_auth("group", 4);
+    let vid = seed_primary(&srv, "rauth", 20);
+
+    let (_tmp, dir) = read_only_dir("rep-auth-ok");
+    let mut eng = replica(&dir);
+    let mut cfg = fcfg(&srv.addr, 1, 1 << 20);
+    cfg.auth = Some(Arc::new(test_key()));
+    let mut f = Follower::new(cfg);
+    let p = converge(&mut f, &mut eng, &srv.log_text());
+    assert_eq!(p.lag, 0);
+    assert!(p.connected, "握过手的副本才算连上");
+    assert_eq!(p.errors, 0, "对密钥不该抬 errors：{p:?}");
+    // 内容与非认证副本同构：握手只建立身份，不改传送的任何字节。
+    assert_eq!(lookup(&mut eng, vid, "f0").uid, 1000);
+    assert_eq!(lookup(&mut eng, vid, "f19").uid, 1019);
+
+    // 错密钥：永远连不上，但 tick 不是致命的，退避重试也不会把循环钉死。
+    let (_tmp2, dir2) = read_only_dir("rep-auth-bad");
+    let mut eng2 = replica(&dir2);
+    let mut bad = fcfg(&srv.addr, 1, 1 << 20);
+    bad.auth = Some(Arc::new(Key([0x9cu8; 32])));
+    let mut f2 = Follower::new(bad);
+    for _ in 0..40 {
+        f2.tick(&mut eng2)
+            .expect("错密钥不该把追平循环做成致命错误");
+        std::thread::sleep(Duration::from_millis(3));
+    }
+    let p2 = f2.progress(&mut eng2);
+    assert!(!p2.connected, "错密钥不算连上：{p2:?}");
+    assert!(p2.errors > 0, "失败必须能在计数里看见：{p2:?}");
+    assert_eq!(p2.applied, 0, "一个字节也不该被 apply");
+    // 引擎仍然是只读副本身份：拒写靠的是 `replica` 旗标，不是“有没有连上主”。
+    match ok(&mut eng2, &Op::ListViews) {
+        Reply::Views(_) => {}
+        other => panic!("副本仍该答读：{other:?}"),
+    }
 }
 
 /// 主被 kill -9 之后，副本不退出、不报错，且继续用已有状态答读。

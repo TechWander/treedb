@@ -11,10 +11,17 @@
 //! 不是重新建模 —— 这是这套形状存在的原因，不是对某个具体客户端的契约。
 
 use crate::engine::codec::{Rd, W};
+use crate::engine::sha256::DIGEST_LEN;
 use crate::error::{Error, Result};
 
 pub type ViewId = u32;
 pub type Ino = u64;
+
+/// 握手随机数的长度（字节），两个方向各一个（§4.4）。
+///
+/// 32 = 与 HMAC-SHA256 的输出同宽，也等于 256 位安全性 —— 挑战值的宽度低于
+/// 摘要宽度就是自削（能碰撞到重放）。
+pub const NONCE_LEN: usize = 32;
 /// 内容对象的引用：一段**不透明字节**，引擎不解释其含义。
 ///
 /// 这里曾经是 `u64`，v2 定稿时改掉：客户端侧的 `data_ref` 是后端自己生成的
@@ -550,6 +557,23 @@ pub mod errno {
     pub const ESTALE: u16 = 116;
 }
 
+/// 定长字节段的解码口：长度不对就是坏帧，不当「短一点也行」。
+///
+/// 握手那两处（随机数与 MAC）必须定长：少字节意味着摘要输入被截，多出来的
+/// 字节会被当成下一个字段 —— 两种都是「静默降级」的形状，所以在入口一次拦住。
+fn fixed_bytes<const N: usize>(r: &mut Rd) -> Result<[u8; N]> {
+    let b = r.bytes_bounded(N as u32)?;
+    if b.len() != N {
+        return Err(Error::Codec(format!(
+            "fixed field: want {N} bytes, got {}",
+            b.len()
+        )));
+    }
+    let mut a = [0u8; N];
+    a.copy_from_slice(&b);
+    Ok(a)
+}
+
 /// 一次请求。字段直接用二进制编码进帧；语义与 POSIX/FUSE 的元数据 op 一一对应。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Op {
@@ -817,6 +841,23 @@ pub enum Op {
         /// 上限 [`SNAP_CHUNK_MAX`]，超了 `EINVAL`。
         len: u32,
     },
+
+    // ---- 接入认证（§4.4）----
+    /// 握手第一步：客户端报自己的随机数（[`NONCE_LEN`] 字节）。
+    ///
+    /// 它**不进引擎**：不碰状态机、不占提交线程，在事件循环里就地处置
+    /// （[`crate::net::auth`]）。服务端没启用认证时直接回 [`Reply::AuthOk`]
+    /// 且 `authed = false` —— 所以一个「客户端总想握手」的形状对两种服务端
+    /// 都成立，区别只在一次还是两次往返。
+    AuthBegin {
+        client_nonce: [u8; NONCE_LEN],
+    },
+    /// 握手第二步：客户端交回 `HMAC-SHA256`。只在上一拍收到
+    /// [`Reply::Challenge`] 之后才有意义；MAC 算错了不会把连接打死，只是
+    /// 回到「还没握手」那一步，可以重头再来（换个密钥重来就行）。
+    AuthFinish {
+        mac: [u8; DIGEST_LEN],
+    },
 }
 
 impl Op {
@@ -871,6 +912,8 @@ impl Op {
             Op::ReadDirPlus { .. } => 0x002b,
             Op::WalFetch { .. } => 0x0080,
             Op::SnapFetch { .. } => 0x0081,
+            Op::AuthBegin { .. } => 0x0090,
+            Op::AuthFinish { .. } => 0x0091,
         }
     }
 
@@ -889,6 +932,8 @@ impl Op {
                 | Op::Shutdown
                 | Op::WalFetch { .. }
                 | Op::SnapFetch { .. }
+                | Op::AuthBegin { .. }
+                | Op::AuthFinish { .. }
         )
     }
 
@@ -955,7 +1000,9 @@ impl Op {
             | Op::RowPut { .. }
             | Op::RowDelete { .. }
             | Op::WalFetch { .. }
-            | Op::SnapFetch { .. } => false,
+            | Op::SnapFetch { .. }
+            | Op::AuthBegin { .. }
+            | Op::AuthFinish { .. } => false,
         }
     }
 
@@ -1206,6 +1253,8 @@ impl Op {
                 w.u64(*offset);
                 w.u32(*len);
             }
+            Op::AuthBegin { client_nonce } => w.bytes(client_nonce),
+            Op::AuthFinish { mac } => w.bytes(mac),
         }
     }
 
@@ -1419,6 +1468,12 @@ impl Op {
                 offset: r.u64()?,
                 len: r.u32()?,
             },
+            0x0090 => Op::AuthBegin {
+                client_nonce: fixed_bytes(r)?,
+            },
+            0x0091 => Op::AuthFinish {
+                mac: fixed_bytes(r)?,
+            },
             x => return Err(Error::Codec(format!("unknown op tag 0x{x:04x}"))),
         };
         Ok(op)
@@ -1628,6 +1683,24 @@ pub enum Reply {
         bytes: Vec<u8>,
         total: u64,
         snap_seq: u64,
+    },
+    /// [`Op::AuthBegin`] 的应答：服务端挑战值。收到它就是「本实例启用了
+    /// 认证，请交回 MAC」；`proto` 是服务端的线协议版本，碰巧也是全协议里
+    /// 唯一一处「在相信任何字节之前就拿到对端版本」的口子（§4.1）。
+    Challenge {
+        server_nonce: [u8; NONCE_LEN],
+        proto: u16,
+    },
+    /// 握手完成。`authed = false` 意味着服务端**没有**启用认证（它只是
+    /// 确认了「这里没事」）：带密钥的客户端收到它就是降级，必须自己报错，
+    /// 不能当成成功（见 [`crate::net::auth`]）。
+    ///
+    /// `server_mac` 是服务端的反向证明，双向认证的其中一半：客户端据此能确认
+    /// 对端真持有那份密钥。注意它证明的是「知道密钥」而不是「是当前那个主」
+    /// —— 后者要 fencing token，还欠着（§11 第 4 条②）。
+    AuthOk {
+        server_mac: [u8; DIGEST_LEN],
+        authed: bool,
     },
 }
 
@@ -1853,6 +1926,19 @@ impl Reply {
                 w.u64(*total);
                 w.u64(*snap_seq);
             }
+            Reply::Challenge {
+                server_nonce,
+                proto,
+            } => {
+                w.u16(0x0190);
+                w.bytes(server_nonce);
+                w.u16(*proto);
+            }
+            Reply::AuthOk { server_mac, authed } => {
+                w.u16(0x0191);
+                w.bytes(server_mac);
+                w.bool(*authed);
+            }
         }
     }
 
@@ -2051,6 +2137,14 @@ impl Reply {
                 bytes: r.bytes_bounded(crate::engine::MAX_FRAME)?,
                 total: r.u64()?,
                 snap_seq: r.u64()?,
+            },
+            0x0190 => Reply::Challenge {
+                server_nonce: fixed_bytes(r)?,
+                proto: r.u16()?,
+            },
+            0x0191 => Reply::AuthOk {
+                server_mac: fixed_bytes(r)?,
+                authed: r.bool()?,
             },
             x => return Err(Error::Codec(format!("unknown reply tag 0x{x:04x}"))),
         };
@@ -2322,6 +2416,12 @@ mod tests {
                 offset: 1 << 40,
                 len: 0,
             },
+            Op::AuthBegin {
+                client_nonce: [0xa5; NONCE_LEN],
+            },
+            Op::AuthFinish {
+                mac: [0x5a; DIGEST_LEN],
+            },
         ];
         for op in ops {
             let mut w = W::new();
@@ -2332,6 +2432,33 @@ mod tests {
             assert_eq!(op, back, "op tag 0x{:04x}", op.tag());
             assert_eq!(r.remaining(), 0, "trailing bytes for tag 0x{:04x}", op.tag());
         }
+    }
+
+    /// 握手的两个定长字段在解码侧就是硬门槛：短一个字节是 `Err`，不是「少读一点」。
+    /// 短的挑战值 = 随机空间缩水，短的 MAC = 摘要被截，两种都是静默降低安全性，
+    /// 所以宁可断连。（长的在 `bytes_bounded` 那一步就被拦掉。）
+    #[test]
+    fn handshake_fixed_fields_reject_wrong_length() {
+        let mut w = W::new();
+        w.u16(0x0090);
+        w.bytes(&[9u8; NONCE_LEN - 1]);
+        assert!(Op::decode(&mut Rd::new(&w.finish())).is_err());
+
+        let mut w = W::new();
+        w.u16(0x0090);
+        w.bytes(&[9u8; NONCE_LEN + 1]);
+        assert!(Op::decode(&mut Rd::new(&w.finish())).is_err());
+
+        let mut w = W::new();
+        w.u16(0x0091);
+        w.bytes(&[7u8; DIGEST_LEN - 1]);
+        assert!(Op::decode(&mut Rd::new(&w.finish())).is_err());
+
+        let mut w = W::new();
+        w.u16(0x0191);
+        w.bytes(&[3u8; DIGEST_LEN - 1]);
+        w.bool(true);
+        assert!(Reply::decode(&mut Rd::new(&w.finish())).is_err());
     }
 
     #[test]
@@ -2480,6 +2607,19 @@ mod tests {
                 bytes: Vec::new(),
                 total: 0,
                 snap_seq: 0,
+            },
+            Reply::Challenge {
+                server_nonce: [0x11; NONCE_LEN],
+                proto: crate::engine::PROTOCOL_VERSION,
+            },
+            Reply::AuthOk {
+                server_mac: [0x22; DIGEST_LEN],
+                authed: true,
+            },
+            // 服务端没启用认证那一支：全零 MAC + `authed = false`。
+            Reply::AuthOk {
+                server_mac: [0u8; DIGEST_LEN],
+                authed: false,
             },
         ];
         for rep in replies {

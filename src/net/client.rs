@@ -8,6 +8,7 @@
 use crate::engine::codec::Rd;
 use crate::engine::{encode_frame, Op, Reply, RxBuf, FRAME_HDR, MAX_FRAME};
 use crate::error::{Error, Result};
+use crate::net::auth::{self, Key};
 use std::io::{ErrorKind, Read, Write};
 use std::net::TcpStream;
 use std::time::Duration;
@@ -43,6 +44,27 @@ impl Client {
             stream,
             rx: RxBuf::with_capacity(4096),
         }
+    }
+
+    /// 连接 + （给了密钥就）握手。`key = None` 与 [`Client::connect`] 逐字等价。
+    ///
+    /// 为什么不把握手合进 `connect`：握手是两次往返，它会让“没打算认证”的
+    /// 调用方白付两次 RTT，也会直接弄坏 v4 服务端。存在 [`auth::handshake`]
+    /// 那一层，开关才能只落在真正需要它的地方。
+    pub fn connect_auth(addr: &str, timeout_ms: u64, key: Option<&Key>) -> Result<Client> {
+        let mut c = Client::connect(addr, timeout_ms)?;
+        auth::handshake(&mut c, key)?;
+        Ok(c)
+    }
+
+    /// [`Client::from_stream`] 的认证版：自己调好 socket 之后也能跑握手。
+    ///
+    /// 不另外提供一个 `from_stream` 是为了背压类用例：它们必须能把缓冲区调到
+    /// 很小、又得能连上开了认证的服务端。
+    pub fn from_stream_auth(stream: TcpStream, key: Option<&Key>) -> Result<Client> {
+        let mut c = Client::from_stream(stream);
+        auth::handshake(&mut c, key)?;
+        Ok(c)
     }
 
     /// 发一个 op 并等它的应答（一问一答）。
@@ -96,7 +118,15 @@ impl Client {
 
     /// 连接保活探测：能 Ping 通就算活。
     pub fn ping(addr: &str) -> bool {
-        match Client::connect(addr, 2000) {
+        Client::ping_auth(addr, None)
+    }
+
+    /// 同 [`Client::ping`]，但对启用了认证的服务端要先握手才能探到活。
+    ///
+    /// 这个区分不是可有可无的：少了它，调用方会把“服务端正在启动”与
+    /// “我根本没密钥”看成同一个结果（两个都是 `false`）。
+    pub fn ping_auth(addr: &str, key: Option<&Key>) -> bool {
+        match Client::connect_auth(addr, 2000, key) {
             Ok(mut c) => matches!(c.call(&Op::Ping), Ok(Reply::Pong)),
             Err(_) => false,
         }

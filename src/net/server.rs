@@ -54,6 +54,7 @@ use crate::engine::codec::Rd;
 use crate::engine::mem::Log;
 use crate::engine::{reply_frame, Durability, Engine, FRAME_HDR, Op, Reply, RxBuf};
 use crate::error::{Error, Result};
+use crate::net::auth::Gate;
 use crate::net::replicate::{Follower, ReplicaCfg};
 use std::collections::{HashMap, VecDeque};
 use std::io::{ErrorKind, Read, Write};
@@ -61,6 +62,7 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// 每轮 `epoll_wait` 最多取回的事件数。
@@ -99,6 +101,16 @@ pub struct ServerConfig {
     /// 主那侧不需要任何对应配置：传送是 pull 的，主只是回答 `WalFetch` /
     /// `SnapFetch`，它不知道也不需要有谁在拉。
     pub replication: Option<ReplicaCfg>,
+    /// 接入认证密钥（§4.4）。`None` = 不认证，这也是默认值。
+    ///
+    /// 一个 `Arc` 而不是 `Key`：它要在 accept 时递给每条新连接的 [`Gate`]，
+    /// 而 `Gate` 自己只存进度、不存密钥（密钥跟着连接数复制 32 字节本身
+    /// 无害，但“谁持有密钥”应该只有一个来源，便于 `--auth-key-file` 轮换时
+    /// 只看一处）。
+    ///
+    /// 开启后**只影响握手**：数据面每 op 多一次 `Gate::allows_data()` 判等，
+    /// 握手本身不占提交线程。代价由 `benches/handshake_cost.sh` 实测。
+    pub auth: Option<Arc<crate::net::auth::Key>>,
 }
 
 impl ServerConfig {
@@ -118,6 +130,7 @@ impl ServerConfig {
             // 直接输给 PG（实测 3-8×）」已作废，见 DESIGN.md §9.1 第 3、4 条。
             workers: crate::net::default_workers(),
             replication: None,
+            auth: None,
         }
     }
 }
@@ -199,10 +212,15 @@ pub(crate) struct Conn {
     /// 小回包恰恰几乎永远相等（本轮就发完了），于是每 op 的 `epoll_ctl`
     /// 从 2 次降到 0 次。
     pub(crate) ep_out: bool,
+    /// 这条连接的握手进度（§4.4）。`Stage::Off` 时所有数据 op 直通，
+    /// 判据只有一次 `matches!`。
+    pub(crate) auth: Gate,
 }
 
 impl Conn {
-    pub(crate) fn new(stream: TcpStream, id: u64) -> Self {
+    /// `auth_required` = 本实例启用了接入认证。它只决定这条连接的闸门
+    /// 从 `Needed` 还是 `Off` 开局，之后两者走的是同一套代码。
+    pub(crate) fn new(stream: TcpStream, id: u64, auth_required: bool) -> Self {
         let fd = stream.as_raw_fd();
         Conn {
             fd,
@@ -216,6 +234,7 @@ impl Conn {
             want_write: false,
             // accept 路径刚用 epoll_set(…, false) 注册过，掩码里没有 EPOLLOUT。
             ep_out: false,
+            auth: Gate::new(auth_required),
         }
     }
 
@@ -442,6 +461,10 @@ pub(crate) fn serve_single(cfg: &ServerConfig, stop: &AtomicBool, live: &AtomicU
     epoll_set(ep, lfd, false)?;
 
     let mut conns: HashMap<i32, Conn> = HashMap::new();
+    // 握手由事件循环就地处置，不进引擎；`as_deref` 是为了下面能直接
+    // 送 `Option<&Key>` 给 [`Gate::on_op`]。
+    let auth_key = cfg.auth.as_deref();
+    let auth_required = cfg.auth.is_some();
     let mut events: Vec<libc::epoll_event> = vec![unsafe { std::mem::zeroed() }; MAX_EVENTS];
     let mut buf = vec![0u8; READ_CHUNK];
     let mut rep = Report::default();
@@ -489,7 +512,7 @@ pub(crate) fn serve_single(cfg: &ServerConfig, stop: &AtomicBool, live: &AtomicU
                             }
                             // id 在多 worker 模式才用得到；单线程按 fd 索引，
                             // 永远不路由应答，故统一填 0。
-                            let c = Conn::new(stream, 0);
+                            let c = Conn::new(stream, 0, auth_required);
                             let nfd = c.fd;
                             epoll_set(ep, nfd, false)?;
                             conns.insert(nfd, c);
@@ -603,6 +626,19 @@ pub(crate) fn serve_single(cfg: &ServerConfig, stop: &AtomicBool, live: &AtomicU
                 continue;
             }
             for op in ops {
+                // 握手拦在引擎之前：它不读也不写状态，所以就地答完就下一
+                // 条（§4.4）。未启用认证时这个 `if` 只对两个握手 tag 成立，
+                // 数据 op 一次额外分派也不付。
+                if auth_required || crate::net::auth::is_handshake(&op) {
+                    let gated = match conns.get_mut(&fd) {
+                        Some(c) => c.auth.on_op(auth_key, &op),
+                        None => None,
+                    };
+                    if let Some(reply) = gated {
+                        push(&mut conns, fd, &reply);
+                        continue;
+                    }
+                }
                 // checkpoint / shutdown 会动 WAL，必须先把本轮已 stage 的写
                 // 落盘，否则快照水位会跑到磁盘前面。
                 if matches!(op, Op::Checkpoint | Op::Shutdown) {

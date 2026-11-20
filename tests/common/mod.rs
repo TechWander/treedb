@@ -9,6 +9,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
+use treedb::engine::sha256::DIGEST_LEN;
+use treedb::net::auth::Key;
 use treedb::net::client::Client;
 
 /// 找一个没人用的 127.0.0.1 端口。绑定后立刻释放，交给服务端去占。
@@ -19,12 +21,26 @@ pub fn free_addr() -> String {
     a.to_string()
 }
 
+/// [`Server::start_auth`] 用的那把密钥。
+///
+/// 公开它不是为了“测试自己生成密钥”，而是为了让副本用例能在测试进程里
+/// 拼出同一个 `ReplicaCfg::auth`。测试要的是可复现，不是强度：强度由
+/// `Key::load` 的长度门禁与 `net::auth` 的单测负责。
+pub fn test_key() -> Key {
+    Key([0x5au8; DIGEST_LEN])
+}
+
 pub struct Server {
     pub addr: String,
     dir: PathBuf,
     child: Option<Child>,
     log: PathBuf,
     pid: u32,
+    /// 本实例的接入密钥（`None` = 不认证）。它存在这里的理由不是方便，
+    /// 是正确性：[`Server::wait_ready`] 与 [`Server::client`] 都要按它决定要不要
+    /// 握手，否则开了认证的实例在探活那一步就永远不 ready，而报出来的错是
+    /// “服务端没起来”。
+    auth: Option<Key>,
     // 数据目录就住在这个 TempDir 里。用 `Option` 是因为 `Server` 实现了
     // `Drop`，字段不能直接搬出去；而崩溃恢复用例必须把目录交给重启的
     // 那个 `Server`，所以得能把它取出来。
@@ -50,7 +66,20 @@ impl Server {
     pub fn start_workers(durability: &str, workers: usize) -> Server {
         let tmp = tempfile::tempdir().expect("tempdir");
         let dir = tmp.path().join("data");
-        let s = Server::spawn(tmp, dir, free_addr(), durability, 4096, workers);
+        let s = Server::spawn(tmp, dir, free_addr(), durability, 4096, workers, None);
+        s.wait_ready();
+        s
+    }
+
+    /// 起一个**启用了接入认证**的服务端（§4.4）。
+    ///
+    /// 密钥是 [`test_key`] 那个固定值：用例要的是可复现与可断言（“错密钥必
+    /// 须被拒”需要一个已知值）。
+    pub fn start_auth(durability: &str, workers: usize) -> Server {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("data");
+        let key = test_key();
+        let s = Server::spawn(tmp, dir, free_addr(), durability, 4096, workers, Some(key));
         s.wait_ready();
         s
     }
@@ -59,7 +88,7 @@ impl Server {
     pub fn start_backlog(durability: &str, backlog: i32) -> Server {
         let tmp = tempfile::tempdir().expect("tempdir");
         let dir = tmp.path().join("data");
-        let s = Server::spawn(tmp, dir, free_addr(), durability, backlog, 1);
+        let s = Server::spawn(tmp, dir, free_addr(), durability, backlog, 1, None);
         s.wait_ready();
         s
     }
@@ -77,7 +106,7 @@ impl Server {
         durability: &str,
         workers: usize,
     ) -> Server {
-        let s = Server::spawn(tmp, dir, free_addr(), durability, 4096, workers);
+        let s = Server::spawn(tmp, dir, free_addr(), durability, 4096, workers, None);
         s.wait_ready();
         s
     }
@@ -85,7 +114,7 @@ impl Server {
     /// 用同一个数据目录 + **同一个地址**重启：优雅停服后端口必须能立刻重绑
     /// （std 的 `TcpListener::bind` 自带 SO_REUSEADDR，TIME_WAIT 不该挡道）。
     pub fn restart_at_addr(tmp: TempDir, dir: PathBuf, addr: String, durability: &str) -> Server {
-        let s = Server::spawn(tmp, dir, addr, durability, 4096, 1);
+        let s = Server::spawn(tmp, dir, addr, durability, 4096, 1, None);
         s.wait_ready();
         s
     }
@@ -97,12 +126,13 @@ impl Server {
         durability: &str,
         backlog: i32,
         workers: usize,
+        auth: Option<Key>,
     ) -> Server {
         let log = tmp.path().join(format!("server-{addr}.log"));
         let pid_file = tmp.path().join("server.pid");
-        let out = Stdio::from(std::fs::File::create(&log).expect("create server log"));
-        let child = Command::new(env!("CARGO_BIN_EXE_treedb-server"))
-            .arg("--dir")
+        let key_file = tmp.path().join("auth.key");
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_treedb-server"));
+        cmd.arg("--dir")
             .arg(&dir)
             .arg("--listen")
             .arg(&addr)
@@ -113,7 +143,15 @@ impl Server {
             .arg("--workers")
             .arg(workers.to_string())
             .arg("--pid-file")
-            .arg(&pid_file)
+            .arg(&pid_file);
+        if let Some(k) = &auth {
+            // 先落密钥文件、再起进程：`--auth-key-file` 读不到会直接 exit 2，
+            // 那比“密钥文件没写成”与“服务起不来”混在一起好查。
+            std::fs::write(&key_file, k.0).expect("write auth key");
+            cmd.arg("--auth-key-file").arg(&key_file);
+        }
+        let out = Stdio::from(std::fs::File::create(&log).expect("create server log"));
+        let child = cmd
             .stdin(Stdio::null())
             .stdout(out)
             .stderr(Stdio::from(
@@ -125,14 +163,17 @@ impl Server {
             .spawn()
             .expect("spawn treedb-server");
         let pid = child.id();
-        Server { addr, dir, child: Some(child), log, pid, tmp: Some(tmp) }
+        Server { addr, dir, child: Some(child), log, pid, auth, tmp: Some(tmp) }
     }
 
     /// 轮询 Ping 直到服务端能答话。冷启动（含 WAL 重放）可能慢，给 15s。
+    ///
+    /// 走 `ping_auth` 而不是 `ping`：开了认证的实例对不握手的探测只会回
+    /// EADV，那会被误读成“还没起来”，然后超时报错。
     pub fn wait_ready(&self) {
         let deadline = Instant::now() + Duration::from_secs(15);
         loop {
-            if Client::ping(&self.addr) {
+            if Client::ping_auth(&self.addr, self.auth.as_ref()) {
                 return;
             }
             if Instant::now() > deadline {
@@ -143,7 +184,13 @@ impl Server {
     }
 
     pub fn client(&self) -> Client {
-        Client::connect(&self.addr, 0).expect("connect")
+        Client::connect_auth(&self.addr, 0, self.auth.as_ref()).expect("connect")
+    }
+
+    /// 本实例的密钥。用例拿它去构造“自己管 socket”的连接（背压、错密钥、
+    /// 故意不握手那些反例）；没开认证时是 `None`。
+    pub fn auth_key(&self) -> Option<&Key> {
+        self.auth.as_ref()
     }
 
     pub fn dir(&self) -> &Path {

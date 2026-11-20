@@ -16,8 +16,8 @@ cargo build --release                                   # 默认档：依赖只�
 ./target/release/treedb-server --dir /var/lib/treedb --listen 127.0.0.1:7777
 ./target/release/treedb-bench --op lookup --conns 64 --pipeline 32 --secs 3
 
-cargo test --release                                    # 默认档 112 passed（引擎本体）
-cargo test --release --features postgres-compat        # 143 passed（含 PG 过渡档）
+cargo test --release                                    # 默认档 134 passed（引擎本体）
+cargo test --release --features postgres-compat        # 165 passed（含 PG 过渡档）
 bash benches/throughput_matrix.sh 3 1 2 3 4 5           # 五轴复现，输出进 benches/results/
 bash benches/sync_ratio.sh 3                           # 写路径机制：一次 fsync 摊了多少写
 bash benches/single_conn.sh 3                          # 单连接对标 PG（$PIPE=32 走批量档、$CONNS/$WORKERS 走并发档）
@@ -26,6 +26,7 @@ bash benches/ab_layout.sh <基线 rev>                     # 受控 A/B：只换
 bash benches/default_check.sh                           # 零旗标默认档同格跑 5 次，验默认值真的生效
 bash benches/ab_durability.sh <基线 rev>                  # 写轴 A/B：只换服务端二进制比持久化档
 bash benches/rehearse_migrate.sh v0.3.2                 # 快照升级真机彩排：旧 tag 的二进制 → 迁移 → 回滚
+bash benches/handshake_cost.sh 20000                   # 接入握手的代价：两臂同轮 A/B（建连 + RSS/conn + 稳态）
 ./target/release/treedb-micro --items 32000             # 纯计算档（不经网络/不写 WAL）+ 分配计数
 ```
 
@@ -60,6 +61,29 @@ group commit 不丢。默认按核数给：`min(8, 核数/2)`（1–3 核机器�
 默认逐字一致）；`--workers 1` 是历史基线档。为什么不再默认单线程、以及它的三个
 代价，见 [DESIGN.md](DESIGN.md) §8 第 1 条。
 
+接入认证是**可选的、默认关**。要给出入口上锁，就配一把 32 字节随机密钥，三个
+入口共用同一个 flag：
+
+```sh
+head -c 32 /dev/urandom > /etc/treedb/auth.key && chmod 0600 /etc/treedb/auth.key
+./target/release/treedb-server  --auth-key-file /etc/treedb/auth.key ...   # banner 多一位 auth=on
+./target/release/treedb-standby --auth-key-file /etc/treedb/auth.key ...   # 一头对主握手，一头要读者握手
+./target/release/treedb-bench   --auth-key-file /etc/treedb/auth.key ...   # 不带密钥的客户端会被 EADV 拒掉
+```
+
+它是共享密钥的双向挑战握手（两次往返，密钥从不上线），**不是 TLS**：只建立身份，
+不建立机密性，也不做授权。带密钥的客户端遇到没开认证的服务端会直接报错退出，
+不静默降级；反过来不带密钥的客户端面对开了认证的端口，每个数据 op 拿 `EADV`。
+没配密钥时线协议与 v4 逐字相同（§4.1 的 `4 → 5`）。
+
+代价量过了（`bash benches/handshake_cost.sh 20000`，20 000 条连接、两臂同轮 A/B
+独立跑 3 次，逐格原始输出 `benches/results/handshake_cost.log`）：常驻内存
+**+93 ~ 96 B/conn**（每连接一个定长 `Gate`，握手做完也不还），建连时间中位
+**+90.9 µs/conn**（两次往返 + 两次 HMAC；但这一列噪声比效应还大 —— 不开认证的
+那一臂自己三次就摆 27 %，所以**单次读数不作数**）；稳态读与写与未开认证同量级
+（握手不进引擎、不占提交线程，group commit 的合并度一字不变）。形状、实现层次与
+四条「防不住什么」见 [DESIGN.md](DESIGN.md) §4.4。
+
 ## 实测（同一台机器、同一块盘，2026-11-19 口径修正后重跑）
 
 | 轴 | 结果 |
@@ -74,6 +98,7 @@ group commit 不丢。默认按核数给：`min(8, 核数/2)`（1–3 核机器�
 | 为什么快（引擎自己的计数器） | 两个「会 fsync」的档位现在共用同一个提交点：64 并发下一轮只付 1 次 fsync、摊 **≈ 55–58 次写/fsync**（`benches/sync_ratio.sh`） |
 | 每 op 一次 fsync（`dur=always` vs PG `synchronous_commit=on`，WAL 同盘） | 改前 1 891 vs 1 469 ops/s（p99 81.5 ms vs 157 ms）；**改后 10 913 vs 1 469 = 7.4×**，p50 优 17×、p99 优 5×（受控 A/B：`benches/ab_durability.sh v0.3.1`）。旧版这句「刨掉合并 fsync，treedb 对 PG 就没有结构性优势」是当时那个**按连接串 fsync** 的实现留下的错判，已作废：两家都是靠一次 fsync 摊多次写，treedb 在这一格摊得动（≈ 55）而 `always` 档以前自己把它抵消掉了 |
 | 持久性 | `kill -9` 六个崩溃用例零丢失（含 checkpoint 瞬间崩、连崩 3 轮）；并另有 `workers=8` 下同语义的一条，目录写与表写逐条交错 |
+| 接入认证（可选、默认关） | 20 000 条连接、两臂同轮 A/B × 3：**RSS +93 ~ 96 B/conn**（439 → 532/535 B，极可复现）、建连中位 **+90.9 µs/conn**（+232 / +1 818 / +1 885 ms —— 噪声比效应大，`off` 臂自己就摆 27 %）、稳态 `ping` 中位 1 147 239 → 1 148 689 ops/s、`create` 67 414 → 64 122（−4.9 %，**落在同臂自身 2.8 ~ 4.5 % 的散布里，既不报回归也不报变快**）。未开认证的数据面另用两臂都不带密钥的 `ab_layout.sh v0.3.5` 证零回归（八格最差 −0.90 %）。逐格原始输出 `benches/results/handshake_cost.log` 与 `ab_layout_v0.3.6.log`，读法见 §4.4 |
 
 两个读数字的历史口径要提醒：旧版这张表写的是「64 并发纯读被 PG 反胜 3.6–7.5×」，
 **已作废** —— `treedb-bench` 的分母把「建连 + 预热」算进去了，而 PG 侧对照器没算，
@@ -115,13 +140,15 @@ DESIGN.md §7（含 §7.8 那次全五轴复跑）。
   fsync、跨连接合并）/ `always`（同一个提交点，单连接下自然退化成每 op 一次盘）/
   `never`（会丢一个窗口）。
 
-## 接入前必读：没做的四件事
+## 接入前必读：没做的（和只做了一半的）四件事
 
-- **连接面没有认证、没有授权、没有传输加密**（§8 第 13 条）。线协议是裸 TCP + 长度
-  前缀 + CRC32，而 CRC32 只判损坏；连上端口就能用全部 49 个 op，包括 `Shutdown` 与
-  `Checkpoint`。「谁能连上」= 「谁能改整个状态」，所以多租户、配额、审计归属必须在
-  引擎之外做（grovefs 的 apikey + 网关白名单就是这一层），或者把端口锁在回环/私有网段。
-  副本对主那一侧同样没有身份认证与 fence（§8 第 6 条②）。
+- **认证只管身份，授权与传输加密仍然没有**（§4.4、§8 第 13 条）。v5 起可以
+  `--auth-key-file` 打开一次共享密钥的双向握手，但它默认关、而且过了握手的连接与
+  不开时一样拥有全部 51 个 op 的权限，包括 `Shutdown` 与 `Checkpoint`；握手之后仍是
+  裸 TCP + 长度前缀 + CRC32，而 CRC32 只判损坏。所以「谁能连上 + 谁持有这把密钥」
+  = 「谁能改整个状态」，多租户、配额、审计归属必须在引擎之外做（grovefs 的
+  apikey + 网关白名单就是这一层），或者把端口锁在回环/私有网段。副本对主那一侧
+  能证明「持有密钥」了，但**没有 fence**：脑裂后的旧主同样拿得出 MAC（§8 第 6 条②）。
 - **没有 PITR、没有 dump/load、没有增量与加密备份**（§8 第 14 条、§6.7）。checkpoint 会
   `wal.reset()`，历史切面不归档；运行中 `cp -a` 能起服、无撕裂，但切点不可控（实测比
   「拷贝前一刻」多 14 400 条 seq），所以它不是备份工具。
@@ -146,11 +173,11 @@ DESIGN.md §7（含 §7.8 那次全五轴复跑）。
 
 | 路径 | 内容 |
 |------|------|
-| `src/engine/` | 线协议类型（`model.rs`，49 个 op / 28 个 Reply）、帧编码（`codec.rs`）、状态机（`mem.rs`）、应用与定序（`apply.rs`）、WAL/快照（`wal.rs`）、核心（`core.rs`） |
-| `src/net/` | 单线程事件循环（`server.rs`）、多前端 worker + 唯一提交线程（`multi.rs`）、跨线程信箱（`mail.rs`）、副本跟踪器（`replicate.rs`）、阻塞客户端（`client.rs`） |
+| `src/engine/` | 线协议类型（`model.rs`，51 个 op / 30 个 Reply）、帧编码（`codec.rs`）、状态机（`mem.rs`）、应用与定序（`apply.rs`）、WAL/快照（`wal.rs`）、核心（`core.rs`）、自写的 SHA-256/HMAC（`sha256.rs`，§4.4） |
+| `src/net/` | 单线程事件循环（`server.rs`）、多前端 worker + 唯一提交线程（`multi.rs`）、跨线程信箱（`mail.rs`）、接入认证闸门（`auth.rs`，§4.4）、副本跟踪器（`replicate.rs`）、阻塞客户端（`client.rs`） |
 | `src/{pool,store,persist,schema,probe}.rs` | `postgres-compat` 过渡档 |
 | `src/bin/` | `treedb-server` / `treedb-bench` / `treedb-pgbench`（对照工具）/ `treedb-micro`（纯计算 + 分配计数）/ `treedb-migrate`（快照升级）/ `treedb-standby`（只读副本）/ `treedb-demo` |
-| `tests/` | `engine_crud` `net_protocol` `read_scaling` `replication` `crash_recovery` `migrate` `scale_connections` `independence`（默认档全部要跑）；`concurrency` 属过渡档 |
+| `tests/` | `engine_crud` `net_protocol` `read_scaling` `replication` `auth` `crash_recovery` `migrate` `scale_connections` `independence`（默认档全部要跑）；`concurrency` 属过渡档 |
 | `benches/` | 五轴矩阵脚本与历史/复跑原始输出 |
 | `DESIGN.md` | 选型判据、协议字节布局、语义边界、五轴实测、已知限制、接入路径与下一步 |
 

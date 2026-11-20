@@ -12,7 +12,9 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
 use treedb::engine::{Durability, Op, Reply, PROTOCOL_VERSION};
+use treedb::net::auth::Key;
 use treedb::net::client::Client;
 use treedb::net::server::{serve, ServerConfig};
 
@@ -31,8 +33,8 @@ fn parse_durability(s: &str) -> Durability {
     }
 }
 
-fn print_stats(addr: &str) -> Result<(), String> {
-    let mut c = Client::connect(addr, 3000).map_err(|e| e.to_string())?;
+fn print_stats(addr: &str, key: Option<&Key>) -> Result<(), String> {
+    let mut c = Client::connect_auth(addr, 3000, key).map_err(|e| e.to_string())?;
     match c.call(&Op::Stats).map_err(|e| e.to_string())? {
         Reply::Stats(s) => {
             println!("views      = {}", s.views);
@@ -86,6 +88,7 @@ fn main() {
     let mut stats_only = false;
     let mut shutdown_only = false;
     let mut pid_file: Option<PathBuf> = None;
+    let mut auth_key_file: Option<PathBuf> = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -102,6 +105,7 @@ fn main() {
             "--backlog" => backlog = next(&mut i).parse().unwrap_or(4096),
             "--workers" => workers = next(&mut i).parse().unwrap_or(0),
             "--pid-file" => pid_file = Some(PathBuf::from(next(&mut i))),
+            "--auth-key-file" => auth_key_file = Some(PathBuf::from(next(&mut i))),
             "--stats" => stats_only = true,
             "--shutdown" => shutdown_only = true,
             "-h" | "--help" => {
@@ -122,15 +126,32 @@ fn main() {
         workers = treedb::net::default_workers();
     }
 
+    // 密钥先于一切加载：一个被要它认证、却因为密钥文件读不到而默默降级成
+    // 不认证的实例，比拒接启动坏得多。`--stats` / `--shutdown` 也要用它，
+    // 所以放在那两个分支之前。
+    let auth: Option<Arc<Key>> = match &auth_key_file {
+        Some(p) => match Key::load(p) {
+            Ok(k) => Some(Arc::new(k)),
+            Err(e) => {
+                eprintln!("bad --auth-key-file: {e}");
+                std::process::exit(2);
+            }
+        },
+        None => None,
+    };
+    let auth_on = auth.is_some();
+
     if stats_only {
-        if let Err(e) = print_stats(&listen) {
+        if let Err(e) = print_stats(&listen, auth.as_deref()) {
             eprintln!("stats: {e}");
             std::process::exit(1);
         }
         return;
     }
     if shutdown_only {
-        match Client::connect(&listen, 3000).and_then(|mut c| c.call(&Op::Shutdown)) {
+        match Client::connect_auth(&listen, 3000, auth.as_deref())
+            .and_then(|mut c| c.call(&Op::Shutdown))
+        {
             Ok(Reply::Ok) => println!("shutdown acknowledged"),
             Ok(other) => eprintln!("unexpected reply: {other:?}"),
             Err(e) => eprintln!("shutdown: {e}"),
@@ -167,18 +188,20 @@ fn main() {
         // `serve` 配上 `replication` 就跑起来。两边各留一套 flag 解析的话，
         // 副本会拿到一份没人测过的默认值。
         replication: None,
+        auth,
     };
     eprintln!(
         // 帧里没有版本位（§4.1），升级顺序又是硬约束，所以 banner 一开就把它摆出来：
         // 运维在两端对不上时第一眼就该看见。
-        "treedb-server pid={} listen={} dir={} protocol={} durability={} backlog={} workers={}",
+        "treedb-server pid={} listen={} dir={} protocol={} durability={} backlog={} workers={} auth={}",
         std::process::id(),
         addr,
         dir.display(),
         PROTOCOL_VERSION,
         durability,
         backlog,
-        workers
+        workers,
+        if auth_on { "on" } else { "off" }
     );
     match serve(&cfg, &STOP, &LIVE) {
         Ok(rep) => {
@@ -227,6 +250,11 @@ treedb-server — 元数据引擎服务端（POSIX 元数据语义，客户端�
   --sync-ms N                事件循环空闲唤醒间隔，默认 20
   --auto-checkpoint-mb N     WAL 超此大小自动快照，默认 64（0 = 关闭）
   --pid-file PATH            启动后写入 pid，便于测试脚本 kill -9
+  --auth-key-file PATH       启用接入认证（§4.4）：从文件读集群共享密钥，必须是
+                             32 原始字节或 64 个十六进制字符（0/64 个零 = 没填的
+                             模板，拒接）。不给这个 flag = 不认证，与 v4 逐字一致。
+                             开了之后所有客户端（含 --stats / --shutdown）都得带
+                             同一把密钥跑完握手才能发数据 op。
   --stats                    不启服务，连上去打印状态后退出（含表的行数、WAL 的
                              逻辑与磁盘两个长度、快照长度与协议版本）
   --shutdown                 通知运行中的实例优雅停服

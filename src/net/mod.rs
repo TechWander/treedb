@@ -9,9 +9,11 @@
 //! | [`server`] | `workers = 1` 的单线程事件循环本体，兼作两条路径共用的 `Conn`/`Slot` 构件 |
 //! | [`multi`] | `workers > 1`：N 条前端线程 + 唯一提交线程 |
 //! | [`mail`] | 两者之间那条能被 `epoll` 唤醒的信箱 |
+//! | [`auth`] | 接入认证：共享密钥 + 双向挑战握手（两条服务端路径共用的闸门） |
 //! | [`client`] | 同步阻塞客户端（压测与真实接入方走同一套代码） |
 //! | [`replicate`] | 只读副本的追平循环（拉主，不是主推） |
 
+pub mod auth;
 pub mod client;
 pub mod mail;
 pub mod multi;

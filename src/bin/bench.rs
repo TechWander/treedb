@@ -22,6 +22,9 @@ struct Args {
     pipeline: usize,
     hold: bool,
     views: usize,
+    /// 集群共享密钥：给了就每条连接先跑一次握手（§4.4）。`None` = 不握手，
+    /// 与旧版逐字一致 —— 历史基线数字因此仍然可以直接对比。
+    auth: Option<std::sync::Arc<treedb::net::auth::Key>>,
 }
 
 fn parse() -> Args {
@@ -35,6 +38,7 @@ fn parse() -> Args {
         pipeline: 1,
         hold: false,
         views: 8,
+        auth: None,
     };
     let mut i = 1;
     while i < a.len() {
@@ -51,6 +55,16 @@ fn parse() -> Args {
             "--pipeline" => args.pipeline = next(&mut i).parse().unwrap_or(1),
             "--views" => args.views = next(&mut i).parse().unwrap_or(8),
             "--hold" => args.hold = true,
+            "--auth-key-file" => {
+                let p = next(&mut i);
+                match treedb::net::auth::Key::load(std::path::Path::new(&p)) {
+                    Ok(k) => args.auth = Some(std::sync::Arc::new(k)),
+                    Err(e) => {
+                        eprintln!("bad --auth-key-file: {e}");
+                        std::process::exit(2);
+                    }
+                }
+            }
             "-h" | "--help" => {
                 println!("{HELP}");
                 std::process::exit(0);
@@ -84,16 +98,39 @@ fn nonce() -> u64 {
 
 fn main() {
     let args = parse();
-    if !Client::ping(&args.addr) {
-        eprintln!("server not reachable at {}", args.addr);
-        std::process::exit(1);
+    // 探活不走 `Client::ping_auth`：它只回 `bool`，能把“对端拒绝降级”与
+    // “MAC 不对”与“端口没人听”归成同一个结果，而这三件事的下一步运维动作
+    // 完全不同。这里自己跑一次握手 + Ping，把真实错误带进文案。
+    match Client::connect_auth(&args.addr, 3000, args.auth.as_deref())
+        .and_then(|mut c| c.call(&Op::Ping))
+    {
+        Ok(Reply::Pong) => {}
+        Ok(other) => {
+            eprintln!("unexpected reply from {}: {other:?}", args.addr);
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("server not usable at {}: {e}", args.addr);
+            eprintln!(
+                "  a server started with --auth-key-file needs the same key here:\n  \
+                 no key    → EADV on every data op\n  \
+                 wrong key → handshake mac fails\n  \
+                 neither case silently downgrades to unauthenticated"
+            );
+            std::process::exit(1);
+        }
     }
 
     if args.hold {
         // 连接轴：只把 N 条连接打开并保持，让外部脚本量服务端 RSS。
+        //
+        // 建连那一段单独报一个时间：它是「成批重连」场景里唯一多出来的开销
+        // （每条连接多两次往返 + 两次 HMAC），而下面那个存活确认的 ping 循环
+        // 与认证无关。两个数分开打，脚本才能把握手的代价从建连里剥出来。
+        let t_conn = Instant::now();
         let mut cs: Vec<Client> = Vec::with_capacity(args.conns);
         for _ in 0..args.conns {
-            match Client::connect(&args.addr, 0) {
+            match Client::connect_auth(&args.addr, 0, args.auth.as_deref()) {
                 Ok(c) => cs.push(c),
                 Err(e) => {
                     eprintln!("opened {} of {} before failure: {e}", cs.len(), args.conns);
@@ -101,6 +138,11 @@ fn main() {
                 }
             }
         }
+        println!(
+            "connected {} conns in {} ms",
+            cs.len(),
+            t_conn.elapsed().as_millis()
+        );
         // 每条连接确认一次存活，保证 fd 真在服务端注册了。
         for c in cs.iter_mut() {
             let _ = c.call(&Op::Ping);
@@ -125,11 +167,12 @@ fn main() {
         let per_conn = (args.conns / args.threads).max(1);
         let pipeline = args.pipeline;
         let views = args.views;
+        let auth = args.auth.clone();
         let nonce = nonce();
         handles.push(std::thread::spawn(move || {
             let mut cs: Vec<Client> = Vec::with_capacity(per_conn);
             for _ in 0..per_conn {
-                cs.push(Client::connect(&a, 0).expect("connect"));
+                cs.push(Client::connect_auth(&a, 0, auth.as_deref()).expect("connect"));
             }
             // 每线程独占一批视图，避免跨线程名字冲突污染语义。
             let mut vids: Vec<u32> = Vec::with_capacity(views);
@@ -379,4 +422,8 @@ treedb-bench — 对 treedb-server 打负载
   --secs N           持续秒数（默认 5）
   --views N          每线程视图数（默认 8）
   --hold             只建立 N 条连接并保持，用于量服务端 RSS
+  --auth-key-file P  每条连接先用这把密钥跑一次握手（§4.4）。不给 = 不握手。
+                     服务端必须开着同一把密钥，否则报错退出（客户端
+                     fail-closed，不会静默降级成不认证）。与 --hold 合用
+                     就是「建连风暴里握手占多少」的口径
 ";

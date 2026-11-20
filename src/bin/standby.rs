@@ -21,6 +21,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use treedb::engine::PROTOCOL_VERSION;
+use treedb::net::auth::Key;
 use treedb::net::replicate::{Follower, ReplicaCfg};
 use treedb::net::server::{serve, ServerConfig};
 
@@ -45,6 +46,7 @@ fn main() {
     let mut backlog: i32 = 4096;
     let mut workers: usize = 0;
     let mut pid_file: Option<PathBuf> = None;
+    let mut auth_key_file: Option<PathBuf> = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -65,6 +67,7 @@ fn main() {
             "--backlog" => backlog = next(&mut i).parse().unwrap_or(4096),
             "--workers" => workers = next(&mut i).parse().unwrap_or(0),
             "--pid-file" => pid_file = Some(PathBuf::from(next(&mut i))),
+            "--auth-key-file" => auth_key_file = Some(PathBuf::from(next(&mut i))),
             "-h" | "--help" => {
                 println!("{}", HELP);
                 return;
@@ -102,10 +105,26 @@ fn main() {
         std::process::exit(2);
     }
 
+    // 一把密钥同时管两头：对主握手（它是主的客户端）、以及要自己的读者
+    // 握手（它同时是个服务端）。拆成两个 flag 的话，“开了认证却把副本
+    // 自己的端口默默留在开门状态”这种组合一定是被忘出来的，不是被设出来的。
+    let auth: Option<std::sync::Arc<Key>> = match &auth_key_file {
+        Some(p) => match Key::load(p) {
+            Ok(k) => Some(std::sync::Arc::new(k)),
+            Err(e) => {
+                eprintln!("bad --auth-key-file: {e}");
+                std::process::exit(2);
+            }
+        },
+        None => None,
+    };
+    let auth_on = auth.is_some();
+
     let mut rcfg = ReplicaCfg::new(primary);
     rcfg.interval_ms = interval_ms;
     rcfg.max_bytes = fetch_bytes;
     rcfg.timeout_ms = timeout_ms;
+    rcfg.auth = auth.clone();
     if let Err(e) = Follower::check_cfg(&rcfg) {
         eprintln!("{e}");
         std::process::exit(2);
@@ -131,9 +150,10 @@ fn main() {
     cfg.backlog = backlog;
     cfg.workers = workers;
     cfg.replication = Some(rcfg.clone());
+    cfg.auth = auth;
 
     eprintln!(
-        "treedb-standby pid={} listen={} dir={} primary={} protocol={} interval={} ms fetch={} B workers={}",
+        "treedb-standby pid={} listen={} dir={} primary={} protocol={} interval={} ms fetch={} B workers={} auth={}",
         std::process::id(),
         addr,
         dir.display(),
@@ -141,7 +161,8 @@ fn main() {
         PROTOCOL_VERSION,
         interval_ms,
         fetch_bytes,
-        workers
+        workers,
+        if auth_on { "on" } else { "off" }
     );
     match serve(&cfg, &STOP, &LIVE) {
         Ok(rep) => {
@@ -207,6 +228,11 @@ treedb-standby — 只读副本（pull 式日志传送，DESIGN.md §6.6）
   --workers N                前端 worker 线程数，默认 0 = auto。只扩展读；写永远
                              被引擎以 EROFS 挡掉，不会到提交线程
   --pid-file PATH            启动后写入 pid
+  --auth-key-file PATH       集群共享密钥（§4.4），一个 flag 管两头：对主握手，
+                             并要求连到本副本的读者也握手。不给 = 不认证。
+                             密钥必须与主的 `--auth-key-file` 是同一把，否则表
+                             现是 lag 永远追不上（副本会指数退避重试并在日志里
+                             报 unusable，不会默默降级）。
 
 监控：treedb-server --listen <本副本地址> --stats，副本会多一行
   replica = yes (primary seq .. lag .. applied .. resyncs .. errors ..)

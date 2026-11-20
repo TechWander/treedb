@@ -20,8 +20,9 @@ mod common;
 use common::Server;
 use treedb::engine::model::{
     errno, AuditRec, ColumnDef, DefRec, KeyRec, Op, Reply, TableDef, COL_INDEX, COL_UNIQUE,
-    COND_NONE, ROW_PK, SNAP_CHUNK_MAX, WAL_FETCH_MAX, WAL_HINT_NONE,
+    COND_NONE, NONCE_LEN, ROW_PK, SNAP_CHUNK_MAX, WAL_FETCH_MAX, WAL_HINT_NONE,
 };
+use treedb::engine::sha256::DIGEST_LEN;
 use treedb::engine::{Durability, Engine};
 use treedb::net::client::Client;
 
@@ -94,7 +95,7 @@ fn rowput(table: &str, key: &str, val: &str, cond_col: u32, cond_val: &str) -> O
     }
 }
 
-/// 49 个 op 变体的语料，每条都带能让它走到真实分支的参数（视图/文件名/表名
+/// 51 个 op 变体的语料，每条都带能让它走到真实分支的参数（视图/文件名/表名
 /// 取自下面 `seed` 播好的状态，所以视图 id 由调用方递进来）。加新 op 必须同时
 /// 补这里 —— 最后两个计数断言就是报警器。
 fn corpus(v: u32) -> Vec<Op> {
@@ -171,6 +172,12 @@ fn corpus(v: u32) -> Vec<Op> {
         // 走的是交付而不是 gap 那条支路。
         Op::WalFetch { want_seq: 1, hint_off: WAL_HINT_NONE, max_bytes: WAL_FETCH_MAX },
         Op::SnapFetch { offset: 0, len: SNAP_CHUNK_MAX },
+        // ---- 接入认证（§4.4）----
+        // 这两条在服务端由事件循环就地处置、根本不进引擎；走进来只会撞上
+        // `apply.rs` 那条大声的 EINVAL 兜底。语料仍然必须覆盖它们：下面两个
+        // 计数断言就是「新 op 有没有被登记进三档分类」的报警器。
+        Op::AuthBegin { client_nonce: [0x11; NONCE_LEN] },
+        Op::AuthFinish { mac: [0x22; DIGEST_LEN] },
     ]
 }
 
@@ -240,9 +247,9 @@ fn readonly_classification_matches_translate() {
         }
     }
     let cs_len = cs.len();
-    assert_eq!(cs_len, 49, "op 语料必须覆盖全部变体");
+    assert_eq!(cs_len, 51, "op 语料必须覆盖全部变体");
     assert_eq!(ro, 22, "只读 op 数变了：分派表、这里和 DESIGN.md §4.2 分组表要一起改");
-    assert_eq!(wr, 27, "非只读 op 数变了：同上");
+    assert_eq!(wr, 29, "非只读 op 数变了：同上");
 }
 
 /// 三档划分必须穷举且两两不交：只读 / 真写 / 控制面。
@@ -267,8 +274,9 @@ fn ops_partition_into_three_classes() {
     }
     assert_eq!(
         (ro, wr, ctl),
-        (22, 22, 5),
-        "三档的分布：只读 22 / 真写 22 / 控制面 5（Stats、Checkpoint、Shutdown、WalFetch、SnapFetch）"
+        (22, 22, 7),
+        "三档的分布：只读 22 / 真写 22 / 控制面 7（Stats、Checkpoint、Shutdown、WalFetch、\
+         SnapFetch、AuthBegin、AuthFinish）"
     );
     // 语料覆盖全部变体，因此三档之和就是 op 总数。
     assert_eq!(ro + wr + ctl, cs.len());

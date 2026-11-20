@@ -100,13 +100,18 @@ struct Counters {
     forwarded: AtomicU64,
 }
 
-/// 一条 worker 线程启动时需要的东西（`Copy`，好往线程里搬）。
-#[derive(Clone, Copy)]
+/// 一条 worker 线程启动时需要的东西。
+///
+/// 以前它是 `Copy`（四个数）；加了 `auth` 之后只能降到 `Clone` —— 一个
+/// `Arc` 多一次计数，在线程启动时付一次，不在数据面上。
+#[derive(Clone)]
 struct WorkerCfg {
     idx: usize,
     listen: SocketAddr,
     backlog: i32,
     sync_ms: i32,
+    /// 接入认证密钥（§4.4）。`None` = 不认证，与 `ServerConfig::auth` 同语义。
+    auth: Option<Arc<crate::net::auth::Key>>,
 }
 
 /// 起 `cfg.workers` 条前端线程，当前线程当 committer。
@@ -148,6 +153,7 @@ pub(crate) fn serve(
             listen: cfg.listen,
             backlog: cfg.backlog,
             sync_ms: cfg.sync_ms,
+            auth: cfg.auth.clone(),
         };
         let (st, oc, fl, ct, er, mi, mo, dd) = (
             state.clone(),
@@ -238,7 +244,7 @@ fn guarded_worker(
     dead: Arc<Mail<()>>,
 ) {
     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        worker_loop(w, listener, &state, &ops_ctr, &flag, &cnt, &m_in, &m_out)
+        worker_loop(&w, listener, &state, &ops_ctr, &flag, &cnt, &m_in, &m_out)
     }));
     let msg = match r {
         Ok(Ok(())) => return,
@@ -253,8 +259,11 @@ fn guarded_worker(
 }
 
 /// 一条前端线程的事件循环。
+///
+/// `w` 按引用传：它现在含一个 `Arc`，搬进 `worker_loop` 会让下面那句
+/// 「panic 了要报 worker 序号」拿不到值。
 fn worker_loop(
-    w: WorkerCfg,
+    w: &WorkerCfg,
     listener: TcpListener,
     state: &Arc<RwLock<State>>,
     ops_ctr: &Arc<AtomicU64>,
@@ -321,7 +330,7 @@ fn worker_loop(
                             }
                             let id = next_id;
                             next_id += 1;
-                            let c = Conn::new(stream, id);
+                            let c = Conn::new(stream, id, w.auth.is_some());
                             let nfd = c.fd;
                             epoll_set(ep, nfd, false)?;
                             by_id.insert(id, nfd);
@@ -406,6 +415,9 @@ fn worker_loop(
             }
             let mut ops: Vec<Op> = Vec::with_capacity(frames.len());
             let mut bad: Option<Reply> = None;
+            // 这批帧里有没有握手 op。记在解码循环里而不是事后重新遍历一遍
+            // `any()`，是为了让没认证的热路径一个额外遍历也不付。
+            let mut needs_gate = false;
             for f in frames {
                 let payload = match f {
                     Ok(p) => p,
@@ -415,7 +427,10 @@ fn worker_loop(
                     }
                 };
                 match Op::decode(&mut Rd::new(&payload)) {
-                    Ok(o) => ops.push(o),
+                    Ok(o) => {
+                        needs_gate |= crate::net::auth::is_handshake(&o);
+                        ops.push(o);
+                    }
                     Err(e) => {
                         bad = Some(Reply::err(errno::EINVAL, e.to_string()));
                         break;
@@ -434,48 +449,106 @@ fn worker_loop(
                 continue;
             }
 
+            // ---- 握手：在路由之前就地答掉（§4.4）----
+            //
+            // 两条不变量决定了这里的形状：
+            // 1. 握手既不读也不写状态，不该占用提交线程 —— 必须就地答；
+            // 2. `out` 是严格 FIFO 而协议没有 request id，所以只有「最后一条握手
+            //    op 之后」的数据 op 能进下面的路由块；夹在它前面的那些只能回
+            //    EAGAIN 让客户端重发（它们还没被碰过，重发安全）。
+            // 单线程那条循环逐条顺序执行，天然没有这个问题。
+            let mut route: Vec<Op> = ops;
+            if w.auth.is_some() || needs_gate {
+                let auth_key = w.auth.as_deref();
+                let cut = route
+                    .iter()
+                    .rposition(crate::net::auth::is_handshake)
+                    .map(|i| i + 1)
+                    .unwrap_or(0);
+                let mut inline: Vec<Reply> = Vec::new();
+                // head 先算：它里面的握手 op 会推进闸门，tail 的放行判据必须
+                // 等它跑完才成立。
+                let open = match conns.get_mut(&fd) {
+                    Some(c) => {
+                        for op in &route[..cut] {
+                            inline.push(
+                                c.auth
+                                    .on_op(auth_key, op)
+                                    .unwrap_or_else(crate::net::auth::Gate::straddled),
+                            );
+                        }
+                        c.auth.allows_data()
+                    }
+                    None => false,
+                };
+                if open {
+                    if cut > 0 {
+                        // 把 head 从待路由的批里摘掉（tail 一定不含握手 op）。
+                        route = route.split_off(cut);
+                    }
+                } else {
+                    for _ in cut..route.len() {
+                        inline.push(crate::net::auth::Gate::denied());
+                    }
+                    route.clear();
+                }
+                if !inline.is_empty() {
+                    if let Some(c) = conns.get_mut(&fd) {
+                        for r in &inline {
+                            if !c.push_frame(r) {
+                                c.out.push_back(Slot::Filled(reply_frame(r)));
+                            }
+                        }
+                    }
+                }
+            }
+
             // ---- 路由：就地算，还是整批交给 committer ----
-            let has_write = ops.iter().any(|o| !o.is_readonly());
-            let waiting = conns.get(&fd).map(|c| c.queued > 0).unwrap_or(false);
-            let conn_id = conns.get(&fd).map(|c| c.id).unwrap_or(0);
-            if has_write || waiting {
-                if let Some(c) = conns.get_mut(&fd) {
-                    for _ in 0..ops.len() {
-                        c.out.push_back(Slot::Await);
-                    }
-                    c.queued += ops.len();
-                }
-                cnt.forwarded
-                    .fetch_add(ops.len() as u64, Ordering::Relaxed);
-                m_in.send(Forwarded {
-                    conn: conn_id,
-                    ops,
-                });
-            } else {
-                let mut broken: Option<usize> = None;
-                if let Some(c) = conns.get_mut(&fd) {
-                    for (k, op) in ops.iter().enumerate() {
-                        let (reply, logs) = Engine::exec_read(state, op);
-                        if !logs.is_empty() {
-                            // 只读 op 却产出了 logs —— 分派表错了。在这里丢掉
-                            // logs 等于丢一次应当被确认的写，宁可不 ack。
-                            broken = Some(k);
-                            break;
+            // `route` 为空 = 这一批全被握手层就地答完了，不能 `continue`（那会
+            // 跳过下面的 EPOLLOUT / 标脏处理，就地答的帧就没人发）。
+            if !route.is_empty() {
+                let has_write = route.iter().any(|o| !o.is_readonly());
+                let waiting = conns.get(&fd).map(|c| c.queued > 0).unwrap_or(false);
+                let conn_id = conns.get(&fd).map(|c| c.id).unwrap_or(0);
+                if has_write || waiting {
+                    if let Some(c) = conns.get_mut(&fd) {
+                        for _ in 0..route.len() {
+                            c.out.push_back(Slot::Await);
                         }
-                        if !c.push_frame(&reply) {
-                            c.out.push_back(Slot::Filled(reply_frame(&reply)));
+                        c.queued += route.len();
+                    }
+                    cnt.forwarded
+                        .fetch_add(route.len() as u64, Ordering::Relaxed);
+                    m_in.send(Forwarded {
+                        conn: conn_id,
+                        ops: route,
+                    });
+                } else {
+                    let mut broken: Option<usize> = None;
+                    if let Some(c) = conns.get_mut(&fd) {
+                        for (k, op) in route.iter().enumerate() {
+                            let (reply, logs) = Engine::exec_read(state, op);
+                            if !logs.is_empty() {
+                                // 只读 op 却产出了 logs —— 分派表错了。在这里丢掉
+                                // logs 等于丢一次应当被确认的写，宁可不 ack。
+                                broken = Some(k);
+                                break;
+                            }
+                            if !c.push_frame(&reply) {
+                                c.out.push_back(Slot::Filled(reply_frame(&reply)));
+                            }
                         }
                     }
+                    if let Some(k) = broken {
+                        return Err(Error::Io(format!(
+                            "internal: op #{k} dispatched as read-only produced logs"
+                        )));
+                    }
+                    let k = route.len() as u64;
+                    // 计数只进原子句柄，`stats` 本体仍然只有 committer 碰得到。
+                    ops_ctr.fetch_add(k, Ordering::Relaxed);
+                    cnt.inline_reads.fetch_add(k, Ordering::Relaxed);
                 }
-                if let Some(k) = broken {
-                    return Err(Error::Io(format!(
-                        "internal: op #{k} dispatched as read-only produced logs"
-                    )));
-                }
-                let k = ops.len() as u64;
-                // 计数只进原子句柄，`stats` 本体仍然只有 committer 碰得到。
-                ops_ctr.fetch_add(k, Ordering::Relaxed);
-                cnt.inline_reads.fetch_add(k, Ordering::Relaxed);
             }
 
             if bits & libc::EPOLLOUT as u32 != 0 {
