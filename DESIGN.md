@@ -1892,8 +1892,8 @@ treedb-server --dir /var/lib/treedb --listen 127.0.0.1:7777  # 新二进制现�
   设了但读不到 = 每次 open 都失败，不静默降级成不认证。§11 第 4 条 ② 那句
   「已补一半」的客户端这一半补上了；**仍没有 fence**，握手只证明对端持有这把密钥。
 - **崩溃演练已跑**（2026-11-20）：挂载点活着时 `kill -9` 引擎、同 dir 同 port 重开，
-  已 ack 的元数据全在、恢复不需要重启任何进程 —— 逐条实测与一处测出来的
-  **错误 errno** 见下面阶段 C 3（那一条改在 grovefs 仓，见 §11 第 11 条）。
+  已 ack 的元数据全在、恢复不需要重启任何进程 —— 逐条实测与那次一并照出来的**错误
+  errno**（读侧回答 `ENOENT`，当日已在 grovefs 仓闭合）见下面阶段 C 3 与 §11 第 11 条。
 - `view create` / `view rm --base` 走控制面 RPC，在**引擎里**建/删树，
   `<meta-dir>/meta/team.db` 始终不存在；
 - 未知 view 被 M_OPEN 拒绝，而不是悄悄长出一棵空树 —— 这条门的存在检查也改问引擎
@@ -1996,17 +1996,44 @@ spike 明确**没**做、也不在接入面上假装做的事 —— 一律返�
      M_OPEN 都重拨引擎，拨不通就拒（日志里逐条
      `treedb connect 127.0.0.1:<port>: Connection refused`），所以它自己也不用重启。
 
-   **读侧的 errno 是错的，记成缺口、不写成契约**（→ §11 第 11 条）：故障期一次需要
-   触达后端的读，对**挂载点自己**回答 `ENOENT` —— `stat`/`ls`/`ls -U`/`ls -f`/`find`
-   五种读法六次尝试全一样，整个文件系统看起来「不在了」。诚实的答案是 `EIO`，
-   最次是 `ESTALE`；`ENOENT` 会让一个正常的脚本去重建一棵其实还在的树。
-   它为什么**不能钉成断言**：第一版断言写下去的那一跑，故障期 `stat` 是**成功**的
+   **读侧的 errno 曾经是错的，2026-11-20 已闭合**（原缺口记在 §11 第 11 条）：故障期
+   一次需要触达后端的读，对**挂载点自己**回答 `ENOENT` —— 探针的六次尝试（`ls`、
+   `ls -U`、`ls -f`、`ls -l`、`find`、`stat`）全一样，整个文件系统看起来「不在了」。
+   诚实的答案是 `EIO`，最次是 `ESTALE`；`ENOENT` 会让一个正常的脚本去重建一棵其实
+   还在的树。
+
+   修法是**加法式**的（grovefs 仓 `723a013`，6 文件 +417/−105）：`MetaProvider` 的四个
+   读方法（`lookup`/`getattr`/`readdir`/`readdir_page`）各多一个 `*_checked` 孪生，
+   默认实现就是 `Ok(self.xxx(...))`，所以只有真有错误源的三份实现要动 ——
+   `RemoteMeta`（`call_node` 由 `Option<NodeInfo>` 换成
+   `Result<Option<NodeInfo>, MetaError>`：`E_NOTFOUND → Ok(None)`、其它线上码走
+   `err_from_code`、传输失败与坏帧 → `MetaError::Db`，`readdir` 同构）、`TreedbStore`
+   （`Fail::to_meta()`，只有 `ENOENT`/`ENOTDIR` 折成「空」）、以及 meta-server 用的
+   `MetaStore` 枚举分派（少了这一层，通道会在服务端被折回去）。FUSE 层把 `Err` 统一
+   交给 `err_to_errno`，`Db → EIO`。旧的 `Option`/`Vec` 签名留着，变成 `_checked` 的
+   薄包装。**引擎侧一行没动。**
+
+   实测（同一份 `.build-bin/probe_crash_ls.sh`，`kill -9` 引擎后逐条量 rc/stderr）：
+   改前故障期那六次尝试**全部**是 "No such file or directory"（`rc=2`、`n=0/12`），
+   改后**全部**是 "Input/output error"；让缓存过期（`sleep 8`）之后再列一次，改前仍是
+   `ENOENT`、改后仍是 `EIO`；引擎在同 dir 同 port 回来之后，第一次 `ls` 就 12/12，
+   与改前一样。
+
+   **为什么当时不能钉、现在能钉**：第一版断言写下去的那一跑，故障期 `stat` 是**成功**的
    （属性缓存还热），换一份探针跑同一句就成了 `ENOENT` —— 同一分钟内自己推翻自己，
-   差别只在缓存热不热。第 10 节因此只钉写侧，外加一条确定性的「listing 要么失败
-   要么列全，绝不静默变短」。这条也测到了实处：六次故障期列举**没有一次**是
-   rc=0 少条目 —— `RemoteMeta::readdir`（grovefs `src/remote/meta.rs:932`）那个把
-   失败折成 `Vec::new()`（= 「目录到此为止」）的分支根本没机会被走到，因为更早的
-   getattr 已经先失败了。这是个**没被观察到的坏路径**，不是一条好性质。
+   差别只在缓存热不热。有通道之后这件事反过来成了论据：缓存 TTL 一过，`getattr` 就
+   必须打到后端，后端不可达就必须是 `EIO`，所以那个值是**确定**的而不是硬币。第 10 节
+   因此从「只钉写侧」升级成两条确定性读侧断言（`sleep 8` 后故障期 `stat` 必须 `EIO`、
+   故障期 `ls` 必须失败），`test_treedb.sh` 53 条断言 → **55 条，全绿**。
+
+   同一次改动还关掉了一条**没被观察到的坏路径**：`RemoteMeta::readdir` 把失败折成
+   `Vec::new()`（= 「目录到此为止」），而 FUSE 的分页循环用 `got < want` 判 EOF ⇒
+   失败会静默截断。改前六次故障期列举**没有一次**是 `rc=0` 少条目，只是因为更早的
+   getattr 已经先失败了 —— 那是个碰巧没被走到的洞，不是一条好性质。
+
+   残留三处，明确不在这笔里：`PgEngine`/SQLite 引擎的读仍在各自的 SQL 调用处把 `Err`
+   折成空值、`LayoutMeta` 这个展示透镜不转发内层错误、`dump_tree`（`du`）没有通道。
+   `_checked` 的默认实现已经在 trait 上，补这三处是纯加法。
 4. **控制面搬家：`grovefs_control` 那六张表迁进引擎的通用表**（**方案，未开工**，
    2026-11-20 成文）。表形状、绕法、切换顺序定死在这里，开工时不再做决定。
 
@@ -2240,22 +2267,32 @@ spike 明确**没**做、也不在接入面上假装做的事 —— 一律返�
       `secret_enc`，`AuditRec` 缺 `key_label`）—— 所以这几组 op 不是「能用但丑」，
       是**不够用**，拆它们的理由比原先记的更硬。
 11. **后端不可达时，grovefs 的读回答 `ENOENT`**（§10 阶段 C 3 测出来的；**改在
-    grovefs 仓，引擎侧一行不用动**）。症状：引擎被 `kill -9` 之后，`stat` 一个确实
-    存在的挂载点回答 "No such file or directory"。根因已定位到行：读侧的 RPC 封装
-    `RemoteMeta::call_node`（grovefs `src/remote/meta.rs:834`）签名是
-    `Option<NodeInfo>`，`_ => None` 把「传输失败」「后端报了个 errno」「这个名字不
-    存在」三件事折成一个值，FUSE 层只能回 `ENOENT`；`readdir`（`:932`）同构，失败
-    折成 `Vec::new()`（= 「目录到底了」）。**写侧没有这个洞**：`call_id`/`call_status`
-    （`:841`、`:849`）返回 `Result<_, MetaError>`，传输失败单独成
-    `MetaError::Db("remote meta transport")` —— 实测那个「写被拒（`EIO`）、读说谎
-    （`ENOENT`）」的不对称，全部来源就是这两组封装的差别。
+    grovefs 仓，引擎侧一行不用动**）—— **2026-11-20 已闭合**：grovefs
+    `feat/treedb-read-errno` `723a013`，6 文件 +417/−105。症状：引擎被 `kill -9`
+    之后，`stat` 一个确实存在的挂载点回答 "No such file or directory"。根因在行：
+    读侧的 RPC 封装 `RemoteMeta::call_node` 签名是 `Option<NodeInfo>`，`_ => None` 把
+    「传输失败」「后端报了个 errno」「这个名字不存在」三件事折成一个值，FUSE 层只能
+    回 `ENOENT`；`readdir` 同构，失败折成 `Vec::new()`（= 「目录到底了」），而分页
+    循环用 `got < want` 判 EOF ⇒ 静默截断。**写侧没有这个洞**：`call_id`/`call_status`
+    返回 `Result<_, MetaError>`，传输失败单独成 `MetaError::Db` —— 那个「写被拒
+    （`EIO`）、读说谎（`ENOENT`）」的不对称，全部来源就是这两组封装的差别。
+
     难在修法的半径：`MetaProvider` 的读方法本身就是 `Option`/`Vec`
-    （grovefs `src/meta.rs:248`），实现有六份（`RemoteMeta`、`MetaEngine`、
-    `MetaStore`、`LayoutMeta`、`PgEngine`、`TreedbStore`）。两条路：给 trait 的读方法
-    加错误通道（六份实现全动，但 PG/SQLite 档同样在说这个谎，一次修完），或只让
-    `RemoteMeta` 自己记住「上一次 RPC 是传输失败」、下一次 FUSE 回复优先回 `EIO`
-    （改动小，但把事实藏进了一个隐式状态）。选哪条是 grovefs 侧的决定，不在本仓。
-    验收判据：§10 阶段 C 3 那条「listing 要么失败要么列全」升级成「必须失败且
-    errno ∉ {`ENOENT`, `ENOTDIR`}」，且 `.build-bin/probe_crash_ls.sh` 里故障期六种
-    读法全部不是 `ENOENT` —— 在那之前第 10 节不敢钉读侧，因为那个值取决于缓存热
-    不热，而不是取决于后端到底了没有。
+    （grovefs `src/meta.rs`），实现有六份（`RemoteMeta`、`MetaEngine`、`MetaStore`、
+    `LayoutMeta`、`PgEngine`、`TreedbStore`）。最后选的**不是**改签名（124 个调用点、
+    78 个在引擎内部），而是加法：四个读方法各长一个 `*_checked` 孪生，默认
+    `Ok(self.xxx(...))`，只有 `RemoteMeta`、`TreedbStore` 与 `MetaStore` 的枚举分派
+    覆盖它；`Err` 在 FUSE 层统一 `err_to_errno`（`Db → EIO`）。被否的另一条是「只让
+    `RemoteMeta` 记住上一次 RPC 是传输失败」—— 改动更小，但把事实藏进隐式状态，
+    且 PG/SQLite 档照样在说这个谎。
+
+    验收判据达成：§10 阶段 C 3 那条「listing 要么失败要么列全」升级成「必须失败且
+    errno ∉ {`ENOENT`, `ENOTDIR`}」—— `.build-bin/probe_crash_ls.sh` 故障期六次尝试
+    （`ls`、`ls -U`、`ls -f`、`ls -l`、`find`、`stat`）改前全是 `ENOENT`、改后全是
+    `EIO`；缓存过期（`sleep 8`）之后仍是 `EIO`，这条才让第 10 节敢钉读侧
+    （`test_treedb.sh` **53 → 55 条，55/0**）。回归面：`cargo test --release` 318/0、
+    阶段 C 1 矩阵 39/0/10、`.build-bin/run_all.sh` 整板逐套件摘要与改前一致。
+
+    残留（同样形状，未修）：`PgEngine`/SQLite 引擎的读仍在 SQL 调用处把 `Err` 折成
+    空值、`LayoutMeta` 透镜不转发内层错误、`dump_tree`（`du`）无通道。`_checked` 已在
+    trait 上，补它们是纯加法。
