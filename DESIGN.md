@@ -2032,8 +2032,8 @@ spike 明确**没**做、也不在接入面上假装做的事 —— 一律返�
 | `refs rebuild` | 拒绝 | 持有者计数在引擎内同 op 维护，没有独立账本可重算 |
 | `gc` 审计 | 拒绝 | 没有聚合的 ledger 视图，回空集等于判所有对象为孤儿 |
 | ~~readdir 的属性~~ **已闭合**（2026-11-20） | provider 改用 `ReadDirPlus` | 原写法准确：协议面 2026-11-19 就闭合了，缺的是调用。两臂实测（同一份 `du` 走完一棵树，配方 grovefs `.build-bin/bench_treedb_readdir.sh`，引擎侧计数器读 `--stats`）：引擎应用的 op 数 3000 条时 **3006 → 6**、20000 条时 **20023 → 23**；把引擎放到每段 2 ms 延迟的 TCP 代理后面墙钟 **256 ms → 52 ms**，同机 loopback 上 106 vs 88 ms（三次分布重叠，量不出差别）。**这项收益的单位是往返**，本机测试恰好把它藏起来，所以两个数都得写。语义零回归：阶段 C 1 那套矩阵改前改后都是 `pass=39 fail=0 skip=10` |
-| 定义/密钥/账户 | 还在本地 SQLite | 引擎侧的通用表本轮已可用（§11 第 7 条 T2），但 grovefs 未拿它拼过语义；`Key*`/`Audit*` 那三个专用 op 仍是业务形状，不能当接入面（上文第 4 步）。**迁法已成文**（下面阶段 C 4），未开工 |
-| `view list` 的物理树 | 列不出来 | 控制面枚举器只看本地 db 文件 |
+| 定义/密钥/账户 | 默认还在本地 SQLite | 引擎侧的通用表已可用（§11 第 7 条 T2）；`GROVEFS_TREEDB_CONTROL=engine` 时密钥、审计、账户、授权**已在通用表上**（2026-11-20，§11 第 13/14 条），但默认关——M2 迁移未跑，切过去等于把它们全判成不存在。视图定义仍在本地；`Key*`/`Audit*` 那三个专用 op 仍是业务形状，不能当接入面（上文第 4 步）。**迁法已成文**（下面阶段 C 4） |
+| ~~`view list` 的物理树~~ **已闭合**（2026-11-20，M1b） | `TreedbControlStore::list_physical` 回答「本地 ∪ 引擎的 `Op::ListViews`」 | 控制面枚举器只看本地 db 文件时，引擎里的基树在 `view list`/`store.info` 里都不存在（委派也因此无法解析）。修了 `list_physical`/`has_physical` 两处双答案，枚举与存在性判据同时看见引擎 |
 | HA / 快照传送 | 启动即拒绝 | 接入面用不上它：§8 限制 6 现在是「有异步只读副本、无同步复制」，而 grovefs 要的是「主挂了切副本」—— 那一步没有提升路径（§11 第 4 条③） |
 | ~~path 依赖的分发方式~~ | 已定：按 tag 的 git 依赖 | 钉 `v0.3.6`（随定版前移），无同级克隆也能构建（实测） |
 
@@ -2129,8 +2129,9 @@ spike 明确**没**做、也不在接入面上假装做的事 —— 一律返�
    残留三处，明确不在这笔里：`PgEngine`/SQLite 引擎的读仍在各自的 SQL 调用处把 `Err`
    折成空值、`LayoutMeta` 这个展示透镜不转发内层错误、`dump_tree`（`du`）没有通道。
    `_checked` 的默认实现已经在 trait 上，补这三处是纯加法。
-4. **控制面搬家：`grovefs_control` 那六张表迁进引擎的通用表**（**方案，未开工**，
-   2026-11-20 成文）。表形状、绕法、切换顺序定死在这里，开工时不再做决定。
+4. **控制面搬家：`grovefs_control` 那六张表迁进引擎的通用表**（**方案 2026-11-20
+   成文；M1 已落地，M2–M4 未开工**——见 §11 第 13/14 条）。表形状、绕法、切换
+   顺序定死在这里，开工时不再做决定。
 
    **走通用表（`TableCreate` + `Row*`），不走 `Key*`/`Audit*`/`Def*`/`Place*`。**
    §11 第 7 条已定过调（专用 op 的形状就是某个客户端的表，直接接上等于把业务语义坐进
@@ -2158,7 +2159,7 @@ spike 明确**没**做、也不在接入面上假装做的事 —— 一律返�
    | `mcp_calls` | `!ts_us`（8 B 大端）`\|\| !seq`（8 B） | `bucket`（UTC 日 `YYYYMMDD`） | 主键取反 ⇒ 「最新 N 条」就是主键序前 N 条，`ORDER BY rowid DESC` 有了着落 |
    | `view_defs` | `name` | 无 | PG 那边靠 `SELECT xmin::text` 做乐观并发，这里换成对 `definition` 列 CAS（见下） |
    | `view_placement` | `view` | 无 | 「表还不存在」这个状态今天由 `lookup_placement` 返回的 bool 表示，正好对上 `TableGet → Table(None)`（不是错误） |
-   | `web_accounts` | `account` | `role` | `SELECT COUNT(*)` → `RowCount{column: ROW_PK}`（O(1)）；`ORDER BY account` → 主键字节序，天然一致 |
+   | `web_accounts` | `account` | `role` | `SELECT COUNT(*)` → `RowCount{column: ROW_PK}`（O(1)）；`ORDER BY account` → 主键字节序，天然一致。**落地时多了一列 `rev`**（第 6 列，8 B 大端）：整行覆盖下两个写者改一行的 CAS 计数器，见下表后的「第五处」 |
    | `web_grants` | `account \|\| 0x00 \|\| base_view` | `account`、`base_view` | 两个方向都要问（某账户有哪些视图 / 某视图给了谁），而通用表**没有前缀谓词**，所以复合主键不能代替那两个索引列。分隔符取 `0x00`：两段都是 UTF-8 文本，NUL 不可能出现 |
 
    三条通用约定：没有 NULL 概念 ⇒ 今天的 `IS NULL` 一律编成**空字节串**（`revoked_at`、
@@ -2181,7 +2182,17 @@ spike 明确**没**做、也不在接入面上假装做的事 —— 一律返�
    | `SELECT … FROM api_keys ORDER BY created_at DESC` | 没有排序 | 全表扫 + 客户端排序。这张表是运维手工发的 key，量级在几百；真到了需要排序访问路径的那天，把 `created_at` 编进主键、`id` 转成 `COL_UNIQUE` 索引列 |
    | `count(*) FROM mcp_calls WHERE ts < cutoff` 与配套的 `DELETE … WHERE ts < cutoff` | `RowCount` 只按**等值**，也没有范围/批量删除 | 按 `bucket` 逐日 `RowCount` 求和；清扫同理，逐日 `RowList` + 逐行 `RowDelete`。今天那条 `DELETE` 在 SQLite 里也是一条条删，只是被语句数骗过去了 |
    | `SELECT COUNT(*) WHERE role='admin' AND disabled_at IS NULL` | 没有跨列条件 | `RowList{column=role, value="admin"}` + 客户端过滤 `disabled_at == ""` 再数（管理员是个位数到十位数）。**不引入派生列**（写一列 `admin_active` 之类）：派生列要求每个写侧都记得维护，漏一处就是一个说不清来源的错数 |
-   | 删账户 = `DELETE FROM web_grants WHERE account=?` 再 `DELETE FROM web_accounts WHERE account=?`，两条语句 | 没有多语句事务（§5.3） | 顺序照今天「先删授权、再删账户」，风险挪到「孤儿授权」那一侧。那一侧今天已经是 fail-closed：登录与鉴权都先 `fetch(account)`，账户行不在就直接拒（`webauth.rs:745-758`、`webauth.rs:917-928`），授权行根本没机会被读到。**这是读代码核实的性质，迁移时要拿一条断言钉住** —— 它是那种漂了不会立刻看得见的那类 |
+   | 删账户 = `DELETE FROM web_grants WHERE account=?` 再 `DELETE FROM web_accounts WHERE account=?`，两条语句 | 没有多语句事务（§5.3） | 顺序照今天「先删授权、再删账户」，风险挪到「孤儿授权」那一侧。那一侧今天已经是 fail-closed：登录与鉴权都先 `fetch(account)`，账户行不在就直接拒（`webauth.rs:745-758`、`webauth.rs:917-928`），授权行根本没机会被读到。**这条已不再只是「读代码核实的性质」：M1b 落地后由 `treedbctl` 套件断言——`account rm` 删掉 bob 后，`grant list` 里没有 bob、`account list` 里也没有，网关登录回 401；引擎重启后再读一遍，两者都没有回来** |
+
+   **第五处（M1b 落地时新发现）：同一行的两个写者。** 这张表列的是「SQL 能力 vs
+   引擎能力」，而真正咬人的一处不在能力，在**写模式**：`RowPut` 整行覆盖，「登录
+   stamp `last_login_at`」与「管理员 disable」同时发生是两个写者，后写者会把自己
+   读到的**陈旧另一半**写回——登录把已禁用账户重新启用是安全 bug，不是普通丢更新
+   （正好与「不做长期双读」那一段同一个理由：分叉的字段里有安全属性）。先想的是
+   SQL 那条 `RowPut{cond_col=disabled_at}`，但它只能表达一个方向（登录不得修改
+   disabled 字段），表达不了「disable 不得旧写 last_login」；所以最终是加一列
+   `rev`（每次编辑自增，`cond_col=rev`）：任何输家拿 `EAGAIN` 重读，只重放自己
+   那一列。代价是一个「不装业务」的列与每次编辑一次额外往返。
 
    **热路径。** 每次鉴权都带一次 `UPDATE api_keys SET last_used_at=?`（`stamp_used`）。
    搬进引擎它就是**一次 WAL 写**：fsync 有 group commit 攒批，但它落在凭据那一行上，与
@@ -2223,8 +2234,56 @@ spike 明确**没**做、也不在接入面上假装做的事 —— 一律返�
      进程看见、control 面自己的鉴权写 4 条 `mcp_calls` 并 stamp `last_used_at`、
      `purge --before` 逐行真删、引擎重启后全在；回归 318/0、55/0、39/0/10 不动。
      边界（写在套件头里，不是沉默的缺口）：`grovefs mcp --meta-store treedb://`
-     仍拒绝该 URI（视图定义 = M2），web 账户表仍在本地（B 半），所以审计行的真实
-     写入方目前只有 control 面鉴权这一条腿。
+     仍拒绝该 URI（视图定义 = M2），所以审计行的真实写入方目前只有 control 面鉴权
+     这一条腿（web 账户表当时还在本地，同日的 B 半已把它也搬进引擎）。
+
+     **B 半（web 账户 + 授权，`webauth`）同日落地**：grovefs `245fd63`（12 文件
+     +1036/−233，其中 `src/webauth/treedb_ctl.rs` 373 行新文件、
+     `src/control_treedb.rs` 271 行新文件）。本节表里那句
+     `COUNT(*) WHERE role='admin' AND disabled_at IS NULL` 的跨列条件就在这一侧。
+     落地时的三处计划纠正：
+     ① **两张表都多一个 `rev` 列，而它不做业务**。`RowPut` 整行覆盖，「登录 stamp
+     `last_login_at`」与「管理员 disable」是两个写者，没有条件时后写者会把陈旧
+     的另一半写回——登录把已禁用账户写回来是**安全 bug**，不是丢更新。所以
+     `web_accounts` 第 6 列 `rev`（8 字节大端，每次编辑自增）就是 CAS 列：输家拿
+     `EAGAIN`、重读后只重放自己那一列，8 次为限。`web_grants` 5 列，主键
+     `account\0base_view`，两列都 `COL_INDEX`——引擎没有前缀谓词，「这个账户的
+     基视图」与「谁持有这棵树」只能走二级索引问，`0x00` 是安全分隔符（两半都是
+     校验过的文本）。
+     ② **`grant` 的 upsert 必须保住 `perm`**。SQL 是
+     `ON CONFLICT DO UPDATE SET granted_at, granted_by`；照抄成整行覆盖会把一条
+     ro 授权悄悄升成 rw。引擎侧是「有行就 CAS 只改这两列、没行就 `PUT_IF_ABSENT`
+     撞键重试」。A 半那个 `keys_uri()` 也在这一半改名 `control_tables_uri()`：
+     它现在同时回答凭据与账户表，控制面块用**同一个**出口开 `ApiKeyStore` 与
+     `WebAuthStore`，两个出口迟早会说两句话。
+     ③ **真正的拦路虎不在 `enum Backend`，而在控制面对引擎树不可见**（第三个
+     计划纠正，单独说）：treedb 档 `rt.control` 的 `has_physical` 只枚举本地
+     `meta/*.db`，而引擎里的基树在磁盘上没有文件 ⇒ `webauth::resolve_base` 对任
+     何 treedb 基视图都回答 `view 'x' has neither a definition nor a tree` ⇒
+     **委派永远命中不了**：账户能登录，但管不了任何东西（`web grant add --base
+     team` 三连红才露头）。解法是 `mcp::TreedbControlStore` 装饰器——17 个方法里
+     12 个定义动词逐个委派给 `FileControlStore`，只有 `list_physical`（本地 ∪
+     引擎的 `Op::ListViews`）与 `has_physical`（本地 || 引擎含）是双答案，
+     `store_for_db_path` 保持绑定（与 PG 同），`server_ext` 按 `StoreKind` 路由到
+     `control_store_for_treedb`。**这条的教训：控制面每个「存在性」判据都得先问
+     一句「它看得见引擎吗」**——单元层全绿，因为每一步都只碰本地文件，缺口只在
+     端到端现形。
+     证据（当轮实跑）：`treedbctl` **61/0**（A 半时 32/0）。新增三段——安装期
+     owner 落进引擎（本地没有 `meta/web_accounts.db`）、create/grant/role/
+     disable/rm 每步被下一个进程看见；网关 `POST /api/login` 把
+     `last_login_at` **就地**写进引擎行、禁用账户登不进且文案说 `disabled`；引擎
+     重启后账户、授权、改过的字段全在，重启的 meta-server 复用同一个
+     `--admin-user` 不重建（`grep -c alice` = 1）。两条把「委派真的咬人」钉住的
+     断言：bob 对授予的引擎基树 `view.stats` 回答 `"tree":true`，对未授予的名字
+     回答 `not delegated base view 'other'`。回归：318/0、55/0、39/0/10，两档
+     `cargo build --release`（含 `--features treedb`）无 warning；板子上
+     web/apikey/ctlplane/manager 四红是基线红（改动前两份日志读数相同，且失败点
+     依赖别的分支才有的 `apikey.secret`）。
+     边界：视图**定义**与 placement 仍永远在本地（引擎没有对应的表），所以 treedb
+     档的形状是「定义本地 + 树在引擎 + 行表在引擎」，
+     `StoreKind::control_uri()` 与 `control_tables_uri()` 这一对就是它的编码；
+     `fork`/`import` 的 treedb 臂未动。M1 至此覆盖整个控制面（凭据、审计、账户、
+     授权），只剩视图定义在 M2。
    - **M2** 新命令 `grovefs control-migrate --to engine`：读旧库、写通用表，**幂等**
      （重跑走覆盖写），跑完做全量比对 —— 每张表比行数与逐行逐列字节相等，比不过就
      非零退出、不进 M3。`secret_enc` 原样搬，**绝不重新包裹**：包裹材料在
@@ -2383,7 +2442,8 @@ spike 明确**没**做、也不在接入面上假装做的事 —— 一律返�
       顺序只能是先在 grovefs 侧用通用表拼出等价语义、跑过端到端，再删 op；先删后补
       会把 spike 分支直接弄坏。拆完之后 L1 那档才从「仍违反」改成「不违反」，
       §5.1 的 12 张表也能缩回 8 张。**「拼出等价语义」这一步 2026-11-20 已成文**
-      （§10 阶段 C 4：表形状、四处不等价的地方与绕法、M1–M4 切换顺序），未开工。
+      （§10 阶段 C 4：表形状、四处不等价的地方与绕法、M1–M4 切换顺序）；M1（控制面
+      A/B 两半）2026-11-20 已落地（第 13/14 条），拆 op 本身是 M4，仍未开工。
       同一次核对还查出专用记录本来就装不下今天要存的字节（`KeyRec` 缺 `scope` 与
       `secret_enc`，`AuditRec` 缺 `key_label`）—— 所以这几组 op 不是「能用但丑」，
       是**不够用**，拆它们的理由比原先记的更硬。
@@ -2472,8 +2532,45 @@ spike 明确**没**做、也不在接入面上假装做的事 —— 一律返�
     件）**——`manager` 与 `treedbmatrix` 早就进了 CANON 而散文没跟上，本轮再
     加 `treedbctl`。
 
-    未做的两半（都不在本条范围内，开关按 M1 原文保留到 M3）：**B 半** =
-    `webauth` 的账户/授权表（§10 C 4 表中那句
-    `WHERE role='admin' AND disabled_at IS NULL` 的跨列条件就在这一侧）；视图定义
-    仍在本地（M2 迁移之前 `grovefs mcp --meta-store treedb://` 继续拒绝该 URI，
-    所以审计行目前唯一的真实写入方是 control 面的鉴权）。
+    未做的部分（不在本条范围内，开关按 M1 原文保留到 M3）：**B 半** = `webauth`
+    的账户/授权表，同日已落地（第 14 条）；视图定义仍在本地（M2 迁移之前
+    `grovefs mcp --meta-store treedb://` 继续拒绝该 URI，所以审计行目前唯一的真实
+    写入方是 control 面的鉴权）。
+
+14. **M1 的 B 半：web 账户 + 授权已落到通用表上，M1 至此覆盖整个控制面**（§10 阶段
+    C 4；**同样改在 grovefs 仓，引擎侧一行不用动**）—— **2026-11-20 已闭合**：
+    grovefs `feat/treedb-read-errno` `245fd63`，12 文件 +1036/−233
+    （`src/webauth/treedb_ctl.rs` 373 行新文件、`src/control_treedb.rs` 271 行新
+    文件——把 A 半 `apikeys/treedb_ctl.rs` 里的行级原语抽出来共用于两家，该文件
+    因此 −224 行；`webauth.rs` 143 行改动、`mcp.rs` +151、`server_ext.rs` 75 行
+    改动，另四份文档）。
+
+    形状：`grovefs_control__web_accounts` 6 列（`pw_hash` / `role` / `created_at`
+    / `disabled_at` / `last_login_at` / **`rev`**）、`grovefs_control__web_grants`
+    5 列（`account` / `base_view` / `perm` / `granted_at` / `granted_by`，主键
+    `account\0base_view`，前两列 `COL_INDEX`）。14 个动词全部有引擎路径，三个 SQL
+    分派器（`exec2`/`query2`/`changes2`）各补一条「忘了委派」的拒绝臂。
+
+    三处计划纠正（前两条与 A 半同构，第三条是本轮唯一的架构改动）：
+    ① `rev` 是 CAS 列而不是业务字段 —— 整行覆盖 + 登录 stamp 与管理员 disable
+    两个写者 ⇒ 后写者会把陈旧的另一半写回，**登录把已禁用账户写回来是安全 bug**；
+    输家拿 `EAGAIN`、重读后只重放自己那一列（8 次为限）。
+    ② `grant` 是保住 `perm` 的 upsert（SQL 的 `ON CONFLICT DO UPDATE SET
+    granted_at, granted_by`），整行覆盖会把 ro 授权悄悄升成 rw；`active_admins`
+    是 `scan_eq(role,"admin")` + 客户端滤空，对齐那句跨列 `COUNT`。
+    ③ **控制面对引擎树不可见，委派根本命中不了**：treedb 档 `rt.control` 的
+    `has_physical` 只枚举本地 `meta/*.db`，引擎基树没有本地文件 ⇒
+    `resolve_base` 恒答「neither a definition nor a tree」⇒ 账户能登录但管不了
+    任何东西（`web grant add --base team` 三连红才露头）。新增
+    `mcp::TreedbControlStore` 装饰器：17 个方法里 12 个定义动词委派
+    `FileControlStore`，`list_physical`/`has_physical` 双答案（引擎侧走
+    `Op::ListViews`），`store_for_db_path` 绑定，`server_ext` 按 `StoreKind` 路由。
+    **控制面每个「存在性」判据都得先问「它看得见引擎吗」。**
+
+    证据（当轮实跑）：`treedbctl` **61/0**（A 半 32/0），含「登录就地 stamp 引擎
+    行」「引擎重启后账户与授权全在且 `--admin-user` 幂等」「bob 对授予的引擎基树
+    `tree:true`、对未授予名字按名拒绝」；回归 318/0、55/0、39/0/10 不动；
+    web/apikey/ctlplane/manager 四红是基线红（改动前日志读数相同）。
+
+    边界：视图定义与 placement 仍永远在本地 ⇒ treedb 档是「定义本地 + 树在引擎 +
+    行表在引擎」；`fork`/`import` 的 treedb 臂未动。
