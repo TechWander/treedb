@@ -1,0 +1,9 @@
+engine 127.0.0.1:53613  (idle window 600s, so nothing is swept during the run)
+ mounted  engine_conns  meta_socks engine_fds
+       0             0           2        74
+      10            40          92       114
+10+1listing            40          92       114
+0 (unmounted)            40          42       114
+views      = 10
+wal        = 1512 B logical, 4194304 B on disk
+PROBE DONE

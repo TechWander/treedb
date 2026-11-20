@@ -1,0 +1,6 @@
+baseline                     engine_conns=0  meta_socks=2
+A mounted                    engine_conns=4  meta_socks=11
+A killed (3s later)          engine_conns=4  meta_socks=6
+B mounted (A gone)           engine_conns=8  meta_socks=15
+B killed (3s later)          engine_conns=8  meta_socks=10
+PROBE DONE

@@ -1,0 +1,38 @@
+=== 万级视图形状（P0-3 C2） 2026-11-20 08:18:38 UTC rev=2625dc5 ===
+host nproc=128 / Linux 5.4.0-216-generic x86_64；一个 treedb-server + 一个 data-server + 一个 meta-server --meta-store treedb://
+被测 grovefs 二进制 = /data/grovefs/.wt-errno/target/release/grovefs（feat/treedb-read-errno 502d929，--features treedb）
+每档：先把视图建到该数，再把**本档新建的每个视图各挂一遍**（每个都建一个 store），卸载不回收（idle 窗口 3600 s）
+levels: 100 1000 5000 10000  (each level: create the new views, then mount every one of them)
+engine 127.0.0.1:38905  meta-server 127.0.0.1:38485  (idle window 3600s: nothing is evicted during the run)
+   views  mounted engine_conns    peak tcp_socks   rss_KiB KiB/store ms/create mnt op us           
+     100      100          4       4       6      8812       10       159      3965           
+    ... 500 views mounted, engine_conns=4
+    ... 1000 views mounted, engine_conns=4
+    1000     1000          4       4       6     10964        2       162      4357           
+    ... 1500 views mounted, engine_conns=4
+    ... 2000 views mounted, engine_conns=4
+    ... 2500 views mounted, engine_conns=4
+    ... 3000 views mounted, engine_conns=4
+    ... 3500 views mounted, engine_conns=4
+    ... 4000 views mounted, engine_conns=4
+    ... 4500 views mounted, engine_conns=4
+    ... 5000 views mounted, engine_conns=4
+    5000     5000          4       4       6     19224        2       160      4299           
+    ... 5500 views mounted, engine_conns=4
+    ... 6000 views mounted, engine_conns=4
+    ... 6500 views mounted, engine_conns=4
+    ... 7000 views mounted, engine_conns=4
+    ... 7500 views mounted, engine_conns=4
+    ... 8000 views mounted, engine_conns=4
+    ... 8500 views mounted, engine_conns=4
+    ... 9000 views mounted, engine_conns=4
+    ... 9500 views mounted, engine_conns=4
+    ... 10000 views mounted, engine_conns=4
+   10000    10000          4       4       6     23216        0       163      4194           
+engine --stats:
+views      = 10000
+nodes      = 10000
+wal        = 2026060 B logical, 4194304 B on disk
+interpretation: engine_conns/peak must stay flat (one process-wide pool per address, so
+                the curve is decoupled from the number of resident stores); KiB/store is the
+                marginal RSS of one more resident store; mnt op us is the mounted latency.

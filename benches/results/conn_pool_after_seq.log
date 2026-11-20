@@ -1,0 +1,16 @@
+engine   127.0.0.1:49739
+views opened sequentially: mount -> ls -> unmount (store stays cached, idle window 600s)
+ views  engine_conns  meta_socks  meta_fds
+     0             0           2        73
+precreated             4           6        77
+     1             4           6        77
+    10             4           6        77
+    50             4           6        77
+   100             4           6        77
+engine --stats:
+views      = 100
+nodes      = 100
+wal        = 15284 B logical, 4194304 B on disk
+meta-server engine-cache log lines:
+0
+PROBE DONE
