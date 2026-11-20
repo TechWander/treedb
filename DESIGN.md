@@ -1873,8 +1873,10 @@ treedb-server --dir /var/lib/treedb --listen 127.0.0.1:7777  # 新二进制现�
 
 ### 阶段 B spike 的实际结果（2026-11-19，`exp/treedb-integration`）
 
-上面四步全部落地，端到端跑通。`.build-bin/test_treedb.sh`（31 条断言，默认档
-自动 SKIP）里 `treedb-server` + `grovefs meta-server --meta-store treedb://…` +
+上面四步全部落地，端到端跑通。`.build-bin/test_treedb.sh`（53 条断言，默认档
+自动 SKIP；其中 7 条是 2026-11-20 加的认证一节、15 条是同日加的崩溃一节）里
+`treedb-server` +
+`grovefs meta-server --meta-store treedb://…` +
 `data-server` + `mount` 四件套做真读写，逐条对上本文的承诺：
 
 - create / write / read / readdir / mkdir / symlink / rename / unlink 全过；
@@ -1883,6 +1885,15 @@ treedb-server --dir /var/lib/treedb --listen 127.0.0.1:7777  # 新二进制现�
   名字，两次都让 `blocks/` 里的对象计数下降 —— `Reply::NodeRef(freed)` 那条通道
   不是纸面设计，它确实把删除决定送到了持有字节的进程；
 - 两台服务（meta-server 与引擎）重启后，树与字节都还在，remount 直接读回；
+- **认证入口已接**（2026-11-20）：grovefs 侧拿环境变量
+  `GROVEFS_TREEDB_KEY_FILE` 给密钥**文件路径**（与仓里既有的
+  `GROVEFS_JOIN_KEY_FILE`/`GROVEFS_ROSTER_KEY_FILE` 同规：密钥字节永不进 argv），
+  四条 `Client::connect` 全改 `connect_auth`。没设 = 不握手（协议 v5 的默认档），
+  设了但读不到 = 每次 open 都失败，不静默降级成不认证。§11 第 4 条 ② 那句
+  「已补一半」的客户端这一半补上了；**仍没有 fence**，握手只证明对端持有这把密钥。
+- **崩溃演练已跑**（2026-11-20）：挂载点活着时 `kill -9` 引擎、同 dir 同 port 重开，
+  已 ack 的元数据全在、恢复不需要重启任何进程 —— 逐条实测与一处测出来的
+  **错误 errno** 见下面阶段 C 3（那一条改在 grovefs 仓，见 §11 第 11 条）。
 - `view create` / `view rm --base` 走控制面 RPC，在**引擎里**建/删树，
   `<meta-dir>/meta/team.db` 始终不存在；
 - 未知 view 被 M_OPEN 拒绝，而不是悄悄长出一棵空树 —— 这条门的存在检查也改问引擎
@@ -1925,8 +1936,8 @@ spike 明确**没**做、也不在接入面上假装做的事 —— 一律返�
 | `view export` / `view import` | 拒绝 | dump reader 是 SQL 形状的，treedb 无等价物 |
 | `refs rebuild` | 拒绝 | 持有者计数在引擎内同 op 维护，没有独立账本可重算 |
 | `gc` 审计 | 拒绝 | 没有聚合的 ledger 视图，回空集等于判所有对象为孤儿 |
-| readdir 的属性 | 仍是 N/64 次往返 | **协议面已闭合**（`ReadDirPlus` 进了 `v0.3.3`，§11 第 6 条），断的是接入侧：provider 还没改用它，而且 grovefs 钉 tag 的升级只带来 op 可用、没带来调用（实测 `src/treedb_store.rs` 里 `ReadDirPlus` 只出现在注释里）。改造前这个缺口真实存在，不能因为 op 进了协议就算完成 |
-| 定义/密钥/账户 | 还在本地 SQLite | 引擎侧的通用表本轮已可用（§11 第 7 条 T2），但 grovefs 未拿它拼过语义；`Key*`/`Audit*` 那三个专用 op 仍是业务形状，不能当接入面（上文第 4 步） |
+| ~~readdir 的属性~~ **已闭合**（2026-11-20） | provider 改用 `ReadDirPlus` | 原写法准确：协议面 2026-11-19 就闭合了，缺的是调用。两臂实测（同一份 `du` 走完一棵树，配方 grovefs `.build-bin/bench_treedb_readdir.sh`，引擎侧计数器读 `--stats`）：引擎应用的 op 数 3000 条时 **3006 → 6**、20000 条时 **20023 → 23**；把引擎放到每段 2 ms 延迟的 TCP 代理后面墙钟 **256 ms → 52 ms**，同机 loopback 上 106 vs 88 ms（三次分布重叠，量不出差别）。**这项收益的单位是往返**，本机测试恰好把它藏起来，所以两个数都得写。语义零回归：阶段 C 1 那套矩阵改前改后都是 `pass=39 fail=0 skip=10` |
+| 定义/密钥/账户 | 还在本地 SQLite | 引擎侧的通用表本轮已可用（§11 第 7 条 T2），但 grovefs 未拿它拼过语义；`Key*`/`Audit*` 那三个专用 op 仍是业务形状，不能当接入面（上文第 4 步）。**迁法已成文**（下面阶段 C 4），未开工 |
 | `view list` 的物理树 | 列不出来 | 控制面枚举器只看本地 db 文件 |
 | HA / 快照传送 | 启动即拒绝 | 接入面用不上它：§8 限制 6 现在是「有异步只读副本、无同步复制」，而 grovefs 要的是「主挂了切副本」—— 那一步没有提升路径（§11 第 4 条③） |
 | ~~path 依赖的分发方式~~ | 已定：按 tag 的 git 依赖 | 钉 `v0.3.6`（随定版前移），无同级克隆也能构建（实测） |
@@ -1963,8 +1974,126 @@ spike 明确**没**做、也不在接入面上假装做的事 —— 一律返�
    （`locks` 那一套没重放）、以及 `edge`/`errors`/`concurrent` 等其余套件。
 2. 万级视图 mount + create + readdir 混打，对照 `pg_stat_activity`（旧）与
    `--stats`（新）两条路径的连接数、RSS、p99。
-3. 容灾演练：`kill -9` → 重启 → 已 ack 写全在（§6.4 已在 crate 内自动化，
-   这步要在 grovefs 的端到端形状上再验一次）。
+3. ~~容灾演练：`kill -9` → 重启 → 已 ack 写全在（§6.4 已在 crate 内自动化，
+   这步要在 grovefs 的端到端形状上再验一次）~~ **已跑**（2026-11-20：grovefs 侧
+   `.build-bin/test_treedb.sh` 第 10 节 15 条断言 `pass=53 fail=0`；故障签名另有两份
+   逐 syscall 探针 `.build-bin/probe_crash.sh`、`.build-bin/probe_crash_ls.sh`）。
+   演练形状：挂载点活着时 `kill -9` **引擎**，再拿**同一个 dir、同一个 port** 把它
+   拉起来，全程不动 mount、不动 meta-server。成立的每一条都是实测：
+
+   - mount 不被拆：故障期 `findmnt` 仍认这个挂载点 —— 后端没了不会把挂载点从
+     调用方脚下抽走；
+   - **写侧全部拒绝，且拒得不留痕迹**：故障期 `create`/`mkdir`/`rm` 都失败，恢复后
+     listing 仍是 seeded 的那几条 —— 被拒的 `after.txt`/`after_dir` 不存在，被拒的
+     `rm f3.txt` 也没少一个名字。§5.2 那条「判定必须与删 dentry 在同一个 op 里」
+     在这里是外部可观察的：后端没收到的删除，名字就不会消失；
+   - **恢复不需要重启任何进程**：引擎回来之后同一个 mount 上第一次 `ls` 就成功
+     （12 个条目的目录列出 12/12，第二次崩溃重演也一样），文件内容、嵌套路径、
+     symlink target 逐条读回，之后的新写也成功；
+   - 同样的 `kill -9` 打在 **meta-server** 上（引擎保持存活）得到**同一个签名**
+     ⇒ 这条恢复路径与 treedb provider 无关，是 mount→meta-server 那一层在兜；
+   - 顺带照出来的一条：引擎不可达期间 meta-server 不会锁死在旧连接上 —— 每一次
+     M_OPEN 都重拨引擎，拨不通就拒（日志里逐条
+     `treedb connect 127.0.0.1:<port>: Connection refused`），所以它自己也不用重启。
+
+   **读侧的 errno 是错的，记成缺口、不写成契约**（→ §11 第 11 条）：故障期一次需要
+   触达后端的读，对**挂载点自己**回答 `ENOENT` —— `stat`/`ls`/`ls -U`/`ls -f`/`find`
+   五种读法六次尝试全一样，整个文件系统看起来「不在了」。诚实的答案是 `EIO`，
+   最次是 `ESTALE`；`ENOENT` 会让一个正常的脚本去重建一棵其实还在的树。
+   它为什么**不能钉成断言**：第一版断言写下去的那一跑，故障期 `stat` 是**成功**的
+   （属性缓存还热），换一份探针跑同一句就成了 `ENOENT` —— 同一分钟内自己推翻自己，
+   差别只在缓存热不热。第 10 节因此只钉写侧，外加一条确定性的「listing 要么失败
+   要么列全，绝不静默变短」。这条也测到了实处：六次故障期列举**没有一次**是
+   rc=0 少条目 —— `RemoteMeta::readdir`（grovefs `src/remote/meta.rs:932`）那个把
+   失败折成 `Vec::new()`（= 「目录到此为止」）的分支根本没机会被走到，因为更早的
+   getattr 已经先失败了。这是个**没被观察到的坏路径**，不是一条好性质。
+4. **控制面搬家：`grovefs_control` 那六张表迁进引擎的通用表**（**方案，未开工**，
+   2026-11-20 成文）。表形状、绕法、切换顺序定死在这里，开工时不再做决定。
+
+   **走通用表（`TableCreate` + `Row*`），不走 `Key*`/`Audit*`/`Def*`/`Place*`。**
+   §11 第 7 条已定过调（专用 op 的形状就是某个客户端的表，直接接上等于把业务语义坐进
+   内核）。这一轮对着列名核了一遍，多出一条更硬的理由：**专用记录装不下今天要存的字节**。
+
+   | 引擎侧 | 客户端表（grovefs `src/apikeys.rs`、`src/mcp.rs`、`src/pg_store.rs`、`src/webauth.rs`） | 差在哪 |
+   |---|---|---|
+   | `KeyRec` 13 列 | `api_keys` 15 列 | 缺 `scope`（这把 key 的授权范围）与 `secret_enc`（包裹后的凭据本体） |
+   | `AuditRec` | `mcp_calls` 7 列 | 缺 `key_label`；多一个引擎自己发的 `seq` |
+   | `DefRec` 4 列 | `view_defs` 3 列 | 不缺列，多一列 `kind` |
+   | `PlaceSet`/`PlaceGet` | `view_placement` 3 列 | 多 `updated_at` |
+
+   拿 `Key*` 接上去只有两条路：丢 `scope`（那是安全属性，不是备注），或者往 `KeyRec`
+   上补两列 —— 后者正是 §11 第 7 条 L1 那一档在反对的事。所以搬家**顺手解掉**了
+   四组专用 op，不是绕开它们。
+
+   **表形状。** 表名一律带 `grovefs_control__` 前缀：§5.3 末写着 `tables` 是全引擎一张
+   平表、没有命名空间也没有权限，所以前缀是唯一的隔离手段，代价是**一个引擎实例只放一套
+   grovefs 控制面** —— 与今天 PG 侧「control schema 只长在实例一上」同构，不算倒退。
+
+   | 表 | 主键 | 索引列 | 现在的 SQL 为什么能落成这个形状 |
+   |---|---|---|---|
+   | `api_keys` | `id` | 无 | 鉴权路径只按 id 查（`fetch_key`）；列举是 `RowList{ROW_PK}` 全表扫 + 客户端排序（见下表「排序」那一格） |
+   | `api_key_usage` | `id` | 无 | **新增**，只装 `last_used_at`，理由见「热路径」 |
+   | `mcp_calls` | `!ts_us`（8 B 大端）`\|\| !seq`（8 B） | `bucket`（UTC 日 `YYYYMMDD`） | 主键取反 ⇒ 「最新 N 条」就是主键序前 N 条，`ORDER BY rowid DESC` 有了着落 |
+   | `view_defs` | `name` | 无 | PG 那边靠 `SELECT xmin::text` 做乐观并发，这里换成对 `definition` 列 CAS（见下） |
+   | `view_placement` | `view` | 无 | 「表还不存在」这个状态今天由 `lookup_placement` 返回的 bool 表示，正好对上 `TableGet → Table(None)`（不是错误） |
+   | `web_accounts` | `account` | `role` | `SELECT COUNT(*)` → `RowCount{column: ROW_PK}`（O(1)）；`ORDER BY account` → 主键字节序，天然一致 |
+   | `web_grants` | `account \|\| 0x00 \|\| base_view` | `account`、`base_view` | 两个方向都要问（某账户有哪些视图 / 某视图给了谁），而通用表**没有前缀谓词**，所以复合主键不能代替那两个索引列。分隔符取 `0x00`：两段都是 UTF-8 文本，NUL 不可能出现 |
+
+   三条通用约定：没有 NULL 概念 ⇒ 今天的 `IS NULL` 一律编成**空字节串**（`revoked_at`、
+   `disabled_at`、`expires_at`…）；布尔用 1 字节；时间戳**保持现有的 RFC 3339 文本**，
+   迁移时不改写值，少一处出错的地方 —— 只有 `mcp_calls` 的主键需要定宽整数，那就让新行
+   同时存 `ts`（文本，给人看）与进主键的 `ts_us`。
+   **对得上、不需要绕的**（逐条对着 grovefs 现在的 SQL 核过，不是推理）：按主键取行、
+   覆盖写（`RowPut` 默认就是 upsert，正对 `web_grants` 的 `ON CONFLICT DO UPDATE`）、
+   只插不改（`PUT_IF_ABSENT`）、条件更新（`RowPut{cond_col, cond_val}`，`RowDelete` 同）。
+   `UPDATE api_keys SET revoked_at=? WHERE id=? AND revoked_at IS NULL` 落成
+   `RowPut(key=id, cond_col=revoked_at, cond_val="")`，而且**只有这一种**正确写法：
+   `RowPut` 是整行覆盖（§5.2），所以「只改一列」必须是 读 → 改 → 带 CAS 写回，CAS
+   不命中回 `EAGAIN`。撤销/过期/只读这些判断今天就不在 SQL 里（`fetch_key` 把行取回来
+   交给 `authenticate_for`/`live_state` 判），所以「没有范围谓词」这一条**不挡**鉴权路径。
+
+   **对不上的四处与绕法**：
+
+   | 现在的 SQL | 缺的能力 | 绕法（全在客户端侧，不动内核） |
+   |---|---|---|
+   | `SELECT … FROM api_keys ORDER BY created_at DESC` | 没有排序 | 全表扫 + 客户端排序。这张表是运维手工发的 key，量级在几百；真到了需要排序访问路径的那天，把 `created_at` 编进主键、`id` 转成 `COL_UNIQUE` 索引列 |
+   | `count(*) FROM mcp_calls WHERE ts < cutoff` 与配套的 `DELETE … WHERE ts < cutoff` | `RowCount` 只按**等值**，也没有范围/批量删除 | 按 `bucket` 逐日 `RowCount` 求和；清扫同理，逐日 `RowList` + 逐行 `RowDelete`。今天那条 `DELETE` 在 SQLite 里也是一条条删，只是被语句数骗过去了 |
+   | `SELECT COUNT(*) WHERE role='admin' AND disabled_at IS NULL` | 没有跨列条件 | `RowList{column=role, value="admin"}` + 客户端过滤 `disabled_at == ""` 再数（管理员是个位数到十位数）。**不引入派生列**（写一列 `admin_active` 之类）：派生列要求每个写侧都记得维护，漏一处就是一个说不清来源的错数 |
+   | 删账户 = `DELETE FROM web_grants WHERE account=?` 再 `DELETE FROM web_accounts WHERE account=?`，两条语句 | 没有多语句事务（§5.3） | 顺序照今天「先删授权、再删账户」，风险挪到「孤儿授权」那一侧。那一侧今天已经是 fail-closed：登录与鉴权都先 `fetch(account)`，账户行不在就直接拒（`webauth.rs:745-758`、`webauth.rs:917-928`），授权行根本没机会被读到。**这是读代码核实的性质，迁移时要拿一条断言钉住** —— 它是那种漂了不会立刻看得见的那类 |
+
+   **热路径。** 每次鉴权都带一次 `UPDATE api_keys SET last_used_at=?`（`stamp_used`）。
+   搬进引擎它就是**一次 WAL 写**：fsync 有 group commit 攒批，但它落在凭据那一行上，与
+   rotate/revoke 抢同一行。三条一起用：① `last_used_at` 拆进 `api_key_usage`，热写不再
+   CAS 凭据行；② 客户端限流，距上次落库不足 60 s 就不写 —— 这不改变可观察契约，今天的
+   注释自己写着这条 UPDATE 可能整条丢（"a no-op for an id that vanished"），它从来不是
+   精确计数；③ 拆表的代价说清楚：删 key 变成删两行而引擎没有级联，顺序是**先删 usage
+   再删 key**，孤儿 usage 行只在 key 行存在时才会被读到，内容又只是一个时间戳。
+
+   **切换顺序 M1–M4，每步单独可回滚：**
+   - **M1** grovefs 侧加第三臂（`apikeys.rs` 与 `webauth.rs` 各自有一个
+     `enum Backend { Sqlite, Pg }`，加 `Treedb` 就是加一个变体），新臂**默认不启用**，
+     只在 `--meta-store treedb://` 且设了 `GROVEFS_TREEDB_CONTROL=engine` 时才走。
+     开关必须有：M1 落地而 M2 还没跑时，引擎里的控制面是**空的**，默认切过去等于
+     把所有密钥和账户判成不存在 —— 症状是「谁都登录不了」，不是「迁移没做」。
+     表在首次 open 时 `TableCreate`，撞 `EEXIST` 视为成功（与 `resolve_or_create_view`
+     同一套路）。M3 完成后删掉这个开关。
+   - **M2** 新命令 `grovefs control-migrate --to engine`：读旧库、写通用表，**幂等**
+     （重跑走覆盖写），跑完做全量比对 —— 每张表比行数与逐行逐列字节相等，比不过就
+     非零退出、不进 M3。`secret_enc` 原样搬，**绝不重新包裹**：包裹材料在
+     `<base>/meta/store.key` 或 `GROVEFS_STORE_KEY`（`apikeys.rs` 的 `STORE_KEY_ENV` /
+     `STORE_KEY_FILE`），它必须跟着数据目录一起走。这是整批迁移里唯一一处不可逆的
+     损失点：换着包裹材料搬 = 全部密钥解不开，而现场看到的症状同样是「谁都登录不了」。
+   - **M3** 切写：控制面读写都走引擎，旧文件**改名保留**（`api_keys.db.pre-treedb`），
+     删除留给下一个版本；回滚 = 把名字改回来。
+   - **M4** 才动 §11 第 10 条那一半：删 `Key*`/`Audit*`/`Def*`/`Place*` 四组 op，
+     §5.1 的 12 张表缩回 8 张、L1 那一档从「仍违反」改成「不违反」。删早了会把
+     M1–M3 这条路踩断。
+
+   **明确不做长期双读。** 直觉上「先双读、发现不一致再切」最稳，这里不成立：
+   `last_used_at` 一直在写，两份副本从任何一处开始写的那一刻就分叉，而分叉的字段里
+   有 `revoked_at`。读「哪份有就用哪份」等于给一把已撤销的 key 第二次机会 —— 那是安全
+   属性，不是可用性属性。可接受的窗口只有 M2 那种**写仍只在一侧**的复制 + 比对，
+   且不长于一次维护窗口。
 
 ---
 
@@ -2015,8 +2144,10 @@ spike 明确**没**做、也不在接入面上假装做的事 —— 一律返�
    `ReadDir` 逐字一致。守门用例两条：
    `readdir_plus_answers_the_same_page_as_readdir_plus_getattr`（同一页、同一边界、
    逐字段对齐 —— 属性必须是算出来的而不是另一套真相）、
-   `generic_table_and_readdir_plus_over_tcp`。**剩下的在接入侧**：grovefs 的
-   `treedb_store.rs::readdir` 得改用它才真省掉往返，而它钉 `v0.3.2`（§10）。
+   `generic_table_and_readdir_plus_over_tcp`。**剩下的在接入侧** —— 2026-11-20 已接：
+   grovefs `treedb_store.rs::page()` 改发 `ReadDirPlus`，`Op::ReadDir` 在这个文件里
+   一处不剩；往返省下多少见 §10 阶段 B 末缺口表那一行（op 数 3006 → 6）。当时写的
+   「而它钉 `v0.3.2`」也已过时，现在钉 `v0.3.6`。
 7. **独立性审计：treedb 是一个数据库项目，不是 GroveFS 的一个模块**。用户定的约束
    是：grovefs 的业务语义不得漏进引擎内核，为 grovefs 做的适配一律留在 grovefs 仓里
    拦在 feature 门后，treedb 对外只讲通用元数据引擎接口。本轮对着代码校了一遍，
@@ -2103,4 +2234,28 @@ spike 明确**没**做、也不在接入面上假装做的事 —— 一律返�
     - **把 `Key*`/`Audit*`/`Def*`/`Place*` 四组专用 op 从内核拆掉**（T2 剩下的那一半）：
       顺序只能是先在 grovefs 侧用通用表拼出等价语义、跑过端到端，再删 op；先删后补
       会把 spike 分支直接弄坏。拆完之后 L1 那档才从「仍违反」改成「不违反」，
-      §5.1 的 12 张表也能缩回 8 张。
+      §5.1 的 12 张表也能缩回 8 张。**「拼出等价语义」这一步 2026-11-20 已成文**
+      （§10 阶段 C 4：表形状、四处不等价的地方与绕法、M1–M4 切换顺序），未开工。
+      同一次核对还查出专用记录本来就装不下今天要存的字节（`KeyRec` 缺 `scope` 与
+      `secret_enc`，`AuditRec` 缺 `key_label`）—— 所以这几组 op 不是「能用但丑」，
+      是**不够用**，拆它们的理由比原先记的更硬。
+11. **后端不可达时，grovefs 的读回答 `ENOENT`**（§10 阶段 C 3 测出来的；**改在
+    grovefs 仓，引擎侧一行不用动**）。症状：引擎被 `kill -9` 之后，`stat` 一个确实
+    存在的挂载点回答 "No such file or directory"。根因已定位到行：读侧的 RPC 封装
+    `RemoteMeta::call_node`（grovefs `src/remote/meta.rs:834`）签名是
+    `Option<NodeInfo>`，`_ => None` 把「传输失败」「后端报了个 errno」「这个名字不
+    存在」三件事折成一个值，FUSE 层只能回 `ENOENT`；`readdir`（`:932`）同构，失败
+    折成 `Vec::new()`（= 「目录到底了」）。**写侧没有这个洞**：`call_id`/`call_status`
+    （`:841`、`:849`）返回 `Result<_, MetaError>`，传输失败单独成
+    `MetaError::Db("remote meta transport")` —— 实测那个「写被拒（`EIO`）、读说谎
+    （`ENOENT`）」的不对称，全部来源就是这两组封装的差别。
+    难在修法的半径：`MetaProvider` 的读方法本身就是 `Option`/`Vec`
+    （grovefs `src/meta.rs:248`），实现有六份（`RemoteMeta`、`MetaEngine`、
+    `MetaStore`、`LayoutMeta`、`PgEngine`、`TreedbStore`）。两条路：给 trait 的读方法
+    加错误通道（六份实现全动，但 PG/SQLite 档同样在说这个谎，一次修完），或只让
+    `RemoteMeta` 自己记住「上一次 RPC 是传输失败」、下一次 FUSE 回复优先回 `EIO`
+    （改动小，但把事实藏进了一个隐式状态）。选哪条是 grovefs 侧的决定，不在本仓。
+    验收判据：§10 阶段 C 3 那条「listing 要么失败要么列全」升级成「必须失败且
+    errno ∉ {`ENOENT`, `ENOTDIR`}」，且 `.build-bin/probe_crash_ls.sh` 里故障期六种
+    读法全部不是 `ENOENT` —— 在那之前第 10 节不敢钉读侧，因为那个值取决于缓存热
+    不热，而不是取决于后端到底了没有。
