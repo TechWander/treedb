@@ -2192,13 +2192,39 @@ spike 明确**没**做、也不在接入面上假装做的事 —— 一律返�
    再删 key**，孤儿 usage 行只在 key 行存在时才会被读到，内容又只是一个时间戳。
 
    **切换顺序 M1–M4，每步单独可回滚：**
-   - **M1** grovefs 侧加第三臂（`apikeys.rs` 与 `webauth.rs` 各自有一个
-     `enum Backend { Sqlite, Pg }`，加 `Treedb` 就是加一个变体），新臂**默认不启用**，
-     只在 `--meta-store treedb://` 且设了 `GROVEFS_TREEDB_CONTROL=engine` 时才走。
-     开关必须有：M1 落地而 M2 还没跑时，引擎里的控制面是**空的**，默认切过去等于
-     把所有密钥和账户判成不存在 —— 症状是「谁都登录不了」，不是「迁移没做」。
-     表在首次 open 时 `TableCreate`，撞 `EEXIST` 视为成功（与 `resolve_or_create_view`
-     同一套路）。M3 完成后删掉这个开关。
+   - **M1** grovefs 侧加第三臂，新臂**默认不启用**，只在 `--meta-store treedb://`
+     且设了 `GROVEFS_TREEDB_CONTROL=engine` 时才走。开关必须有：M1 落地而 M2 还没跑
+     时，引擎里的控制面是**空的**，默认切过去等于把所有密钥和账户判成不存在 ——
+     症状是「谁都登录不了」，不是「迁移没做」。表在首次 open 时 `TableCreate`，
+     撞 `EEXIST` 视为成功（与 `resolve_or_create_view` 同一套路）。M3 完成后删掉这
+     个开关。
+
+     **A 半（凭据 + 审计，`apikeys`）2026-11-20 已落地**：grovefs `0a3b92c`
+     （`feat/treedb-read-errno`，7 文件 +827/−26，其中新文件
+     `src/apikeys/treedb_ctl.rs` 580 行）。落地时原文那句「`apikeys.rs` 与
+     `webauth.rs` 各自有一个 `enum Backend`，加 `Treedb` 就是加一个变体」被实测
+     纠正两处，记在这里免得下一个人照原文重画一遍：
+     ① `apikeys::Backend` 分派的不是后端，是**两套 SQL 方言**
+     （`exec2(sqlite_sql, ps, pg_sql, pp)` / `query2(...)`）。treedb 没有 SQL，
+     第三臂只能接在**方法层**：12 个动词各自先问一句「是不是引擎后端」，是就把语义
+     交给 `treedb_ctl`。`exec2`/`query2` 里那个 `Treedb` 臂是「永远不该走到」的
+     拒绝（同 PG 臂的理由，不是 `unreachable!()`）；方法里 5 处
+     `let n = match &self.backend` 还得显式补一臂 —— 编译器看不见函数体里的早返回。
+     ② 凭据读哪一份原本只由 `StoreKind::control_uri()` 一个出口决定，而它同时管着
+     视图定义、凭据、web 账户三样东西；treedb 档它恒 `None`（"control plane
+     stayed local"），于是 meta-server 的 control 面读的是本地 SQLite —— 端到端
+     先撞出来的就是 `authentication failed: unknown api key id`。新增的
+     `keys_uri()` 只回答凭据：PG → URI、SQLite → `None`、treedb → **仅当开关打开
+     时** `Some("treedb://…")`，`WebAuthStore` 仍走 `control_uri`。
+     引擎里的形状就是上面那三张表（`grovefs_control__` 前缀，12 + 1 + 7 列），
+     热写按本节拆进 `api_key_usage`，`mcp_calls` 主键 `!ts_us || !seq` 让主键序 =
+     时间倒序。证据：板上一行 `treedbctl`（`.build-bin/test_treedb_control.sh`，
+     本地脚本不入库）**32/0** —— 开关关时逐字拒绝并点名变量、每个动词被下一个
+     进程看见、control 面自己的鉴权写 4 条 `mcp_calls` 并 stamp `last_used_at`、
+     `purge --before` 逐行真删、引擎重启后全在；回归 318/0、55/0、39/0/10 不动。
+     边界（写在套件头里，不是沉默的缺口）：`grovefs mcp --meta-store treedb://`
+     仍拒绝该 URI（视图定义 = M2），web 账户表仍在本地（B 半），所以审计行的真实
+     写入方目前只有 control 面鉴权这一条腿。
    - **M2** 新命令 `grovefs control-migrate --to engine`：读旧库、写通用表，**幂等**
      （重跑走覆盖写），跑完做全量比对 —— 每张表比行数与逐行逐列字节相等，比不过就
      非零退出、不进 M3。`secret_enc` 原样搬，**绝不重新包裹**：包裹材料在
@@ -2416,3 +2442,38 @@ spike 明确**没**做、也不在接入面上假装做的事 —— 一律返�
     多一份池，部署时连接总数按进程数算。另记一个把结论测反的坑：不要在循环里
     「建视图 → 挂一次 → 卸掉」去数连接，`view create` 结尾的 `rt.evict()` 会清掉整个
     引擎缓存，读数会恒定成「本来就是共享的」（§7.12 末）。
+
+13. **M1 的 A 半：控制面凭据 + 审计已在 grovefs 侧落到通用表上**（§10 阶段 C 4
+    切换顺序的第一步；**改在 grovefs 仓，引擎侧一行不用动**）—— **2026-11-20 已
+    闭合**：grovefs `feat/treedb-read-errno` `0a3b92c`，7 文件 +827/−26
+    （`src/apikeys/treedb_ctl.rs` 580 行新文件、`apikeys.rs` +192/−4、
+    `treedb_store.rs` +20/−11、`remote/meta/server_ext.rs` +26/−2，另三份文档）。
+
+    形状：`apikeys` 的 12 个动词全部有引擎路径（`fetch_key`/`stamp_used`/
+    `create_extended`/`set_ro`/`update_fields`/`rotate`/`revoke`/`list`/
+    `log_call`/`recent_calls`/`count_calls_older_than`/
+    `purge_calls_older_than`），三张 `grovefs_control__` 前缀的通用表
+    （`api_keys` 12 列 / `api_key_usage` 1 列 / `mcp_calls` 7 列），首次 open 时
+    `TableCreate`、撞 `EEXIST` 视为成功。开关 `GROVEFS_TREEDB_CONTROL=engine`
+    **默认关**，关时拒绝且点名变量、不建本地 `api_keys.db` —— 这正是 M1 原文要求
+    “在 M2 跑完之前不能默认切”的那道闸。
+
+    两处与原文不成立的地方（详细理由写进 §10 C 4 的 M1 条）：`Backend` 分派的是
+    两套 SQL 方言而非后端（第三臂落在**方法层**）；凭据的出口要从
+    `StoreKind::control_uri()` 拆出只回答凭据的 `keys_uri()`，否则 meta-server 的
+    control 面永远读本地 SQLite（端到端先撞出来的是
+    `authentication failed: unknown api key id`）。
+
+    证据（当轮实跑）：新套件 `.build-bin/test_treedb_control.sh`——板上 `treedbctl`
+    一行，本地脚本不入库——**32/0**；端到端草稿 31/0。回归：默认档
+    `cargo test --release` **318/0**、`test_treedb.sh` **55/0**、阶段 C 1 矩阵
+    **39/0/10**，与 M1 前逐项相同。另外三处散文计数也顺手对齐了：USAGE.md /
+    USAGE.en.md / README.md 的「全板 41 段（38 个套件）」实为 **44 段（41 个套
+    件）**——`manager` 与 `treedbmatrix` 早就进了 CANON 而散文没跟上，本轮再
+    加 `treedbctl`。
+
+    未做的两半（都不在本条范围内，开关按 M1 原文保留到 M3）：**B 半** =
+    `webauth` 的账户/授权表（§10 C 4 表中那句
+    `WHERE role='admin' AND disabled_at IS NULL` 的跨列条件就在这一侧）；视图定义
+    仍在本地（M2 迁移之前 `grovefs mcp --meta-store treedb://` 继续拒绝该 URI，
+    所以审计行目前唯一的真实写入方是 control 面的鉴权）。
