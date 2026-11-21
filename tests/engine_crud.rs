@@ -1797,6 +1797,187 @@ fn row_scans_page_by_key_cursor_without_gaps_or_repeats() {
     assert!(s.row_index.is_empty(), "删行必须同时摘掉索引项");
 }
 
+fn rowrange_op(
+    table: &str,
+    column: u32,
+    lo: &str,
+    hi: &str,
+    after_val: &str,
+    after_key: &str,
+    limit: u32,
+) -> Op {
+    Op::RowRange {
+        table: table.as_bytes().to_vec(),
+        column,
+        lo: lo.as_bytes().to_vec(),
+        hi: hi.as_bytes().to_vec(),
+        after_val: after_val.as_bytes().to_vec(),
+        after_key: after_key.as_bytes().to_vec(),
+        limit,
+    }
+}
+
+/// 区间读的一页：`(主键序, end)`。
+fn range_page(
+    e: &mut Engine,
+    table: &str,
+    column: u32,
+    lo: &str,
+    hi: &str,
+    after_val: &str,
+    after_key: &str,
+    limit: u32,
+) -> (Vec<String>, bool) {
+    match ok(e, &rowrange_op(table, column, lo, hi, after_val, after_key, limit)) {
+        Reply::Rows { rows, end } => (
+            rows.iter()
+                .map(|x| String::from_utf8_lossy(&x.key).into_owned())
+                .collect(),
+            end,
+        ),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// 按区间游标翻完一段。主键区间只需主键作游标；索引列区间要连列值一起带上
+/// —— 同一个值可能跨页，只给主键回不到「这一页停在哪一段」。
+fn walk_range(
+    e: &mut Engine,
+    table: &str,
+    column: u32,
+    lo: &str,
+    hi: &str,
+    page: u32,
+) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let (mut av, mut ak) = (String::new(), String::new());
+    for _ in 0..1000 {
+        let (rows, end) = match ok(e, &rowrange_op(table, column, lo, hi, &av, &ak, page)) {
+            Reply::Rows { rows, end } => {
+                if !end {
+                    assert_eq!(rows.len() as u32, page, "没到底的页必须装满");
+                }
+                (rows, end)
+            }
+            other => panic!("{other:?}"),
+        };
+        let Some(last) = rows.last() else {
+            assert!(end, "空页不能说「还没到底」");
+            break;
+        };
+        ak = String::from_utf8_lossy(&last.key).into_owned();
+        av = if column == ROW_PK {
+            String::new()
+        } else {
+            last.cols
+                .get(column as usize)
+                .map(|v| String::from_utf8_lossy(v).into_owned())
+                .unwrap_or_default()
+        };
+        for r in &rows {
+            let k = String::from_utf8_lossy(&r.key).into_owned();
+            assert!(!out.contains(&k), "翻页重复返回了 {k}");
+            out.push(k);
+        }
+        if end {
+            break;
+        }
+    }
+    out
+}
+
+#[test]
+fn row_range_by_key_is_half_open_and_keeps_the_bounds_when_paging() {
+    let d = Dir::new("rowrange");
+    let mut e = d.open();
+    mk_table(&mut e, "t");
+    for i in 0..25 {
+        let (k, a) = (format!("k{i:02}"), format!("a{i:02}"));
+        put_row(&mut e, "t", &k, &[&a, "c", "d"], 0, COND_NONE, "");
+    }
+    let keys = |a: usize, b: usize| (a..b).map(|i| format!("k{i:02}")).collect::<Vec<_>>();
+
+    // 左闭右开：`lo` 那一行在里面，`hi` 那一行恰好在外面。
+    assert_eq!(range_page(&mut e, "t", ROW_PK, "k05", "k15", "", "", 100), (keys(5, 15), true));
+    // 两侧空 = 该侧无界。
+    assert_eq!(range_page(&mut e, "t", ROW_PK, "", "", "", "", 100), (keys(0, 25), true));
+    assert_eq!(range_page(&mut e, "t", ROW_PK, "k20", "", "", "", 100), (keys(20, 25), true));
+    assert_eq!(range_page(&mut e, "t", ROW_PK, "", "k03", "", "", 100), (keys(0, 3), true));
+    // 翻页不重不漏，末页说清到底。
+    assert_eq!(walk_range(&mut e, "t", ROW_PK, "k05", "k20", 3), keys(5, 20));
+    // 游标就是 `lo` 那一行：不含它自己。
+    assert_eq!(range_page(&mut e, "t", ROW_PK, "k05", "k10", "", "k05", 100), (keys(6, 10), true));
+    // 游标落在 `lo` 之前：仍从 `lo` 起，不能把前面那段带出来。
+    assert_eq!(range_page(&mut e, "t", ROW_PK, "k10", "k12", "", "k02", 100), (keys(10, 12), true));
+    // 游标越过上界 / `lo == hi` / `lo > hi`：一律空页 + 到底。这几条都在
+    // `BTreeMap::range` 的 panic 条件上，不能用「肯定不会这么调」推掉。
+    for (lo, hi, ak) in [
+        ("k05", "k10", "k10"),
+        ("k05", "k10", "k99"),
+        ("k07", "k07", ""),
+        ("k20", "k05", ""),
+    ] {
+        assert_eq!(
+            range_page(&mut e, "t", ROW_PK, lo, hi, "", ak, 10),
+            (Vec::new(), true),
+            "lo={lo} hi={hi} after={ak} 应当是一页空 + 到底"
+        );
+    }
+    // `limit = 0` 与 RowList 同一个默认页宽（1000），整段一页装完。
+    assert_eq!(range_page(&mut e, "t", ROW_PK, "", "", "", "", 0), (keys(0, 25), true));
+    // 拒绝路径与列举同规矩：没有表 ENOENT，没索引的列 / 越界列号 EINVAL。
+    assert_eq!(err_code(&mut e, &rowrange_op("nope", ROW_PK, "", "", "", "", 10)), errno::ENOENT);
+    assert_eq!(err_code(&mut e, &rowrange_op("t", 2, "", "", "", "", 10)), errno::EINVAL);
+    assert_eq!(err_code(&mut e, &rowrange_op("t", 9, "", "", "", "", 10)), errno::EINVAL);
+}
+
+#[test]
+fn index_range_walks_column_values_and_pages_inside_one_value() {
+    let d = Dir::new("idxrange");
+    let mut e = d.open();
+    mk_table(&mut e, "t");
+    // 30 行：`b` 列 even/odd 交替，`a` 列唯一（也建了索引）。定宽字符串让字节序 = 数字序。
+    for i in 0..30 {
+        let (k, a) = (format!("k{i:02}"), format!("a{i:02}"));
+        let b = if i % 2 == 0 { "even" } else { "odd" };
+        put_row(&mut e, "t", &k, &[&a, b, "c"], 0, COND_NONE, "");
+    }
+    let evens: Vec<String> = (0..30).step_by(2).map(|i| format!("k{i:02}")).collect();
+    let odds: Vec<String> = (1..30).step_by(2).map(|i| format!("k{i:02}")).collect();
+
+    // 区间落在**列值**上：`[even, f)` 只含 even —— `f` 排在 even 与 odd 之间，
+    // 这正好说明上界挡的是整段「值」而不是「某一行」。
+    assert_eq!(walk_range(&mut e, "t", 1, "even", "f", 4), evens);
+    assert_eq!(walk_range(&mut e, "t", 1, "odd", "", 3), odds, "hi 空 = 上界无界，走到底");
+    // 一个值内部按主键序；游标 `(值, 主键)` 要把同值的下一页接上。
+    assert_eq!(range_page(&mut e, "t", 1, "even", "f", "", "", 4), (evens[0..4].to_vec(), false));
+    assert_eq!(range_page(&mut e, "t", 1, "even", "f", "even", "k06", 3), (evens[4..7].to_vec(), false));
+    assert_eq!(range_page(&mut e, "t", 1, "even", "f", "even", "k26", 3), (vec!["k28".to_string()], true));
+    assert_eq!(
+        range_page(&mut e, "t", 1, "even", "f", "even", "k28", 3),
+        (Vec::new(), true),
+        "游标落在该值最后一行之后：空页 + 到底，不能越过 `hi` 去碰下一个值"
+    );
+    // 游标的值落在 `lo` 之前：仍从 `lo` 那一段起，不能把前面带出来。
+    assert_eq!(range_page(&mut e, "t", 1, "even", "f", "aaa", "k00", 10).0, evens[0..10].to_vec());
+    // 游标的值到 `hi` 之后：空页 + 到底。
+    assert_eq!(range_page(&mut e, "t", 1, "even", "f", "zzz", "k00", 10), (Vec::new(), true));
+    // `lo > hi` 是空区间而不是错误；两侧空 = 全列按值序。
+    assert_eq!(range_page(&mut e, "t", 1, "odd", "even", "", "", 100), (Vec::new(), true));
+    let all = range_page(&mut e, "t", 1, "", "", "", "", 100);
+    assert_eq!(all.0.len(), 30, "两侧空要走完这一列");
+    assert!(all.1, "一页装完必须说清到底");
+    // 跨值翻页：唯一列 a 的 `[a03, a09)`，一个值一行，页宽 2。
+    assert_eq!(
+        walk_range(&mut e, "t", 0, "a03", "a09", 2),
+        (3..9).map(|i| format!("k{i:02}")).collect::<Vec<_>>()
+    );
+    // 拒绝路径：没有表 ENOENT，没索引的列 / 越界列号 EINVAL。
+    assert_eq!(err_code(&mut e, &rowrange_op("nope", 1, "", "", "", "", 10)), errno::ENOENT);
+    assert_eq!(err_code(&mut e, &rowrange_op("t", 2, "", "", "", "", 10)), errno::EINVAL);
+    assert_eq!(err_code(&mut e, &rowrange_op("t", 9, "", "", "", "", 10)), errno::EINVAL);
+}
+
 #[test]
 fn table_state_survives_checkpoint_and_reopen() {
     let d = Dir::new("tblreopen");

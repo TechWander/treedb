@@ -1,5 +1,5 @@
 #!/bin/bash
-# 通用表（DESIGN.md §5.1）的基准：`treedb-bench --op row*` 七条路径各自一格。
+# 通用表（DESIGN.md §5.1）的基准：`treedb-bench --op row*` 九条路径各一格。
 #
 # 为什么单开一个脚本：通用表是 G4（RowRange 范围扫描）与 G6（加列）的基准面，
 # 而那两条改动都要回答「快了多少 / 慢了没有」。没有这张底表，后面只能拿目录树
@@ -24,6 +24,11 @@
 # 用法：bash benches/bench_rows.sh        → 追加到 benches/results/bench_rows.log
 #       SECS=8 CONNS=64 REPS=3 bash benches/bench_rows.sh   # 换强度
 #       TREEDB_BENCH_WARM=50000 bash benches/bench_rows.sh   # 大表形状（默认 500 行）
+#
+# 区间那一族为什么要两档窗宽：`rowrange` 的页宽固定 100，窗宽 64 时一页装完
+# （`end=true`），窗宽 400 时每页都是满的且 `end=false` —— 后者与 `rowlist`
+# 的 100 行回包同形，两格对拉才能把「扫描一段」与「回包大小」分开。
+#
 # 全程只用临时目录与 127.0.0.1:17846，不碰真数据。
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -80,8 +85,12 @@ stop() { # 换 durability / workers 都要重启：两个 flag 都只在启动�
 
 rows_now() { $BIN/treedb-server --listen 127.0.0.1:$PORT --stats | grep -oE 'rows [0-9]+' | head -1 | cut -d' ' -f2; }
 
-run() { # TAG OP [extra...]
-    local tag=$1 op=$2; shift 2
+run() { # TAG OP[:NAME] [extra...]
+    # `OP:NAME` 让同一个 bin op 能在表里占两行（`rowrange` 的两档窗宽），
+    # 汇总以 NAME 为键；不写 `:NAME` 时两者相同。
+    local tag=$1 spec=$2; shift 2
+    local op=${spec%%:*} name=${spec#*:}
+    [ "$name" = "$spec" ] && name=$op
     local r l q best=0 lo=0 line=""
     for r in $(seq "$REPS"); do
         l=$($BIN/treedb-bench --addr 127.0.0.1:$PORT --op "$op" --conns "$CONNS" \
@@ -99,9 +108,9 @@ run() { # TAG OP [extra...]
     [ "$best" -eq 0 ] && return 1
     # 抖动用倍数写在行尾：同一个盘的 fsync 在两次跑里可能差一倍，看到 1.5× 以上
     # 就该知道这一格的绝对值不能拿去跟另一台机器对拉。
-    say "$(printf '%-16s %s  [best of %d, lo/hi=%.2f]' "$tag" "$line" "$REPS" \
+    say "$(printf '%-16s %s  [best of %d, lo/hi=%.2f]' "$name" "$line" "$REPS" \
         "$(echo "$lo $best" | awk '{printf "%.2f", $1 / $2}')")"
-    printf '%s\t%s\t%s\n' "$tag" "$op" "$best" >> "$R/raw.tsv"
+    printf '%s\t%s\t%s\n' "$tag" "$name" "$best" >> "$R/raw.tsv"
 }
 
 say "== 通用表基准 $(date '+%F %T')  secs=$SECS conns=$CONNS pipeline=$PIPE =="
@@ -114,7 +123,9 @@ say "== 通用表基准 $(date '+%F %T')  secs=$SECS conns=$CONNS pipeline=$PIPE
 D=$R/never
 say "-- A) durability=never workers=auto：树 + 索引 + 帧"
 start "$D" 0 never
-for op in rowget rowlist rowidx rowcount; do run never "$op"; done
+for op in rowget rowlist rowidx rowidxrange rowcount; do run never "$op"; done
+run never rowrange:rowrange_w64 --range 64
+run never rowrange:rowrange_w400 --range 400
 # churn 单独跑：前后各数一次行数，成对才算真的在「长-缩」。
 R0=$(rows_now)
 run never rowchurn
@@ -130,13 +141,15 @@ for op in rowinsert rowput; do run never "$op"; done
 say "-- B) durability=group workers=auto：同一批 op 加回每轮 fsync"
 stop
 start "$R/group" 0 group
-for op in rowget rowlist rowidx rowcount rowinsert rowput rowchurn; do run group "$op"; done
+for op in rowget rowlist rowidx rowidxrange rowcount rowinsert rowput rowchurn; do run group "$op"; done
+run group rowrange:rowrange_w64 --range 64
 
 # ---- C：单线程事件循环的地板（读轴对照组） ----
 say "-- C) durability=never workers=1：单线程事件循环，读轴对照组"
 stop
 start "$R/w1" 1 never
-for op in rowget rowlist rowidx rowcount rowput; do run w1 "$op"; done
+for op in rowget rowlist rowidx rowidxrange rowcount rowput; do run w1 "$op"; done
+run w1 rowrange:rowrange_w64 --range 64
 
 # ---- 汇总 ----
 say ""
@@ -144,20 +157,20 @@ say "== 汇总（ops/s）=="
 awk -F'\t' '
 { v[$2, $1] = $3 }
 END {
-  printf "%-10s %12s %12s %12s %9s\n", "op", "never/auto", "group/auto", "never/w1", "g/n"
-  n = split("rowinsert rowput rowget rowlist rowidx rowcount rowchurn", order, " ")
+  printf "%-14s %12s %12s %12s %9s\n", "op", "never/auto", "group/auto", "never/w1", "g/n"
+  n = split("rowinsert rowput rowget rowlist rowidx rowidxrange rowrange_w64 rowrange_w400 rowcount rowchurn", order, " ")
   for (i = 1; i <= n; i++) {
     k = order[i]
     a = v[k, "never"] + 0; b = v[k, "group"] + 0; c = v[k, "w1"] + 0
     if (a == 0) continue
     r = (b > 0) ? sprintf("%.2f", b / a) : "-"
-    printf "%-10s %12d %12s %12s %9s\n", k, a, (b > 0 ? b : "-"), (c > 0 ? c : "-"), r
+    printf "%-14s %12d %12s %12s %9s\n", k, a, (b > 0 ? b : "-"), (c > 0 ? c : "-"), r
   }
 }' "$R/raw.tsv" | tee -a "$OUT"
 
 say ""
 if [ "$fail" -eq 0 ]; then
-    say "== 全部通过：七格 errors=0，churn 行数不变 =="
+    say "== 全部通过：每格 errors=0，churn 行数不变 =="
     exit 0
 fi
 say "== $fail 处失败 =="

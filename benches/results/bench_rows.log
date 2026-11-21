@@ -37,3 +37,55 @@ rowcount        2425380      2439149       913272      1.01
 rowchurn         213503        20946            -      0.10
 
 == 全部通过：七格 errors=0，churn 行数不变 ==
+
+-- 注：以下一节起（G4）基准表主键改为定宽零填充 r000000，与上面几节的 r%d 键不可直接对拉；
+--     新增 rowrange（主键区间，两档窗宽）与 rowidxrange（索引列值区间 [t0,t1)）两族。
+== 通用表基准 2026-11-21 12:32:17  secs=3 conns=8 pipeline=8 ==
+-- A) durability=never workers=auto：树 + 索引 + 帧
+   服务端 durability=never workers=8
+rowget           op=rowget conns=8 threads=8 pipeline=8 → 1805948 ops/s over 3.00s | lat us: p50=3 p90=4 p99=6 max=65 | errors=0  [best of 2, lo/hi=0.95]
+rowlist          op=rowlist conns=8 threads=8 pipeline=8 → 124572 ops/s over 3.00s | lat us: p50=52 p90=59 p99=85 max=275 | errors=0  [best of 2, lo/hi=0.83]
+rowidx           op=rowidx conns=8 threads=8 pipeline=8 → 286026 ops/s over 3.00s | lat us: p50=22 p90=27 p99=40 max=128 | errors=0  [best of 2, lo/hi=0.97]
+rowidxrange      op=rowidxrange conns=8 threads=8 pipeline=8 → 277062 ops/s over 3.00s | lat us: p50=24 p90=29 p99=48 max=427 | errors=0  [best of 2, lo/hi=0.95]
+rowcount         op=rowcount conns=8 threads=8 pipeline=8 → 2423400 ops/s over 3.00s | lat us: p50=3 p90=3 p99=5 max=62 | errors=0  [best of 2, lo/hi=0.99]
+rowrange_w64     op=rowrange conns=8 threads=8 pipeline=8 → 158148 ops/s over 3.00s | lat us: p50=40 p90=53 p99=72 max=192 | errors=0  [best of 2, lo/hi=0.77]
+rowrange_w400    op=rowrange conns=8 threads=8 pipeline=8 → 127532 ops/s over 3.00s | lat us: p50=48 p90=57 p99=97 max=233 | errors=0  [best of 2, lo/hi=0.98]
+rowchurn         op=rowchurn conns=8 threads=8 pipeline=8 → 150734 ops/s over 3.03s | lat us: p50=16 p90=31 p99=68 max=9606 | errors=0  [best of 2, lo/hi=0.98]
+   churn 前后行数 500 = 500（put/del 成对）
+rowinsert        op=rowinsert conns=8 threads=8 pipeline=8 → 91557 ops/s over 3.00s | lat us: p50=31 p90=61 p99=2620 max=6941 | errors=0  [best of 2, lo/hi=0.95]
+rowput           op=rowput conns=8 threads=8 pipeline=8 → 105666 ops/s over 3.02s | lat us: p50=30 p90=69 p99=1695 max=5970 | errors=0  [best of 2, lo/hi=0.98]
+-- B) durability=group workers=auto：同一批 op 加回每轮 fsync
+   服务端 durability=group workers=8
+rowget           op=rowget conns=8 threads=8 pipeline=8 → 1786262 ops/s over 3.00s | lat us: p50=3 p90=5 p99=7 max=116 | errors=0  [best of 2, lo/hi=0.87]
+rowlist          op=rowlist conns=8 threads=8 pipeline=8 → 129917 ops/s over 3.00s | lat us: p50=49 p90=57 p99=90 max=1297 | errors=0  [best of 2, lo/hi=0.89]
+rowidx           op=rowidx conns=8 threads=8 pipeline=8 → 257389 ops/s over 3.00s | lat us: p50=25 p90=31 p99=59 max=141 | errors=0  [best of 2, lo/hi=0.97]
+rowidxrange      op=rowidxrange conns=8 threads=8 pipeline=8 → 315792 ops/s over 3.00s | lat us: p50=20 p90=25 p99=40 max=119 | errors=0  [best of 2, lo/hi=0.90]
+rowcount         op=rowcount conns=8 threads=8 pipeline=8 → 2452916 ops/s over 3.00s | lat us: p50=2 p90=3 p99=5 max=89 | errors=0  [best of 2, lo/hi=0.84]
+rowinsert        op=rowinsert conns=8 threads=8 pipeline=8 → 22882 ops/s over 3.00s | lat us: p50=190 p90=892 p99=2469 max=6655 | errors=0  [best of 2, lo/hi=0.90]
+rowput           op=rowput conns=8 threads=8 pipeline=8 → 19233 ops/s over 3.00s | lat us: p50=216 p90=1028 p99=3563 max=10438 | errors=0  [best of 2, lo/hi=0.86]
+rowchurn         op=rowchurn conns=8 threads=8 pipeline=8 → 22668 ops/s over 3.00s | lat us: p50=173 p90=887 p99=3123 max=7040 | errors=0  [best of 2, lo/hi=0.86]
+rowrange_w64     op=rowrange conns=8 threads=8 pipeline=8 → 142176 ops/s over 3.00s | lat us: p50=43 p90=62 p99=91 max=186 | errors=0  [best of 2, lo/hi=0.70]
+-- C) durability=never workers=1：单线程事件循环，读轴对照组
+   服务端 durability=never workers=1
+rowget           op=rowget conns=8 threads=8 pipeline=8 → 754250 ops/s over 3.00s | lat us: p50=11 p90=12 p99=14 max=252 | errors=0  [best of 2, lo/hi=1.00]
+rowlist          op=rowlist conns=8 threads=8 pipeline=8 → 51676 ops/s over 3.00s | lat us: p50=139 p90=143 p99=175 max=2240 | errors=0  [best of 2, lo/hi=1.00]
+rowidx           op=rowidx conns=8 threads=8 pipeline=8 → 112431 ops/s over 3.00s | lat us: p50=65 p90=66 p99=74 max=3541 | errors=0  [best of 2, lo/hi=0.93]
+rowidxrange      op=rowidxrange conns=8 threads=8 pipeline=8 → 114194 ops/s over 3.00s | lat us: p50=64 p90=65 p99=69 max=2286 | errors=0  [best of 2, lo/hi=0.99]
+rowcount         op=rowcount conns=8 threads=8 pipeline=8 → 921424 ops/s over 3.00s | lat us: p50=6 p90=11 p99=13 max=3095 | errors=0  [best of 2, lo/hi=0.99]
+rowput           op=rowput conns=8 threads=8 pipeline=8 → 138815 ops/s over 3.03s | lat us: p50=24 p90=39 p99=1639 max=6239 | errors=0  [best of 2, lo/hi=0.93]
+rowrange_w64     op=rowrange conns=8 threads=8 pipeline=8 → 82799 ops/s over 3.00s | lat us: p50=87 p90=90 p99=106 max=363 | errors=0  [best of 2, lo/hi=0.99]
+
+== 汇总（ops/s）==
+op               never/auto   group/auto     never/w1       g/n
+rowinsert             91557        22882            -      0.25
+rowput               105666        19233       138815      0.18
+rowget              1805948      1786262       754250      0.99
+rowlist              124572       129917        51676      1.04
+rowidx               286026       257389       112431      0.90
+rowidxrange          277062       315792       114194      1.14
+rowrange_w64         158148       142176        82799      0.90
+rowrange_w400        127532            -            -         -
+rowcount            2423400      2452916       921424      1.01
+rowchurn             150734        22668            -      0.15
+
+== 全部通过：每格 errors=0，churn 行数不变 ==

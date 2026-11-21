@@ -811,6 +811,24 @@ pub enum Op {
         from: Vec<u8>,
         limit: u32,
     },
+    /// 区间扫描：按 `column` 的字节序取 `[lo, hi)` 一段。`lo` / `hi` 空 = 该侧无界。
+    ///
+    /// 与 [`Op::RowList`] 只差「选哪一段」：那边是等值一点，这里是左闭右开的一段。
+    /// `column == `[`ROW_PK`] 时区间落在**主键**上；否则必须是有索引的列，区间落在
+    /// **列值**上，同一个值内仍按主键序。`lo > hi` 是空区间，不是错误。
+    ///
+    /// 游标 `after_*` 是「上一页最后一条」：`ROW_PK` 只看 `after_key`；索引列要连
+    /// `after_val` 一起给 —— 同一个值可能跨页，只给主键回不去「这一页停在哪一段」。
+    /// `after_key` 空 = 从区间头开始（主键不得为空，所以不会与「游标恰好是空键」撞车）。
+    RowRange {
+        table: Vec<u8>,
+        column: u32,
+        lo: Vec<u8>,
+        hi: Vec<u8>,
+        after_val: Vec<u8>,
+        after_key: Vec<u8>,
+        limit: u32,
+    },
     /// 删一行。默认幂等（删不存在的行也成功），[`DEL_IF_EXISTS`] 则回 `ENOENT`。
     /// 条件不命中 → `EAGAIN`。
     RowDelete {
@@ -926,6 +944,7 @@ impl Op {
             Op::RowList { .. } => 0x0076,
             Op::RowDelete { .. } => 0x0077,
             Op::RowCount { .. } => 0x0078,
+            Op::RowRange { .. } => 0x0079,
             Op::ReadDirPlus { .. } => 0x002b,
             // 目录树那一段 0x0020–0x002b 已排满，`Link` 取紧接着的下一个空位。
             Op::Link { .. } => 0x002c,
@@ -992,6 +1011,7 @@ impl Op {
             | Op::TableList
             | Op::RowGet { .. }
             | Op::RowList { .. }
+            | Op::RowRange { .. }
             | Op::RowCount { .. } => true,
             Op::Stats
             | Op::Checkpoint
@@ -1257,6 +1277,23 @@ impl Op {
                 w.bytes(from);
                 w.u32(*limit);
             }
+            Op::RowRange {
+                table,
+                column,
+                lo,
+                hi,
+                after_val,
+                after_key,
+                limit,
+            } => {
+                w.bytes(table);
+                w.u32(*column);
+                w.bytes(lo);
+                w.bytes(hi);
+                w.bytes(after_val);
+                w.bytes(after_key);
+                w.u32(*limit);
+            }
             Op::RowDelete {
                 table,
                 key,
@@ -1491,6 +1528,15 @@ impl Op {
                 table: r.bytes()?,
                 column: r.u32()?,
                 value: r.bytes()?,
+            },
+            0x0079 => Op::RowRange {
+                table: r.bytes()?,
+                column: r.u32()?,
+                lo: r.bytes()?,
+                hi: r.bytes()?,
+                after_val: r.bytes()?,
+                after_key: r.bytes()?,
+                limit: r.u32()?,
             },
             // 两个长度上限（`WAL_FETCH_MAX` / `SNAP_CHUNK_MAX`）**不在这里拦**：
             // 越界的解码会连带断连（解码失败在事件循环里就是 `drop_conn`），
@@ -2434,6 +2480,15 @@ mod tests {
                 column: 0,
                 value: b"v1".to_vec(),
                 from: b"k0".to_vec(),
+                limit: 100,
+            },
+            Op::RowRange {
+                table: b"kv".to_vec(),
+                column: 0,
+                lo: b"v0".to_vec(),
+                hi: b"v9".to_vec(),
+                after_val: b"v1".to_vec(),
+                after_key: b"k0".to_vec(),
                 limit: 100,
             },
             Op::RowDelete {

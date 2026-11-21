@@ -244,7 +244,7 @@ test 现在分两档报：默认档（纯引擎）`cargo test --release` = **172
                                   │            src/net/mail.rs     纯读批次就地算完直接回；
                                   │           （eventfd 信箱）     含写批次整批 ──► 唯一提交线程
                                   │                                 （只有它持 Engine/WAL/stats）
-                                  │  Op/Reply（src/engine/model.rs，52 op / 30 reply）
+                                  │  Op/Reply（src/engine/model.rs，53 op / 30 reply）
                                   ▼
                                   src/engine/core.rs   Engine：apply → WAL → 持久化 → 回包
                                   │  src/engine/apply.rs  语义实现（rename/锁/账本/分页/表约束）
@@ -271,9 +271,9 @@ test 现在分两档报：默认档（纯引擎）`cargo test --release` = **172
 | `src/engine/wal.rs` | 1211 | WAL 帧格式、CRC32、预分配、group commit、扫描/重放、`reset` 与旁路快照收尾用的 `truncate_before`，外加面向副本的只读交付入口 `deliver`（§6.6、§8 第 7 条） |
 | `src/engine/core.rs` | 1593 | `Engine`：op 入口、durability 分档、同步与旁路 checkpoint（`checkpoint_start/poll/wait`）、`Stats`、只读入口 `exec_read`、副本侧的 `install_snapshot`/`replicate_records`、fencing token（`read_fence`/`raise_fence`/`promote`/`admit_epoch`，§6.6 切主）；外加快照探测与迁移（`probe_snapshot`/`migrate_snapshot`，§6.5），以及离线 dump/load 的目录半边（`dump_dir`/`restore_dump`，与 `write_snapshot` 共用同一处落盘，§6.9） |
 | `src/engine/dump.rs` | 539 | 逻辑 dump 容器：`Dump`/`DumpCounts`、`encode`/`decode`（魔数 + 版本 + 三个 `next_*` + 条数 + 尾部 CRC32）、终态→重建序列的 `state_to_logs`（视图→节点→目录项→…→表→行的三条硬顺序）与文件读写；导出确定性由 `dump → restore → dump` 的字节相等钉住（§6.9） |
-| `src/engine/mem.rs` | 1764 | `State`（views/nodes/dentries/locks/refs/keys/audit/defs/place/tables/rows/row_index）+ `Log`；快照的版本闸门与两代读入口（`load` / `load_for_migration`） |
-| `src/engine/apply.rs` | 1412 | 52 个 op 里那 50 个的具体语义：环检测、硬链接引用计数、租约过滤、分页游标、表形状校验与约束、副本拒写（两条握手 op 不进引擎，§4.4；这里只留一道 `EINVAL` 兜底） |
-| `src/engine/model.rs` | 2778 | `Op`/`Reply` 定义与 codec 实现（含 `WalBatch`/`SnapChunk` 尾部的 `epoch` 与目录树的 `Link`） |
+| `src/engine/mem.rs` | 1842 | `State`（views/nodes/dentries/locks/refs/keys/audit/defs/place/tables/rows/row_index）+ `Log`；快照的版本闸门与两代读入口（`load` / `load_for_migration`） |
+| `src/engine/apply.rs` | 1444 | 53 个 op 里那 51 个的具体语义：环检测、硬链接引用计数、租约过滤、分页游标、表形状校验与约束、副本拒写（两条握手 op 不进引擎，§4.4；这里只留一道 `EINVAL` 兜底） |
+| `src/engine/model.rs` | 2834 | `Op`/`Reply` 定义与 codec 实现（含 `WalBatch`/`SnapChunk` 尾部的 `epoch`、目录树的 `Link`、通用表的 `RowRange`） |
 | `src/engine/sha256.rs` | 365 | 自写的 SHA-256 / HMAC-SHA256 / 常数时间比对 —— 依赖门逼出来的（§11 第 7 条），正确性钉在 FIPS 180-4 与 RFC 4231 的已知向量上（§4.4） |
 | `src/net/server.rs` | 891 | `workers=1` 的 epoll 循环、连接生命周期、写回背压、周期任务（含追平 tick 与旁路快照的 poll/派工）；兼作两条路径共用的 `Conn`/`Slot` 构件 |
 | `src/net/multi.rs` | 935 | `workers>1`：N 条前端 worker + 唯一提交线程（路由闸门、按连接号回程、停机收尾），自动档快照同样只 poll/派工 |
@@ -342,8 +342,13 @@ payload = tag: u16 | 字段…            （Op / Reply 各自的 tag 空间，R
   旧服务端收到未知 tag 在 `decode` 的兜底那里回 `EINVAL` —— 两边都不会静默走进错误
   分支。所以 `PROTOCOL_VERSION` 留在 6：旧服务端只是不认这条 op，而副本链路
   （`WalFetch`/`SnapFetch`）根本不经过它，主与副本混版不受影响。
+  `6 → 6`（第二例，`RowRange` 0x0079）：同样只加一个 op tag，而且**连 reply 都没加**
+  —— 它直接复用 `Reply::Rows { rows, end }`（与 `RowList` 同一个应答）。判据与 `Link`
+  那次一致：旧客户端不发它，旧服务端回 `EINVAL`，没有静默分支。两条先例合起来把
+  「什么时候必须升版本」收窄成一句：**只有既有帧的字段顺序/长度变了，或者
+  `EngineStats` 加长了，才必须 +1**；新增 op / reply tag 本身不是理由。
 
-### 4.2 op 分组（52 个）
+### 4.2 op 分组（53 个）
 
 | 组 | op |
 |----|----|
@@ -358,15 +363,15 @@ payload = tag: u16 | 字段…            （Op / Reply 各自的 tag 空间，R
 | 密钥 | `KeyCreate` `KeyGet` `KeyList` `KeyUpdate` `KeyCheck` |
 | 审计 | `AuditAppend` `AuditList` |
 | 定义/放置 | `DefPut` `DefGet` `DefList` `DefDel` `PlaceSet` `PlaceGet` `PlaceList` |
-| 通用表 | `TableCreate` `TableDrop` `TableGet` `TableList` `RowPut` `RowGet` `RowList` `RowDelete` `RowCount` |
+| 通用表 | `TableCreate` `TableDrop` `TableGet` `TableList` `RowPut` `RowGet` `RowList` `RowRange` `RowDelete` `RowCount` |
 
-52 个 op 分**三档**，两个布尔判据（`is_readonly` / `is_control`）恰好切出三块，
+53 个 op 分**三档**，两个布尔判据（`is_readonly` / `is_control`）恰好切出三块，
 两两不交、并起来是全集：
 
-- **只读 22 个 = worker 可就地执行集**：`Ping` `ListViews` `Lookup` `Getattr`
+- **只读 23 个 = worker 可就地执行集**：`Ping` `ListViews` `Lookup` `Getattr`
   `Readlink` `ReadDir` `ReadDirPlus` `RefLookup` `LockQuery` `KeyGet` `KeyList` `KeyCheck`
   `AuditList` `DefGet` `DefList` `PlaceGet` `PlaceList` `TableGet` `TableList` `RowGet`
-  `RowList` `RowCount`；
+  `RowList` `RowRange` `RowCount`；
 - **真写 23 个**：`!is_readonly() && !is_control()`，全部要过 WAL；
 - **控制面 7 个**：`Stats` `Checkpoint` `Shutdown` `WalFetch` `SnapFetch` `AuthBegin`
   `AuthFinish`。
@@ -379,12 +384,12 @@ payload = tag: u16 | 字段…            （Op / Reply 各自的 tag 空间，R
 位置在事件循环，比提交线程还靠前一层（§4.4）；把它归进只读档会更贴近「不碰状态」
 这句字面意思，但那会让 worker 以为可以在自己手里就地算它，而它必须**串行于同连接
 的状态机进度**（`Gate` 是每连接一份的可变状态）。三档的现值由
-`tests/read_scaling.rs::ops_partition_into_three_classes` 钉住（22/23/7）。
+`tests/read_scaling.rs::ops_partition_into_three_classes` 钉住（23/23/7）。
 
 - 只读那一档的划分不只是优化提示，**它是语义地基**：`Op::is_readonly()` 判错一条，
   就是把一次应当被确认的写丢在 worker 手里。`readonly_classification_matches_translate`
-  拿 52 个 op 的语料逐条跑 `translate`，断言「判为只读 ⇒ logs 必空」，同时钉住
-  52/22/30 这三个数 —— 加 op、改分派表，这里和测试必须一起动。语料里每条只读 op 都要
+  拿 53 个 op 的语料逐条跑 `translate`，断言「判为只读 ⇒ logs 必空」，同时钉住
+  53/23/30 这三个数 —— 加 op、改分派表，这里和测试必须一起动。语料里每条只读 op 都要
   真查到东西（`seed` 因此也建表灌行），否则「不产 logs」这句只在测「查不存在的表
   不产 logs」那种废话。
 - `Stats` 刻意**不在**只读集里：它不写 WAL，但它读的是 `Engine` 手里的计数器，而那些
@@ -535,7 +540,7 @@ with a handshake"`，它根本没被碰过，重发即可），切点之后要�
 
 1. **不防窃听**。握手之后的每一个字节仍是明文，CRC32 只判损坏。抓包的人拿不到
    密钥，但拿得到全部数据，也随时能 RST 掉这条连接。
-2. **不做授权**。过了握手的连接与今天一样拥有全部 52 个 op，包括 `Shutdown`。
+2. **不做授权**。过了握手的连接与今天一样拥有全部 53 个 op，包括 `Shutdown`。
    它是「一把钥匙开整扇门」，不是租户模型 —— 多租户、配额、审计归属仍在引擎
    之外（§8 第 13 条）。
 3. **不防字典攻击**。密钥必须是 32 字节随机值；从口令派生的话，抓一次握手就能
@@ -584,6 +589,28 @@ GC 拿它当唯一依据。
   拿到同一个 id，而 translate 对状态只读 —— 那正是单写者流水线能成立的前提。id 单调
   不回收：`TableDrop` 后重建同名表得到新 id，旧行不可能被误认成新表的数据。
 
+**区间扫描（`RowRange` 0x0079）**。`RowList` 是「等值一点」，`RowRange` 是「左闭右开
+的一段」，两者共用 `Reply::Rows { rows, end }` 与同一个页宽规则（`limit = 0` → 1000）：
+
+- **`[lo, hi)` 而不是闭区间**。翻页游标天然是「不含上一页最后一条」，与 `row_page` /
+  `index_page` 里的 `Excluded` 同形；做成闭区间的话，要么下一页重复末条，要么得在
+  客户端造一个「字节序上紧跟在 x 之后的键」—— 而字节串没有通用 successor。
+- **空串 = 该侧无界**，不另设 flag：主键不得为空（`ROW_KEY_MAX` 校验链），所以「空」
+  只有「无界」这一个意思。`lo > hi` 是空区间而不是错误 —— 客户端拼出来的窗口可能
+  本来就没有，为此回 `EINVAL` 只会逼它去解析错误码做分支。同样地，游标越过上界
+  也是空页。这两条都在 `BTreeMap::range` 的 panic 条件上（`start > end`，以及
+  `start == end` 且两端都不含），所以守卫必须在 `mem.rs` 里，不能交给调用方去记。
+- **`column == ROW_PK` 时区间落在主键上；否则必须是已建索引的列**，区间落在**列值**
+  上、同一个值内仍按主键序（`bad_column` 与 `RowList` 同一条拒绝链，不静默扫全表）。
+  索引侧的上界不能用 `Excluded((tid, col, hi, ""))`：那只是「值为 `hi` 的最小键」，
+  同值的其它行全部排在它之后，一个也挡不住 —— 所以上界是一条 `take_while:
+  k.2 < hi`，整段值一起排除。
+- **游标是一对 `(after_val, after_key)`**。主键区间只要主键；索引列的值可能跨页，
+  只给主键回不到「这一页停在哪一段」。`after_key` 空 = 从区间头开始（主键非空，
+  所以不会与「游标恰好是空键」撞车）。
+- **只按字节序**：没有 collation、没有数值序。要按数字排就自己定宽零填充 ——
+  `benches/bench_rows.sh` 的主键就是 `r%06d`，这也正好让区间窗口的宽度可预测。
+
 ### 5.2 已经锁进测试的语义
 
 | 语义 | 测试 |
@@ -608,6 +635,8 @@ GC 拿它当唯一依据。
 | `RowDelete` 默认幂等（重发一个已成功的删除不该看到错误），`DEL_IF_EXISTS` 才回 `ENOENT` | 同上 |
 | 翻页游标 = 「上一页最后一行的主键」（不含本身），与 `readdir` 同语义；不用「已返回若干条」那种序号游标（BTreeMap 的 `skip(n)` 是 O(n)，翻到第 k 页就把前 k 页重走一遍） | `row_scans_page_by_key_cursor_without_gaps_or_repeats` |
 | 只能按主键或有索引的列列举（否则 `EINVAL`，不静默扫全表）；`limit = 0` 走默认页宽而不是「不限」 | 同上 |
+| 区间扫描 `[lo, hi)`：左闭右开，空串 = 该侧无界；`lo > hi`、`lo == hi`、游标越过上界一律是空页 + `end=true`，不是错误也不是崩溃（这四条正落在 `BTreeMap::range` 的 panic 条件上）；游标落在 `lo` 之前时仍从 `lo` 起 | `row_range_by_key_is_half_open_and_keeps_the_bounds_when_paging` |
+| 索引列的区间上限按**整段值**排除（值为 `hi` 的行一条不返回），同一个值内按主键序，游标是 `(列值, 主键)` 一对；游标停在该值末行之后不能越过 `hi` 去碰下一个值 | `index_range_walks_column_values_and_pages_inside_one_value` |
 | `TableDrop` 级联掉行与二级索引，一条不剩；空内层表不留；`next_table_id` 不回收 | `generic_tables_keep_rows_and_rebuild_indexes`、`table_state_survives_checkpoint_and_reopen` |
 | 表与行走完全部四条持久化路径：WAL 重放、checkpoint 截断、`kill -9`、TCP 端到端 | `reopen_replays_wal_into_identical_state`、`control_plane_survives_sigkill`、`generic_table_and_readdir_plus_over_tcp` |
 | 硬链接：`Op::Link`（`v0.5.0`）给已有 inode 加第二根 dentry，两个名字指向同一个 ino、`nlink` 按引用计数增减、内容对象只在最后一个名字离开时下账。此前 `nlink` 只在目录意义上活动（`2 + 子目录数`）；现在文件与符号链接的 `nlink` 是真实引用计数，`Unlink` / `Rename` 覆盖 / `Symlink` upsert 三条路径都按「是不是最后一个名字」分流 —— 不是的话只减一票且**不下内容引用账**，应答里的空键保证调用方不会把还有人用的对象当孤儿回收。三条拒绝：目录 `EPERM`、名字已存在 `EEXIST`（`link(2)` 没有 upsert，`ln f f` 也是 `EEXIST`）、跨视图不成立（一个 op 只落在一个命名空间里） | `hard_links_share_the_inode_and_keep_bytes_alive`、`link_refusals_name_the_posix_errno`、`overwriting_one_of_several_links_only_drops_one_vote` |
@@ -634,9 +663,8 @@ GC 拿它当唯一依据。
   跑，本仓不代替它报数。
 - **字节区间锁**：锁的 key 是 `(view, ino, owner)`，没有 `(start, end, pid)`。POSIX 记录锁
   要的是按区间合并/拆分的那套语义，这里给不了 —— provider 只能拒，不能假装支持。
-- **通用表只给 §4.2 那九条 op 的形状**（状态与定型见 §5.1）：没有类型、没有 JOIN 与跨表条件、没有范围/前缀
-  谓词（`RowList` 只能按主键字节序、或按某个已建索引列的**等值**翻页）、没有排序与
-  聚合（只有 `RowCount`）、除唯一列外没有其他约束（没 NULL 概念、没外键、没 CHECK）。
+- **通用表只给 §4.2 那十条 op 的形状**（状态与定型见 §5.1）：没有类型、没有 JOIN 与跨表条件、没有前缀匹配与排序（`RowRange` 只给「按主键或某一个已建索引列的一段字节区间」，
+  不给 `LIKE 'a%'` 这种前缀语义，也不给多列组合键）、没有聚合（只有 `RowCount`）、除唯一列外没有其他约束（没 NULL 概念、没外键、没 CHECK）。
   每一条都是把「查询能力」换回「可推的索引 + 不解释的字节」：内核一旦开始解释列值，
   客户端语义就顺着类型漏进来（§11 第 7 条的约束）。
 - **表没有命名空间与权限**：`tables` 是全引擎一张平表，不像 `views` 那样按视图隔离
@@ -2167,14 +2195,15 @@ treedb 这一列**没有**在 `v0.3.7` 与 `v0.4.0` 上复跑：`v0.3.7` 只改�
 
 ---
 
-### 7.15 通用表基准：七条 `row*` 路径（2026-11-21）
+### 7.15 通用表基准：九条 `row*` 路径（2026-11-21，G4 后）
 
-§5.1 的通用表此前只有功能测试，没有性能数字。而 G4（`RowRange` 范围扫描）与 G6
-（`TableAlterAddColumn`）落地后都要回答「快了多少 / 慢了没有」，拿目录树的 ops/s
-去类比是不成立的：两条路的常数开销完全不同（表要定位主键树、维护二级索引、帧里
-多两列），差一个数量级的优化在另一个轴上可能根本不存在。所以量具先落地。
+§5.1 的通用表此前只有功能测试，没有性能数字。而 G6（`TableAlterAddColumn`）落地后
+要回答「快了多少 / 慢了没有」，拿目录树的 ops/s 去类比是不成立的：两条路的常数开销
+完全不同（表要定位主键树、维护二级索引、 帧里多两列），差一个数量级的优化在另一个
+轴上可能根本不存在。所以量具先落地，G4（`RowRange` 0x0079）落地后再把它自己的
+两族扫描格补进来 —— 下面这张表是补了之后的完整一次。
 
-**七条路径各量什么**（`treedb-bench --op row*`）：
+**九条路径各量什么**（`treedb-bench --op row*`）：
 
 | op | 走的路 | 为什么单列一格 |
 |----|--------|----------------|
@@ -2183,7 +2212,9 @@ treedb 这一列**没有**在 `v0.3.7` 与 `v0.4.0` 上复跑：`v0.3.7` 只改�
 | `rowget` | 主键点查 | 不进 WAL，量树查找本身的常数地板 |
 | `rowlist` | 主键序翻页（`limit 100`） | 树的顺序遍历 + 帧编码，行数由 `limit` 定 |
 | `rowidx` | 二级索引等值页 | 索引树定位 + 回查，路径与主键序不同 |
-| `rowcount` | 按主键计数（O(1)） | 不碰树，量的是**分派地板**（分帧/派发/回包） |
+| `rowidxrange` | 索引列值区间 `[t0, t1)` | 约 31 行，与 `rowidx` 回包同大小 —— 两格只差「等值前缀」与「值区间 + `take_while`」这两条路径本身 |
+| `rowrange` | 主键区间 `[lo, hi)`，窗宽 `--range` | 跑两档窗宽：64 行（一页装完，`end=true`）与 400（每页满 100 且 `end=false`）。后者与 `rowlist` 回包同形，两格对拉才能把「扫描一段」与「回包大小」分开 |
+| `rowcount` | 按主键计数（O(1)） | 不碰树，量的是**分派地板**（分帧/派发/ 回包） |
 | `rowchurn` | put/del 成对同键 | 树节点长到一格再缩回零，含索引侧反向删除；表规模恒定 |
 
 **表形状固定，且只在测量窗口外建一次。** `benchkv(tag 索引, payload)` 两列是刻意
@@ -2205,6 +2236,14 @@ treedb 这一列**没有**在 `v0.3.7` 与 `v0.4.0` 上复跑：`v0.3.7` 只改�
 可改），`rowchurn` 前后行数 **500 = 500** 就是这条的证 —— 它同时证明 put/del 真的
 成对（行数要是涨了，量到的就不是「树节点缩回零」那条路）。
 
+**主键从这一轮起定宽零填充（`r%06d`）。** `rowrange` 的区间两端就是两个主键字符串：
+不定宽的话字节序与数字序不一致（`r10` 排在 `r2` 前面），「宽 64 个键的窗口」到底
+装了几行要看 `span` —— 而这一格量的正是「扫描 + 回包」的单位成本，窗宽必须可预测。
+代价是**本轮之前的 §7.15 数字不能与本轮直接对拉**（行键从 2–4 字节变 9 字节），
+`benches/results/bench_rows.log` 里在两种格式之间留了一行说明。附带好处：这次改键
+格式正好把「预热后必须查得到行」那道守卫真实行使了一遍 —— 探针键与预热键是同一个
+`row_key()`，若两边有一边漏改，`rowrange`/`rowget` 会在预热后直接 `exit 2`。
+
 **每格跑 `REPS` 次取最大值**（默认 2），行尾附 `lo/hi` 离散度。这条是跑出来的：
 同一格 `rowinsert/group` 两次跑出 20 557 与 8 441（2.4×），落盘档的 fsync 抖动就是
 这么大，单次采样不配当基线。看到 `lo/hi < 0.7` 就该知道那一格的绝对值不能拿去跟
@@ -2223,37 +2262,52 @@ pipeline 8 secs 3`，500 行表，auto-checkpoint 关）**：
 
 | op | A never/auto | B group/auto | C never/w1 | B/A |
 |----|-------------:|-------------:|-----------:|----:|
-| `rowinsert` | 113 436 | 20 156 | — | 0.18 |
-| `rowput` | 122 918 | 21 711 | 142 200 | 0.18 |
-| `rowget` | 1 763 912 | 1 868 244 | 761 333 | 1.06 |
-| `rowlist` | 128 320 | 131 537 | 52 863 | 1.03 |
-| `rowidx` | 287 514 | 259 710 | 114 503 | 0.90 |
-| `rowcount` | 2 425 380 | 2 439 149 | 913 272 | 1.01 |
-| `rowchurn` | 213 503 | 20 946 | — | 0.10 |
+| `rowinsert` | 91 557 | 22 882 | — | 0.25 |
+| `rowput` | 105 666 | 19 233 | 138 815 | 0.18 |
+| `rowget` | 1 805 948 | 1 786 262 | 754 250 | 0.99 |
+| `rowlist` | 124 572 | 129 917 | 51 676 | 1.04 |
+| `rowidx` | 286 026 | 257 389 | 112 431 | 0.90 |
+| `rowidxrange` | 277 062 | 315 792 | 114 194 | 1.14 |
+| `rowrange_w64` | 158 148 | 142 176 | 82 799 | 0.90 |
+| `rowrange_w400` | 127 532 | — | — | — |
+| `rowcount` | 2 423 400 | 2 452 916 | 921 424 | 1.01 |
+| `rowchurn` | 150 734 | 22 668 | — | 0.15 |
 
-延迟（p50 / p99 µs，A 档）：`rowget` 3/7、`rowlist` 48/91、`rowidx` 23/40、`rowcount`
-3/6、`rowinsert` 27/1746、`rowput` 26/1687、`rowchurn` 14/45。
+延迟（p50 / p99 µs，A 档）：`rowget` 3/7、`rowlist` 52/85、`rowidx` 22/40、
+`rowidxrange` 24/48、`rowrange_w64` 40/72、`rowrange_w400` 48/97、`rowcount` 3/5、
+`rowinsert` 31/2620、`rowput` 30/1695、`rowchurn` 16/68。
 
 **怎么读这组数：**
 
-1. **写轴的成本 82% 在落盘。** `B/A` 全落在 0.18–0.20，p50 从 27 µs 抬到 194 µs
+1. **写轴的成本 80% 在落盘。** `B/A` 落在 0.15–0.25，p50 从 31 µs 抬到 190 µs
    （一次 fsync 的量级）。口径是 `8 连接 × pipeline 8 = 64 op` 摊一次 fsync，
-   与 §7.9 的摊比同形；`rowchurn` 更低（0.10）是因为它一半 op 是删除，每轮仍只
+   与 §7.9 的摊比同形；`rowchurn` 更低（0.15）是因为它一半 op 是删除，每轮仍只
    fsync 一次。
-2. **读轴与 durability 无关**：0.90–1.06，全在 run 内噪声内 —— 读不进 WAL。
-3. **写轴不吃多前端，读轴吃**：C 档 `rowget` 761 333 vs A 档 1 763 912（2.3×）、
-   `rowcount` 913 272 vs 2 425 380（2.7×）、`rowidx` 114 503 vs 287 514（2.5×）；
-   而 `rowput` 单线程 142 200 **高于** auto 的 122 918 —— 写由唯一提交线程定序，
-   多前端只多排队。与 §7.9、§8 第 1 条是同一件事。
-4. **`rowidx` 比 `rowlist` 快，是回包大小不是路径优劣。** 500 行表里 `tag` 只有
-   16 个取值，每页约 31 行；主键序首页满 100 行。所以这两格的差主要是帧长。
-   G4 的范围扫描必须**按 `limit` 分档**量，不能用「索引 vs 主键」这种对拉代替。
-5. **「不 fsync」不等于「无尾延迟」：** A 档写轴的 p99 仍到 1.7 ms。这一格没有做
-   逐层归因（本机 `--auto-checkpoint-mb 0`，快照不参与），只记下来，别拿 p50 当
-   SLO 依据。
+2. **读轴与 durability 无关**：0.90–1.14，全在 run 内噪声内 —— 读不进 WAL。
+   `rowidxrange` 的 1.14 是「反过来」的那一例，它说明这组单次 best-of-2 的噪声量级
+   就是 ±15%；所以下结论只看方向（区间与等值同价），不看百分位小数。
+3. **写轴不吃多前端，读轴吃**：C 档 `rowget` 754 250 vs A 档 1 805 948（2.4×）、
+   `rowcount` 921 424 vs 2 423 400（2.6×）、`rowidxrange` 114 194 vs 277 062（2.4×）、
+   `rowrange_w64` 82 799 vs 158 148（1.9×）；而 `rowput` 单线程 138 815 **高于**
+   auto 的 105 666 —— 写由唯一提交线程定序，多前端只多排队。与 §7.9、§8 第 1 条是
+   同一件事。
+4. **区间的价就是回包大小的价，不是另一条路。** 窗宽 64（回包 64 行）158 148、
+   窗宽 400（回包满页 100 行）127 532、`rowlist`（100 行）124 572 —— 后两者差 2.4%，
+   而 64→100 行只换来 1.24×，说明区间扫描没有额外的「路径税」，差额主要落在
+   帧长与逐行拷贝上。这一格也正是 G8 留下的那个问题（「G4 必须按 `limit` 分档量」）
+   的答案：不分档把它与 `rowlist` 对拉，会得出「区间比等值快 27%」这种错结论。
+5. **值区间与等值前缀同价。** `rowidxrange` 与 `rowidx` 在 A 档是 277 062 vs 286 026
+   （0.97）、C 档 114 194 vs 112 431（1.02）—— 全在噪声内。索引侧上界那条
+   `take_while`（§5.1）实测量不到成本：它扫的仍是同一棵 `row_index` 树，只多一次
+   每个键的边界比较。
+6. **「不 fsync」不等于「无尾延迟」：** A 档写轴的 p99 仍到 1.7–2.6 ms。这一格
+   没有做逐层归因（本机 `--auto-checkpoint-mb 0`，快照不参与），只记下来，别拿
+   p50 当 SLO 依据。
 
 **不要外推。** 这是 500 行表的本地数：换 `TREEDB_BENCH_WARM=50000` 就是另一种形状
-（树更深、页更满、p99 更长），而 `rowlist`/`rowidx` 的绝对值对表规模敏感。
+（树更深、页更满、p99 更长），而 `rowlist`/`rowidx`/`rowrange` 的绝对值对表规模
+敏感 —— 尤其区间档，窗宽固定时表越大，一页装完的比例越低，`rowrange_w64` 与
+`rowrange_w400` 的差别会反过来。
 
 ---
 

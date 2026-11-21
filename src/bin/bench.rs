@@ -3,11 +3,12 @@
 //! 三个轴分别对应验收目标：
 //! - `--op ping` / `--op stat`：纯读路径（不进 WAL），看事件循环本身的上限。
 //! - `--op create` / `--op lookup` / `--op readdir`：目录树常见 op。
-//! - `--op row*`：通用表（§5.1）的五条路径 —— `rowinsert` 插入（树 + 主键索引）、
+//! - `--op row*`：通用表（§5.1）的七条路径 —— `rowinsert` 插入（树 + 主键索引）、
 //!   `rowput` 覆盖已有行、`rowget` 主键点查、`rowlist` 主键序翻页、`rowidx` 二级
-//!   索引等值列举、`rowcount` 按主键计数（O(1)，量的是分派地板）、`rowchurn` 插入+
-//!   删除成对（树节点到零回收的那条路）。表形状固定为 `(tag 索引, payload)`，
-//!   由 [`setup_row_table`] 建一劳永逸。
+//!   索引等值列举、`rowrange` 主键区间扫描、`rowidxrange` 索引列值区间扫描、
+//!   `rowcount` 按主键计数（O(1)，量的是分派地板）、`rowchurn` 插入+删除成对
+//!   （树节点到零回收的那条路）。表形状固定为 `(tag 索引, payload)`，由
+//!   [`setup_row_table`] 建一劳永逸。
 //! - `--op write`：`Setattr` 提交 data_ref，会动 refs 账本，是最重的写。
 //! - `--conns N`：只把连接数堆到 N（配合 `--hold`）观察服务端 RSS。
 
@@ -29,6 +30,9 @@ struct Args {
     pipeline: usize,
     hold: bool,
     views: usize,
+    /// `rowrange` 的区间宽度（键数）。小于页宽（100）时一页装完，大于页宽才会
+    /// 走到「区间没走完」那一支。
+    range: u64,
     /// 集群共享密钥：给了就每条连接先跑一次握手（§4.4）。`None` = 不握手，
     /// 与旧版逐字一致 —— 历史基线数字因此仍然可以直接对比。
     auth: Option<std::sync::Arc<treedb::net::auth::Key>>,
@@ -45,6 +49,7 @@ fn parse() -> Args {
         pipeline: 1,
         hold: false,
         views: 8,
+        range: 64,
         auth: None,
     };
     let mut i = 1;
@@ -61,6 +66,7 @@ fn parse() -> Args {
             "--secs" => args.secs = next(&mut i).parse().unwrap_or(5),
             "--pipeline" => args.pipeline = next(&mut i).parse().unwrap_or(1),
             "--views" => args.views = next(&mut i).parse().unwrap_or(8),
+            "--range" => args.range = next(&mut i).parse().unwrap_or(64),
             "--hold" => args.hold = true,
             "--auth-key-file" => {
                 let p = next(&mut i);
@@ -164,12 +170,21 @@ fn setup_row_table(addr: &str, auth: Option<&treedb::net::auth::Key>) {
     }
 }
 
+/// 一行的主键：定宽零填充（`r000000`）。
+///
+/// 定宽是 `rowrange` 的需要：区间两端就是两个主键字符串，不定宽的话字节序
+/// 与数字序不一致（`r10` 排在 `r2` 前面），「宽 64 个键的窗口」到底装了几行
+/// 要看 span —— 而这一格量的正是「扫描 + 回包」的单位成本，窗宽必须可预测。
+fn row_key(i: u64) -> Vec<u8> {
+    format!("r{i:06}").into_bytes()
+}
+
 /// 一行的样子：键 + `(tag, payload)`。`tag` 只有 16 个取值，让索引列上每页
 /// 都有多个命中（否则 `rowidx` 量到的全是「索引里只有一条」那条快路径）。
 fn row_op(seq: u64, span: u64) -> Op {
     Op::RowPut {
         table: ROW_TABLE.to_vec(),
-        key: format!("r{}", seq % span).into_bytes(),
+        key: row_key(seq % span),
         cols: vec![
             format!("t{}", seq % 16).into_bytes(),
             format!("p{seq}").into_bytes(),
@@ -258,6 +273,7 @@ fn main() {
         let per_conn = (args.conns / args.threads).max(1);
         let pipeline = args.pipeline;
         let views = args.views;
+        let range = args.range;
         let auth = args.auth.clone();
         let nonce = nonce();
         handles.push(std::thread::spawn(move || {
@@ -353,7 +369,10 @@ fn main() {
             // 通用表同理：`rowput` 要量的是覆盖、`rowget`/`rowlist`/`rowidx` 要量
             // 命中，都得先有行。`rowinsert` 与 `rowchurn` 自己造行（键里带 nonce），
             // 不预热 —— 给它们预热只会把「预热那 500 行」也算进索引规模里。
-            if matches!(op.as_str(), "rowput" | "rowget" | "rowlist" | "rowidx" | "rowcount") {
+            if matches!(
+                op.as_str(),
+                "rowput" | "rowget" | "rowlist" | "rowidx" | "rowrange" | "rowidxrange" | "rowcount"
+            ) {
                 const WARM: u64 = 250;
                 let span = warm_span() as u64;
                 for base in (0..span).step_by(WARM as usize) {
@@ -375,13 +394,16 @@ fn main() {
             // 不是 `Err`。于是一张空表能跑出「几百万 ops/s、errors=0」这种最好看
             // 也最没用的数字。预热刚写完 span 行，这里必须查得到；查不到就说明
             // 键的构造与预热不一致（改过 span 或键格式），宁可在这儿炸掉。
-            if matches!(op.as_str(), "rowget" | "rowlist" | "rowidx" | "rowcount") {
+            if matches!(
+                op.as_str(),
+                "rowget" | "rowlist" | "rowidx" | "rowrange" | "rowidxrange" | "rowcount"
+            ) {
                 let (what, probe) = match op.as_str() {
                     "rowget" => (
-                        "RowGet(r0)",
+                        "RowGet(r000000)",
                         Op::RowGet {
                             table: ROW_TABLE.to_vec(),
-                            key: b"r0".to_vec(),
+                            key: row_key(0),
                         },
                     ),
                     "rowlist" => (
@@ -401,6 +423,30 @@ fn main() {
                             column: ROW_TAG,
                             value: b"t0".to_vec(),
                             from: Vec::new(),
+                            limit: 1,
+                        },
+                    ),
+                    "rowidxrange" => (
+                        "RowRange(tag [t0, t1), limit=1)",
+                        Op::RowRange {
+                            table: ROW_TABLE.to_vec(),
+                            column: ROW_TAG,
+                            lo: b"t0".to_vec(),
+                            hi: b"t1".to_vec(),
+                            after_val: Vec::new(),
+                            after_key: Vec::new(),
+                            limit: 1,
+                        },
+                    ),
+                    "rowrange" => (
+                        "RowRange(pk [r000000, r000001), limit=1)",
+                        Op::RowRange {
+                            table: ROW_TABLE.to_vec(),
+                            column: ROW_PK,
+                            lo: row_key(0),
+                            hi: row_key(1),
+                            after_val: Vec::new(),
+                            after_key: Vec::new(),
                             limit: 1,
                         },
                     ),
@@ -449,7 +495,7 @@ fn main() {
                 } else {
                     vids[(seq as usize) % vids.len()]
                 };
-                let batch = build(&op, view, seq, pipeline, t, nonce, warm_span() as u64);
+                let batch = build(&op, view, seq, pipeline, t, nonce, warm_span() as u64, range);
                 let idx = ci % cs.len();
                 ci += 1;
                 let c = &mut cs[idx];
@@ -525,7 +571,7 @@ fn warm_span() -> usize {
 ///
 /// `nonce` 是本次进程的启动时间：没有它，同一数据目录上重跑 create/key 就
 /// 全在撞 EEXIST，量到的是“已存在”这条早退路径，不是真的建项开销。
-fn build(op: &str, view: u32, seq: u64, n: usize, t: usize, nonce: u64, span: u64) -> Vec<Op> {
+fn build(op: &str, view: u32, seq: u64, n: usize, t: usize, nonce: u64, span: u64, rw: u64) -> Vec<Op> {
     let mut v = Vec::with_capacity(n);
     for k in 0..n as u64 {
         let s = seq + k;
@@ -581,7 +627,7 @@ fn build(op: &str, view: u32, seq: u64, n: usize, t: usize, nonce: u64, span: u6
             "rowput" => row_op(s, span),
             "rowget" => Op::RowGet {
                 table: ROW_TABLE.to_vec(),
-                key: format!("r{}", s % span).into_bytes(),
+                key: row_key(s % span),
             },
             // 主键序第一页：`from` 空 = 从头。固定首页而不翻到底，是因为翻页的
             // 成本与「翻到第几页」无关（键游标直接从树上定位），而首页恰好是
@@ -606,6 +652,38 @@ fn build(op: &str, view: u32, seq: u64, n: usize, t: usize, nonce: u64, span: u6
                 table: ROW_TABLE.to_vec(),
                 column: ROW_PK,
                 value: Vec::new(),
+            },
+            // 主键区间 `[lo, hi)`：窗口在整张表上滑着走，宽度 = `--range`，
+            // 页宽固定 100。窗宽 < 100 时一页装完（`end=true`），> 100 才走到
+            // 「区间没走完」那一支 —— 两档的差就是 `end` 判定与满页循环的价。
+            //
+            // `win` 夹到 `span - 1`：窗口与表一样宽时 `start` 只有一个取值，
+            // 量到的就不再是「扫描一段」而是「扫全表」。
+            "rowrange" => {
+                let win = rw.min(span.saturating_sub(1)).max(1);
+                let start = s % (span - win + 1);
+                Op::RowRange {
+                    table: ROW_TABLE.to_vec(),
+                    column: ROW_PK,
+                    lo: row_key(start),
+                    hi: row_key(start + win),
+                    after_val: Vec::new(),
+                    after_key: Vec::new(),
+                    limit: 100,
+                }
+            }
+            // 索引列值区间 `[t0, t1)`：`t0` 这一段在 500 行里约 31 行，与
+            // `rowidx` 的回包一样大 —— 两格差别只在「等值前缀」与「值区间 +
+            // 逐行 take_while」这两条路径本身。不拿 `--range` 去切 tag：16 个
+            // 值切不出「宽 64」这种窗口，硬切只会让两档语料不可比。
+            "rowidxrange" => Op::RowRange {
+                table: ROW_TABLE.to_vec(),
+                column: ROW_TAG,
+                lo: b"t0".to_vec(),
+                hi: b"t1".to_vec(),
+                after_val: Vec::new(),
+                after_key: Vec::new(),
+                limit: 100,
             },
             // 插入 + 删除成对：树每轮长一格又缩回去，量的是「Delete 把树节点
             // 减到零」那条路（包括索引侧的反向删除），而树规模恒定。
@@ -670,14 +748,17 @@ treedb-bench — 对 treedb-server 打负载
   --addr HOST:PORT   服务端地址（默认 127.0.0.1:7777）
   --op NAME          create|lookup|readdir|write|lock|key|ping|stat
                      |rowinsert|rowput|rowget|rowlist|rowidx|rowcount|rowchurn
+                     |rowrange|rowidxrange
                      通用表档用固定形状的表 benchkv(tag 索引, payload)，首次运行
                      自动建表；rowchurn 是 put+del 成对发，ops/s 是两者之和、
-                     配对速率是它的一半
+                     配对速率是它的一半。rowrange 扫主键区间 [lo, hi)（窗宽
+                     --range，页宽 100），rowidxrange 扫 tag 列的值区间 [t0, t1)
   --conns N          总连接数（默认 8）
   --threads N        工作线程数（默认 8）
   --pipeline N       每批请求数，1 = 一问一答（默认 1）
   --secs N           持续秒数（默认 5）
   --views N          每线程视图数（默认 8）
+  --range N          rowrange 的区间宽度（默认 64）
   --hold             只建立 N 条连接并保持，用于量服务端 RSS
   --auth-key-file P  每条连接先用这把密钥跑一次握手（§4.4）。不给 = 不握手。
                      服务端必须开着同一把密钥，否则报错退出（客户端

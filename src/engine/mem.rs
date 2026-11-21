@@ -767,6 +767,88 @@ impl State {
         (rows, end)
     }
 
+    /// 主键区间 `[lo, hi)` 的一页：`after` 之后的至多 `limit` 行，并说清到底没。
+    ///
+    /// `lo` / `hi` 空 = 该侧无界（主键不得为空，所以「空」只能是无界这一个意思）。
+    /// `lo > hi` 是空区间而不是错误 —— 但 `BTreeMap::range` 在 `start > end` 时
+    /// **panic**，所以得先在这里挡掉，不能让调用方替它记着这条。
+    pub fn row_range(
+        &self,
+        tid: u32,
+        lo: &[u8],
+        hi: &[u8],
+        after: &[u8],
+        limit: usize,
+    ) -> (Vec<RowRec>, bool) {
+        let Some(m) = self.rows.get(&tid) else {
+            return (Vec::new(), true);
+        };
+        if !lo.is_empty() && !hi.is_empty() && lo > hi {
+            return (Vec::new(), true);
+        }
+        // 游标越过上界也落在这里：`after > hi` 时下界与上界反了，而 `after == hi`
+        // 时两端都是 `Excluded` —— 这两种都在 `BTreeMap::range` 的 panic 条件里。
+        if !after.is_empty() && !hi.is_empty() && after >= hi {
+            return (Vec::new(), true);
+        }
+        // 下界取 max(lo, after)：有游标就从它之后接，但绝不能跑到 `lo` 前面去。
+        let lower = if !after.is_empty() && (lo.is_empty() || after >= lo) {
+            Bound::Excluded(after)
+        } else if lo.is_empty() {
+            Bound::Unbounded
+        } else {
+            Bound::Included(lo)
+        };
+        let upper = if hi.is_empty() {
+            Bound::Unbounded
+        } else {
+            Bound::Excluded(hi)
+        };
+        let mut it = m.range::<[u8], _>((lower, upper));
+        let rows: Vec<RowRec> = it.by_ref().take(limit).map(|(_, r)| r.clone()).collect();
+        let end = it.next().is_none();
+        (rows, end)
+    }
+
+    /// 索引列值区间 `[lo, hi)` 的一页；同一个值内按主键序。
+    ///
+    /// 游标是 `(after_val, after_key)` 一对：一个值可能跨页，只拿主键回不到
+    /// 「这一页停在哪一段」。`None` = 从区间头开始。
+    pub fn index_range(
+        &self,
+        tid: u32,
+        col: u32,
+        lo: &[u8],
+        hi: &[u8],
+        after: Option<(&[u8], &[u8])>,
+        limit: usize,
+    ) -> (Vec<RowRec>, bool) {
+        // 起点 = max(lo, 游标)：给了游标就是「不含」，否则是「含 lo」。
+        let (sv, sk, excl) = match after {
+            Some((v, k)) if lo.is_empty() || (v, k) > (lo, &b""[..]) => (v, k, true),
+            _ => (lo, &b""[..], false),
+        };
+        let lower = if excl {
+            Bound::Excluded((tid, col, sv.to_vec(), sk.to_vec()))
+        } else {
+            Bound::Included((tid, col, sv.to_vec(), Vec::new()))
+        };
+        let hi_v = hi.to_vec();
+        let mut it = self
+            .row_index
+            .range((lower, Bound::Unbounded))
+            // 上界只能靠 `take_while`：键是 `(表, 列, 值, 主键)`，而
+            // `(tid, col, hi, "")` 只是「值为 hi 的最小键」—— 同值的其它行排在它
+            // 之后，用 `Excluded` 一个也挡不住。值为 `hi` 的那一段必须整段排除。
+            .take_while(move |(k, _)| {
+                k.0 == tid && k.1 == col && (hi_v.is_empty() || k.2 < hi_v)
+            })
+            .filter_map(|(k, _)| self.rows.get(&tid).and_then(|m| m.get(&k.3)).cloned());
+        let rows: Vec<RowRec> = it.by_ref().take(limit).collect();
+        let end = it.next().is_none();
+        (rows, end)
+    }
+
     /// `(view, parent, *)` 区间内、`after` 之后的至多 `limit` 条 dentry。
     /// 内层 key 的字节序即 name 的字节序。`after` 为空 = 从头开始。
     pub fn read_dir(&self, view: ViewId, parent: Ino, after: &[u8], limit: usize) -> Vec<(Vec<u8>, Ino)> {

@@ -1155,6 +1155,37 @@ pub fn translate(s: &State, now: i64, op: &Op) -> (Vec<Log>, Reply) {
             };
             (vec![], Reply::Rows { rows, end })
         }
+        Op::RowRange {
+            table,
+            column,
+            lo,
+            hi,
+            after_val,
+            after_key,
+            limit,
+        } => {
+            let Some(t) = s.tables.get(table) else {
+                return (vec![], no_table(table));
+            };
+            if let Some(r) = bad_column(t, *column) {
+                return (vec![], r);
+            }
+            let lim = if *limit == 0 { 1000 } else { *limit as usize };
+            let (rows, end) = if *column == ROW_PK {
+                // 主键区间只要主键游标：主键唯一，一条主键就定死了停在哪。
+                s.row_range(t.id, lo, hi, after_key, lim)
+            } else {
+                // 索引列要连值一起给：同一个值可能跨页，只拿主键回不到「这一页
+                // 停在哪一段」。空主键 = 从区间头开始（主键不得为空，不歧义）。
+                let cursor = if after_key.is_empty() {
+                    None
+                } else {
+                    Some((after_val.as_slice(), after_key.as_slice()))
+                };
+                s.index_range(t.id, *column, lo, hi, cursor, lim)
+            };
+            (vec![], Reply::Rows { rows, end })
+        }
         Op::RowCount { table, column, value } => {
             let Some(t) = s.tables.get(table) else {
                 return (vec![], no_table(table));

@@ -95,7 +95,7 @@ fn rowput(table: &str, key: &str, val: &str, cond_col: u32, cond_val: &str) -> O
     }
 }
 
-/// 52 个 op 变体的语料，每条都带能让它走到真实分支的参数（视图/文件名/表名
+/// 53 个 op 变体的语料，每条都带能让它走到真实分支的参数（视图/文件名/表名
 /// 取自下面 `seed` 播好的状态，所以视图 id 由调用方递进来）。加新 op 必须同时
 /// 补这里 —— 最后两个计数断言就是报警器。
 fn corpus(v: u32) -> Vec<Op> {
@@ -165,6 +165,7 @@ fn corpus(v: u32) -> Vec<Op> {
         Op::RowPut { table: name("seed-table"), key: name("r-new"), cols: vec![name("v-new"), name("x")], flags: 0, cond_col: COND_NONE, cond_val: Vec::new() },
         Op::RowGet { table: name("seed-table"), key: name("r1") },
         Op::RowList { table: name("seed-table"), column: ROW_PK, value: Vec::new(), from: Vec::new(), limit: 10 },
+        Op::RowRange { table: name("seed-table"), column: ROW_PK, lo: name("r1"), hi: name("r3"), after_val: Vec::new(), after_key: Vec::new(), limit: 10 },
         Op::RowDelete { table: name("seed-table"), key: name("r2"), flags: 0, cond_col: COND_NONE, cond_val: Vec::new() },
         Op::RowCount { table: name("seed-table"), column: 1, value: name("x") },
         // ---- readdir 带属性 ----
@@ -249,8 +250,8 @@ fn readonly_classification_matches_translate() {
         }
     }
     let cs_len = cs.len();
-    assert_eq!(cs_len, 52, "op 语料必须覆盖全部变体");
-    assert_eq!(ro, 22, "只读 op 数变了：分派表、这里和 DESIGN.md §4.2 分组表要一起改");
+    assert_eq!(cs_len, 53, "op 语料必须覆盖全部变体");
+    assert_eq!(ro, 23, "只读 op 数变了：分派表、这里和 DESIGN.md §4.2 分组表要一起改");
     assert_eq!(wr, 30, "非只读 op 数变了：同上");
 }
 
@@ -276,8 +277,8 @@ fn ops_partition_into_three_classes() {
     }
     assert_eq!(
         (ro, wr, ctl),
-        (22, 23, 7),
-        "三档的分布：只读 22 / 真写 23 / 控制面 7（Stats、Checkpoint、Shutdown、WalFetch、\
+        (23, 23, 7),
+        "三档的分布：只读 23 / 真写 23 / 控制面 7（Stats、Checkpoint、Shutdown、WalFetch、\
          SnapFetch、AuthBegin、AuthFinish）"
     );
     // 语料覆盖全部变体，因此三档之和就是 op 总数。
@@ -343,6 +344,10 @@ fn worker_reads_answer_identically_to_inline_reads() {
             .chain(std::iter::once(Op::TableList))
             .chain((0..5).map(|k| Op::RowGet { table: b"parity".to_vec(), key: format!("p{k}").into_bytes() }))
             .chain(std::iter::once(Op::RowList { table: b"parity".to_vec(), column: ROW_PK, value: Vec::new(), from: Vec::new(), limit: 4 }))
+            // 两条区间读：一条走主键，一条走索引列。后者全体同值（`b` 列恒为
+            // `x`），既测「值区间」也测「同值跨页」，与只读并行走的是同一批查询。
+            .chain(std::iter::once(Op::RowRange { table: b"parity".to_vec(), column: ROW_PK, lo: b"p3".to_vec(), hi: b"p9".to_vec(), after_val: Vec::new(), after_key: Vec::new(), limit: 3 }))
+            .chain(std::iter::once(Op::RowRange { table: b"parity".to_vec(), column: 1, lo: b"x".to_vec(), hi: b"y".to_vec(), after_val: Vec::new(), after_key: Vec::new(), limit: 4 }))
             .chain(std::iter::once(Op::RowCount { table: b"parity".to_vec(), column: 1, value: b"x".to_vec() }))
             .collect();
         out.extend(c.pipeline(&batch).expect("pipeline reads"));
@@ -368,7 +373,7 @@ fn worker_reads_answer_identically_to_inline_reads() {
     }
     assert_eq!(
         got[0].len(),
-        40 + 1 + 10 + 1 + 2 + 5 + 2 + 8,
+        40 + 1 + 10 + 1 + 2 + 5 + 2 + 2 + 8,
         "负载条数对不上，用例本身写坏了"
     );
 }
