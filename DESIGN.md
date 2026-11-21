@@ -86,7 +86,9 @@ SQLite3，24 格）写成文，并给 `final.tsv` 补了生成器与两条对账
 decode 处得到 `unknown op tag 0x002c`，而不是把一条写静默当成别的样子。真正的变化
 不在协议在记账：`nlink > 1` 之后「摘一个名字」与「删 inode」必须分开，`Unlink` /
 `Rename` 覆盖 / `Symlink` upsert 三条路径都按「是不是最后一个名字」分流 —— 不是的话
-只减一票、不下内容引用账、应答里带空键（§5.2）。定版 `v0.5.0`。
+只减一票、不下内容引用账、应答里带空键（§5.2）。定版 `v0.5.0`。接入侧随后跟着
+闭合（2026-11-21）：grovefs 把 pin 从 `v0.3.7` 升到 `v0.5.0`、`link_node` 改成真发
+`Op::Link`，阶段 C 1 的 10 条硬链接断言由 SKIP 转正（§10）。
 
 test 现在分两档报：默认档（纯引擎）`cargo test --release` = **148 passed**（55 lib +
 31 engine_crud + 14 migrate + 14 replication + 11 net_protocol + 8 read_scaling +
@@ -604,9 +606,10 @@ GC 拿它当唯一依据。
 - **硬链接的其余形态**：`Op::Link` 本身已提供（`v0.5.0`，语义与测试见 §5.2），
   不提供的是这三样 —— 目录硬链接（`EPERM`，与 `link(2)` 同款；视图根是目录，因此天然
   被挡）、`link` 的 upsert 变体（名字已存在一律 `EEXIST`）、跨视图链接（与 `Rename`
-  同一条边界）。接入侧那一步是 grovefs 的活：provider 仍钉 `v0.3.7`，`link_node` 仍回
-  `EPERM`，所以阶段 C 1 的 10 条 `[posix C]` 仍是 SKIP；重放结果要等那一侧升 pin 并
-  改成真发 `Op::Link` 之后实测，本仓不代替它报数。
+  同一条边界）。接入侧已闭合（2026-11-21）：grovefs 把 pin 从 `v0.3.7` 升到 `v0.5.0`、
+  `link_node` 改成真发 `Op::Link`，阶段 C 1 的矩阵从 `pass=39 fail=0 skip=10` 变成
+  `pass=51 fail=0 skip=0`，那 10 条 `[posix C]` 全转正。数字出自那一侧的一次完整板子
+  跑，本仓不代替它报数。
 - **字节区间锁**：锁的 key 是 `(view, ino, owner)`，没有 `(start, end, pid)`。POSIX 记录锁
   要的是按区间合并/拆分的那套语义，这里给不了 —— provider 只能拒，不能假装支持。
 - **通用表只给 §4.2 那九条 op 的形状**（状态与定型见 §5.1）：没有类型、没有 JOIN 与跨表条件、没有范围/前缀
@@ -2399,17 +2402,17 @@ spike 明确**没**做、也不在接入面上假装做的事 —— 一律返�
 
 | 缺口 | 现在的行为 | 为什么不能假装支持 |
 |---|---|---|
-| 硬链接 `link_node` | 引擎已能表达（`v0.5.0` 的 `Op::Link`，§5.2）；grovefs provider 仍回 EPERM | 两个仓各欠一半：引擎那半已闭合，接入那半要先升 pin 再改 `link_node`。在 provider 改成真发 `Op::Link` 之前，那里仍回 EPERM，阶段 C 1 的 10 条 `[posix C]` 也仍是 SKIP |
+| ~~硬链接 `link_node`~~ **已闭合**（2026-11-21） | provider 改发 `Op::Link`（pin `v0.5.0`，§5.2） | 两个仓各欠一半，现在两半都合上了：引擎 `v0.5.0` 加了 `Op::Link`，grovefs 升 pin 后 `link_node` 真发这条 op。阶段 C 1 的 10 条 `[posix C]` 从 SKIP 转正（`39/0/10 → 51/0/0`），`nlink` 报表与「最后一个名字离开才释放字节」两条都按 SQLite 档同一契约实测 |
 | POSIX 字节区间锁 | EPERM / None | 引擎只有整 inode 锁（§5.3） |
 | `refs` 的字节量 | 恒 0 | 字节权威在数据面，size 也从数据面取 |
 | `view export` / `view import` | 拒绝 | dump reader 是 SQL 形状的，treedb 无等价物 |
 | `refs rebuild` | 拒绝 | 持有者计数在引擎内同 op 维护，没有独立账本可重算 |
 | `gc` 审计 | 拒绝 | 没有聚合的 ledger 视图，回空集等于判所有对象为孤儿 |
-| ~~readdir 的属性~~ **已闭合**（2026-11-20） | provider 改用 `ReadDirPlus` | 原写法准确：协议面 2026-11-19 就闭合了，缺的是调用。两臂实测（同一份 `du` 走完一棵树，配方 grovefs `.build-bin/bench_treedb_readdir.sh`，引擎侧计数器读 `--stats`）：引擎应用的 op 数 3000 条时 **3006 → 6**、20000 条时 **20023 → 23**；把引擎放到每段 2 ms 延迟的 TCP 代理后面墙钟 **256 ms → 52 ms**，同机 loopback 上 106 vs 88 ms（三次分布重叠，量不出差别）。**这项收益的单位是往返**，本机测试恰好把它藏起来，所以两个数都得写。语义零回归：阶段 C 1 那套矩阵改前改后都是 `pass=39 fail=0 skip=10` |
+| ~~readdir 的属性~~ **已闭合**（2026-11-20） | provider 改用 `ReadDirPlus` | 原写法准确：协议面 2026-11-19 就闭合了，缺的是调用。两臂实测（同一份 `du` 走完一棵树，配方 grovefs `.build-bin/bench_treedb_readdir.sh`，引擎侧计数器读 `--stats`）：引擎应用的 op 数 3000 条时 **3006 → 6**、20000 条时 **20023 → 23**；把引擎放到每段 2 ms 延迟的 TCP 代理后面墙钟 **256 ms → 52 ms**，同机 loopback 上 106 vs 88 ms（三次分布重叠，量不出差别）。**这项收益的单位是往返**，本机测试恰好把它藏起来，所以两个数都得写。语义零回归：阶段 C 1 那套矩阵改前改后都是 `pass=39 fail=0 skip=10`（硬链接闭合后同一套是 `51/0/0`，见阶段 C 1） |
 | 定义/密钥/账户 | 行表全部在引擎（M3，无开关），定义仍在本地 SQLite | 密钥、审计、账户、授权**已在通用表上**（M1 2026-11-20，§11 第 13/14 条），M3 删掉了开关：treedb 档读写都走引擎，没跑过搬家命令的部署**拒绝启动**并点名 `control-migrate`（§11 第 15/16 条）。视图**定义**仍在本地（引擎没有定义表）；`Key*`/`Audit*` 那三个专用 op 仍是业务形状，不能当接入面（上文第 4 步）。迁法与切写步骤见下面阶段 C 4 |
 | ~~`view list` 的物理树~~ **已闭合**（2026-11-20，M1b） | `TreedbControlStore::list_physical` 回答「本地 ∪ 引擎的 `Op::ListViews`」 | 控制面枚举器只看本地 db 文件时，引擎里的基树在 `view list`/`store.info` 里都不存在（委派也因此无法解析）。修了 `list_physical`/`has_physical` 两处双答案，枚举与存在性判据同时看见引擎 |
 | HA / 快照传送 | 手工可做（不是自动化） | 接入面用不上它：§8 限制 6 现在是「有异步只读副本、无同步复制」。v0.4.0 起有了 `treedb-standby --promote` + fencing token（§6.6「切主」），但它是**人手动的一步离线动作**：不开服务、不自动选主、旧主靠人停。grovefs 要的「主挂了自动切副本」仍然没有 |
-| ~~path 依赖的分发方式~~ | 已定：按 tag 的 git 依赖 | grovefs 侧钉 `v0.3.7`（无同级克隆也能构建，实测）；本仓已到 `v0.5.0`。`v0.4.0` 与 `v0.5.0` 都不会逼它升级：前者的线协议变更只在 `WalBatch`/`SnapChunk` 两个副本专用 reply 的尾部，后者是纯追加的新 op tag（旧服务端回 `unknown op tag`），grovefs 走的普通 CRUD 与 `Stats` 字节一个未动。升 pin 的动机只有一个：把 `link_node` 接上真硬链接（上一行）。它不升，本仓不代替它报数 |
+| ~~path 依赖的分发方式~~ | 已定：按 tag 的 git 依赖 | grovefs 侧已跟着钉到 `v0.5.0`（2026-11-21；`v0.3.7` 曾是无同级克隆也能构建的实测点）；两仓同版。`v0.4.0` 与 `v0.5.0` 都不会逼它升级：前者的线协议变更只在 `WalBatch`/`SnapChunk` 两个副本专用 reply 的尾部，后者是纯追加的新 op tag（旧服务端回 `unknown op tag`），grovefs 走的普通 CRUD 与 `Stats` 字节一个未动。升 pin 的动机只有一个：把 `link_node` 接上真硬链接（上一行），现在已升到 `v0.5.0` 并实测（阶段 C 1） |
 
 ### 阶段 C（回归与灰度）
 1. ~~`posix`/`e2e` 那种全量断言矩阵还没在 treedb 上跑过~~ **已跑**（2026-11-20，
@@ -2422,6 +2425,12 @@ spike 明确**没**做、也不在接入面上假装做的事 —— 一律返�
    后两次是现在的三计数器版本（`pass=39 fail=0 skip=10`）：一次直接跑脚本、
    一次走板子 `FEATURES_TREEDB=1 bash .build-bin/run_all.sh treedb treedbmatrix`，
    得 `build PASS / treedb PASS / treedbmatrix PASS`。
+   第五次是硬链接闭合之后（2026-11-21，同一台机器、同一套夹具，grovefs 侧把 pin
+   升到 `v0.5.0` 且 `link_node` 真发 `Op::Link`）：`pass=51 fail=0 skip=0`，直接跑脚本
+   连跑两次一致，板子同样 `build PASS / treedb PASS / treedbmatrix PASS`。新增的三格
+   是拒绝面：重名回 `EEXIST`、源缺失回 `ENOENT`、两次被拒都不新增 dentry；原来那
+   10 条 `[posix C]` 全部转正（其中「同一个 inode 两个名字」与「删最后一个名字才
+   释放字节」两条才是这条 op 的正题）。
    **为什么改成三个计数器**：硬链接那一节 `[posix C]` 的 10 条不是「这一跑坏了」
    （FAIL），而是「这个后端问不了」（没有第二个名字，断言的主语不存在）；把两者
    混在一个数里，缺口要么把板子永久考红，要么被一句「已知不通过」洗成沉默。
@@ -2430,20 +2439,23 @@ spike 明确**没**做、也不在接入面上假装做的事 —— 一律返�
    `stat -c %i` 在一个名字存在时也答「1」，把「一个 inode 两个名字」抬成了绿；
    一次是数据面异步释放对象，两条 refcount GC 断言靠同一次延迟双双变绿。
    现在靠 `settle`（1.5 s）与依赖守卫钉住。
-   除硬链接之外每一格都过：视图隔离、append/rename/rm、4 MiB md5 逐字节、
+   前四次里，除硬链接之外每一格都过：视图隔离、append/rename/rm、4 MiB md5 逐字节、
    孤儿对象回收、symlink 四形态、`df`、`touch -d` 的 mtime、`chmod` 两档、`mkfifo`
-   干净拒绝、detached mount 的整套守护进程契约。
-   `[posix C*]` 那两条钉的是**缺口的形状**：`ln` 必须回 EPERM 而不是造出半个名字，
-   且挂载点必须活着。缺口本身可以接受，静默的半链接不行。
-   板上这一行**按实测三元组门控而不是按零门控**：`pass=39 fail=0 skip=10` 记 PASS，
-   三元组只要动一下都记红 —— 多一条 FAIL（回归）、少一条断言（脚本退化）、
-   skip 变小（缺口自己合上了，得重读文档再改契约）都会让这一行变红。一个永远红的
+   干净拒绝、detached mount 的整套守护进程契约；第五次连硬链接那 14 格也全过。
+   前四次里 `[posix C*]` 那两条钉的是**缺口的形状**：`ln` 必须回 EPERM 而不是造出
+   半个名字，且挂载点必须活着（缺口本身可以接受，静默的半链接不行）。第五次起
+   这两条退场，接替它们的是三格拒绝面：重名 `EEXIST`、源缺失 `ENOENT`、两次被拒
+   都不新增 dentry；目录 `EPERM` 在 coreutils 层到不了（`ln` 先拒），留在引擎侧
+   `link_refusals_name_the_posix_errno` 里守。
+   板上这一行**按实测三元组门控而不是按零门控**：`pass=51 fail=0 skip=0` 记 PASS
+   （旧 pin 上 `39/0/10` 也记 PASS —— 那正是文档化的缺口），其他三元组一律记红 ——
+   多一条 FAIL（回归）、少一条断言（脚本退化）、skip 变了（要么缺口合上、要么
+   脚本退化，两种都得重读文档再改契约）都会让这一行变红。一个永远红的
    格子等于没有格子；默认构建（没开 feature）落 INFO，不拉低 GREEN。
    仍然没定价的：字节区间锁（`locks` 那一套没重放）、以及 `edge`/`errors`/
-   `concurrent` 等其余套件。`Link` op 原先列在这里，`v0.5.0` 已把它从「引擎没有」
-   变成「接入未接」（§5.2）：重放那一步要先在 grovefs 升 pin、把 `link_node` 从
-   `EPERM` 改成发 `Op::Link`，跑完才能把 `skip=10` 改成 0 —— 本仓只有引擎半边的
-   证据（31 条 engine_crud 里的三条硬链接用例），矩阵那半边等 grovefs 实测。
+   `concurrent` 等其余套件。`Link` op 曾经也列在这里：`v0.5.0` 给了引擎半边（31 条
+   engine_crud 里的三条硬链接用例），2026-11-21 接入半边也接上并实测（上一段第五次
+   重放），`skip` 归零 —— 这一项已从清单上划掉。
 2. 万级视图 mount + create + readdir 混打，对照 `pg_stat_activity`（旧）与
    `--stats`（新）两条路径的连接数、RSS、p99。
 3. ~~容灾演练：`kill -9` → 重启 → 已 ack 写全在（§6.4 已在 crate 内自动化，
@@ -2767,7 +2779,9 @@ spike 明确**没**做、也不在接入面上假装做的事 —— 一律返�
    只动 `Cargo.toml` / `Cargo.lock` 两行，无适配改动；`test_treedb.sh` 在该分支实测
    **53/0**）。本仓随后到了 `v0.4.0`（切主），但那一版的线协议变更只在两个副本专用
    的 reply 尾部，grovefs 那条路径不受影响 —— 所以 grovefs 仍钉 `v0.3.7` 是有意的，
-   不是漏升级（§10 阶段 B 末表最后一行）。
+   不是漏升级（§10 阶段 B 末表最后一行）。**2026-11-21 这一行也翻页了**：硬链接闭合
+   时 grovefs 把 pin 升到了 `v0.5.0`（动机只有 `link_node`，§10 阶段 C 1），所以「仍钉
+   `v0.3.7` 是有意的」只在硬链接闭合之前成立。
 7. **独立性审计：treedb 是一个数据库项目，不是 GroveFS 的一个模块**。用户定的约束
    是：grovefs 的业务语义不得漏进引擎内核，为 grovefs 做的适配一律留在 grovefs 仓里
    拦在 feature 门后，treedb 对外只讲通用元数据引擎接口。本轮对着代码校了一遍，
