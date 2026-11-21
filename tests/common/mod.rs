@@ -150,6 +150,12 @@ impl Server {
             std::fs::write(&key_file, k.0).expect("write auth key");
             cmd.arg("--auth-key-file").arg(&key_file);
         }
+        // 写轴流水线档（§11 第 8 条）。用环境变量而不是改 spawn 签名：
+        // 用例只需要“同一套脚本在两条路径上都跑一遍”，而重启路径
+        // （`restart_at*`）也走这里，所以两边自动一致。
+        if std::env::var_os("TREEDB_TEST_FLUSH_PIPELINE").is_some() {
+            cmd.arg("--flush-pipeline");
+        }
         let out = Stdio::from(std::fs::File::create(&log).expect("create server log"));
         let child = cmd
             .stdin(Stdio::null())

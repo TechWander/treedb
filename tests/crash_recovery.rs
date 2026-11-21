@@ -143,7 +143,19 @@ fn stats(srv: &Server) -> treedb::engine::EngineStats {
 ///
 /// 这是最纯粹的一条：**ack 严格晚于 fsync**，所以这里一条都不许丢。
 fn hammer_then_kill(durability: &str, threads: usize, per_thread: usize) -> Vec<(u32, String)> {
-    let srv = Server::start(durability);
+    hammer_then_kill_workers(durability, 1, threads, per_thread)
+}
+
+/// 同上，但前端 worker 数可配。`workers > 1` 走的是 multi 事件循环：写由
+/// 唯一提交线程定序，ack 可能由 flusher 的回执驱动（`--flush-pipeline`）
+/// 而不是提交线程自己站着等 fsync —— 两条路径的 ack 语义必须一字不差。
+fn hammer_then_kill_workers(
+    durability: &str,
+    workers: usize,
+    threads: usize,
+    per_thread: usize,
+) -> Vec<(u32, String)> {
+    let srv = Server::start_workers(durability, workers);
     let addr = srv.addr.clone();
     let acked: Acked = Arc::new(Mutex::new(Vec::new()));
     let mut handles = Vec::new();
@@ -172,7 +184,7 @@ fn hammer_then_kill(durability: &str, threads: usize, per_thread: usize) -> Vec<
 
     // 关键一步：ack 都已收到，此刻 SIGKILL 不能丢任何一条。
     let (tmp, dir) = srv.sigkill_and_take_dir();
-    let srv2 = Server::restart_at(tmp, dir, durability);
+    let srv2 = Server::restart_at_workers(tmp, dir, durability, workers);
     let list = snapshot(&acked);
     // 同一批名字在不同视图下会重名，去重前先确认视图集合正确。
     let uniq: HashSet<(u32, String)> = list.iter().cloned().collect();
@@ -206,6 +218,17 @@ fn acked_writes_survive_sigkill_always() {
 fn acked_writes_survive_sigkill_group() {
     let list = hammer_then_kill("group", 4, 400);
     assert_eq!(list.len(), 4 * 400);
+}
+
+/// 多前端 worker 下的同一条承诺（§11 第 8 条）。
+///
+/// 默认跑的是提交线程自己 fsync 的路径；`TREEDB_TEST_FLUSH_PIPELINE=1`
+/// 跑的是 ack 由 flusher 回执驱动的路径（见 `tests/common/mod.rs` 的
+/// `spawn`）。两条路径都必须在 SIGKILL 后一条不丢。
+#[test]
+fn acked_writes_survive_sigkill_group_multi_worker() {
+    let list = hammer_then_kill_workers("group", 4, 4, 300);
+    assert_eq!(list.len(), 4 * 300);
 }
 
 /// 崩溃正好落在写的中间：已 ack 的仍在，未 ack 的可以没，但状态必须还能起来。

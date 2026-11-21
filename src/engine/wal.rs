@@ -218,6 +218,41 @@ impl Wal {
         self.durable_seq
     }
 
+    /// 已追加到文件、但未必 fsync 过的最后一条 seq。
+    ///
+    /// 流水线（`multi` 路径）里提交线程在 `append_nodur` 之后拿它告诉
+    /// flusher「fsync 到哪就算这批落了盘」，flusher 的完成通知把它带回
+    /// 提交线程，由 [`Wal::advance_durable`] 推进水位。
+    pub fn appended_seq(&self) -> u64 {
+        self.next_seq - 1
+    }
+
+    /// dup 一个只用来 fsync 的独立 fd。
+    ///
+    /// `fsync`/`fdatasync` 不看文件偏移，所以与提交线程的 `seek + write`
+    /// 并发安全；dup 共享同一个 file description，刷的就是同一批页。
+    ///
+    /// **`truncate_before` / `reset` 会把日志换成新 inode**：那之后必须重新
+    /// 取一次本函数并让 flusher 换 fd（`multi::Flusher::retarget`），否则
+    /// 后续 fsync 全刷到一个已被 rename 走的孤儿 inode 上 —— 新记录永不落盘，
+    /// 而 ack 照发。
+    pub fn try_clone_sync_fd(&self) -> Result<File> {
+        self.file
+            .try_clone()
+            .map_err(|e| Error::Io(format!("dup wal fd: {e}")))
+    }
+
+    /// flusher 报完成之后由提交线程推进水位。
+    ///
+    /// 三重守卫都是必要的：只进不退（合并提交时晚到的 Done 可能带更小的
+    /// seq）；不超过逻辑末尾（checkpoint 收口会把 `next_seq` 拨回水位，此时
+    /// 一个旧 Done 带来的大 seq 在新一代日志里根本不存在）。
+    pub fn advance_durable(&mut self, seq: u64) {
+        if seq > self.durable_seq && seq < self.next_seq {
+            self.durable_seq = seq;
+        }
+    }
+
     /// 把 seq 水位抬到 `seq`。
     ///
     /// checkpoint 会把 WAL 截成空文件，重启后 `scan` 只能查到 0，若不把

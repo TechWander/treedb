@@ -2961,17 +2961,39 @@ spike 明确**没**做、也不在接入面上假装做的事 —— 一律返�
    `Key*`/`Audit*` 直接给 grovefs 用，而是 grovefs 用 T2 的通用表自己拼语义 ——
    T2 本轮已可用，这句从「得先造工具」变成了「可以开工」；§10 阶段 B 第 4 步那句
    「走 treedb 的 `Key*`/`Audit*`」作废。
-8. ~~**`always` 档的 flush 流水线**~~ **已完成一半**（§7.9 第 3 条）：按连接串行
-   fsync 已删，p99 从 81.5 ms 降到 31.1 ms、吞吐 5.77×，且原判据（与 `group` 同量级、
-   崩溃用例全绿）已满足。**没做的那一半才是剩下的肉**：提交线程仍然在
-   `wal.commit()` 里**阻塞等盘**，这一窗口内它既不接 worker 的转发也不发 ack，
-   `group` 档 64 并发那 p99 24–29 ms 就是「堆在 fsync 窗口外面」的排队。
-   改法：专用 flusher 线程持有 WAL 的 `try_clone()` fd，提交线程只 append（一次
-   write）并把目标 seq 交给 flusher，完成事件回送到提交线程后再 ack 那一批；
-   checkpoint / 退出前必须 drain（`wal.reset()` 与 `truncate_before()` 都从
-   「逻辑末尾」切，不能与 in-flight flush 共命）。
-   验收判据：`benches/ab_durability.sh` 同格 p99 ≤ 8 ms、机械盘 ops/s 从 12 k 再往上，
-   且 `tests/crash_recovery.rs` 六条仍全绿 —— 不然只是把尾延迟换成了丢写。
+8. **`always` 档的 flush 流水线**：**已实现，但默认关 —— 实测推翻了原本的收益
+   假设**。两段历史要分开看。
+   - 第一段（已完成）：按连接串行 fsync 已删，p99 从 81.5 ms 降到 31.1 ms、吞吐
+     5.77×，原判据（与 `group` 同量级、崩溃用例全绿）已满足。
+   - 第二段（本轮做完，结论是**不该默认开**）：专用 flusher 线程（fd 由
+     `Wal::try_clone_sync_fd` 从提交线程 dup）、提交线程只 `append`、`SyncDone`
+     回执到了才 ack 那一批（`net::multi::Flusher` / `Pending::Flight`）。三条实现
+     纪律：同一时刻只允许一个 fsync 在飞（每轮都 submit 会把批次切碎，fsync
+     次数变多、每次覆盖变少，实测 QPS 再掉 13%）；checkpoint 收口与退出前
+     `drain_all`，收口后 `Flusher::retarget` 换 fd（`truncate_before` 会换 inode，
+     旧 fd 上的 fsync 全打在孤儿 inode 上）；`never` 档不进 flusher。
+
+     **实测（128 核、fsync 1.3–1.6 ms，同目录同参数各 3 跑取中位）**：
+
+     | 格 | 默认（提交线程 fsync） | `--flush-pipeline` | 差 |
+     |---|---|---|---|
+     | create 64/1 | 3 945 ops/s，p50 1 073 µs | 3 862 ops/s，p50 1 243 µs | QPS −2.1%，p50 +15.8% |
+     | create 64/32 | 22 257 ops/s，p50 269 µs | 21 074 ops/s，p50 304 µs | QPS −5.3%，p50 +13% |
+     | create 1/1（8 线程在飞） | 4 121 ops/s，p50 1 052 µs | 3 856 ops/s，p50 1 211 µs | QPS −6.4%，p50 +15% |
+     | p99（64/1 / 64/32） | 18.1 / 1.3 ms | 18.0 / 1.3 ms | 持平 |
+
+     结论：**原判断里「fsync 窗口内不接活」这半句不成立**。旧实现里转发本来就堆
+     在 worker 信箱里，fsync 返回后照样一次性排干；提交线程在窗口内唯一没做的是
+     `translate`，而它是 µs 级。把 fsync 挪出去换来的重叠抵不过多出来的
+     「eventfd + poll + 线程唤醒」约 150 µs。默认档因此回到同步路径，开关
+     `--flush-pipeline` 保留：它的收益条件是「fsync 占周期比例高 **且** 单 op 的
+     `translate` 重」（大目录 readdir 的兄弟 op），届时可单独打开。
+
+     验收：`tests/crash_recovery.rs` 七条在**两档下都绿**（新增
+     `acked_writes_survive_sigkill_group_multi_worker`；`TREEDB_TEST_FLUSH_PIPELINE=1`
+     把整套用例切到流水线路径）。原判据里的「p99 ≤ 8 ms / 12 k ops/s」在本机不可达，
+     因为瓶颈是 64 连接轮转（每 op 一次 fsync、1.3 ms），与是否异步无关 —— 那两个
+     数字依赖的是「一轮能合并多少写」，那是批大小的取舍，不是流水线能给的。
 9. **dirents 应答直接编进连接发送缓冲**（§7.10 剩下那一条）：一页仍有 104 次堆
    分配，100 次来自 `Reply::Dirents.names` 的逐名 `Vec<u8>`。改造点是 encode 侧
    往调用方给的 `&mut Vec<u8>` 直接写，而不是先造一个 `Vec<Vec<u8>>`。收益只能

@@ -850,6 +850,68 @@ impl Engine {
         Ok(())
     }
 
+    /// 只追加、不 fsync：`multi` 路径把提交这一步与落盘那一步拆开。
+    ///
+    /// 提交线程 append 完就把控制权交回事件循环（接下一轮转发、translate
+    /// 下一批），落盘交给 flusher 线程。**ack 仍然严格晚于 fsync**：调用方
+    /// 必须把返回的 seq 交给 flusher，并且只有收到它的完成通知才 ack 这一批。
+    /// 分离只把「等盘」从提交线程的窗口里拿出去，没有把 ack 提前一个毫秒。
+    ///
+    /// 返回 `None` = 这一批一条日志都没有（纯读轮），不需要落盘。
+    pub fn stage_batch(&mut self, groups: &[&[Log]]) -> Result<Option<u64>> {
+        let mut payloads: Vec<Vec<u8>> = Vec::new();
+        for g in groups {
+            for l in *g {
+                payloads.push(log_payload(l));
+            }
+        }
+        if payloads.is_empty() {
+            return Ok(None);
+        }
+        let last = self.wal.append_nodur(&payloads)?;
+        self.stats.seq = last;
+        Ok(Some(last))
+    }
+
+    /// flusher 落完一次盘：推进 durable 水位，记一次 sync。
+    ///
+    /// `seq` 是提交线程 append 时给的承诺上界（不是 fsync 实际覆盖到哪里 ——
+    /// 那期间可能又 append 了新记录）。只按承诺计，宁可少算不多算。
+    pub fn note_synced(&mut self, seq: u64, us: u64) {
+        self.wal.advance_durable(seq);
+        if self.durability != Durability::Never {
+            self.stats.syncs_total += 1;
+            self.stats.sync_us_total += us;
+        }
+    }
+
+    /// 给 flusher dup 一个 fsync 专用 fd。
+    ///
+    /// checkpoint 收口（`truncate_before` / `reset`）会把日志换成新 inode，
+    /// 那之后必须重新取一次并让 flusher 换 fd。
+    pub fn wal_sync_fd(&self) -> Result<File> {
+        self.wal.try_clone_sync_fd()
+    }
+
+    /// 写是否需要落盘才允许 ack（即 `group` / `always` 两档）。
+    ///
+    /// `never` 档下 ack 本来就不等盘，流水线必须跳过 flusher —— 否则等于
+    /// 把 never 档静默升级成 group 档，性能特征与文档承诺同时失效。
+    pub fn durable_writes(&self) -> bool {
+        self.durability != Durability::Never
+    }
+
+    /// 旁路快照已经编完了吗（尚未收口）。
+    ///
+    /// 事件循环用它决定收口前要不要先把 in-flight 的 fsync 排空：
+    /// `truncate_before` 会换 inode，不能让一次旧的 fsync 跨过去。
+    pub fn checkpoint_ready(&self) -> bool {
+        self.inflight
+            .as_ref()
+            .map(|j| j.handle.is_finished())
+            .unwrap_or(false)
+    }
+
     /// `Durability::Never` / `Group` 下把缓冲刷下去（周期调用，不阻塞本轮 ack
     /// 语义由调用方保证——只在 Never 模式用）。
     pub fn sync_now(&mut self) -> Result<()> {

@@ -105,6 +105,7 @@ fn main() {
     let mut auto_ckpt_mb: u64 = 64;
     let mut backlog: i32 = 4096;
     let mut workers: usize = 0;
+    let mut flush_pipeline = false;
     let mut stats_only = false;
     let mut shutdown_only = false;
     let mut pid_file: Option<PathBuf> = None;
@@ -126,6 +127,7 @@ fn main() {
             }
             "--backlog" => backlog = num("--backlog", &next(&mut i), backlog),
             "--workers" => workers = num("--workers", &next(&mut i), workers),
+            "--flush-pipeline" => flush_pipeline = true,
             "--pid-file" => pid_file = Some(PathBuf::from(next(&mut i))),
             "--auth-key-file" => auth_key_file = Some(PathBuf::from(next(&mut i))),
             "--stats" => stats_only = true,
@@ -212,6 +214,7 @@ fn main() {
         auto_checkpoint_bytes: auto_ckpt_mb * 1024 * 1024,
         backlog,
         workers,
+        flush_pipeline,
         // 这个二进制永远是主：副本入口是 `treedb-standby`，它把同一个
         // `serve` 配上 `replication` 就跑起来。两边各留一套 flag 解析的话，
         // 副本会拿到一份没人测过的默认值。
@@ -276,6 +279,12 @@ treedb-server — 元数据引擎服务端（POSIX 元数据语义，客户端�
                              一次 fsync。写多读少的负载可以显式收到 1：并行
                              只偷得到读，且每个 worker 要多占 3 个 fd。
   --sync-ms N                事件循环空闲唤醒间隔，默认 20
+  --flush-pipeline           写轴流水线（§11 第 8 条）：提交线程只 append，
+                             fdatasync 交给专用线程，落盘回执到了再 ack。
+                             默认关：实测在 fsync 1.3–1.6 ms 的盘上是净负收益
+                             （多一次线程往返，而 fsync 期间并没有可重叠的活），
+                             只在该盘 fsync 占比高、或单个 op 的 translate 很重时
+                             才值得打开。打开后 ack 语义不变（仍严格晚于落盘）。
   --auto-checkpoint-mb N     WAL 超此大小自动快照，默认 64（0 = 关闭）
   --pid-file PATH            启动后写入 pid，便于测试脚本 kill -9
   --auth-key-file PATH       启用接入认证（§4.4）：从文件读集群共享密钥，必须是

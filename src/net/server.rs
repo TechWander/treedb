@@ -95,8 +95,22 @@ pub struct ServerConfig {
     /// `--workers 1` 是旧默认，也是全部历史基线数字的档。超过核数没有意义，
     /// 超过并发连接数也没有意义（内核按四元组哈希分流，多出来的线程只会空转）。
     pub workers: usize,
-    /// 非 `None` 就是**只读副本**：本实例以 [`Engine::open_replica`] 开局，事件
-    /// 循环每轮拿这个配置去主那里追一次（§6.6）。
+    /// 写轴流水线（§11 第 8 条）：提交线程只 `append`，`fdatasync` 交给专用
+    /// flusher 线程，落盘回执到了再 ack。
+    ///
+    /// **默认关**，因为实测在本项目的目标硬件上是净负收益：一次 fsync
+    /// 1.3–1.6 ms 的盘上，多出来的「eventfd + poll + 线程唤醒」往返约
+    /// 150 µs（占周期 10%），而它换来的「fsync 期间继续接活」在 group 档
+    /// 并没有可接的活 —— 旧实现里转发本来就堆在 worker 信箱里，fsync 返回
+    /// 后照样一次性排干；translate 本身是 µs 级，把它从周期里挑出去赚不回
+    /// 线路往返。
+    ///
+    /// 开关留着是因为收益条件是可判定的：单次 fsync 占周期比例越高、
+    /// 且单个 op 的 translate 越重（大目录 readdir 的兄弟 op），重叠才赚得
+    /// 回来。默认关意味着默认档的数字与改造前逐字一致。
+    pub flush_pipeline: bool,
+    /// 非 `None` 就是**只读副本**：本实例以 [`Engine::open_replica`] 开局，
+    /// 事件循环每轮拿这个配置去主那里追一次（§6.6）。
     ///
     /// 主那侧不需要任何对应配置：传送是 pull 的，主只是回答 `WalFetch` /
     /// `SnapFetch`，它不知道也不需要有谁在拉。
@@ -129,6 +143,8 @@ impl ServerConfig {
             // 理由见 [`crate::net::default_workers`]；旧版这里写的那句「高并发纯读
             // 直接输给 PG（实测 3-8×）」已作废，见 DESIGN.md §9.1 第 3、4 条。
             workers: crate::net::default_workers(),
+            // 默认关：本机实测净负收益，理由见字段上的注释与 DESIGN §11 第 8 条。
+            flush_pipeline: false,
             replication: None,
             auth: None,
         }
