@@ -1672,7 +1672,7 @@ mod tests {
         // 少跑了一个 `if`。这句话一旦不成立，迁移工具的「读旧写新」就得改写。
         let mut w3 = W::new();
         s.save(&mut w3);
-        let mut v3 = w3.finish();
+        let v3 = w3.finish();
         let body_end = raw.len() - 8;
         assert_eq!(
             &v3[4..body_end],

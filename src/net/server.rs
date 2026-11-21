@@ -125,6 +125,23 @@ pub struct ServerConfig {
     /// 开启后**只影响握手**：数据面每 op 多一次 `Gate::allows_data()` 判等，
     /// 握手本身不占提交线程。代价由 `benches/handshake_cost.sh` 实测。
     pub auth: Option<Arc<crate::net::auth::Key>>,
+    /// 同时在册的连接数上限；`0` = 不限（默认，与历史行为逐字一致）。
+    ///
+    /// 为什么需要它：§7 的连接轴实测到 25 000 条连接、0.31 KiB/conn，也就是说
+    /// **资源不是瓶颈** —— 那么把进程跑死的方式就剩一种：一条不守规矩的客户端
+    /// 无限开连接（或一个失去回收的 fork 风暴），把 fd 配额与内存慢慢吃光，
+    /// 而症状是「所有连接一起变慢」而不是「多出来的那条被拒」。
+    ///
+    /// 判定的原子性：多 worker 模式下每条 worker 各自 accept，所以不能用
+    /// 「读 live → 比较 → 加一」三步（两条线程会同时看到 `max-1` 而各收一条，
+    /// 超拨）。这里一律 `fetch_add` 之后再判超，超了就减回去，读数只在
+    /// 成功那条路径上生效。
+    ///
+    /// 拒绝形状是**接受后立刻关闭**（客户端看到 EOF），不发任何帧：协议每连接
+    /// 严格 FIFO 且没有 request id，在没有请求的情况下先塞一个 `Reply::Err`
+    /// 没有任何位置可放，客户端也无从对应。要让客户端看到原因，看服务端
+    /// 那行 `refused connection #N`（限速打印）。
+    pub max_conn: usize,
 }
 
 impl ServerConfig {
@@ -147,6 +164,8 @@ impl ServerConfig {
             flush_pipeline: false,
             replication: None,
             auth: None,
+            // 默认不限：v0.5 之前的实例没有这个概念，默认值一变就是行为变更。
+            max_conn: 0,
         }
     }
 }
@@ -167,6 +186,9 @@ pub struct Report {
     pub rec: crate::engine::core::Recovery,
     pub peak_conns: usize,
     pub accepted: u64,
+    /// 因 `max_conn` 被接受后立刻关闭的连接数。与 `accepted` 并列才说明得清
+    /// 「没人来」与「来了但被上限挡回去了」—— 两者在 `peak_conns` 里长得一样。
+    pub refused: u64,
     pub rounds: u64,
     pub worst_round_us: u64,
     pub ops: u64,
@@ -487,6 +509,18 @@ pub fn serve(cfg: &ServerConfig, stop: &AtomicBool, live: &AtomicUsize) -> Resul
     }
 }
 
+/// 拒绝新连接时打一行，**限速**：连接风暴下每条一行日志会把盘写满，
+/// 而真正要看的只是「从某一个时刻起开始拒了」和「一共拒了多少」。
+/// 所以只打第 1 条与之后的每 1000 条；总数在停服汇总里给。
+///
+/// 两条事件循环共用（单线程直接调、多 worker 从 `multi` 里调）：
+/// 拒绝的日志格式不该因为 `--workers` 不同而不同。
+pub(crate) fn note_refusal(total: u64, max_conn: usize) {
+    if total == 1 || total % 1000 == 0 {
+        eprintln!("treedb: refused connection #{total} (--max-conn {max_conn} is full)");
+    }
+}
+
 /// 单线程事件循环：一个监听 fd、一个 epoll、全部连接。
 pub(crate) fn serve_single(cfg: &ServerConfig, stop: &AtomicBool, live: &AtomicUsize) -> Result<Report> {
     let mut engine = open_engine(cfg)?;
@@ -558,6 +592,15 @@ pub(crate) fn serve_single(cfg: &ServerConfig, stop: &AtomicBool, live: &AtomicU
                 loop {
                     match listener.accept() {
                         Ok((stream, _addr)) => {
+                            // 上限判定放在 accept 之后、注册之前：一条已经落在
+                            // 接受队列里的连接必须被拿出来再关，否则它会永远占着
+                            // 队列位（关掉未 accept 的 fd 需要关闭监听 socket）。
+                            if cfg.max_conn > 0 && conns.len() >= cfg.max_conn {
+                                drop(stream);
+                                rep.refused += 1;
+                                note_refusal(rep.refused, cfg.max_conn);
+                                continue;
+                            }
                             if stream.set_nonblocking(true).is_err() || tune_conn(&stream).is_err() {
                                 continue;
                             }

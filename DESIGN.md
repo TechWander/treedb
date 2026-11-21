@@ -110,11 +110,11 @@ decode 处得到 `unknown op tag 0x002c`，而不是把一条写静默当成别�
 按「不改写已推引用」的纪律保留现状：Cargo 解析 git 依赖只看 tag/rev 与 lock 里的
 hash，不看这个字段，所以不影响任何构建；下一次带 API 变更的发版重新对齐。
 
-test 现在分两档报：默认档（纯引擎）`cargo test --release` = **163 passed**（60 lib +
+test 现在分两档报：默认档（纯引擎）`cargo test --release` = **172 passed**（64 lib +
 33 engine_crud + 14 migrate + 14 replication + 11 net_protocol + 8 read_scaling +
-7 crash_recovery + 5 auth + 3 independence + 4 dump_restore + 3 backup_online +
-1 scale_connections，10k 那条仍 `#[ignore]`）；
-`--features postgres-compat` = **194 passed**，多出的 31 条 = 过渡档自己的 30 条单测 +
+7 crash_recovery + 5 auth + 5 observe + 4 dump_restore + 3 backup_online +
+3 independence + 1 scale_connections，10k 那条仍 `#[ignore]`）；
+`--features postgres-compat` = **203 passed**，多出的 31 条 = 过渡档自己的 30 条单测 +
 `concurrency.rs` 里那条
 不需要 PG 的拨号用例（剩下 6 条要真 PG，默认 `#[ignore]`，不计入 passed）。即 PG 只出现在
 `postgres-compat` 后面的 `src/pool`、`src/store`、
@@ -2091,6 +2091,82 @@ treedb 这一列**没有**在 `v0.3.7` 与 `v0.4.0` 上复跑：`v0.3.7` 只改�
 
 ---
 
+### 7.14 接入面两个旋钮：`--max-conn` 与 `--stats --format prometheus`（2026-11-21）
+
+§7.6 的连接轴已经把「资源不是瓶颈」量死了：25 000 条连接 0.39 KiB/conn。
+既然如此，把进程跑死的方式就只剩一种 —— **一条不守规矩的客户端无限开连接**（或一个失去
+回收的 fork 风暴），把 fd 拍额度与内存慢慢吃光，而症状是「所有连接一起变慢」而不是
+「多出来的那条被拒」。所以上限要能配；配了之后还得好观测，这就是这一节的两件事。
+
+**两件事都没碰协议。** `PROTOCOL_VERSION` 仍是 6，`Op` 表一条没加（拒绝不靠发帧，
+靠关闭连接），`EngineStats` 一个字段没动 —— 理由在第三段。所以旧数据目录、旧客户端
+全部零改动。
+
+**上限怎么算。** 判定必须在 `accept` 之后、入表之前：一条已经落在内核接受队列里的连接
+如果没人 `accept` 就拿不到 fd，关掉未 accept 的连接只能关监听 socket。`--workers > 1` 时
+每条 worker 各自 `accept`，所以不能写「读 live → 比较 → 加一」（两条线程会同时看到
+`max-1` 而各收一条，超拨）；一律 `fetch_add` 之后判超，超了就 `fetch_sub` 退回并 `drop`。
+拒绝的形状是**接受后立刻关闭**（客户端看到 EOF），不发任何帧：协议每连接严格 FIFO
+且没有 request id，在没有请求的情况下先塞一个 `Reply::Err` 既没有位置放、客户端也
+无从对应。原因只能在服务端看，而那里日志是**限速**的：只打第 1 条与之后每 1 000 条
+（1 000 条一轮的连接风暴下逐条打日志会把盘写满），总数给在停服汇总里。
+
+**为什么连接计数不进 `EngineStats`。** 那个结构没有版本位：`encode` 在尾巴追加、
+`decode` 按定长读，加一个字段就必须把 `PROTOCOL_VERSION` 从 6 抬到 7。而连接数是
+**进程**的属性，不是**引擎状态**的属性 —— 为一个运维数字把全部客户端跟一次协议升级
+绑在一起，代价与收益完全不对等。所以 `accepted / refused / peak` 只走两处：停服
+汇总那一行，和 `--stats` 的 prometheus 形态里的外部指标。
+
+**指标口径三条**（实现见 `src/metrics.rs`）：
+
+1. **不开 `/metrics` 端点**。接入面只有二进制协议，多开一个 HTTP 监听就是多一份
+   攻击面与一份配置；`treedb-server --stats --format prometheus` 就是采集器，采集器
+   自己管超时与重试，不需要服务端再长一个口。
+2. `_total` 的语义是**进程启动以来**（`treedb_ops_total` / `writes_total` /
+   `fsyncs_total` / `fsync_seconds_total` / `checkpoints_total` 与副本的
+   `applied_total` / `resyncs_total` / `errors_total`）。重启就归零，率要在面板侧
+   用 `rate()` 算；字节一律基本单位不换算，微秒到秒保留 6 位小数。
+3. 副本专用项在主上也输出 0（`treedb_replica == 0`）。面板要过滤
+   `treedb_replica == 1` 才画 lag，否则主上的「0」会被读成「追得很紧」。
+
+抓取失败时的形状也定死了：stdout 只有 `treedb_up 0` 那三行（HELP/TYPE/样本）并以
+**退出码 1** 退出 —— 面板上应当是 down，而不是 no data（后者看起来像监控没配好）。
+参数错（`--format` 拼错、`--format` 不带 `--stats`、`--max-conn abc`）一律
+**退出码 2 且不产出任何字节**，与其它 usage error 一致。
+
+**实测（2026-11-21，本机 `127.0.0.1`，`bash benches/observe.sh`，`--workers 4
+--max-conn 8`）**：
+
+| 档 | 量到的 |
+|----|--------|
+| 空载探测（正对照） | 连上并保持 —— 判据不是一味返回「拒」 |
+| 装满 8 条后探测 | 被拒；64 条并发探测 **64/64 全拒、0 漏过**（这就是「先加再判超」在多 worker 下不超拨的证据） |
+| 拒绝风暴后 | 在册 8 条一条没掉，新探测仍被拒 |
+| 拒绝日志 | `refused connection #1` 出现 1 次、`#2` 0 次（限速生效） |
+| 释放 1 格后 | 立即能进 —— 上限算的是「同时在册」，不是「连过一次就永久拉黑」 |
+| `--format prometheus` | 81 行 = HELP 27 + TYPE 27 + 样本 27，每段三行、名字唯一、值都是数字，`treedb_up 1` |
+| 与文本档对账 | `views` / `nodes` / `dentries` / `seq` 四项逐个相等 |
+| 抓取失败 | 3 行 `treedb_up 0` + 退出码 1；三种参数错全部退出码 2 且 stdout 0 B |
+| 停服汇总 | `accepted 14 refused 66 peak 8` —— 与脚本里逐次点名算的账**逐项相等** |
+
+**顺带修了一个真 bug（档 4 逼出来的）**：`--workers > 1` 下 `treedb-server --shutdown`
+从来没拿到过 ack，客户端只看到 `shutdown: io: server closed` —— 而服务端其实已经
+乖乖停了。原因是停位 `flag` 由提交线程**在回包之前**置位（它一看到 `Op::Shutdown`
+就置），前端线程完全可能先看到停位就跳出循环，那个 ack 于是永远停在信箱里。单线程
+路径没有这个窗口，所以这个 bug 只存在于多 worker 形态，而它恰好把「停服到底有没有
+被确认」这件事变成了不可观测。修法是退出前先等一拍 BYE（上限 100 ms）再把信箱排干、
+填进槽位统一写出；`tests/observe.rs` 里 `cli_shutdown_is_acked_in_both_worker_shapes`
+钉住它（两种 worker 形状各跑一遍，2026-11-21 之后 15/15 次全过）。
+
+**脚本里踩的两个坑**（与引擎无关，但值得记）：一是拿 `sleep` 常驻持连接会把 fd 传给
+子进程，`kill` 掉子 shell 后连接仍然开着，服务端等不到 EOF、槽位永不释放 —— 第一轮
+跑出来的「释放 1 格后仍被拒」与 70 次（而不是 66）拒绝全出自这一个坑，改法是让子壳
+最后一个动作是**内建** `read`。二是「两份空文件对账 4/4 相等」也会变绿：抓取失败时
+文本档与指标档都是空的，所以断言把指标数钉死在 27，不再允许「段数等于样本数」这种
+自洽就过关的形状（与 §7.13 那次「表必须从原始采集重算」同型）。
+
+---
+
 ## 8. 已知限制（诚实边界）
 
 1. **读并行不是免费的，而且默认值本身是个折中**（§7.5）。默认 `workers` 现在按核数
@@ -2215,8 +2291,8 @@ treedb 这一列**没有**在 `v0.3.7` 与 `v0.4.0` 上复跑：`v0.3.7` 只改�
 ## 9. 测试清单
 
 ```sh
-cargo test --release                            # 默认档（纯引擎），148 条（+1 ignored）
-cargo test --release --features postgres-compat # 加上过渡档，179 条（+7 ignored）
+cargo test --release                            # 默认档（纯引擎），172 条（+1 ignored）
+cargo test --release --features postgres-compat # 加上过渡档，203 条（+7 ignored）
 cargo test --release --lib                      # 只看引擎单测
 cargo test --release --test migrate              # 快照升级：11 条走 API + 3 条真进程跑 CLI（§6.5）
 cargo test --release --test scale_connections -- --ignored   # 万级连接重压（§7.6）；并发数由 TREEDB_CONNS 控制，本机到 25 000 为限（再高是客户端源端口不够）
@@ -2225,6 +2301,7 @@ bash benches/throughput_matrix.sh 3             # 五轴吞吐矩阵（默认只
 bash benches/default_check.sh                   # 零旗标默认档同格重跑 5 次（§7.5）
 bash benches/ab_layout.sh <基线 rev>            # 受控 A/B：只换服务端二进制（§7.10）
 bash benches/handshake_cost.sh 20000            # 接入认证的代价：建连风暴 + 稳态两臂（§4.4）
+bash benches/observe.sh                         # 接入面两个旋钮：上限/拒绝/限速/指标/停服总账（§7.14）
 bash benches/promote_smoke.sh                   # 切主的活体验证：提升 → 新主起服 → 旧主被拒（§6.6 切主）
 bash benches/sync_ratio.sh 3                    # 一次 fsync 摊了几次写（§7.9）
 bash benches/ab_durability.sh <基线 rev>        # 写轴 A/B：持久化档的吞吐与尾延迟（§7.9 第 3 条）
@@ -2252,7 +2329,7 @@ gcc -O2 -pthread -o /tmp/lb_floor benches/lb_floor.c && /tmp/lb_floor 1 64 3   #
 
 | 目标 | 数量 | 覆盖 |
 |------|------|------|
-| `--lib` | **60**（+30 属 `postgres-compat`） | codec round-trip（全 tag：52 op / 30 reply）、**fetch 应答的两条长度/计数上限在 decode 处兼得**（`fetch_reply_bounds_are_enforced_on_decode`，§6.6）、**`Log` 全变体 round-trip**、**握手两条 op 的定长字段多一字节少一字节都拒**（`handshake_fixed_fields_reject_wrong_length`，§4.4）、**自写 SHA-256/HMAC 的已知向量 10 条**（FIPS 180-4 与 RFC 4231 逐条对表 + `ct_eq` 长度严格，`src/engine/sha256.rs`）、**`Key::load` 收哪三种形状拒哪三种**（`key_load_is_strict`：32 原始字节**一个字节都不剔**、hex 档忽略尾随换行、全空白与全零拒 —— 那条「不剔」是拿真密钥踩出来的，随机密钥末位正好是 ASCII 空白的概率是 1/64，§4.4）、**`Gate` 的四档进度与双向 MAC**（`gate_gates`、`gate_without_key_is_open`、`macs_are_directional_and_nonce_bound`、`key_debug_does_not_leak_bytes`）、CRC 已知向量、碎帧/超长帧、WAL 帧与截断重放、**预分配空洞重开**（`prealloc_padding_reopens_cleanly`）、**大批次不跳写**（`huge_batch_writes_every_record`）、**交付只到 durable 水位**（`deliver_stops_at_the_durable_watermark_not_the_logical_end`，§6.6 第一条口径）、**hint 命中与退回全扫**（`deliver_streams_forward_with_the_returned_hint` / `deliver_ignores_a_stale_or_absent_hint_and_still_lands_right`）、**跨滑动窗口不丢记录**、**max_bytes 是软上限**（至少给一条 + 逐轮恰好吃完整批）、**两代快照正文逐字节相同**（`legacy_snapshot_decodes_from_the_same_prefix`，§6.5 的前提）、**旧布局写回不能默默丢表**（`legacy_writer_refuses_to_drop_tables`）、**seq 跳号硬错**、状态快照保留 node key、**两层 dentry 与 kind 冗余过快照不坏**（`dentries_are_two_level_and_kind_survives_snapshot`，§7.10）、**通用表行与索引过快照不坏**（`generic_tables_keep_rows_and_rebuild_indexes`，§5.1）、缓冲压缩、租约过期边界、**快照收尾只切割水位以下的记录**（`truncate_before_drops_the_covered_prefix_and_keeps_the_tail`，§8 第 7 条）、**dump 容器的四条自测**（全域往返逐字段相等、容器头独占三个 `next_*`、编解码字节稳定且 CRC 拓坏必拒、未知容器版本点名拒，§6.9）、`default_workers` 上下界 |
+| `--lib` | **64**（+30 属 `postgres-compat`） | codec round-trip（全 tag：52 op / 30 reply）、**fetch 应答的两条长度/计数上限在 decode 处兼得**（`fetch_reply_bounds_are_enforced_on_decode`，§6.6）、**`Log` 全变体 round-trip**、**握手两条 op 的定长字段多一字节少一字节都拒**（`handshake_fixed_fields_reject_wrong_length`，§4.4）、**自写 SHA-256/HMAC 的已知向量 10 条**（FIPS 180-4 与 RFC 4231 逐条对表 + `ct_eq` 长度严格，`src/engine/sha256.rs`）、**`Key::load` 收哪三种形状拒哪三种**（`key_load_is_strict`：32 原始字节**一个字节都不剔**、hex 档忽略尾随换行、全空白与全零拒 —— 那条「不剔」是拿真密钥踩出来的，随机密钥末位正好是 ASCII 空白的概率是 1/64，§4.4）、**`Gate` 的四档进度与双向 MAC**（`gate_gates`、`gate_without_key_is_open`、`macs_are_directional_and_nonce_bound`、`key_debug_does_not_leak_bytes`）、CRC 已知向量、碎帧/超长帧、WAL 帧与截断重放、**预分配空洞重开**（`prealloc_padding_reopens_cleanly`）、**大批次不跳写**（`huge_batch_writes_every_record`）、**交付只到 durable 水位**（`deliver_stops_at_the_durable_watermark_not_the_logical_end`，§6.6 第一条口径）、**hint 命中与退回全扫**（`deliver_streams_forward_with_the_returned_hint` / `deliver_ignores_a_stale_or_absent_hint_and_still_lands_right`）、**跨滑动窗口不丢记录**、**max_bytes 是软上限**（至少给一条 + 逐轮恰好吃完整批）、**两代快照正文逐字节相同**（`legacy_snapshot_decodes_from_the_same_prefix`，§6.5 的前提）、**旧布局写回不能默默丢表**（`legacy_writer_refuses_to_drop_tables`）、**seq 跳号硬错**、状态快照保留 node key、**两层 dentry 与 kind 冗余过快照不坏**（`dentries_are_two_level_and_kind_survives_snapshot`，§7.10）、**通用表行与索引过快照不坏**（`generic_tables_keep_rows_and_rebuild_indexes`，§5.1）、缓冲压缩、租约过期边界、**快照收尾只切割水位以下的记录**（`truncate_before_drops_the_covered_prefix_and_keeps_the_tail`，§8 第 7 条）、**dump 容器的四条自测**（全域往返逐字段相等、容器头独占三个 `next_*`、编解码字节稳定且 CRC 拓坏必拒、未知容器版本点名拒，§6.9）、`default_workers` 上下界 |
 | `tests/engine_crud.rs` | **33** | §5.2 全部 POSIX 语义（含 GC 线索、NOREPLACE 与硬链接）+ 控制面（密钥/审计/定义/放置）+ checkpoint 后重开 + 坏尾截断；v0.5.0 新增 3 条硬链接：多名字共享 inode 与字节（含 `drop` 后重开仍是 `nlink = 2`）、五种拒绝各报对应 errno 且不动票数、覆盖其中一个名字只减一票；再往前新增 6 条：4 条盖通用表（表形状校验与表名回收、行写边界/约束/CAS/flags、主键与索引列游标翻页、表状态过 checkpoint+重开），1 条盖 `ReadDirPlus` 与 `ReadDir`+`Getattr` 逐字段对齐，1 条盖 `Stats` 新字段；2026-11-20 又加 2 条：`a_data_dir_refuses_a_second_engine`（同一个目录开第二个引擎必须被拒，且 `drop` 后立刻可开）、`unlink_and_rmdir_report_enotdir_for_a_non_dir_parent`（§5.2 的 `ENOTDIR` 口径）；2026-11-21 又加 2 条旁路快照：`background_snapshot_costs_a_dispatch_not_a_pause`（派工 37.5 µs vs 停轮 23.2 ms @ 20 000 节点，且取水位之后的尾巴必须活过 `truncate_before`）、`explicit_checkpoint_drains_the_background_one_first`（同步 checkpoint 先收掉在编那份，不许两份抢同一个 `.tmp`） |
 | `tests/net_protocol.rs` | **11** | TCP 端到端：CRUD、碎帧、pipeline 保序、并发连接不串扰、超长帧只杀违规者、大回包流式读完、`--stats`/`--checkpoint`/`--shutdown`（含两个磁盘长度与协议版本）、优雅停服后同地址立刻重绑、**通用表 + readdirplus 走 TCP**（1000 行 pipeline、错误帧经网络回真实 errno、8 KiB 收缓冲下大应答完整接回） |
 | `tests/dump_restore.rs` | **4** | §6.9 的目录级闭环：真造一份「每张表都有内容」的状态（视图/目录/文件/硬链接/符号链接/锁/引用/密钥/审计/定义/放置/两张表与行）→ 同步 checkpoint → 再写两条尾巴 → `dump_dir` → 落文件读回 → 导进新目录 → `Engine::open` 重开逐字段相等、`snap_seq == dump.seq`、`wal_records == 0`；**再从目标目录导一次比字节**（确定性）；第二条钉拒绝路径（非空目标拒且一个字节不动、空目录可导、服务在跑时 dump 被锁拒且释放后可导）；第三条钉零票引用不进 dump、`Kind` 与冗余 `Dent::kind` 过重建不变；第四条起**真进程**钉两个命令的退出码契约（0 完成 / 1 拒绝且不动字节 / 2 参数不全，含改一个字节后的 CRC 拒收与「锁解除后立即可导」） |
@@ -2265,6 +2342,18 @@ gcc -O2 -pthread -o /tmp/lb_floor benches/lb_floor.c && /tmp/lb_floor 1 64 3   #
 | `tests/scale_connections.rs` | 1（+1 ignored） | 1 000 连接 fd/RSS 断言每次跑；万级（`TREEDB_CONNS`，含 25 000）手动 |
 | `tests/independence.rs` | **3** | 独立性三把门：内核目录（`src/engine`、`src/net`）不出现客户端名字；`[dependencies]` 非 optional 项只能是 `libc` + `thiserror`；`postgres-compat` 不得进 `default`（§11 第 7 条） |
 | `tests/migrate.rs` | **14** | §6.5 那四条承诺。11 条直接打 API：v2 样本迁移后 `State` 逐字段相等且 WAL 文件字节不变、重开后每个语义面都能读到（密钥/审计/定义/放置/锁/引用）、尾巴 seq 照搬且发号接着走、幂等重跑不动当前目录、未知版本与「正文配不上版本位」都拒动且零改动、既有备份不被覆盖、迁完的目录能直接用通用表。3 条用 `env!("CARGO_BIN_EXE_treedb-migrate")` 起**真进程**钉退出码（10 / 1 / 0）与输出里的命令、备份路径、回滚步骤 |
+| `tests/observe.rs` | **5** | §7.14 的接入面契约，全部起**真进程**：`--max-conn` 在 `workers = 1` 与 `8` 两种形状下都只放行上限内、第三条起被拒且在册连接不受牵连、日志只打第 1 条、`drop` 后能重新进；prometheus 输出与 `Op::Stats` 逐项对上（稳定项精确相等、计数器只要求 ≥、`fsync_seconds_total ≈ sync_us_total/1e6`）且默认文本档 5 行格式不变；抓不上时只剩一行 `treedb_up 0` 且退出码 1；四种参数错全 exit 2 不产出字节；`--shutdown` 在两种 worker 形状下都得到 ack 且进程干净退出（§7.14 那条真 bug 的回归锁） |
+
+本轮（接入面旋钮，2026-11-21）新加的回归锁（全部在 `tests/observe.rs`）：
+`max_conn_bounds_the_registry_in_both_worker_shapes`（上限 2 下前两条可用、第 3~5 条
+`Ping` 必 `Err` 而在册连接照答，日志只出现 `refused connection #1` 且**不**出现 `#2`，
+`drop` 后 5 s 内新连接能进 —— 两种 worker 形状各跑一遍）、
+`prometheus_exposition_matches_the_wire_stats`（造数据 + checkpoint 后与 `Op::Stats`
+逐项对照，且 stderr 为空、默认文本档格式仍在）、
+`prometheus_scrape_says_down_when_nothing_listens`（exit 1 + 只有一条样本 +
+stderr 非空）、`bad_flags_exit_two_instead_of_starting_a_server`（四种参数错）、
+`cli_shutdown_is_acked_in_both_worker_shapes`（§7.14 那个「多 worker 下 ack 永远发不
+出去」的真 bug：单线程与多 worker 各跑一遍）。
 
 本轮（硬链接，`v0.5.0`）新加的三条回归锁（`tests/engine_crud.rs` 的「硬链接」一节）：
 `hard_links_share_the_inode_and_keep_bytes_alive`（两个名字一个 ino、`nlink` 记账、

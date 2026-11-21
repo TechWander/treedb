@@ -61,6 +61,9 @@
 pub mod config;
 pub mod engine;
 pub mod error;
+// `--stats --format prometheus` 的文本格式：纯函数 `EngineStats -> String`，
+// 不碰事件循环，也不进线协议（指标里没有任何一个字节需要服务端特殊应答）。
+pub mod metrics;
 pub mod net;
 
 // 过渡档：PG 共享池 + SQLite 镜像 + grovefs_control 表形。引擎本体

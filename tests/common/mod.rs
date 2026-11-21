@@ -3,6 +3,12 @@
 //! 每个 `Server` 拥有自己的数据目录（`tempfile::TempDir`）与子进程，Drop 时
 //! 保证回收，不会留下占着端口的孤儿进程。
 
+// 这是**七个测试 crate 共用的**脚手架：每个 crate 只用到其中一部分（只有崩溃
+// 用例要 `sigkill_and_take_dir`、只有连接风暴用例要 `start_backlog`）。不用
+// `#[allow(dead_code)]` 的话，每加一个只被一个 crate 用到的方法，就会在其余
+// 六个 crate 里各报一条 never used —— 那种噪声会让人习惯性无视编译警告。
+#![allow(dead_code)]
+
 use std::net::TcpListener;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
@@ -93,6 +99,27 @@ impl Server {
         s
     }
 
+    /// 起一个带额外 flag 的服务端（`--max-conn` 这类运行期旋钮）。
+    ///
+    /// 仍在参数形式上报 `(flag, value)` 对，而不是一个拼好的字符串：
+    /// 用例里看得见自己到底改了什么，也不会绕过下面那套固定参数。
+    pub fn start_extra(durability: &str, workers: usize, extra: &[&str]) -> Server {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("data");
+        let s = Server::spawn_extra(
+            tmp,
+            dir,
+            free_addr(),
+            durability,
+            4096,
+            workers,
+            None,
+            extra,
+        );
+        s.wait_ready();
+        s
+    }
+
     /// 用**同一个数据目录**在新端口重启（崩溃恢复用例的核心动作）。
     pub fn restart_at(tmp: TempDir, dir: PathBuf, durability: &str) -> Server {
         Server::restart_at_addr(tmp, dir, free_addr(), durability)
@@ -128,6 +155,20 @@ impl Server {
         workers: usize,
         auth: Option<Key>,
     ) -> Server {
+        Server::spawn_extra(tmp, dir, addr, durability, backlog, workers, auth, &[])
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_extra(
+        tmp: TempDir,
+        dir: PathBuf,
+        addr: String,
+        durability: &str,
+        backlog: i32,
+        workers: usize,
+        auth: Option<Key>,
+        extra: &[&str],
+    ) -> Server {
         let log = tmp.path().join(format!("server-{addr}.log"));
         let pid_file = tmp.path().join("server.pid");
         let key_file = tmp.path().join("auth.key");
@@ -150,6 +191,9 @@ impl Server {
             std::fs::write(&key_file, k.0).expect("write auth key");
             cmd.arg("--auth-key-file").arg(&key_file);
         }
+        // 额外 flag 放在认证之后、环境变量之前：顺序不影响解析（每个 flag
+        // 自己带值），但固定顺序才能让日志里的命令行可复现。
+        cmd.args(extra);
         // 写轴流水线档（§11 第 8 条）。用环境变量而不是改 spawn 签名：
         // 用例只需要“同一套脚本在两条路径上都跑一遍”，而重启路径
         // （`restart_at*`）也走这里，所以两边自动一致。
@@ -258,6 +302,19 @@ impl Server {
             let mut c = self.client();
             let _ = c.call(&treedb::engine::Op::Shutdown);
         }
+        self.poll_exit()
+    }
+
+    /// 只等进程自己退出并检查退出码，**不**再发 `Op::Shutdown`。
+    ///
+    /// 停服由外部（`treedb-server --shutdown`）触发时用这个：那时端口已经关了，
+    /// 走 [`Server::graceful_shutdown`] 会在 `connect` 上 panic，而用例要验的
+    /// 恰恰是「停服被客户端确认」与「进程干净退出」这两件事。
+    pub fn wait_exit(mut self) -> std::process::ExitStatus {
+        self.poll_exit()
+    }
+
+    fn poll_exit(&mut self) -> std::process::ExitStatus {
         let mut child = self.child.take().expect("child already reaped");
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {

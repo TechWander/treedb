@@ -16,8 +16,8 @@ cargo build --release                                   # 默认档：依赖只�
 ./target/release/treedb-server --dir /var/lib/treedb --listen 127.0.0.1:7777
 ./target/release/treedb-bench --op lookup --conns 64 --pipeline 32 --secs 3
 
-cargo test --release                                    # 默认档 163 passed（引擎本体）
-cargo test --release --features postgres-compat        # 190 passed（含 PG 过渡档）
+cargo test --release                                    # 默认档 172 passed（引擎本体）
+cargo test --release --features postgres-compat        # 203 passed（含 PG 过渡档）
 bash benches/throughput_matrix.sh 3 1 2 3 4 5           # 五轴复现，输出进 benches/results/
 bash benches/sync_ratio.sh 3                           # 写路径机制：一次 fsync 摊了多少写
 bash benches/single_conn.sh 3                          # 单连接对标 PG（$PIPE=32 走批量档、$CONNS/$WORKERS 走并发档）
@@ -70,6 +70,25 @@ dump 走的是日志标签表（`Log`，1..=22）而不是内部快照格式，�
 不写 WAL，目标目录必须为空。导出是确定性的：`dump → load → dump` 字节相同。
 格式与实测（82 888 节点：dump 279 ms / 11.65 MB，还原快照与源逐字节相同）见
 [DESIGN.md](DESIGN.md) §6.9。
+
+**运维面两个旋钮**（都不碰协议：`PROTOCOL_VERSION` 仍 6，`Op` 表一条没加）：
+
+```sh
+# 1) 连接上限：防「一条不守规矩的客户端把 fd 吃光」。默认 0 = 不限。
+#    超额的连接会被 accept 后立刻关掉（客户端看到 EOF）；日志限速（第 1 条 + 每 1000 条），
+#    总数在停服汇总里：accepted 14 refused 66 peak 8
+./target/release/treedb-server --dir /var/lib/treedb --max-conn 2000
+
+# 2) 机器可读指标：27 个，直接进 Prometheus / 采集脚本
+./target/release/treedb-server --listen 127.0.0.1:7777 --stats --format prometheus
+#    treedb_up 1 / treedb_views … / treedb_ops_total … / treedb_replica_lag …
+```
+
+抓不到服务时 `--format prometheus` 仍会输出 `treedb_up 0` 三行并以**退出码 1** 退出
+（面板上是 down，不是 no data）；参数错一律退出码 2 且不产出字节。`_total` 的语义是
+**进程启动以来**，率在面板侧用 `rate()` 算；副本专用项在主上输出 0，面板要过滤
+`treedb_replica == 1`。口径与实测（含 `src/metrics.rs` 的三条纪律与一个顺带修掉的
+停服 ack bug）见 [DESIGN.md](DESIGN.md) §7.14，复现跑 `bash benches/observe.sh`。
 
 只读副本是另一个二进制，它不需要主做任何配置：
 

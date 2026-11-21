@@ -100,6 +100,8 @@ struct Counters {
     inline_reads: AtomicU64,
     /// 整批交给 committer 的 op 数（写 + 排在写之后的读）。
     forwarded: AtomicU64,
+    /// 因 `max_conn` 被接受后立刻关掉的连接数（所有 worker 之和）。
+    refused: AtomicU64,
 }
 
 /// 一条 worker 线程启动时需要的东西。
@@ -114,6 +116,9 @@ struct Counters {
 struct WorkerCfg {
     idx: usize,
     sync_ms: i32,
+    /// 同时在册连接数上限，`0` = 不限。每一条 worker 都要它：accept 是各自
+    /// 干的，上限必须拿全局原子计数判，不能按线程算。
+    max_conn: usize,
     /// 接入认证密钥（§4.4）。`None` = 不认证，与 `ServerConfig::auth` 同语义。
     auth: Option<Arc<crate::net::auth::Key>>,
 }
@@ -155,6 +160,7 @@ pub(crate) fn serve(
         let arg = WorkerCfg {
             idx: i,
             sync_ms: cfg.sync_ms,
+            max_conn: cfg.max_conn,
             auth: cfg.auth.clone(),
         };
         let (st, oc, fl, ct, er, mi, mo, dd) = (
@@ -225,6 +231,7 @@ pub(crate) fn serve(
     rep.reads_inline = cnt.inline_reads.load(Ordering::Relaxed);
     rep.forwarded = cnt.forwarded.load(Ordering::Relaxed);
     rep.accepted = cnt.accepted.load(Ordering::Relaxed);
+    rep.refused = cnt.refused.load(Ordering::Relaxed);
     rep.peak_conns = cnt.peak.load(Ordering::Relaxed) as usize;
     Ok(rep)
 }
@@ -327,7 +334,20 @@ fn worker_loop(
                 loop {
                     match listener.accept() {
                         Ok((stream, _addr)) => {
+                            // **先加再判超**，不能读-比-加：多条 worker 同时
+                            // accept 时，两条线程会同时看到 `max-1` 而各收一条，
+                            // 实际上限就变成 max + 并发 worker 数。代价是下面
+                            // 两条失败路径要把这个名额退回去。
+                            let now = cnt.live.fetch_add(1, Ordering::Relaxed) + 1;
+                            if w.max_conn > 0 && now > w.max_conn {
+                                cnt.live.fetch_sub(1, Ordering::Relaxed);
+                                let r = cnt.refused.fetch_add(1, Ordering::Relaxed) + 1;
+                                crate::net::server::note_refusal(r, w.max_conn);
+                                drop(stream);
+                                continue;
+                            }
                             if stream.set_nonblocking(true).is_err() || tune_conn(&stream).is_err() {
+                                cnt.live.fetch_sub(1, Ordering::Relaxed);
                                 continue;
                             }
                             let id = next_id;
@@ -338,7 +358,6 @@ fn worker_loop(
                             by_id.insert(id, nfd);
                             conns.insert(nfd, c);
                             cnt.accepted.fetch_add(1, Ordering::Relaxed);
-                            let now = cnt.live.fetch_add(1, Ordering::Relaxed) + 1;
                             cnt.peak.fetch_max(now as u64, Ordering::Relaxed);
                         }
                         // WouldBlock（backlog 已空）或 EMFILE：留给下一轮。
@@ -582,8 +601,25 @@ fn worker_loop(
         }
     }
 
+    // 退出前把 committer 的答话再收一遍。
+    //
+    // `flag` 是它在**回包之前**置的（`accept_batch` 里一看到 `Op::Shutdown`
+    // 就置了），所以本线程完全可能先看到停位、跳出循环，而那个 ack 那时还
+    // 在路上 —— 客户端只看到 EOF，`treedb-server --shutdown` 报
+    // `shutdown: io: server closed`。先等一拍 BYE 再把信箱排干，让已经算好的
+    // 成帧落进槽位、走下面统一写出。等不到（committer 崩了）也不拖住停服：
+    // 上限 100 ms，比一次 fsync 的周期还短。
+    if !bye {
+        let _ = wait_readable(wfd, 100);
+    }
+    for a in m_out.drain() {
+        if a.conn != BYE {
+            let _ = fill_answer(&mut conns, &by_id, a);
+        }
+    }
+
     // 退出前尽力把已经算出来的应答发出去。`Op::Shutdown` 的 ack 就是在这里
-    // 送达的：committer 回完答案立刻发了 BYE，本线程直接跳出循环，不在轮末
+    // 送达的：上面那次排空把它填进了槽位，本线程已经跳出循环，所以不在轮末
     // 写出路径里。
     let all: Vec<i32> = conns.keys().copied().collect();
     for closed in flush_dirty(&mut conns, ep, &all)? {

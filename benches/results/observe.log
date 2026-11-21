@@ -1,0 +1,41 @@
+
+=============== 2026-11-21 11:20:37  接入面：--max-conn + prometheus（rev f245cf0）
+
+[1] --max-conn 8 --workers 4：正对照 → 装满 → 超额全拒 → 腾一格恢复
+  空载探测：连上并保持（正对照：判据不是一味返回“拒”） ✓
+  占满：8 条常驻连接（上限 8）
+  装满后探测：被拒 ✓
+  并发 64 条超额探测：被拒 64 / 仍连上 0（期望 64 / 0）
+  并发档全部被拒 ✓
+  风暴之后探测：仍被拒（8 个槽位都还在册） ✓
+  拒绝日志：#1 出现 1 次、#2 出现 0 次（限速：第 1 条 + 每 1000 条）
+  拒绝日志已限速 ✓
+  释放 1 个槽位后探测：连上并保持（上限算的是“同时在册”） ✓
+
+[2] --stats --format prometheus：结构三件套 + 与文本档对账
+  退出码 0；81 行 = HELP 27 + TYPE 27 + 样本 27（期望 27 指标 / 81 行）；结构错误 0
+  三件套齐、27 个指标、行数与段数自洽 ✓
+  treedb_up = 1 且 stderr 为空 ✓
+  文本档与指标档同源：4/4 项相等（views/nodes/dentries/seq）
+  两档逐项对账一致 ✓
+  指标样例：treedb_wal_logical_bytes 0 treedb_fsyncs_total 0 treedb_protocol_version 6 
+
+[3] 失败形状
+  连不上：退出码 1（期望 1），stdout = [# HELP treedb_up 1 if this scrape reached the server|# TYPE treedb_up gauge|treedb_up 0|]，stderr = stats: io: connect 127.0.0.1:17842: Connection refused (os error 111)
+  抓取不到时输出 treedb_up 0 并以 1 退出 ✓
+  参数「--stats --format nope」：退出码 2（期望 2）、stdout 0 B（期望 0）
+  参数错按 usage error 处理 ✓
+  参数「--format prometheus」：退出码 2（期望 2）、stdout 0 B（期望 0）
+  参数错按 usage error 处理 ✓
+  参数「--max-conn abc」：退出码 2（期望 2）、stdout 0 B（期望 0）
+  参数错按 usage error 处理 ✓
+
+[4] 优雅停服：一次连接的命运要能在汇总里算清
+  --shutdown：shutdown acknowledged 
+  --shutdown 送达并得到确认 ✓
+  accepted 14 refused 66 peak 8
+  accepted=14（期望 14） refused=66（期望 66） peak=8（期望 8）
+  连接总账三项都对得上（accepted / refused / peak） ✓
+
+判定：全档通过 ✓
+--- 完

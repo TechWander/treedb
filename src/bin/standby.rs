@@ -52,6 +52,7 @@ fn main() {
     let mut sync_ms: i32 = 20;
     let mut auto_ckpt_mb: u64 = 64;
     let mut backlog: i32 = 4096;
+    let mut max_conn: usize = 0;
     let mut workers: usize = 0;
     let mut pid_file: Option<PathBuf> = None;
     let mut auth_key_file: Option<PathBuf> = None;
@@ -76,6 +77,7 @@ fn main() {
                 auto_ckpt_mb = num("--auto-checkpoint-mb", &next(&mut i), auto_ckpt_mb)
             }
             "--backlog" => backlog = num("--backlog", &next(&mut i), backlog),
+            "--max-conn" => max_conn = num("--max-conn", &next(&mut i), max_conn),
             "--workers" => workers = num("--workers", &next(&mut i), workers),
             "--pid-file" => pid_file = Some(PathBuf::from(next(&mut i))),
             "--auth-key-file" => auth_key_file = Some(PathBuf::from(next(&mut i))),
@@ -208,6 +210,7 @@ fn main() {
     cfg.sync_ms = sync_ms;
     cfg.auto_checkpoint_bytes = auto_ckpt_mb * 1024 * 1024;
     cfg.backlog = backlog;
+    cfg.max_conn = max_conn;
     cfg.workers = workers;
     cfg.replication = Some(rcfg.clone());
     cfg.auth = auth;
@@ -240,11 +243,12 @@ fn main() {
     match serve(&cfg, &STOP, &LIVE) {
         Ok(rep) => {
             eprintln!(
-                "shutdown: recovered {} wal recs ({} ms, snap {}) | accepted {} peak {} | rounds {} worst {} us | ops {} writes {} syncs {} avg {} us | checkpoints {} | replica applied {} lag {} resyncs {} errors {}",
+                "shutdown: recovered {} wal recs ({} ms, snap {}) | accepted {} refused {} peak {} | rounds {} worst {} us | ops {} writes {} syncs {} avg {} us | checkpoints {} | replica applied {} lag {} resyncs {} errors {}",
                 rep.rec.wal_records,
                 rep.rec.elapsed_ms,
                 rep.rec.snap_seq,
                 rep.accepted,
+                rep.refused,
                 rep.peak_conns,
                 rep.rounds,
                 rep.worst_round_us,
@@ -317,6 +321,8 @@ treedb-standby — 只读副本（pull 式日志传送，DESIGN.md §6.6）
   --auto-checkpoint-mb N     副本 WAL 超此大小自动快照，默认 64（0 = 关闭）。
                              别关：副本的 WAL 只会因为追平而增长
   --backlog N                listen 接受队列长度，默认 4096
+  --max-conn N               同时在册的连接数上限，默认 0 = 不限（超出的连接
+                             接受后立刻关闭，客户端看到 EOF）
   --workers N                前端 worker 线程数，默认 0 = auto。只扩展读；写永远
                              被引擎以 EROFS 挡掉，不会到提交线程
   --pid-file PATH            启动后写入 pid
@@ -340,6 +346,7 @@ treedb-standby — 只读副本（pull 式日志传送，DESIGN.md §6.6）
 
 监控：treedb-server --listen <本副本地址> --stats，副本会多一行
   replica = yes (primary seq .. lag .. applied .. resyncs .. errors ..)
+要机器可读的指标就换 --format prometheus（`treedb_replica=1` 过滤副本专用项）。
 resyncs 持续上涨 = 追不上主（主 checkpoint 太快或 fetch-bytes 太小）；
 errors 持续上涨 = 连不上主或主拒了请求，此时副本仍在用已有状态答读。
 ";

@@ -53,10 +53,16 @@ fn num<T: std::str::FromStr>(flag: &str, raw: &str, default: T) -> T {
     }
 }
 
-fn print_stats(addr: &str, key: Option<&Key>) -> Result<(), String> {
+fn print_stats(addr: &str, key: Option<&Key>, prometheus: bool) -> Result<(), String> {
     let mut c = Client::connect_auth(addr, 3000, key).map_err(|e| e.to_string())?;
     match c.call(&Op::Stats).map_err(|e| e.to_string())? {
         Reply::Stats(s) => {
+            if prometheus {
+                // 整个指标块一次写完：中间不能夹任何进度输出，否则抓取方会
+                // 把提示文字当成解析失败的注释行。
+                print!("{}", treedb::metrics::prometheus(&s));
+                return Ok(());
+            }
             println!("views      = {}", s.views);
             println!("nodes      = {}", s.nodes);
             println!("dentries   = {}", s.dentries);
@@ -104,12 +110,15 @@ fn main() {
     let mut sync_ms: i32 = 20;
     let mut auto_ckpt_mb: u64 = 64;
     let mut backlog: i32 = 4096;
+    let mut max_conn: usize = 0;
     let mut workers: usize = 0;
     let mut flush_pipeline = false;
     let mut stats_only = false;
     let mut shutdown_only = false;
     let mut pid_file: Option<PathBuf> = None;
     let mut auth_key_file: Option<PathBuf> = None;
+    let mut format = "text".to_string();
+    let mut format_given = false;
 
     let mut i = 1;
     while i < args.len() {
@@ -126,11 +135,16 @@ fn main() {
                 auto_ckpt_mb = num("--auto-checkpoint-mb", &next(&mut i), auto_ckpt_mb)
             }
             "--backlog" => backlog = num("--backlog", &next(&mut i), backlog),
+            "--max-conn" => max_conn = num("--max-conn", &next(&mut i), max_conn),
             "--workers" => workers = num("--workers", &next(&mut i), workers),
             "--flush-pipeline" => flush_pipeline = true,
             "--pid-file" => pid_file = Some(PathBuf::from(next(&mut i))),
             "--auth-key-file" => auth_key_file = Some(PathBuf::from(next(&mut i))),
             "--stats" => stats_only = true,
+            "--format" => {
+                format = next(&mut i);
+                format_given = true;
+            }
             "--shutdown" => shutdown_only = true,
             "-h" | "--help" => {
                 println!("{}", HELP);
@@ -171,10 +185,30 @@ fn main() {
     };
     let auth_on = auth.is_some();
 
+    // `--format` 只影响 `--stats` 的输出形状。给了它却忘了 `--stats` 的话，
+    // 用户以为自己在抓指标、实际上起了一个服务端 —— 那种误会必须在参数
+    // 层就杀掉，不能等到“怎么一直不退出”才发现。
+    let format_prom = match format.as_str() {
+        "text" => false,
+        "prometheus" => true,
+        other => die(&format!("bad --format {other:?}: expected text or prometheus")),
+    };
+    if format_given && !stats_only {
+        die("--format only applies to --stats");
+    }
+
     if stats_only {
-        if let Err(e) = print_stats(&listen, auth.as_deref()) {
-            eprintln!("stats: {e}");
-            std::process::exit(1);
+        match print_stats(&listen, auth.as_deref(), format_prom) {
+            Ok(()) => {}
+            Err(e) => {
+                eprintln!("stats: {e}");
+                if format_prom {
+                    // 抓取失败也得有一个样本，否则面板上是 no data（看起来像
+                    // “监控没配好”）而不是 down（那才是真相）。退出码仍是 1。
+                    print!("{}", treedb::metrics::down());
+                }
+                std::process::exit(1);
+            }
         }
         return;
     }
@@ -213,6 +247,7 @@ fn main() {
         sync_ms,
         auto_checkpoint_bytes: auto_ckpt_mb * 1024 * 1024,
         backlog,
+        max_conn,
         workers,
         flush_pipeline,
         // 这个二进制永远是主：副本入口是 `treedb-standby`，它把同一个
@@ -224,24 +259,26 @@ fn main() {
     eprintln!(
         // 帧里没有版本位（§4.1），升级顺序又是硬约束，所以 banner 一开就把它摆出来：
         // 运维在两端对不上时第一眼就该看见。
-        "treedb-server pid={} listen={} dir={} protocol={} durability={} backlog={} workers={} auth={}",
+        "treedb-server pid={} listen={} dir={} protocol={} durability={} backlog={} max_conn={} workers={} auth={}",
         std::process::id(),
         addr,
         dir.display(),
         PROTOCOL_VERSION,
         durability,
         backlog,
+        if max_conn == 0 { "unlimited".to_string() } else { max_conn.to_string() },
         workers,
         if auth_on { "on" } else { "off" }
     );
     match serve(&cfg, &STOP, &LIVE) {
         Ok(rep) => {
             eprintln!(
-                "shutdown: recovered {} wal recs ({} ms, snap {}) | accepted {} peak {} | rounds {} worst {} us | ops {} writes {} syncs {} avg {} us | checkpoints {} | {} reads inline on {} workers, {} ops forwarded",
+                "shutdown: recovered {} wal recs ({} ms, snap {}) | accepted {} refused {} peak {} | rounds {} worst {} us | ops {} writes {} syncs {} avg {} us | checkpoints {} | {} reads inline on {} workers, {} ops forwarded",
                 rep.rec.wal_records,
                 rep.rec.elapsed_ms,
                 rep.rec.snap_seq,
                 rep.accepted,
+                rep.refused,
                 rep.peak_conns,
                 rep.rounds,
                 rep.worst_round_us,
@@ -271,6 +308,9 @@ treedb-server — 元数据引擎服务端（POSIX 元数据语义，客户端�
   --durability NAME          group（默认，每轮一次 fsync）| always（与 group 同一个
                              落盘点：已 ack 的写必已落盘，不再按连接串 fsync）| never
   --backlog N                listen 接受队列长度，默认 4096（受 somaxconn 截断）
+  --max-conn N               同时在册的连接数上限，默认 0 = 不限。超出的连接会被
+                             接受后立刻关闭（客户端看到 EOF），并在服务端日志
+                             限速打一行；总数在停服汇总的 refused 里
   --workers N                前端 worker 线程数，默认 0 = auto（按核数取
                              min(8, 核数/2)，至少 1）。=1 就是单线程事件
                              循环，也是全部历史基线数字的档。>1 时每条线程
@@ -294,5 +334,8 @@ treedb-server — 元数据引擎服务端（POSIX 元数据语义，客户端�
                              同一把密钥跑完握手才能发数据 op。
   --stats                    不启服务，连上去打印状态后退出（含表的行数、WAL 的
                              逻辑与磁盘两个长度、快照长度与协议版本）
+  --format NAME              --stats 的输出形状：text（默认，逐行 key = value）|
+                             prometheus（text exposition 0.0.4，直接喂监控；
+                             连不上时输出一行 `treedb_up 0` 并以 1 退出）
   --shutdown                 通知运行中的实例优雅停服
 ";
