@@ -27,6 +27,7 @@ bash benches/default_check.sh                           # 零旗标默认档同�
 bash benches/ab_durability.sh <基线 rev>                  # 写轴 A/B：只换服务端二进制比持久化档
 bash benches/rehearse_migrate.sh v0.3.2                 # 快照升级真机彩排：旧 tag 的二进制 → 迁移 → 回滚
 bash benches/handshake_cost.sh 20000                   # 接入握手的代价：两臂同轮 A/B（建连 + RSS/conn + 稳态）
+bash benches/bench_rows.sh                             # 通用表七条路径（rowput/rowget/rowlist/rowidx/…）× 三形状
 ./target/release/treedb-micro --items 32000             # 纯计算档（不经网络/不写 WAL）+ 分配计数
 ```
 
@@ -249,7 +250,7 @@ DESIGN.md §7（含 §7.8 那次全五轴复跑）。
 | `src/{pool,store,persist,schema,probe}.rs` | `postgres-compat` 过渡档 |
 | `src/bin/` | `treedb-server` / `treedb-bench` / `treedb-pgbench`（对照工具）/ `treedb-micro`（纯计算 + 分配计数）/ `treedb-migrate`（快照升级）/ `treedb-standby`（只读副本 + `--promote`）/ `treedb-dump` + `treedb-load`（离线逻辑导出与重建）/ `treedb-backup`（在线一致快照）/ `treedb-demo` |
 | `tests/` | `engine_crud` `net_protocol` `read_scaling` `replication` `auth` `crash_recovery` `migrate` `dump_restore` `backup_online` `scale_connections` `independence`（默认档全部要跑）；`concurrency` 属过渡档 |
-| `benches/` | 五轴矩阵脚本与历史/复跑原始输出 |
+| `benches/` | 五轴矩阵脚本与历史/复跑原始输出；通用表的七条 `row*` 路径基准在 `bench_rows.sh`（§7.15） |
 | `DESIGN.md` | 选型判据、协议字节布局、语义边界、五轴实测、已知限制、接入路径与下一步 |
 
 ## 许可

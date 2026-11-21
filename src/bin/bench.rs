@@ -3,12 +3,19 @@
 //! 三个轴分别对应验收目标：
 //! - `--op ping` / `--op stat`：纯读路径（不进 WAL），看事件循环本身的上限。
 //! - `--op create` / `--op lookup` / `--op readdir`：目录树常见 op。
+//! - `--op row*`：通用表（§5.1）的五条路径 —— `rowinsert` 插入（树 + 主键索引）、
+//!   `rowput` 覆盖已有行、`rowget` 主键点查、`rowlist` 主键序翻页、`rowidx` 二级
+//!   索引等值列举、`rowcount` 按主键计数（O(1)，量的是分派地板）、`rowchurn` 插入+
+//!   删除成对（树节点到零回收的那条路）。表形状固定为 `(tag 索引, payload)`，
+//!   由 [`setup_row_table`] 建一劳永逸。
 //! - `--op write`：`Setattr` 提交 data_ref，会动 refs 账本，是最重的写。
 //! - `--conns N`：只把连接数堆到 N（配合 `--hold`）观察服务端 RSS。
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
-use treedb::engine::model::{errno, KeyRec, Op, Reply};
+use treedb::engine::model::{
+    errno, ColumnDef, KeyRec, Op, Reply, TableDef, COL_INDEX, COND_NONE, PUT_IF_ABSENT, ROW_PK,
+};
 use treedb::net::client::Client;
 
 static ERRORS: AtomicU64 = AtomicU64::new(0);
@@ -96,6 +103,83 @@ fn nonce() -> u64 {
         .unwrap_or(0)
 }
 
+// ---------------------------------------------------------------- 通用表档
+
+/// 基准用的表名。固定一个而不带 nonce：行键里已经带了 nonce，而反复跑同一条
+/// 基准要能命中上一轮已经预热好的那张表 —— 每次重建一遍等于把建表成本混进
+/// 第一格。
+const ROW_TABLE: &[u8] = b"benchkv";
+/// 索引列下标。列序固定为 `(tag, payload)`，所以 tag 恒为 0。
+const ROW_TAG: u32 = 0;
+
+/// 基准表的形状：`tag` 可索引（`rowidx` 走它），`payload` 无约束。
+///
+/// 只有两列是刻意的：再加列只会把每行的字节数变大，而这里要量的是「表这条
+/// 路径」的常数开销（定位 / 索引维护 / 帧编解码），不是某种真实业务的行宽。
+fn row_table_def() -> TableDef {
+    TableDef {
+        name: ROW_TABLE.to_vec(),
+        columns: vec![
+            ColumnDef { name: b"tag".to_vec(), flags: COL_INDEX },
+            ColumnDef { name: b"payload".to_vec(), flags: 0 },
+        ],
+    }
+}
+
+/// 建表（或确认已有的那张就是本轮的形状）。
+///
+/// 「已存在」不能默默放过：上一轮用别的列序建的表会让后续每一个 `RowPut` 都
+/// `EINVAL`，而那时报出来的错在压测输出里只是一行 `errors=NNN`，查起来要绕
+/// 一大圈。形状不同就在建连阶段直接退出并说清差异。
+fn setup_row_table(addr: &str, auth: Option<&treedb::net::auth::Key>) {
+    let mut c = Client::connect_auth(addr, 3000, auth).expect("connect for table setup");
+    match c.call(&Op::TableCreate { def: row_table_def() }) {
+        Ok(Reply::Table(Some(_))) => {}
+        Ok(Reply::Err { code, .. }) if code == errno::EEXIST => {
+            match c.call(&Op::TableGet { name: ROW_TABLE.to_vec() }) {
+                Ok(Reply::Table(Some(d))) if d == row_table_def() => {}
+                Ok(Reply::Table(Some(d))) => {
+                    eprintln!(
+                        "table {} already exists with a different shape ({} columns); \
+                         drop it or use another --dir",
+                        String::from_utf8_lossy(ROW_TABLE),
+                        d.columns.len()
+                    );
+                    std::process::exit(2);
+                }
+                other => {
+                    eprintln!("table get: {other:?}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        Ok(other) => {
+            eprintln!("table create: {other:?}");
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("table create: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// 一行的样子：键 + `(tag, payload)`。`tag` 只有 16 个取值，让索引列上每页
+/// 都有多个命中（否则 `rowidx` 量到的全是「索引里只有一条」那条快路径）。
+fn row_op(seq: u64, span: u64) -> Op {
+    Op::RowPut {
+        table: ROW_TABLE.to_vec(),
+        key: format!("r{}", seq % span).into_bytes(),
+        cols: vec![
+            format!("t{}", seq % 16).into_bytes(),
+            format!("p{seq}").into_bytes(),
+        ],
+        flags: 0,
+        cond_col: COND_NONE,
+        cond_val: Vec::new(),
+    }
+}
+
 fn main() {
     let args = parse();
     // 探活不走 `Client::ping_auth`：它只回 `bool`，能把“对端拒绝降级”与
@@ -156,6 +240,13 @@ fn main() {
         return;
     }
 
+    // 通用表档：表是全局的（不在视图里），所以先把它建好再开线程 —— 让「建表」
+    // 这件事发生在测量窗口之外，且八条线程不会抢着建同一张表。
+    let row_axis = args.op.starts_with("row");
+    if row_axis {
+        setup_row_table(&args.addr, args.auth.as_deref());
+    }
+
     // 测量窗口从**每个工作线程预热完成之后**才起算：把 deadline 在外层算好传
     // 进去，一旦预热（建视图 + 灌 500×views 个文件）比 secs 还长，整个循环会
     // 一次都不跑，量出 `0 ops/s` 这种假数字。
@@ -175,41 +266,47 @@ fn main() {
                 cs.push(Client::connect_auth(&a, 0, auth.as_deref()).expect("connect"));
             }
             // 每线程独占一批视图，避免跨线程名字冲突污染语义。
-            let mut vids: Vec<u32> = Vec::with_capacity(views);
+            //
+            // 通用表档不建视图：表是全局的，`row*` 那几条 op 的 `view` 字段根本
+            // 不存在。建 64 个视图只会把建视图的开销混进预热，同时让服务端多攒
+            // 64 份视图状态 —— 而这一格要量的是表那条路径。
+            let mut vids: Vec<u32> = Vec::with_capacity(if row_axis { 0 } else { views });
             let mut missing: Vec<String> = Vec::new();
-            for v in 0..views {
-                let name = format!("bench{t}v{v}");
-                match cs[0].call(&Op::CreateView {
-                    name: name.clone().into_bytes(),
-                }) {
-                    Ok(Reply::View { id, .. }) => vids.push(id),
-                    // 视图已在上一轮建过：这不是错误，压测脚本要能反复跑。
-                    // 记住名字，稍后一次性 ListViews 把 id 查回来。
-                    Ok(Reply::Err { code, .. }) if code == errno::EEXIST => {
-                        missing.push(name);
-                    }
-                    Ok(other) => {
-                        eprintln!("create view: {other:?}");
-                        std::process::exit(1);
-                    }
-                    Err(e) => {
-                        eprintln!("create view: {e}");
-                        std::process::exit(1);
+            if !row_axis {
+                for v in 0..views {
+                    let name = format!("bench{t}v{v}");
+                    match cs[0].call(&Op::CreateView {
+                        name: name.clone().into_bytes(),
+                    }) {
+                        Ok(Reply::View { id, .. }) => vids.push(id),
+                        // 视图已在上一轮建过：这不是错误，压测脚本要能反复跑。
+                        // 记住名字，稍后一次性 ListViews 把 id 查回来。
+                        Ok(Reply::Err { code, .. }) if code == errno::EEXIST => {
+                            missing.push(name);
+                        }
+                        Ok(other) => {
+                            eprintln!("create view: {other:?}");
+                            std::process::exit(1);
+                        }
+                        Err(e) => {
+                            eprintln!("create view: {e}");
+                            std::process::exit(1);
+                        }
                     }
                 }
-            }
-            if !missing.is_empty() {
-                let Ok(Reply::Views(all)) = cs[0].call(&Op::ListViews) else {
-                    eprintln!("视图已存在但 ListViews 没答上来");
-                    std::process::exit(1);
-                };
-                for name in &missing {
-                    let hit = all.iter().find(|(n, _, _)| n.as_slice() == name.as_bytes());
-                    match hit {
-                        Some((_, id, _)) => vids.push(*id),
-                        None => {
-                            eprintln!("视图 {name} 报 EEXIST 却查不到");
-                            std::process::exit(1);
+                if !missing.is_empty() {
+                    let Ok(Reply::Views(all)) = cs[0].call(&Op::ListViews) else {
+                        eprintln!("视图已存在但 ListViews 没答上来");
+                        std::process::exit(1);
+                    };
+                    for name in &missing {
+                        let hit = all.iter().find(|(n, _, _)| n.as_slice() == name.as_bytes());
+                        match hit {
+                            Some((_, id, _)) => vids.push(*id),
+                            None => {
+                                eprintln!("视图 {name} 报 EEXIST 却查不到");
+                                std::process::exit(1);
+                            }
                         }
                     }
                 }
@@ -253,6 +350,89 @@ fn main() {
                     }
                 }
             }
+            // 通用表同理：`rowput` 要量的是覆盖、`rowget`/`rowlist`/`rowidx` 要量
+            // 命中，都得先有行。`rowinsert` 与 `rowchurn` 自己造行（键里带 nonce），
+            // 不预热 —— 给它们预热只会把「预热那 500 行」也算进索引规模里。
+            if matches!(op.as_str(), "rowput" | "rowget" | "rowlist" | "rowidx" | "rowcount") {
+                const WARM: u64 = 250;
+                let span = warm_span() as u64;
+                for base in (0..span).step_by(WARM as usize) {
+                    let batch: Vec<Op> = (base..(base + WARM).min(span))
+                        .map(|k| row_op(k, span))
+                        .collect();
+                    for r in cs[0].pipeline(&batch).expect("row warmup pipeline") {
+                        if let Reply::Err { code, ref msg } = r {
+                            panic!(
+                                "row warmup 失败 code={code} msg={}",
+                                String::from_utf8_lossy(msg)
+                            );
+                        }
+                    }
+                }
+            }
+            // 命中校验：四条「查」的 op 在空表上同样零错误 —— `RowGet` 未命中回的
+            // 是 `Reply::Row(None)`、`RowList` 回空行集、`RowCount` 回 0，三者都
+            // 不是 `Err`。于是一张空表能跑出「几百万 ops/s、errors=0」这种最好看
+            // 也最没用的数字。预热刚写完 span 行，这里必须查得到；查不到就说明
+            // 键的构造与预热不一致（改过 span 或键格式），宁可在这儿炸掉。
+            if matches!(op.as_str(), "rowget" | "rowlist" | "rowidx" | "rowcount") {
+                let (what, probe) = match op.as_str() {
+                    "rowget" => (
+                        "RowGet(r0)",
+                        Op::RowGet {
+                            table: ROW_TABLE.to_vec(),
+                            key: b"r0".to_vec(),
+                        },
+                    ),
+                    "rowlist" => (
+                        "RowList(pk, limit=1)",
+                        Op::RowList {
+                            table: ROW_TABLE.to_vec(),
+                            column: ROW_PK,
+                            value: Vec::new(),
+                            from: Vec::new(),
+                            limit: 1,
+                        },
+                    ),
+                    "rowidx" => (
+                        "RowList(tag=t0, limit=1)",
+                        Op::RowList {
+                            table: ROW_TABLE.to_vec(),
+                            column: ROW_TAG,
+                            value: b"t0".to_vec(),
+                            from: Vec::new(),
+                            limit: 1,
+                        },
+                    ),
+                    _ => (
+                        "RowCount(pk)",
+                        Op::RowCount {
+                            table: ROW_TABLE.to_vec(),
+                            column: ROW_PK,
+                            value: Vec::new(),
+                        },
+                    ),
+                };
+                let hit = match cs[0].call(&probe) {
+                    Ok(Reply::Row(Some(_))) => true,
+                    Ok(Reply::Rows { rows, .. }) => !rows.is_empty(),
+                    Ok(Reply::Count(n)) => n > 0,
+                    Ok(other) => {
+                        eprintln!("{what}: unexpected reply {other:?}");
+                        std::process::exit(1);
+                    }
+                    Err(e) => {
+                        eprintln!("{what}: {e}");
+                        std::process::exit(1);
+                    }
+                };
+                // 不用 `assert!`：panic 只会在这个线程里炸，主线程再 `join`
+                // 一次，看到的是不透明的 `Any { .. }`，真正的文案被冲掉。
+                if !hit {
+                    eprintln!("{what} 预热后仍查不到行：这一格会量成「空表快路径」");
+                    std::process::exit(2);
+                }
+            }
             // 计时窗口只包被测循环。分母不能在 join 前取：那样“建 N 条连接 +
             // 预热 500 个文件”这段固定开销会被算进去，--secs 3 时 readdir/lookup
             // 那一格的分母实测被撑到 6.2 s，吞吐虚低一倍；而旧版 pgbench 因为
@@ -262,7 +442,13 @@ fn main() {
             let wstart = Instant::now();
             let deadline = wstart + dur;
             while Instant::now() < deadline {
-                let view = vids[(seq as usize) % vids.len()];
+                // 通用表档没有视图（`vids` 为空），传 0 给 build 即可 —— 那几条
+                // op 的帧里没有 view 字段。
+                let view = if vids.is_empty() {
+                    0
+                } else {
+                    vids[(seq as usize) % vids.len()]
+                };
                 let batch = build(&op, view, seq, pipeline, t, nonce, warm_span() as u64);
                 let idx = ci % cs.len();
                 ci += 1;
@@ -381,6 +567,73 @@ fn build(op: &str, view: u32, seq: u64, n: usize, t: usize, nonce: u64, span: u6
                 kind: 1,
                 lease_expiry: 0,
             },
+            // ---- 通用表 ----
+            // `rowinsert` 的键带 nonce：重跑时不撞上一轮的键（撞上就不是插入而是
+            // 覆盖，量的将是另一条路径）。
+            "rowinsert" => Op::RowPut {
+                table: ROW_TABLE.to_vec(),
+                key: format!("n{nonce}-{t}-{s}").into_bytes(),
+                cols: vec![format!("t{}", s % 16).into_bytes(), b"p".to_vec()],
+                flags: PUT_IF_ABSENT,
+                cond_col: COND_NONE,
+                cond_val: Vec::new(),
+            },
+            "rowput" => row_op(s, span),
+            "rowget" => Op::RowGet {
+                table: ROW_TABLE.to_vec(),
+                key: format!("r{}", s % span).into_bytes(),
+            },
+            // 主键序第一页：`from` 空 = 从头。固定首页而不翻到底，是因为翻页的
+            // 成本与「翻到第几页」无关（键游标直接从树上定位），而首页恰好是
+            // `rowlist` 最常用的形状（挂载后第一次列目录）。
+            "rowlist" => Op::RowList {
+                table: ROW_TABLE.to_vec(),
+                column: ROW_PK,
+                value: Vec::new(),
+                from: Vec::new(),
+                limit: 100,
+            },
+            // 二级索引等值页：16 个 tag 轮转，每个 tag 在 500 行里约 31 行 ——
+            // 既不是「只命中一条」的快路径，也不会大到把回包帧长测成瓶颈。
+            "rowidx" => Op::RowList {
+                table: ROW_TABLE.to_vec(),
+                column: ROW_TAG,
+                value: format!("t{}", s % 16).into_bytes(),
+                from: Vec::new(),
+                limit: 100,
+            },
+            "rowcount" => Op::RowCount {
+                table: ROW_TABLE.to_vec(),
+                column: ROW_PK,
+                value: Vec::new(),
+            },
+            // 插入 + 删除成对：树每轮长一格又缩回去，量的是「Delete 把树节点
+            // 减到零」那条路（包括索引侧的反向删除），而树规模恒定。
+            //
+            // 配对靠 s 的奇偶：偶数下 put、奇数下 del 同一个键 —— 当 pipeline=1
+            // 时两轮一对，pipeline=N 时同一批里先 put 后 del，次序由协议 FIFO
+            // 保证。所以报告的 ops/s 是 **put+del 之和**，配对速率是它的一半。
+            "rowchurn" => {
+                let key = format!("c{nonce}-{t}-{}", s / 2).into_bytes();
+                if s % 2 == 0 {
+                    Op::RowPut {
+                        table: ROW_TABLE.to_vec(),
+                        key,
+                        cols: vec![b"tchurn".to_vec(), b"p".to_vec()],
+                        flags: 0,
+                        cond_col: COND_NONE,
+                        cond_val: Vec::new(),
+                    }
+                } else {
+                    Op::RowDelete {
+                        table: ROW_TABLE.to_vec(),
+                        key,
+                        flags: 0,
+                        cond_col: COND_NONE,
+                        cond_val: Vec::new(),
+                    }
+                }
+            }
             "key" => Op::KeyCreate {
                 key: KeyRec {
                     id: format!("k{t}{nonce}{s}").into_bytes(),
@@ -416,6 +669,10 @@ treedb-bench — 对 treedb-server 打负载
 
   --addr HOST:PORT   服务端地址（默认 127.0.0.1:7777）
   --op NAME          create|lookup|readdir|write|lock|key|ping|stat
+                     |rowinsert|rowput|rowget|rowlist|rowidx|rowcount|rowchurn
+                     通用表档用固定形状的表 benchkv(tag 索引, payload)，首次运行
+                     自动建表；rowchurn 是 put+del 成对发，ops/s 是两者之和、
+                     配对速率是它的一半
   --conns N          总连接数（默认 8）
   --threads N        工作线程数（默认 8）
   --pipeline N       每批请求数，1 = 一问一答（默认 1）
