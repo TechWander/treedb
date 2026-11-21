@@ -1,0 +1,41 @@
+
+=============== 2026-11-21 09:59:46  treedb-backup（rev 3e8cfd6，每档写 2s）
+
+[1] 主从未 checkpoint：没有 state.snap，WalFetch 必须从头重放
+  bench   op=create conns=4 threads=4 pipeline=1 → 2911 ops/s over 2.01s | lat us: p50=693 p90=1759 p99=15085 max=44342 | errors=0
+  主      views=32 nodes=5881 dentries=5849 seq=17611
+  backup  treedb-backup: 127.0.0.1:17821 -> .spot/bkon/nosnap.dump (817145 bytes, 11762 logs, seq 17611)
+  backup    snapshot seq 0 (0 bytes) + wal seq 1..17611 (17611 records, epoch 0)
+  backup    views 32 nodes 5881 dentries 5849 locks 0 refs 0 keys 0 audit 0 defs 0 placement 0 tables 0 rows 0
+  backup    took 67.2 ms
+  备件    views=32 nodes=5881 dentries=5849
+  判定：无快照档计数一致 ✓（切面 seq 17611）
+
+[2] 快照 + 尾巴：checkpoint 后再写一段，备份要两段拼接
+  bench   op=create conns=4 threads=4 pipeline=1 → 2658 ops/s over 2.00s | lat us: p50=708 p90=1768 p99=16460 max=43570 | errors=0
+  主      views=32 nodes=5350 dentries=5318 seq=16018（605008 B）
+  backup  treedb-backup: 127.0.0.1:17821 -> .spot/bkon/live.dump (745202 bytes, 10700 logs, seq 16018)
+  backup    snapshot seq 14032 (605008 bytes) + wal seq 14033..16018 (1986 records, epoch 0)
+  backup    views 32 nodes 5350 dentries 5318 locks 0 refs 0 keys 0 audit 0 defs 0 placement 0 tables 0 rows 0
+  backup    took 99.7 ms
+  备件    views=32 nodes=5350 dentries=5318
+  判定：静置档计数一致 ✓
+
+[3] 备份进行中主持续写：切面必须落在 [备份前, 备份后] 且自洽
+  backup  treedb-backup: 127.0.0.1:17821 -> .spot/bkon/w.dump (771739 bytes, 11090 logs, seq 16603)
+  backup    snapshot seq 14032 (605008 bytes) + wal seq 14033..16603 (2571 records, epoch 0)
+  backup    views 32 nodes 5545 dentries 5513 locks 0 refs 0 keys 0 audit 0 defs 0 placement 0 tables 0 rows 0
+  backup    took 109.2 ms
+  load    written = state.snap only (no WAL): the server can start on this directory
+  load    elapsed = 56 ms
+  切面 seq=16603，主 16018 → 17323；恢复后 views=32 nodes=5545 dentries=5513 seq=16603
+  判定：切面在区间内且恢复水位等于切面 ✓
+
+[4] 管道档：--out - 接 gzip，摘要走 stderr，字节流不能被污染
+  backup  treedb-backup: 127.0.0.1:17821 -> - (1433343 bytes, 20622 logs, seq 30901)
+  backup    snapshot seq 28099 (1208373 bytes) + wal seq 28100..30901 (2802 records, epoch 0)
+  backup    views 32 nodes 10311 dentries 10279 locks 0 refs 0 keys 0 audit 0 defs 0 placement 0 tables 0 rows 0
+  backup    took 61.4 ms
+  压缩后 167050 B；views=32 nodes=10311 dentries=10279
+  判定：管道字节与同切面的文件版本逐字节相同 ✓
+--- 完

@@ -42,6 +42,13 @@ path = "src/bin/dump.rs"
 name = "treedb-load"
 path = "src/bin/load.rs"
 
+# 在线导出：dump 读本地目录、要目录独占；backup 读在线主，两条腿都是主已经
+# 实现的只读 op（SnapFetch + WalFetch），所以主不停机也能拿到一致切面。
+# 产出与 dump 同格式（TDBDUMP1），`treedb-load` 直接吃得下。
+[[bin]]
+name = "treedb-backup"
+path = "src/bin/backup.rs"
+
 [[bin]]
 name = "treedb-bench"
 path = "src/bin/bench.rs"

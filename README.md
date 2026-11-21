@@ -16,7 +16,7 @@ cargo build --release                                   # 默认档：依赖只�
 ./target/release/treedb-server --dir /var/lib/treedb --listen 127.0.0.1:7777
 ./target/release/treedb-bench --op lookup --conns 64 --pipeline 32 --secs 3
 
-cargo test --release                                    # 默认档 159 passed（引擎本体）
+cargo test --release                                    # 默认档 163 passed（引擎本体）
 cargo test --release --features postgres-compat        # 190 passed（含 PG 过渡档）
 bash benches/throughput_matrix.sh 3 1 2 3 4 5           # 五轴复现，输出进 benches/results/
 bash benches/sync_ratio.sh 3                           # 写路径机制：一次 fsync 摊了多少写
@@ -51,6 +51,19 @@ bash benches/handshake_cost.sh 20000                   # 接入握手的代价�
 ./target/release/treedb-load --in /backup/treedb.dump            # 只体检：解码 + 打规模
 ./target/release/treedb-load --in /backup/treedb.dump --dir /srv/treedb-new
 ```
+
+**不想停服就用 `treedb-backup`**：它从在线主拉一份一致切面（`SnapFetch` + `WalFetch`
+两条只读 op，与副本同源），落成与 dump 完全相同的文件，`treedb-load` 直接吃得下。
+主端零改动，也不需要任何配置：
+
+```sh
+./target/release/treedb-backup --primary 10.0.0.1:7777 --out /backup/treedb.dump
+./target/release/treedb-backup --primary 10.0.0.1:7777 --out - | gzip > /backup/t.dump.gz
+```
+
+切面就是「第一次拉 WAL 那一刻主已确认的最大 seq」（RPO 可据此报）；主在备份期间
+checkpoint 追过了头会整份重来（`--retries` 默认 3）。仍是整份一次性导出，不是持续
+追赶 —— 要镜像用 `treedb-standby`（§6.10）。
 
 dump 走的是日志标签表（`Log`，1..=22）而不是内部快照格式，所以它跨版本、跨机器能读；
 容器自带 CRC32 与三个 `next_*` 计数器。load 只写 `state.snap`（水位 = dump 的 seq）、
@@ -167,10 +180,11 @@ DESIGN.md §7（含 §7.8 那次全五轴复跑）。
   连接只共享一个状态机：锁按**连接号**归属（不用会被复用的 fd），死连接的锁由租约过期回收。
   引擎没有连接数上限常量，卡它的是服务端 `RLIMIT_NOFILE` 与客户端源端口空间（§7.6）。
 - **持久性与备份面**：CRC32 WAL + 快照 checkpoint + 崩溃重放（§6.1/§6.2），优雅
-  停服自带最后一次 checkpoint。备份可用的形状有四种且都跑过（§6.7/§6.9）：停服后 `cp -a` 目录、
+  停服自带最后一次 checkpoint。备份可用的形状有五种且都跑过（§6.7/§6.9/§6.10）：停服后 `cp -a` 目录、
   `treedb-standby` 拉一份持续追平的异地镜像（那个目录可以直接当还原点起服，
   v0.4.0 起还能用 `treedb-standby --promote` 把它合法地提成主）、
-  `treedb-migrate` 处理快照格式跨代、`treedb-dump`/`treedb-load` 做离线逻辑导出与重建。
+  `treedb-migrate` 处理快照格式跨代、`treedb-dump`/`treedb-load` 做离线逻辑导出与重建、
+  `treedb-backup` 从在线主拉同一格式的一致切面（不停服）。
   `--durability` 三档：`group`（默认，一轮一次
   fsync、跨连接合并）/ `always`（同一个提交点，单连接下自然退化成每 op 一次盘）/
   `never`（会丢一个窗口）。
@@ -186,7 +200,8 @@ DESIGN.md §7（含 §7.8 那次全五轴复跑）。
   能证明「持有密钥」了，`v0.4.0` 起也能认出被提掉权的旧主（`fence`，§6.6）；但
   那只保护副本，不阻止旧主对自己的客户端继续服务。
 - **没有 PITR、没有增量与加密备份**（§8 第 14 条、§6.7）。`treedb-dump`/`treedb-load`
-  是停服的整份导出，不是在线热备；checkpoint 会抹掉水位以下的日志（同步档
+  是停服的整份导出，`treedb-backup` 不停服但同样是整份一次性切面（不是持续追赶）；
+  checkpoint 会抹掉水位以下的日志（同步档
   `wal.reset()`、自动档 `truncate_before()`），历史切面不归档；运行中 `cp -a` 能起服、
   无撕裂，但切点不可控（实测比「拷贝前一刻」多 14 400 条 seq），所以它不是备份工具。
 - **没有 SQL、没有 JOIN/排序/范围谓词、没有用户可见事务、没有跨视图原子 op**（§5.3）。
@@ -213,8 +228,8 @@ DESIGN.md §7（含 §7.8 那次全五轴复跑）。
 | `src/engine/` | 线协议类型（`model.rs`，52 个 op / 30 个 Reply）、帧编码（`codec.rs`）、状态机（`mem.rs`）、应用与定序（`apply.rs`）、WAL/快照（`wal.rs`）、核心（`core.rs`）、离线 dump 容器（`dump.rs`，§6.9）、自写的 SHA-256/HMAC（`sha256.rs`，§4.4） |
 | `src/net/` | 单线程事件循环（`server.rs`）、多前端 worker + 唯一提交线程（`multi.rs`）、跨线程信箱（`mail.rs`）、接入认证闸门（`auth.rs`，§4.4）、副本跟踪器（`replicate.rs`）、阻塞客户端（`client.rs`） |
 | `src/{pool,store,persist,schema,probe}.rs` | `postgres-compat` 过渡档 |
-| `src/bin/` | `treedb-server` / `treedb-bench` / `treedb-pgbench`（对照工具）/ `treedb-micro`（纯计算 + 分配计数）/ `treedb-migrate`（快照升级）/ `treedb-standby`（只读副本 + `--promote`）/ `treedb-dump` + `treedb-load`（离线逻辑导出与重建）/ `treedb-demo` |
-| `tests/` | `engine_crud` `net_protocol` `read_scaling` `replication` `auth` `crash_recovery` `migrate` `dump_restore` `scale_connections` `independence`（默认档全部要跑）；`concurrency` 属过渡档 |
+| `src/bin/` | `treedb-server` / `treedb-bench` / `treedb-pgbench`（对照工具）/ `treedb-micro`（纯计算 + 分配计数）/ `treedb-migrate`（快照升级）/ `treedb-standby`（只读副本 + `--promote`）/ `treedb-dump` + `treedb-load`（离线逻辑导出与重建）/ `treedb-backup`（在线一致快照）/ `treedb-demo` |
+| `tests/` | `engine_crud` `net_protocol` `read_scaling` `replication` `auth` `crash_recovery` `migrate` `dump_restore` `backup_online` `scale_connections` `independence`（默认档全部要跑）；`concurrency` 属过渡档 |
 | `benches/` | 五轴矩阵脚本与历史/复跑原始输出 |
 | `DESIGN.md` | 选型判据、协议字节布局、语义边界、五轴实测、已知限制、接入路径与下一步 |
 

@@ -94,9 +94,12 @@ decode 处得到 `unknown op tag 0x002c`，而不是把一条写静默当成别�
 接入侧随后跟到 `v0.5.1`（grovefs 只动 pin 与 lock，适配层零改动）：矩阵仍
 `51/0/0`、`test_treedb.sh` `53/0`、grovefs `cargo test --features treedb` `318/0/4`。
 
-`v0.5.1` 之后（未发版）收了问题清单里最后一条能力缺口：**离线 dump / load**（§6.9）。
-新工具 `treedb-dump` / `treedb-load` 把整份状态导成自描述的逻辑记录流（`Log` 标签表
-1..=22）再重建目录，容器带 CRC32 与三个 `next_*`；load 只写 `state.snap`、不写 WAL。
+`v0.5.1` 之后（未发版）收了问题清单里的两条能力缺口。第一条是**离线 dump / load**
+（§6.9）：新工具 `treedb-dump` / `treedb-load` 把整份状态导成自描述的逻辑记录流（`Log`
+标签表 1..=22）再重建目录，容器带 CRC32 与三个 `next_*`；load 只写 `state.snap`、
+不写 WAL。第二条是**在线备份**（§6.10）：`treedb-backup` 用副本那两条只读 op
+（`SnapFetch` + `WalFetch`）从在线主拉一份一致切面，落成与 dump 逐字节同格式的文件
+—— 主不停机、主端零改动，`PROTOCOL_VERSION` 也不动。
 **不碰引擎字节格式与线协议**（无 op/reply/tag 变更，`PROTOCOL_VERSION` 6 / `SNAP_VERSION`
 3 不动），所以它是纯增量能力：旧数据目录、接入侧适配层全部零改动。
 实测（§6.9）：82 888 节点的目录 dump 279 ms / 11.65 MB、load 265 ms，还原目录的
@@ -107,11 +110,11 @@ decode 处得到 `unknown op tag 0x002c`，而不是把一条写静默当成别�
 按「不改写已推引用」的纪律保留现状：Cargo 解析 git 依赖只看 tag/rev 与 lock 里的
 hash，不看这个字段，所以不影响任何构建；下一次带 API 变更的发版重新对齐。
 
-test 现在分两档报：默认档（纯引擎）`cargo test --release` = **159 passed**（60 lib +
+test 现在分两档报：默认档（纯引擎）`cargo test --release` = **163 passed**（60 lib +
 33 engine_crud + 14 migrate + 14 replication + 11 net_protocol + 8 read_scaling +
-6 crash_recovery + 5 auth + 3 independence + 4 dump_restore + 1 scale_connections，
-10k 那条仍 `#[ignore]`）；
-`--features postgres-compat` = **190 passed**，多出的 31 条 = 过渡档自己的 30 条单测 +
+7 crash_recovery + 5 auth + 3 independence + 4 dump_restore + 3 backup_online +
+1 scale_connections，10k 那条仍 `#[ignore]`）；
+`--features postgres-compat` = **194 passed**，多出的 31 条 = 过渡档自己的 30 条单测 +
 `concurrency.rs` 里那条
 不需要 PG 的拨号用例（剩下 6 条要真 PG，默认 `#[ignore]`，不计入 passed）。即 PG 只出现在
 `postgres-compat` 后面的 `src/pool`、`src/store`、
@@ -1005,11 +1008,12 @@ committer，`workers = 1` 时是轮末周期任务）。两档跑的是同一份
   因此没有 PITR**。能还原到的时间点只有
   「最近一次快照 + 其后的尾日志」这一条线，历史切面不归档、不落地。要按时间点
   恢复就得在外面自己留 WAL 分段，或者靠副本（§8 第 14 条）。
-- **没有独立的 backup/restore 命令**。§6.7 那三条仍是还原手段：停服后 `cp -a` 目录、
-  `treedb-standby` 拉一份持续追平的镜像、`treedb-migrate` 只处理快照格式版本（§6.5）。
-  2026-11-21 多了第四条**离线形状**：`treedb-dump` / `treedb-load` 把整份状态导成
-  一个自描述文件再重建目录（§6.9）—— 它比 `cp -a` 多的是「跨版本、跨机器、可读」，
-  少的依旧是「不停服」与「按时间点」。仍然没有增量备份、没有加密备份。
+- **还原手段从三条长到五条，但增量 / 加密 / PITR 仍然没有**。§6.7 那三条照旧：停服后
+  `cp -a` 目录、`treedb-standby` 拉一份持续追平的镜像、`treedb-migrate` 只处理快照格式
+  版本（§6.5）。2026-11-21 多了两个**文件形状**：`treedb-dump` / `treedb-load` 把整份状态
+  导成自描述文件再重建目录（§6.9，要求目录独占），`treedb-backup` 从在线主拉同一格式
+  的一致切面（§6.10，不停服）。前者比 `cp -a` 多的是「跨版本、跨机器、人眼可读」，后
+  者补的是「不停服」；两者都不做增量、不加密、不支持按时间点恢复。
 
 ### 6.8 快照的自校验尾巴与数据目录互斥（2026-11-20）
 
@@ -1135,9 +1139,94 @@ checkpoint、旁路快照与 `restore_dump` 三处共用，所以三条路径写
 改一个字节再 load → `dump crc mismatch: ...`；缺参数 → 退出码 2。
 
 **边界**：dump 把整份状态读进内存再展开成记录流（源 `State` + 记录流同时在手），所以
-它是离线工具 —— 在线热备仍是 §6.7 那三形状。也没有增量、没有加密、没有 PITR：`seq`
+它是离线工具；不停服的那一条见 §6.10。也没有增量、没有加密、没有 PITR：`seq`
 只是水位，不是可回拨的时间轴。dump 文件比快照大约 7.7%（11.65 MB vs 10.83 MB）：换的
 是「不依赖 `SNAP_VERSION`、人眼可读」这一层自描述成本。
+
+### 6.10 在线一致快照（`treedb-backup`，2026-11-21 新增）
+
+§6.7 的三形状有一个共同前提：要拿一致切面就得停服，或者常驻一个副本。§6.9 的
+dump 更进一步 —— 它要目录独占，服务在跑直接拒。补第五个形状：**从在线主拉一份
+一致快照，落成与 dump 同格式的文件**。
+
+```text
+treedb-backup --primary 10.0.0.1:7777 --out /backup/treedb.dump
+treedb-backup --primary 10.0.0.1:7777 --out - | gzip > /backup/t.dump.gz   # 管道档
+treedb-load --in /backup/treedb.dump --dir /srv/treedb-new                 # 恢复
+```
+
+**它没有发明任何协议**：两条腿都是 §6.6 给副本开的那两条只读 op。
+
+| 段 | op | 语义 |
+|----|----|------|
+| 状态主体 | `SnapFetch { offset, len }` | 分块读主的 `state.snap`；`snap_seq` 换代即整份重下 |
+| 增量尾巴 | `WalFetch { want_seq, hint_off, max_bytes }` | 交付 `seq >= want_seq` 的 WAL 记录**原字节**，上界是主已 fsync 的 `durable_seq` |
+
+**为什么拼出来的一定自洽**，三条一起看：
+
+1. WAL 只追加、不改历史 —— `(S, T]` 这段重放出来的状态就是主在 seq `T` 那一刻的状态；
+2. `WalFetch` 的上界是 `durable_seq`，不是「文件里已经写出去的字节」—— 因此切面里
+   不会有主崩溃时可能回滚的写（与副本同一条规矩）；
+3. 快照自带 `seq` 与 crc（§6.8），拼错代际会在读取时就被拒，而不是悄悄拼出一份
+   两个时代都不属于的状态。
+
+**目标水位在第一轮 `WalFetch` 就固定**（`stop_at` = 该轮返回的 `durable_seq`），此后
+不再上移。这条是实测逼出来的：最初写成「一直追到追平」，主持续写入时备份耗时与
+写入时长同步增长（3 s 写入 → **3 336 ms** 备份，仍然追不完），而且说不清切面落在
+哪一刻。固定之后同一个库、同样 3 s 写入 → **322 ms**，与写入量无关 —— 备份是
+「取某一刻的切面」，不是「跟上写入流」（后者是副本的职责）。
+
+**RPO = 「第一次 `WalFetch` 那一刻主已确认的最大 seq」**。要把切面钉死在备份
+启动那一刻的调用方，可以先读一次 `--stats` 的 `Stats.seq` 再启动备份，两者之差
+就是这份文件的 RPO 上界（量级是快照下载耗时加一次往返）。
+
+**两条要重来的失败态**，判据与副本逐个对应：
+
+- **`gap`（主在备份期间 checkpoint 追过了头）**：`want_seq <= snap_seq` 时主回
+  `gap=true`，整份重来。这不是错误而是「没跟上」，`--retries`（默认 3）管次数；
+  触发与否取决于主自动 checkpoint 的周期与备份窗口的重叠。
+- **`epoch` 中途变动**（备份期间发生 `--promote`）：同样整份重来 —— 快照与尾巴可能
+  来自两个时代，拼起来没有意义。
+
+两次实测都没撞上这两条（备份窗口在本机是 50–400 ms 量级，主每 1 MB WAL 换一次快照），所以
+验收没有把「一定重来过」写成断言；替代的钉子是把**重试循环本身**钉死
+（`--retries 3` 必须真的转满 3 轮，见下面第 3 条用例）。
+
+**实测（2026-11-21，本机 `127.0.0.1`，主 `--workers 4 --auto-checkpoint-mb 1`）**：
+
+| 场景 | 主的数据量 | 产出 | 耗时 |
+|------|-----------|------|------|
+| 无快照（`snap_seq 0`，从头重放 WAL） | 32 views / 5 371 nodes / seq 16 081 | 748 KB，10 742 条 | 79 ms |
+| 快照 + 尾巴（主静置） | 32 / 10 577 / seq 31 699 | 1.47 MB，21 154 条 | 107 ms |
+| 快照 + 尾巴（主在写 3 s，未触发重来） | 64 / 78 529 / seq 235 523 | 10.97 MB，157 058 条 | 322 ms |
+| 同上，连跑 5 次（主持续写 1 s/轮） | 64 / 86 532→97 033 | 12.1→13.5 MB | 353 / 342 / 328 / 365 / 405 ms |
+| 管道档（`--out -` \| `gzip -1`） | 32 / 10 577 / seq 31 699 | 1.47 MB → 161 KB | 74 ms |
+
+每次摘要都打印四段：切面 `seq`、快照水位与字节数、尾巴区间与条数、以及 11 张表的
+行数 —— 最后一组与主 `--stats` 的同一组逐格相等（上表五档都核过）。
+
+表里是**某一次**的数（每轮写入量不同，耗时随之变）；同一组关系可以复现：
+`bash benches/backup_online.sh [每档写入秒数]` 跑四档（无快照 / 快照+尾巴 / 写入中 /
+管道），四档全 ✓，原始输出落在 `benches/results/backup_online.log`。
+
+**验收**在 `tests/backup_online.rs`（3 条，全部真起子进程）：
+
+1. `online_backup_equals_the_instance_it_came_from` —— 静置后备份；停机取源目录的
+   `State` 作期望，`treedb-load` 恢复出来的 `state_snapshot()` 必须**逐字段相等**；
+   同时要求「备份前后 `Ping` 都通」（在线）与「`backup → load → dump` 逐字节相同」
+   （确定性）。
+2. `an_online_backup_is_a_consistent_slice_while_the_primary_keeps_writing` —— 主每
+   400 条换一代快照的同时持续写；断言切面 `seq ∈ [备份前, 备份后]`、`nodes` 不倒退、
+   恢复后水位等于 `dump.seq` 且 `wal_records == 0`。
+3. `cli_exit_codes_are_the_scripting_contract` —— 2 = 参数不全/未知参数，
+   1 = 连不上，且 `--retries N` 真的转满 N 轮（`gap` 走的就是这条 `continue`）。
+
+**边界**：仍是**全量**备份（没有增量/差异）；没有 WAL 归档，所以没有 PITR（§6.7 那条
+结论不变）；不搬 `fence`（备份是内容不是权杖，要提升由 `treedb-standby --promote`
+发号）；不做压缩（管道交给 `gzip`，摘要走 stderr 以免污染字节流）。主端**零改动**：它
+只是被「副本之外的另一类只读客户端」读了同一对 op，`PROTOCOL_VERSION` 不动。要
+持续追平的镜像仍用 `treedb-standby`；要能停服的物理拷贝仍用 `cp -a`；`treedb-backup`
+补的是中间那一格 —— **不停服、一次性、可跨机器搬**。
 
 ---
 
@@ -2087,13 +2176,15 @@ treedb 这一列**没有**在 `v0.3.7` 与 `v0.4.0` 上复跑：`v0.3.7` 只改�
     apikey 与网关白名单就是这一层的现状），或者把端口锁在本机回环/私有网段里 ——
     `--listen` 默认就是 `127.0.0.1:7777`。也没有 TLS，没有 Unix socket 选项。视图名
     25 字节那道墙（第 8 条）只是命名空间隔离，不是访问控制。
-14. **备份能力就到 §6.7 那三形状 + §6.9 的离线 dump，不再多**。具体边界：无 PITR
+14. **备份能力是「五形状、三条不做」，不再多**。具体边界：无 PITR
     （`checkpoint` 会抹掉水位以下的日志 —— 同步档 `wal.reset()`、自动档
-    `truncate_before()` —— 历史切面不归档）；无增量备份、无加密备份；dump/load 是
-    **停服的整份导出**（两侧都要目录独占），不是在线热备；运行中 `cp -a` 拷不到撕裂尾但
-    切点不可控（实测：比拷贝前一刻多 14 400 条 seq），所以它不是备份工具；副本目录可以
-    当还原点，且从 v0.4.0 起有了 `treedb-standby --promote` 这条提升路径（§6.6「切主」），
-    但它只抬令牌、不开服务，旧主还得人确认停掉（第 6 条③）。
+    `truncate_before()` —— 历史切面不归档）；无增量备份、无加密备份；dump/load  是
+    **停服的整份导出**（两侧都要目录独占）；`treedb-backup`（§6.10）能从在线主拿一致
+    切面、不用停服，但它同样是**整份**导出且切面固定在一个 seq 上，不是持续追赶；
+    运行中 `cp -a` 拷不到 撕裂尾但切点不可控（实测：比拷贝前一刻多 14 400 条 seq），
+    所以它不是备份工具；副本目录可以当还原点，且从 v0.4.0 起有了
+    `treedb-standby --promote` 这条提升路径（§6.6「切主」），但它只抬令牌、不开服务，
+    旧主还得人确认停掉（第 6 条③）。
 15. **treedb 后端的连接池是「每进程」共享，池大小就是跨视图并发上限**（§7.12）。
     默认 `GROVEFS_TREEDB_CONNS = 4` 条长连接服务该进程里的**全部**视图，
     `TreedbStore` 不再各持一份 —— 这才是「10 000 视图 4 条连接」能成立的原因，但也
@@ -2165,7 +2256,8 @@ gcc -O2 -pthread -o /tmp/lb_floor benches/lb_floor.c && /tmp/lb_floor 1 64 3   #
 | `tests/engine_crud.rs` | **33** | §5.2 全部 POSIX 语义（含 GC 线索、NOREPLACE 与硬链接）+ 控制面（密钥/审计/定义/放置）+ checkpoint 后重开 + 坏尾截断；v0.5.0 新增 3 条硬链接：多名字共享 inode 与字节（含 `drop` 后重开仍是 `nlink = 2`）、五种拒绝各报对应 errno 且不动票数、覆盖其中一个名字只减一票；再往前新增 6 条：4 条盖通用表（表形状校验与表名回收、行写边界/约束/CAS/flags、主键与索引列游标翻页、表状态过 checkpoint+重开），1 条盖 `ReadDirPlus` 与 `ReadDir`+`Getattr` 逐字段对齐，1 条盖 `Stats` 新字段；2026-11-20 又加 2 条：`a_data_dir_refuses_a_second_engine`（同一个目录开第二个引擎必须被拒，且 `drop` 后立刻可开）、`unlink_and_rmdir_report_enotdir_for_a_non_dir_parent`（§5.2 的 `ENOTDIR` 口径）；2026-11-21 又加 2 条旁路快照：`background_snapshot_costs_a_dispatch_not_a_pause`（派工 37.5 µs vs 停轮 23.2 ms @ 20 000 节点，且取水位之后的尾巴必须活过 `truncate_before`）、`explicit_checkpoint_drains_the_background_one_first`（同步 checkpoint 先收掉在编那份，不许两份抢同一个 `.tmp`） |
 | `tests/net_protocol.rs` | **11** | TCP 端到端：CRUD、碎帧、pipeline 保序、并发连接不串扰、超长帧只杀违规者、大回包流式读完、`--stats`/`--checkpoint`/`--shutdown`（含两个磁盘长度与协议版本）、优雅停服后同地址立刻重绑、**通用表 + readdirplus 走 TCP**（1000 行 pipeline、错误帧经网络回真实 errno、8 KiB 收缓冲下大应答完整接回） |
 | `tests/dump_restore.rs` | **4** | §6.9 的目录级闭环：真造一份「每张表都有内容」的状态（视图/目录/文件/硬链接/符号链接/锁/引用/密钥/审计/定义/放置/两张表与行）→ 同步 checkpoint → 再写两条尾巴 → `dump_dir` → 落文件读回 → 导进新目录 → `Engine::open` 重开逐字段相等、`snap_seq == dump.seq`、`wal_records == 0`；**再从目标目录导一次比字节**（确定性）；第二条钉拒绝路径（非空目标拒且一个字节不动、空目录可导、服务在跑时 dump 被锁拒且释放后可导）；第三条钉零票引用不进 dump、`Kind` 与冗余 `Dent::kind` 过重建不变；第四条起**真进程**钉两个命令的退出码契约（0 完成 / 1 拒绝且不动字节 / 2 参数不全，含改一个字节后的 CRC 拒收与「锁解除后立即可导」） |
-| `tests/crash_recovery.rs` | **6** | §6.4 |
+| `tests/crash_recovery.rs` | **7** | §6.4；2026-11-21 加一条多 worker（`workers=4`）下 `kill -9` 的已 ack 写验收 —— 同一套断言在两条 ack 路径（默认同步档与 `--flush-pipeline`）上各跑一遍 |
+| `tests/backup_online.rs` | **3** | §6.10 的在线面：主静置时备份，停机取源目录 `State` 作期望，恢复后 **逐字段相等**，且「备份前后 `Ping` 都通」+ `backup → load → dump` 逐字节相同；主每 400 条换一代快照且持续写时，切面 `seq ∈ [备份前, 备份后]`、`nodes` 不倒退、恢复水位 = `dump.seq` 且 `wal_records == 0`；第三条起真进程钉退出码（2 参数 / 1 连不上）并验证 `--retries N` 真的转满 N 轮 |
 | `tests/read_scaling.rs` | **8** | 只读分派表逐条对 `translate`（判错一条就是丢写；语料 52 条全变体，钉住 52/22/30 三个数）、**三档划分穷举且两两不交**（`ops_partition_into_three_classes`，22/23/7，§4.2 与副本拒写的判据同源）、`workers=1/8` 答复逐条相同（负载含表读与 `ReadDirPlus`，混合批里把 CAS 写夹在读之间）、每连接流内顺序、一写多读不读到半截状态、`ops_total` 记上 worker 就地算的读、并行档下 `kill -9` 已 ack 的写全在（目录写与表写逐条交错）、**fd 复用不会把上一任的应答塞给新任** |
 | `tests/auth.rs` | **5** | §4.4 在线协议上的握手形状（MAC 的数学性质与闸门四档在 lib 单测里，不重复）：未握手的连接一个数据 op 也拿不到（**两种 worker 形状各一跑，两条路径拦截点不是同一处代码**）、错密钥被拒但不锁死 + 旧 MAC 重放不上 + 换对密钥能过、带密钥的客户端拒绝降级、未配密钥的服务端一次往返回 `authed: false`（这是 v5 客户端连 v4 形状不卡死的依据）、握手与数据 op 挤同批时**应答次序不能被打乱** |
 | `tests/replication.rs` | **14** | §6.6 的十二件事（十四条用例，端到端那一件两档各一条；主是真进程，副本是测试里的 `Engine` + `Follower`，只有最后三件起真 `treedb-standby`）：主写逐条收敛（ino/属性/readdir 与主对齐）、**主被 `kill -9` 后副本仍答读且不退出**（`replica_errors` 抬、`connected` 落 true→false）、**gap 触发分块重装快照**（4 KiB 块下 ≥ 2 块，且副本落盘的 `state.snap` 与主的逐字节相同）、**副本拒写在引擎层**（五个形状不同的写真 op 全 `EROFS` 且零 logs、零水位推进，而 `ListViews`/`Stats`/`Checkpoint` 放行）、**lag 中途为正、追平归零**（2 KiB/轮喂不饱一批）、**副本重启靠自己的日志接上**（`resyncs == 0`，快照+尾巴那条恢复路径）、端到端两档事件循环同一份断言（`workers=1`/`2`：线上 `EROFS`、`Stats` 新字段过线、追平后读到主的新写）、启动参数三道门（缺 `--primary` / 自己拉自己 / `--fetch-bytes 0` 均退出码 2）、**开了认证的主只有握得上手的副本追得动**（对密钥逐条收敛、错密钥不收敛）；v0.4.0 新增四条 fencing：令牌只升不降/落盘/坏文件不当 0、副本侧四档闸门（含“权力优先于新旧”与它的反面）、**真链路上提权后拒旧主的批**（状态不回滚、仍在答读、`replica_errors` 抬）、`--promote` 离线动作（不开端口、两次 0→1→2、与 `--primary` 同时给退出码 2） |

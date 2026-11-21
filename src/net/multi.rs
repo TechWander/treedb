@@ -104,13 +104,15 @@ struct Counters {
 
 /// 一条 worker 线程启动时需要的东西。
 ///
-/// 以前它是 `Copy`（四个数）；加了 `auth` 之后只能降到 `Clone` —— 一个
+/// 监听套接字不在这里：主线程已经 bind 好、随参数交给线程（`guarded_worker`）。
+/// 历史上这里还挂过 `listen`/`backlog` 两个字段，自从 bind 上移之后就没人读过，
+/// 已清掉。
+///
+/// 以前它是 `Copy`（几个整数）；加了 `auth` 之后只能降到 `Clone` —— 一个
 /// `Arc` 多一次计数，在线程启动时付一次，不在数据面上。
 #[derive(Clone)]
 struct WorkerCfg {
     idx: usize,
-    listen: SocketAddr,
-    backlog: i32,
     sync_ms: i32,
     /// 接入认证密钥（§4.4）。`None` = 不认证，与 `ServerConfig::auth` 同语义。
     auth: Option<Arc<crate::net::auth::Key>>,
@@ -152,8 +154,6 @@ pub(crate) fn serve(
     for (i, l) in listeners.into_iter().enumerate() {
         let arg = WorkerCfg {
             idx: i,
-            listen: cfg.listen,
-            backlog: cfg.backlog,
             sync_ms: cfg.sync_ms,
             auth: cfg.auth.clone(),
         };
