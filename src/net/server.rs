@@ -732,10 +732,14 @@ pub(crate) fn serve_single(cfg: &ServerConfig, stop: &AtomicBool, live: &AtomicU
             engine.sync_now()?;
             last_sync = Instant::now();
         }
+        // 旁路快照（§8 第 7 条）：每轮先收一份已完成的（常数时间：看一眼
+        // 线程是否结束），再判要不要派新的。派工只取水位 + 起线程，本轮停顿
+        // 与状态大小无关；编快照的成本在后台线程里，收尾只做一次「抹掉前段」。
+        engine.checkpoint_poll()?;
         if cfg.auto_checkpoint_bytes > 0 {
             // 只要 WAL 尺寸：走 snapshot_stats() 会变成每轮数一遍七张表。
             if engine.wal_bytes() > cfg.auto_checkpoint_bytes {
-                engine.checkpoint()?;
+                engine.checkpoint_start()?;
             }
         }
         // 副本追平（§6.6）。放在 checkpoint 之后：自己这边的周期任务先做完，

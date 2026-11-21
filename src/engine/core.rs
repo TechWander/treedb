@@ -29,6 +29,7 @@ use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::thread::JoinHandle;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// 取读锁。poison 只可能来自 worker 线程 panic（它们只读，不会把状态改成
@@ -382,6 +383,73 @@ pub struct Engine {
     fence: u64,
     /// 数据目录的进程间互斥。字段只为活着（drop = 解锁）。
     _lock: DirLock,
+    /// 正在后台编的一份快照（§8 第 7 条）。有它时自动档不再派新的；
+    /// 退出、显式 checkpoint 与副本装快照都会先把它收掉。
+    inflight: Option<Inflight>,
+}
+
+/// 一份正在后台生成的快照。
+struct Inflight {
+    /// 要写进快照尾巴的水位，也是回来之后 `truncate_before` 的切割点。
+    seq: u64,
+    handle: JoinHandle<Result<u64>>,
+}
+
+/// 旁路快照的全部工作：读 `state.snap` → 重放 `(snap_seq, upto]` 的 WAL →
+/// 编成新快照 → tmp / fsync / rename。
+///
+/// **不碰活状态**，因此不持任何读锁：这正是「停顿与状态大小无关」的来源。
+/// 读的是磁盘上那两个文件，与 `Engine::open` 的恢复路径是同一份语义；写入端
+/// 同时在追加 WAL 也没关系——只要 `upto` 之前的字节都落了盘（`durable_seq`
+/// 的定义），按帧顺序读到那里就是完整的。
+///
+/// 失败只会留下「旧快照 + 更长的 WAL」，与崩溃恢复看到的形状一样。
+fn build_snapshot_from_disk(dir: &Path, upto: u64) -> Result<u64> {
+    let snap_path = dir.join(SNAP_FILE);
+    let (mut state, snap_seq) = if snap_path.exists() {
+        let raw = std::fs::read(&snap_path)?;
+        let (body, seq) = State::snapshot_split(&raw)?;
+        (State::load(&mut Rd::new(body))?, seq)
+    } else {
+        (State::new(), 0u64)
+    };
+    if upto < snap_seq {
+        return Err(Error::Io(format!(
+            "background snapshot target {upto} is behind the on-disk snapshot {snap_seq}"
+        )));
+    }
+    let mut logs = Wal::replay(&dir.join(WAL_FILE), snap_seq)?;
+    let need = (upto - snap_seq) as usize;
+    if logs.len() < need {
+        return Err(Error::Io(format!(
+            "background snapshot wanted {need} wal record(s) past {snap_seq}, log has {}",
+            logs.len()
+        )));
+    }
+    // 多出来的是取水位之后才进的写：它们不进这份快照，留给日志（
+    // `truncate_before` 会把它们原样搬到新日志里）。
+    logs.truncate(need);
+    for l in &logs {
+        state.apply(l);
+    }
+    let mut w = W::new();
+    state.save_with_trailer(&mut w, upto);
+    let buf = w.finish();
+    let tmp = dir.join(format!("{SNAP_FILE}.tmp"));
+    {
+        let mut f = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp)?;
+        f.write_all(&buf)?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, snap_path)?;
+    if let Ok(d) = File::open(dir) {
+        let _ = d.sync_all();
+    }
+    Ok(upto)
 }
 
 impl Engine {
@@ -447,6 +515,7 @@ impl Engine {
                 elapsed_ms: t0.elapsed().as_millis() as u64,
             },
             _lock: lock,
+            inflight: None,
         };
         // Stats 反映本进程服务量，故不把恢复期的重放计入 ops/writes；
         // 但 seq 水位必须对齐磁盘，否则重启后第一次 Stats 会回退。
@@ -734,11 +803,84 @@ impl Engine {
         self.wal.logical_size().unwrap_or(0)
     }
 
-    /// 全量快照 + WAL 重置。
+    /// 派一份旁路快照（§8 第 7 条）。返回是否真派出去了。
+    ///
+    /// 热路径在这里只做两件事：取一个已经 durable 的水位、起一个线程。编快照
+    /// （重放 + 全量编码 + 写盘 + fsync）全在后台，所以本轮停顿与状态大小
+    /// 无关 —— 这是与 [`Engine::checkpoint`] 那条 stop-the-round 路径的区别。
+    ///
+    /// 已经有一份在路上时直接返回 `false`：让它编完更划算，硬插一份只会
+    /// 两份抢同一个 `state.snap.tmp`。
+    pub fn checkpoint_start(&mut self) -> Result<bool> {
+        if self.inflight.is_some() {
+            return Ok(false);
+        }
+        // 水位取已 durable 的 seq：内存可能比磁盘更靠前（本轮 commit 尚未
+        // fsync），把未落盘的记录当成“快照已覆盖”会丢数据。
+        let seq = self.wal.durable_seq();
+        if seq <= self.snap_seq {
+            return Ok(false);
+        }
+        let dir = self.dir.clone();
+        let handle = std::thread::Builder::new()
+            .name("treedb-snap".into())
+            .spawn(move || build_snapshot_from_disk(&dir, seq))
+            .map_err(|e| Error::Io(format!("spawn background snapshot: {e}")))?;
+        self.inflight = Some(Inflight { seq, handle });
+        Ok(true)
+    }
+
+    /// 收一份已完成的旁路快照（非阻塞）：`Some(seq)` = 这一次落定。
+    ///
+    /// 要每轮调一次。后台线程的错不吞：编不出来说明盘或日志有真问题，与
+    /// 同步 checkpoint 报错同一个处置（事件循环随之退出）。
+    pub fn checkpoint_poll(&mut self) -> Result<Option<u64>> {
+        match self.inflight.as_ref() {
+            Some(j) if j.handle.is_finished() => self.finish_checkpoint(),
+            _ => Ok(None),
+        }
+    }
+
+    /// 等在路上的那份落定（没有就什么都不做）。
+    pub fn checkpoint_wait(&mut self) -> Result<()> {
+        self.finish_checkpoint().map(|_| ())
+    }
+
+    fn finish_checkpoint(&mut self) -> Result<Option<u64>> {
+        let Some(job) = self.inflight.take() else {
+            return Ok(None);
+        };
+        let seq = match job.handle.join() {
+            Ok(Ok(seq)) => seq,
+            Ok(Err(e)) => return Err(e),
+            Err(_) => return Err(Error::Io("background snapshot thread panicked".into())),
+        };
+        if seq != job.seq {
+            return Err(Error::Io(format!(
+                "background snapshot reported seq {seq} for a job dispatched at {}",
+                job.seq
+            )));
+        }
+        // 快照已经是水位 `seq` 的那一份：日志里 ≤ seq 的记录从此多余，而取
+        // 水位之后才 ack 的那些只活在日志里 —— 所以是「抹掉前段、留下尾巴」，
+        // 不是 `wal.reset`（那会把尾巴一起清掉，等于静默丢已确认的写）。
+        self.wal.truncate_before(seq)?;
+        self.snap_seq = seq;
+        self.stats.snap_seq = seq;
+        self.stats.checkpoints += 1;
+        Ok(Some(seq))
+    }
+
+    /// 全量快照 + WAL 重置（停轮），退出路径与显式命令走这条。
     ///
     /// 顺序：state.save → tmp → fsync(tmp) → rename → fsync(dir) → wal.reset。
     /// 任一步崩溃都只可能留下「旧快照 + 更长的 WAL」，重放仍能还原。
+    ///
+    /// 自动档不走这里（§8 第 7 条）：它在轮与轮之间派 [`Engine::checkpoint_start`]，
+    /// 只在本函数里停轮一口气编完。开编前先把在路上的那份收掉：两份抢同一个
+    /// tmp，而且收得晚的那份会把水位往回带。
     pub fn checkpoint(&mut self) -> Result<u64> {
+        self.checkpoint_wait()?;
         // 水位取当前已 durable 的 seq：内存可能比磁盘更靠前（本轮 commit
         // 尚未发生），把未落盘的记录当成"快照已覆盖"会丢数据。
         let seq = self.wal.durable_seq();
@@ -899,6 +1041,8 @@ impl Engine {
     /// 那才是真的脑裂回滚。所以判据不是“谁更新”，而是“谁有权写”，权力相同
     /// 时才比新旧。
     pub fn install_snapshot(&mut self, bytes: &[u8], epoch: u64) -> Result<u64> {
+        // 在路上的旁路快照先收掉：它和下面这句都要动 `state.snap`。
+        self.checkpoint_wait()?;
         let was = self.fence;
         self.admit_epoch(epoch, "snapshot")?;
         // 先切尾巴（顺带验主的 crc32）：传输层保的是“字节到了”，不保“字节没
@@ -1077,6 +1221,24 @@ impl Engine {
     #[allow(dead_code)]
     pub fn next_seq(&self) -> u64 {
         self.stats.seq
+    }
+}
+
+impl Drop for Engine {
+    /// 退出时不能把后台快照线程丢下：它可能在别的进程已经接管目录、写下更新的
+    /// 快照之后才 rename，把快照水位往回带。这里等的是本地一次重放 + fsync，
+    /// 不等网络 —— 值得。
+    ///
+    /// 不在这里补 `truncate_before`：日志里还剩哪些记录都不影响恢复（`open` 按
+    /// 快照水位过滤），而 drop 阶段拿不到 `Result` 可回，做一半的整理只能靠猜。
+    fn drop(&mut self) {
+        if let Some(job) = self.inflight.take() {
+            match job.handle.join() {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => eprintln!("treedb: background snapshot failed on drop: {e}"),
+                Err(_) => eprintln!("treedb: background snapshot thread panicked on drop"),
+            }
+        }
     }
 }
 

@@ -796,13 +796,17 @@ fn committer(
             engine.sync_now()?;
             last_sync = Instant::now();
         }
+        // 旁路快照（§8 第 7 条）：收一份已完成的 + 判要不要派新的，两件都是
+        // 常数时间。这里不能走 stop-the-round 的那条：一条慢轮会把所有连接
+        // 的 ack 一起拖长，而那正是自动档要避免的。
+        engine.checkpoint_poll()?;
         if cfg.auto_checkpoint_bytes > 0 {
             // 只要 WAL 尺寸。这里不能走 `snapshot_stats()`：它除了判尺寸还会
             // 顺手折一次 worker 的 op 计数，而折计数只在有人真问数时才值钱
             // （`Op::Stats` 与退出收口两处），每轮折一次等于白拿一次读锁，
             // 而且 dentry 条数在两层表下是 O(目录数)。
             if engine.wal_bytes() > cfg.auto_checkpoint_bytes {
-                engine.checkpoint()?;
+                engine.checkpoint_start()?;
             }
         }
         if let Some(f) = follower.as_mut() {

@@ -609,6 +609,96 @@ impl Wal {
             .map(|m| m.len())
             .unwrap_or(self.allocated))
     }
+
+    /// checkpoint 之后把 `(0, seq]` 的记录从日志里抹掉，**保留 `seq` 之后
+    /// 的那些**，返回保留下来多少条。
+    ///
+    /// 为什么不直接 [`Wal::reset`]：同步 checkpoint 在单线程循环里跑，取水位
+    /// 那一刻之后不可能再进新记录，所以「全清 + 水位接回 seq」恰好等价于
+    /// 「抹掉 ≤ seq」。旁路快照（`Engine::checkpoint_start`）不同 —— 它在后台
+    /// 线程里编，期间事件循环照常 commit，那些 > seq 的记录**已经 ack、只活在
+    /// 日志里**（内存里也有，但重启之后只剩日志）。一起抹掉就是静默丢已确认
+    /// 的写，所以这里逐帧把尾巴搬进新文件；seq 不从 0 重编 —— 重编会让恢复时
+    /// 快照水位与日志首条对不上。
+    ///
+    /// 顺序与 [`Wal::reset`] 同一套纪律：新文件 → `sync_all` → rename → 刷父目录。
+    /// 任一步崩溃只会留下「旧快照 + 更长的 WAL」或「新日志」两个自洽形状。
+    /// 预分配空洞 / 短读 / CRC 不符一律当尾部（与 [`Wal::replay`] 同口径）：
+    /// 那些字节要么从没写过，要么本身就是未确认的写。
+    pub fn truncate_before(&mut self, seq: u64) -> Result<u64> {
+        let tmp = self.path.with_extension("wal.tmp");
+        let mut src = OpenOptions::new().read(true).open(&self.path)?;
+        let mut out = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(&tmp)?;
+        out.set_len(0)?;
+        let mut hdr = [0u8; HDR];
+        let mut body: Vec<u8> = Vec::new();
+        let mut end = 0u64;
+        let mut kept = 0u64;
+        let mut last = seq;
+        let mut next = seq + 1;
+        loop {
+            if !read_exact_or_eof(&mut src, &mut hdr)? {
+                break;
+            }
+            let s = u64::from_le_bytes(hdr[0..8].try_into().unwrap());
+            let crc = u32::from_le_bytes(hdr[8..12].try_into().unwrap());
+            let len = u32::from_le_bytes(hdr[12..16].try_into().unwrap());
+            if len == 0 || len > MAX_RECORD {
+                break;
+            }
+            body.clear();
+            body.resize(len as usize, 0);
+            if !read_exact_or_eof(&mut src, &mut body)? {
+                break;
+            }
+            if crc32(&body) != crc {
+                break;
+            }
+            if s <= seq {
+                continue;
+            }
+            if s != next {
+                return Err(Error::Io(format!(
+                    "wal record seq gap while compacting {}: expected {next}, found {s}",
+                    self.path.display()
+                )));
+            }
+            out.write_all(&s.to_le_bytes())?;
+            out.write_all(&crc32(&body).to_le_bytes())?;
+            out.write_all(&(body.len() as u32).to_le_bytes())?;
+            out.write_all(&0u32.to_le_bytes())?;
+            out.write_all(&body)?;
+            end += (HDR + body.len()) as u64;
+            next = s + 1;
+            last = s;
+            kept += 1;
+        }
+        let pre = preallocate(&out, PREALLOC_MIN.max(end));
+        // 长度/内容先落定再 rename，与 reset 同一条理由：换名之后新文件就是
+        // 唯一的日志，它的扇区与长度必须已经在盘上。
+        out.sync_all()?;
+        std::fs::rename(&tmp, &self.path)?;
+        let dir = self
+            .path
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("."));
+        if let Ok(d) = File::open(&dir) {
+            let _ = d.sync_all();
+        }
+        self.file = out;
+        self.end = end;
+        self.allocated = if pre.is_ok() { PREALLOC_MIN.max(end) } else { end };
+        self.prealloc_ok = pre.is_ok();
+        // 保留下来的那些记录刚被 `sync_all` 带下去了，所以水位至少是 `last`。
+        self.next_seq = next;
+        self.durable_seq = last.max(seq);
+        Ok(kept)
+    }
 }
 
 /// 把 `f` 的真实长度抬到 `target` 并保证那段空间可读为 0。
@@ -829,6 +919,57 @@ mod tests {
         let (w2, last2, end2) = Wal::open(&p).unwrap();
         assert_eq!(last2, 8);
         assert_eq!(w2.logical_size().unwrap(), end2);
+    }
+
+    /// 旁路快照的收尾切割：`(0, seq]` 整段丢掉，`seq` 之后的尾巴原样搬走，
+    /// seq 一个都不重编。
+    ///
+    /// 换成 `reset(seq)` 写这条测试就会红 —— 尾巴那两条已经 ack 的写会连着
+    /// 前缀一起蒸发，这是「已确认的写不丢」直接破掉的地方。
+    #[test]
+    fn truncate_before_drops_the_covered_prefix_and_keeps_the_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("t.wal");
+        let tail_bytes = (HDR + log_payload(&put_view(b"v4", 4)).len()
+            + HDR
+            + log_payload(&put_view(b"v5", 5)).len()) as u64;
+        let mut w = Wal::open(&p).unwrap().0;
+        for i in 1..=3u32 {
+            w.commit(&[log_payload(&put_view(format!("v{i}").as_bytes(), i))])
+                .unwrap();
+        }
+        w.commit(&[
+            log_payload(&put_view(b"v4", 4)),
+            log_payload(&put_view(b"v5", 5)),
+        ])
+        .unwrap();
+
+        assert_eq!(w.truncate_before(3).unwrap(), 2, "水位之前那三条该被丢掉");
+        assert_eq!(w.next_seq(), 6, "切割不能把已经用掉的 seq 还回去");
+        assert_eq!(w.durable_seq(), 5, "搬过来的尾巴已经 sync，水位跟着它走");
+        assert_eq!(w.logical_size().unwrap(), tail_bytes);
+        assert_eq!(
+            Wal::replay(&p, 0).unwrap(),
+            vec![put_view(b"v4", 4), put_view(b"v5", 5)],
+            "尾巴必须原样留在文件里，一条不少、号也不变"
+        );
+
+        // 切割之后接着写：seq 接得上，重开也不跳号。
+        assert_eq!(w.commit(&[log_payload(&put_view(b"v6", 6))]).unwrap(), 6);
+        drop(w);
+        let (mut w2, last, end) = Wal::open(&p).unwrap();
+        assert_eq!(last, 6);
+        assert_eq!(w2.logical_size().unwrap(), end);
+        assert_eq!(Wal::replay(&p, 0).unwrap().len(), 3);
+
+        // 全部被盖住：文件清空，但水位不退回 1。
+        assert_eq!(w2.truncate_before(6).unwrap(), 0);
+        assert_eq!(w2.logical_size().unwrap(), 0);
+        assert_eq!(w2.next_seq(), 7);
+        assert_eq!(w2.durable_seq(), 6);
+        assert_eq!(w2.commit(&[log_payload(&put_view(b"v7", 7))]).unwrap(), 7);
+        drop(w2);
+        assert_eq!(Wal::replay(&p, 0).unwrap(), vec![put_view(b"v7", 7)]);
     }
 
     /// 预分配空洞不能被当成记录：健康日志重开 N 次都得给出同样的结论。

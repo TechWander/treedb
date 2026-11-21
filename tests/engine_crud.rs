@@ -1999,3 +1999,134 @@ fn unlink_and_rmdir_report_enotdir_for_a_non_dir_parent() {
     // 正常的 unlink 不受影响。
     ok(&mut e, &Op::Unlink { view: v, parent: 1, name: b"f".to_vec() });
 }
+
+// ------------------------------------------------- 旁路快照（§8 第 7 条）
+
+/// 等到后台快照落定，返回它写进快照尾巴的水位。
+fn settle_background(e: &mut Engine) -> u64 {
+    for _ in 0..10_000 {
+        if let Some(seq) = e.checkpoint_poll().expect("poll") {
+            return seq;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    panic!("background snapshot never landed");
+}
+
+/// 停轮的代价必须与状态大小脱钩：派工只取水位 + 起线程。
+///
+/// 这个用例同时把最危险的那一格钉住 —— **取水位之后才 ack 的写**。它们不在
+/// 这份快照里，只活在日志中；收尾若走 `wal.reset` 就会把它们一起抹掉，重启
+/// 后两条都消失（内存里有、盘上没有，等于静默丢已确认的写）。
+#[test]
+fn background_snapshot_costs_a_dispatch_not_a_pause() {
+    use std::time::Instant;
+    const N: usize = 20_000;
+    let d = Dir::new("bgpause");
+    let mut e = Engine::open(&d.path(), Durability::Never).expect("open");
+    let v = mk_view(&mut e, "v");
+    for i in 0..N {
+        ok(
+            &mut e,
+            &Op::Create {
+                view: v,
+                parent: 1,
+                name: format!("f{i}").into(),
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+            },
+        );
+    }
+    e.sync_now().expect("sync");
+
+    // 基准：同规模状态走一次停轮快照。
+    let t = Instant::now();
+    let sync_seq = e.checkpoint().expect("sync checkpoint");
+    let paused = t.elapsed();
+
+    // 再来一条写，好让旁路快照有活干。
+    ok(
+        &mut e,
+        &Op::Create { view: v, parent: 1, name: b"after".to_vec(), mode: 0o644, uid: 0, gid: 0 },
+    );
+    e.sync_now().expect("sync");
+    // 一条写可能落好几条日志（inode + 目录项 + …），所以这里不断言步长，
+    // 只确认「水位确实往前走了」—— 派工取的就是它。
+    let cut = e.snapshot_stats().seq;
+    assert!(cut > sync_seq, "写一条新 op 之后水位必须往前走：{sync_seq} → {cut}");
+
+    let t = Instant::now();
+    assert!(e.checkpoint_start().expect("start"), "应当真的派出去");
+    let dispatch = t.elapsed();
+    eprintln!("checkpoint pause vs dispatch @ {N} nodes: paused={paused:?} dispatch={dispatch:?}");
+    assert!(
+        dispatch * 5 < paused,
+        "派工 {dispatch:?} 应当远小于停轮 {paused:?}（状态 {N} 条）"
+    );
+    // 在路上时第二次派工直接放弃：不让两份抢同一个 `state.snap.tmp`。
+    assert!(!e.checkpoint_start().expect("second start"), "不许两份同时在编");
+
+    // 取水位之后才 ack 的两条：不属于这份快照，但必须活过日志整理。
+    for name in [b"tail1".to_vec(), b"tail2".to_vec()] {
+        ok(
+            &mut e,
+            &Op::Create { view: v, parent: 1, name, mode: 0o644, uid: 0, gid: 0 },
+        );
+    }
+    e.sync_now().expect("sync");
+
+    assert_eq!(settle_background(&mut e), cut, "快照水位就是派工时取的那一个");
+    assert_eq!(e.snapshot_stats().snap_seq, cut);
+    drop(e);
+
+    let mut e = Engine::open(&d.path(), Durability::Never).expect("reopen");
+    for name in [
+        "f0".to_string(),
+        format!("f{}", N - 1),
+        "after".to_string(),
+        "tail1".to_string(),
+        "tail2".to_string(),
+    ] {
+        let n = node(ok(
+            &mut e,
+            &Op::Lookup { view: v, parent: 1, name: name.clone().into_bytes() },
+        ));
+        assert_eq!(n.nlink, 1, "{name} 没活过旁路快照");
+    }
+}
+
+/// 退出/显式 checkpoint 会先把在路上的那份收掉：两份抢同一个 tmp，而且
+/// 收得晚的那份会把水位往回带。
+#[test]
+fn explicit_checkpoint_drains_the_background_one_first() {
+    let d = Dir::new("bgdrain");
+    let mut e = d.open();
+    let v = mk_view(&mut e, "v");
+    for i in 0..3 {
+        ok(
+            &mut e,
+            &Op::Create {
+                view: v,
+                parent: 1,
+                name: format!("n{i}").into(),
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+            },
+        );
+    }
+    assert!(e.checkpoint_start().expect("start"));
+    // 不等它跑完，直接走同步那条：开编前它自己会先 join。
+    let seq = e.checkpoint().expect("sync checkpoint");
+    assert_eq!(e.snapshot_stats().snap_seq, seq);
+    drop(e);
+
+    let mut e = Engine::open(&d.path(), Durability::Always).expect("reopen");
+    for i in 0..3 {
+        node(ok(
+            &mut e,
+            &Op::Lookup { view: v, parent: 1, name: format!("n{i}").into_bytes() },
+        ));
+    }
+}

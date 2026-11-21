@@ -16,8 +16,8 @@ cargo build --release                                   # 默认档：依赖只�
 ./target/release/treedb-server --dir /var/lib/treedb --listen 127.0.0.1:7777
 ./target/release/treedb-bench --op lookup --conns 64 --pipeline 32 --secs 3
 
-cargo test --release                                    # 默认档 148 passed（引擎本体）
-cargo test --release --features postgres-compat        # 179 passed（含 PG 过渡档）
+cargo test --release                                    # 默认档 150 passed（引擎本体）
+cargo test --release --features postgres-compat        # 181 passed（含 PG 过渡档）
 bash benches/throughput_matrix.sh 3 1 2 3 4 5           # 五轴复现，输出进 benches/results/
 bash benches/sync_ratio.sh 3                           # 写路径机制：一次 fsync 摊了多少写
 bash benches/single_conn.sh 3                          # 单连接对标 PG（$PIPE=32 走批量档、$CONNS/$WORKERS 走并发档）
@@ -39,7 +39,7 @@ bash benches/handshake_cost.sh 20000                   # 接入握手的代价�
 ```
 
 回滚是把自动落下的 `state.snap.v2.bak` 拷回去再跑旧二进制 —— 但无损只维持到新二进制
-做过第一次 checkpoint 之前（checkpoint 会 `wal.reset()`，把上一代日志物理抹掉）。
+做过第一次 checkpoint 之前（同步 checkpoint 会 `wal.reset()`，把上一代日志物理抹掉）。
 四条承诺、回滚窗口与为什么不在启动路径上开「自动兼容读」的口子，见
 [DESIGN.md](DESIGN.md) §6.5；`bash benches/rehearse_migrate.sh v0.3.2` 拿真旧二进制
 把整条链（造旧目录 → 迁移 → 开门 → 回滚）复算一遍。
@@ -171,7 +171,8 @@ DESIGN.md §7（含 §7.8 那次全五轴复跑）。
   能证明「持有密钥」了，`v0.4.0` 起也能认出被提掉权的旧主（`fence`，§6.6）；但
   那只保护副本，不阻止旧主对自己的客户端继续服务。
 - **没有 PITR、没有 dump/load、没有增量与加密备份**（§8 第 14 条、§6.7）。checkpoint 会
-  `wal.reset()`，历史切面不归档；运行中 `cp -a` 能起服、无撕裂，但切点不可控（实测比
+  抹掉水位以下的日志（同步档 `wal.reset()`、自动档 `truncate_before()`），历史切面
+  不归档；运行中 `cp -a` 能起服、无撕裂，但切点不可控（实测比
   「拷贝前一刻」多 14 400 条 seq），所以它不是备份工具。
 - **没有 SQL、没有 JOIN/排序/范围谓词、没有用户可见事务、没有跨视图原子 op**（§5.3）。
   通用表只给「按唯一键取一行、按前缀列举个数」这一档机制，语义留给接入方。
