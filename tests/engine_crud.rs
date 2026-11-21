@@ -588,6 +588,154 @@ fn unlink_and_rename_report_the_last_holder_key() {
     assert_eq!(err_code(&mut e, &Op::Lookup { view: v, parent: 1, name: b"x".to_vec() }), errno::ENOENT);
 }
 
+// ---------------------------------------------------------------- 硬链接
+
+/// `Op::Link` 的权责：两个名字一个 inode、`nlink` 记账、内容对象只在最后一个
+/// 名字离开时下账。grovefs 的 `ln` 类断言在 treedb 后端从 SKIP 变 OK 靠的就是
+/// 这里 —— 引擎侧唯一缺的就是「第二根 dentry」。
+#[test]
+fn hard_links_share_the_inode_and_keep_bytes_alive() {
+    let d = Dir::new("link");
+    let mut e = d.open();
+    let v = mk_view(&mut e, "ln");
+    let f = mk_file(&mut e, v, 1, "f");
+    ok(&mut e, &commit_ref(v, f.ino, 900, 1024));
+
+    // 第二个名字：同一个 ino、nlink 2、内容对象原样共享（不复制、不重复记账）。
+    let n = node(ok(&mut e, &Op::Link { view: v, ino: f.ino, parent: 1, name: b"g".to_vec() }));
+    assert_eq!((n.ino, n.nlink), (f.ino, 2));
+    assert_eq!(n.data_ref, blk(900), "另一个名字共享同一份内容对象");
+    assert_eq!(node(ok(&mut e, &Op::Lookup { view: v, parent: 1, name: b"g".to_vec() })).ino, f.ino);
+    assert_eq!(refcount(&mut e, 900), (1, 1024), "Link 不动引用账本");
+
+    // 摘一个名字：inode 还在、nlink 1、字节仍被持有 —— 应答必须是空键，
+    // 否则调用方会把还在用的对象当孤儿回收。
+    assert_eq!(
+        ok(&mut e, &Op::Unlink { view: v, parent: 1, name: b"f".to_vec() }),
+        Reply::NodeRef(Vec::new())
+    );
+    assert_eq!(getattr(&mut e, v, f.ino).nlink, 1);
+    assert_eq!(refcount(&mut e, 900), (1, 1024));
+    assert_eq!(
+        err_code(&mut e, &Op::Lookup { view: v, parent: 1, name: b"f".to_vec() }),
+        errno::ENOENT
+    );
+
+    // 最后一个名字离开时才把键带回来。
+    assert_eq!(
+        ok(&mut e, &Op::Unlink { view: v, parent: 1, name: b"g".to_vec() }),
+        Reply::NodeRef(blk(900))
+    );
+    assert_eq!(refcount(&mut e, 900), (0, 0));
+
+    // 重开引擎：nlink 与 dentry 都得从快照 / WAL 里回来，不是只活在内存里。
+    drop(e);
+    let mut e = d.open();
+    let re = mk_file(&mut e, v, 1, "again");
+    ok(&mut e, &Op::Link { view: v, ino: re.ino, parent: 1, name: b"again2".to_vec() });
+    assert_eq!(getattr(&mut e, v, re.ino).nlink, 2, "重建后 nlink 必须是 2");
+    assert_eq!(node(ok(&mut e, &Op::Lookup { view: v, parent: 1, name: b"again2".to_vec() })).ino, re.ino);
+}
+
+/// 拒绝面逐条点名 errno：`link(2)` 没有 upsert、目录不可链接、父目录先验优先。
+#[test]
+fn link_refusals_name_the_posix_errno() {
+    let d = Dir::new("link-err");
+    let mut e = d.open();
+    let v = mk_view(&mut e, "lne");
+    let f = mk_file(&mut e, v, 1, "f");
+    let dir = mk_dir(&mut e, v, 1, "d");
+    let link = |name: &[u8], ino: u64, parent: u64| Op::Link {
+        view: v,
+        ino,
+        parent,
+        name: name.to_vec(),
+    };
+
+    assert_eq!(err_code(&mut e, &link(b"f", f.ino, 1)), errno::EEXIST, "同名就 EEXIST，含 ln f f");
+    assert_eq!(err_code(&mut e, &link(b"x", dir.ino, 1)), errno::EPERM, "目录不可链接");
+    assert_eq!(err_code(&mut e, &link(b"x", 9999, 1)), errno::ENOENT);
+    assert_eq!(err_code(&mut e, &link(b"x", f.ino, f.ino)), errno::ENOTDIR, "父是文件");
+    assert_eq!(err_code(&mut e, &link(b"x", f.ino, 9999)), errno::ENOENT, "父不存在");
+    assert_eq!(err_code(&mut e, &link(b"a/b", f.ino, 1)), errno::EINVAL, "名字里的 '/' 是协议级错误");
+    assert_eq!(getattr(&mut e, v, f.ino).nlink, 1, "拒绝不许改动 inode 画像");
+}
+
+/// 覆盖「多链接 inode 的一个名字」时只减一票：另一个名字还能读，字节不下账。
+/// 两条覆盖路径都要走一遍 —— `Rename` 的覆盖目标与 `Symlink` 的 upsert。
+#[test]
+fn overwriting_one_of_several_links_only_drops_one_vote() {
+    let d = Dir::new("link-over");
+    let mut e = d.open();
+    let v = mk_view(&mut e, "lno");
+
+    // f 与 g 是同一个 inode，内容对象 905 只被它持有一次。
+    let f = mk_file(&mut e, v, 1, "f");
+    ok(&mut e, &commit_ref(v, f.ino, 905, 4096));
+    ok(&mut e, &Op::Link { view: v, ino: f.ino, parent: 1, name: b"g".to_vec() });
+    assert_eq!(refcount(&mut e, 905), (1, 4096));
+
+    // rename 覆盖 g：inode 还活着（f 这个名字还在），引用不许下账。
+    let tmp = mk_file(&mut e, v, 1, "tmp");
+    assert_eq!(
+        ok(&mut e, &Op::Rename { view: v, old_parent: 1, old_name: b"tmp".to_vec(), new_parent: 1, new_name: b"g".to_vec(), flags: 0 }),
+        Reply::NodeRef(Vec::new())
+    );
+    assert_eq!(getattr(&mut e, v, f.ino).nlink, 1);
+    assert_eq!(refcount(&mut e, 905), (1, 4096), "另一个名字还指着它");
+    assert_eq!(node(ok(&mut e, &Op::Lookup { view: v, parent: 1, name: b"f".to_vec() })).ino, f.ino);
+    assert_eq!(node(ok(&mut e, &Op::Lookup { view: v, parent: 1, name: b"g".to_vec() })).ino, tmp.ino);
+
+    // 再挂一次，然后用 symlink 的 upsert 覆盖其中一个名字。
+    ok(&mut e, &Op::Link { view: v, ino: f.ino, parent: 1, name: b"h".to_vec() });
+    assert_eq!(getattr(&mut e, v, f.ino).nlink, 2);
+    ok(&mut e, &Op::Symlink { view: v, parent: 1, name: b"h".to_vec(), target: b"t".to_vec(), uid: 1000, gid: 1000 });
+    assert_eq!(getattr(&mut e, v, f.ino).nlink, 1, "upsert 也只减一票");
+    assert_eq!(refcount(&mut e, 905), (1, 4096));
+    assert_eq!(node(ok(&mut e, &Op::Lookup { view: v, parent: 1, name: b"h".to_vec() })).kind, Kind::Symlink);
+    assert_eq!(node(ok(&mut e, &Op::Lookup { view: v, parent: 1, name: b"f".to_vec() })).ino, f.ino);
+
+    // 同一个 inode 的两个名字互相 rename：POSIX 要求成功且什么都不做。不挡
+    // 的话，「被覆盖项只减一票」会与末尾那份按旧 nlink 写的 PutNode 打架，
+    // 留下一个没有第二个名字却 nlink = 2 的 inode —— 此后它永远删不掉。
+    ok(&mut e, &Op::Link { view: v, ino: f.ino, parent: 1, name: b"k".to_vec() });
+    assert_eq!(getattr(&mut e, v, f.ino).nlink, 2);
+    assert_eq!(
+        ok(&mut e, &Op::Rename { view: v, old_parent: 1, old_name: b"f".to_vec(), new_parent: 1, new_name: b"k".to_vec(), flags: 0 }),
+        Reply::NodeRef(Vec::new())
+    );
+    assert_eq!(getattr(&mut e, v, f.ino).nlink, 2, "两个名字都在，票数不动");
+    assert_eq!(node(ok(&mut e, &Op::Lookup { view: v, parent: 1, name: b"f".to_vec() })).ino, f.ino);
+
+    // 跨目录也是同一条：不是「先删旧名字再建新名字」。
+    let sub = mk_dir(&mut e, v, 1, "sub");
+    ok(&mut e, &Op::Link { view: v, ino: f.ino, parent: sub.ino, name: b"far".to_vec() });
+    assert_eq!(getattr(&mut e, v, f.ino).nlink, 3);
+    assert_eq!(
+        ok(&mut e, &Op::Rename { view: v, old_parent: 1, old_name: b"f".to_vec(), new_parent: sub.ino, new_name: b"far".to_vec(), flags: 0 }),
+        Reply::NodeRef(Vec::new())
+    );
+    assert_eq!(getattr(&mut e, v, f.ino).nlink, 3);
+    assert_eq!(node(ok(&mut e, &Op::Lookup { view: v, parent: 1, name: b"f".to_vec() })).ino, f.ino);
+    assert_eq!(node(ok(&mut e, &Op::Lookup { view: v, parent: sub.ino, name: b"far".to_vec() })).ino, f.ino);
+
+    // 三个名字逐个离开：前两个不下账，最后一个才把键带回来。
+    assert_eq!(
+        ok(&mut e, &Op::Unlink { view: v, parent: 1, name: b"f".to_vec() }),
+        Reply::NodeRef(Vec::new())
+    );
+    assert_eq!(
+        ok(&mut e, &Op::Unlink { view: v, parent: 1, name: b"k".to_vec() }),
+        Reply::NodeRef(Vec::new())
+    );
+    assert_eq!(refcount(&mut e, 905), (1, 4096));
+    assert_eq!(
+        ok(&mut e, &Op::Unlink { view: v, parent: sub.ino, name: b"far".to_vec() }),
+        Reply::NodeRef(blk(905))
+    );
+    assert_eq!(refcount(&mut e, 905), (0, 0));
+}
+
 #[test]
 fn rename_rejects_cycles_and_type_mismatches() {
     let d = Dir::new("rename_bad");

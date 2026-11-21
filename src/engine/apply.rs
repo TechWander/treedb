@@ -593,12 +593,25 @@ pub fn translate(s: &State, now: i64, op: &Op) -> (Vec<Log>, Reply) {
                         ),
                     );
                 }
-                logs.push(Log::DelNode {
-                    view: *view,
-                    ino: old_ino,
-                });
-                if !old.data_ref.is_empty() {
-                    book.down(&old.data_ref, old.size);
+                // 旧项如果是被 `Op::Link` 共享的 inode（nlink > 1），这里只摘
+                // 一个名字：另一些名字还指着它，删 node / 下内容引用会让那些
+                // 文件读到旧字节之外的东西（甚至把对象真删掉）。
+                if old.nlink <= 1 {
+                    logs.push(Log::DelNode {
+                        view: *view,
+                        ino: old_ino,
+                    });
+                    if !old.data_ref.is_empty() {
+                        book.down(&old.data_ref, old.size);
+                    }
+                } else {
+                    let mut o = old.clone();
+                    o.nlink -= 1;
+                    o.ctime = now;
+                    logs.push(Log::PutNode {
+                        view: *view,
+                        node: o,
+                    });
                 }
             }
             let parent_node = match node_of(s, *view, *parent) {
@@ -634,6 +647,58 @@ pub fn translate(s: &State, now: i64, op: &Op) -> (Vec<Log>, Reply) {
                 });
             }
             logs.extend(book.finish(s).0);
+            (logs, Reply::Node(node))
+        }
+        Op::Link {
+            view,
+            ino,
+            parent,
+            name,
+        } => {
+            if let Some(r) = name_err(name) {
+                return (vec![], r);
+            }
+            if view_meta(s, *view).is_none() {
+                return (vec![], no_view(*view));
+            }
+            // 父目录先验：“路径前缀不是目录” 优先于 “源 inode 不存在”，与
+            // unlink/rename 同一条口径。
+            match node_of(s, *view, *parent) {
+                Some(p) if p.kind == Kind::Dir => {}
+                Some(_) => return (vec![], Reply::err(errno::ENOTDIR, "parent is not a dir")),
+                None => return (vec![], Reply::err(errno::ENOENT, "no such parent")),
+            }
+            let mut node = match node_of(s, *view, *ino) {
+                Some(n) => n,
+                None => return (vec![], Reply::err(errno::ENOENT, "no such inode")),
+            };
+            // POSIX link(2)：源是目录回 EPERM（视图根本来也是目录）。不做“只允许
+            // root 链接目录”的例外：本引擎没有 uid 0 的概念，能写这棵树的人已经
+            // 越过权限面了，假装限制了反而会让人以为这里有一道门。
+            if node.kind == Kind::Dir {
+                return (vec![], Reply::err(errno::EPERM, "cannot link a directory"));
+            }
+            // 包括 `ln f f`：POSIX 也把它算 EEXIST，而不是 no-op。
+            if s.dentry(*view, *parent, name).is_some() {
+                return (vec![], Reply::err(errno::EEXIST, "file exists"));
+            }
+            // 不分配 ino、不碰 data_ref：两个名字就是同一个 inode，只多一票引用。
+            // `node.parent`/`node.name` 保留第一个名字的位置（它们只是冗余的
+            // “主名”，readdir 走 dentries，不读这两个字段）。
+            node.nlink += 1;
+            node.ctime = now;
+            let logs = vec![
+                Log::PutNode {
+                    view: *view,
+                    node: node.clone(),
+                },
+                Log::PutDentry {
+                    view: *view,
+                    parent: *parent,
+                    name: name.clone(),
+                    ino: *ino,
+                },
+            ];
             (logs, Reply::Node(node))
         }
         Op::Unlink { view, parent, name } | Op::Rmdir { view, parent, name } => {
@@ -674,21 +739,34 @@ pub fn translate(s: &State, now: i64, op: &Op) -> (Vec<Log>, Reply) {
             if want_dir && !dir_empty(s, *view, ino) {
                 return (vec![], Reply::err(errno::ENOTEMPTY, "directory not empty"));
             }
-            let mut logs = vec![
-                Log::DelDentry {
-                    view: *view,
-                    parent: *parent,
-                    name: name.clone(),
-                },
-                Log::DelNode {
+            // 摘一条名字与删 inode 是两件事（`Op::Link` 之后前者不再蕴含后
+            // 者）：nlink > 1 时只减一票、内容对象仍被其余名字持有，应答里的
+            // 空键也保证调用方不会把它当孤儿回收。
+            //
+            // 目录不跑这条路：`Op::Link` 拒目录，目录的 nlink 是「. + 子目录
+            // 数」，与引用计数不是同一个量。
+            let last = want_dir || node.nlink <= 1;
+            let mut logs = vec![Log::DelDentry {
+                view: *view,
+                parent: *parent,
+                name: name.clone(),
+            }];
+            if last {
+                logs.push(Log::DelNode {
                     view: *view,
                     ino,
-                },
-            ];
-            // 唯一一条链接断开 = 内容对象少一次引用（客户端的 data_ref
-            // 由 inode 持有，没有额外硬链接，故 unlink 必然减引用）。
+                });
+            } else {
+                let mut n = node.clone();
+                n.nlink -= 1;
+                n.ctime = now;
+                logs.push(Log::PutNode {
+                    view: *view,
+                    node: n,
+                });
+            }
             let mut book = RefBook::default();
-            if !node.data_ref.is_empty() {
+            if last && !node.data_ref.is_empty() {
                 book.down(&node.data_ref, node.size);
             }
             if want_dir {
@@ -838,6 +916,13 @@ pub fn translate(s: &State, now: i64, op: &Op) -> (Vec<Log>, Reply) {
                     Some(t) => t,
                     None => return (vec![], Reply::err(errno::ESTALE, "dangling target")),
                 };
+                // 源与目标其实是同一个 inode 的两个名字：POSIX 要求成功且什么都不
+                // 做。硬链接之前这不可能，现在必须显式挡 —— 否则「被覆盖项只减
+                // 一票」与末尾那份按旧 `nlink` 写的 `PutNode` 会打架，留下一个
+                // 没有第二个名字却 `nlink = 2` 的 inode（整个 inode 从此泄漏）。
+                if tino == ino {
+                    return (vec![], Reply::NodeRef(Vec::new()));
+                }
                 if t.kind == Kind::Dir && node.kind != Kind::Dir {
                     return (vec![], Reply::err(errno::ENOTDIR, "target is a dir"));
                 }
@@ -850,13 +935,25 @@ pub fn translate(s: &State, now: i64, op: &Op) -> (Vec<Log>, Reply) {
                 if t.ino == meta.root {
                     return (vec![], Reply::err(errno::EBUSY, "target is view root"));
                 }
-                logs.push(Log::DelNode {
-                    view: *view,
-                    ino: tino,
-                });
-                if !t.data_ref.is_empty() {
-                    book.down(&t.data_ref, t.size);
-                    over = t.data_ref.clone();
+                // 目录无双链接（`Op::Link` 拒目录），它的 nlink 是「. + 子目录数」；
+                // 非目录则看 nlink：多链接 inode 被覆盖时只减一票。
+                if t.kind == Kind::Dir || t.nlink <= 1 {
+                    logs.push(Log::DelNode {
+                        view: *view,
+                        ino: tino,
+                    });
+                    if !t.data_ref.is_empty() {
+                        book.down(&t.data_ref, t.size);
+                        over = t.data_ref.clone();
+                    }
+                } else {
+                    let mut o = t.clone();
+                    o.nlink -= 1;
+                    o.ctime = now;
+                    logs.push(Log::PutNode {
+                        view: *view,
+                        node: o,
+                    });
                 }
             }
             node.parent = *new_parent;

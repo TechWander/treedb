@@ -95,7 +95,7 @@ fn rowput(table: &str, key: &str, val: &str, cond_col: u32, cond_val: &str) -> O
     }
 }
 
-/// 51 个 op 变体的语料，每条都带能让它走到真实分支的参数（视图/文件名/表名
+/// 52 个 op 变体的语料，每条都带能让它走到真实分支的参数（视图/文件名/表名
 /// 取自下面 `seed` 播好的状态，所以视图 id 由调用方递进来）。加新 op 必须同时
 /// 补这里 —— 最后两个计数断言就是报警器。
 fn corpus(v: u32) -> Vec<Op> {
@@ -119,6 +119,8 @@ fn corpus(v: u32) -> Vec<Op> {
         Op::Create { view: v, parent: 1, name: name("new-file"), mode: 0o644, uid: 1, gid: 1 },
         Op::Mkdir { view: v, parent: 1, name: name("new-dir"), mode: 0o755, uid: 1, gid: 1 },
         Op::Symlink { view: v, parent: 1, name: name("new-link"), target: name("a"), uid: 1, gid: 1 },
+        // 源 ino 取种子里的 "a"（=2）：给真存在的 inode 再加一个名字。
+        Op::Link { view: v, ino: 2, parent: 1, name: name("a2") },
         Op::Readlink { view: v, ino: 2 },
         Op::Unlink { view: v, parent: 1, name: name("a") },
         Op::Rmdir { view: v, parent: 1, name: name("new-dir") },
@@ -247,9 +249,9 @@ fn readonly_classification_matches_translate() {
         }
     }
     let cs_len = cs.len();
-    assert_eq!(cs_len, 51, "op 语料必须覆盖全部变体");
+    assert_eq!(cs_len, 52, "op 语料必须覆盖全部变体");
     assert_eq!(ro, 22, "只读 op 数变了：分派表、这里和 DESIGN.md §4.2 分组表要一起改");
-    assert_eq!(wr, 29, "非只读 op 数变了：同上");
+    assert_eq!(wr, 30, "非只读 op 数变了：同上");
 }
 
 /// 三档划分必须穷举且两两不交：只读 / 真写 / 控制面。
@@ -274,8 +276,8 @@ fn ops_partition_into_three_classes() {
     }
     assert_eq!(
         (ro, wr, ctl),
-        (22, 22, 7),
-        "三档的分布：只读 22 / 真写 22 / 控制面 7（Stats、Checkpoint、Shutdown、WalFetch、\
+        (22, 23, 7),
+        "三档的分布：只读 22 / 真写 23 / 控制面 7（Stats、Checkpoint、Shutdown、WalFetch、\
          SnapFetch、AuthBegin、AuthFinish）"
     );
     // 语料覆盖全部变体，因此三档之和就是 op 总数。

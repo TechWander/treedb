@@ -9,7 +9,7 @@
 自己的仓里；本仓唯一与 PostgreSQL 有关的东西是默认关掉的 `postgres-compat` 脚手架，
 而这条约束有测试守着（`tests/independence.rs`，详见 §11 第 7 条）。
 
-**状态**：v0.4.0。引擎本体已落地并跑完五轴验收（§7.8 是 2026-11-19 的全轴复跑）；
+**状态**：v0.5.0。引擎本体已落地并跑完五轴验收（§7.8 是 2026-11-19 的全轴复跑）；
 已建 git 仓推 `origin`(gitee) + `github` 两远端。0.3.0 之后的一批全在**读轴**上：
 量具口径对称化（§9.1 第 3 条）、默认前端 worker 按核数（§8 第 1 条）、目录项两层表
 + kind 冗余（§7.10）；那一批**线协议、WAL 与快照的字节格式一个字节没动**（当时
@@ -79,10 +79,19 @@ SQLite3，24 格）写成文，并给 `final.tsv` 补了生成器与两条对账
 两个既有 reply 各多一个 `u64`），`SNAP_VERSION` 仍 3 —— 令牌故意不进快照也不进 WAL，
 所以旧快照零迁移。定版 `v0.4.0`。
 
-test 现在分两档报：默认档（纯引擎）`cargo test --release` = **145 passed**（55 lib +
-28 engine_crud + 14 migrate + 14 replication + 11 net_protocol + 8 read_scaling +
+`v0.4.0` 之后是**硬链接**一轮（§5.2，收掉 §10 阶段 C 1 里「`Link` op 要动协议」这个
+未定价项）：`Op::Link`（tag `0x002c`）给已有 inode 加第二根 dentry。**这一轮是纯追加**：
+既有帧一个字节未动、`EngineStats` 也没加长，所以 `PROTOCOL_VERSION` 仍 6、
+`SNAP_VERSION` 仍 3，任何 `v0.3.x`/`v0.4.0` 数据目录零迁移；把新 op 发给旧服务端会在
+decode 处得到 `unknown op tag 0x002c`，而不是把一条写静默当成别的样子。真正的变化
+不在协议在记账：`nlink > 1` 之后「摘一个名字」与「删 inode」必须分开，`Unlink` /
+`Rename` 覆盖 / `Symlink` upsert 三条路径都按「是不是最后一个名字」分流 —— 不是的话
+只减一票、不下内容引用账、应答里带空键（§5.2）。定版 `v0.5.0`。
+
+test 现在分两档报：默认档（纯引擎）`cargo test --release` = **148 passed**（55 lib +
+31 engine_crud + 14 migrate + 14 replication + 11 net_protocol + 8 read_scaling +
 6 crash_recovery + 5 auth + 3 independence + 1 scale_connections，10k 那条仍 `#[ignore]`）；
-`--features postgres-compat` = **176 passed**，多出的 31 条 = 过渡档自己的 30 条单测 +
+`--features postgres-compat` = **179 passed**，多出的 31 条 = 过渡档自己的 30 条单测 +
 `concurrency.rs` 里那条
 不需要 PG 的拨号用例（剩下 6 条要真 PG，默认 `#[ignore]`，不计入 passed）。即 PG 只出现在
 `postgres-compat` 后面的 `src/pool`、`src/store`、
@@ -212,7 +221,7 @@ test 现在分两档报：默认档（纯引擎）`cargo test --release` = **145
                                   │            src/net/mail.rs     纯读批次就地算完直接回；
                                   │           （eventfd 信箱）     含写批次整批 ──► 唯一提交线程
                                   │                                 （只有它持 Engine/WAL/stats）
-                                  │  Op/Reply（src/engine/model.rs，51 op / 30 reply）
+                                  │  Op/Reply（src/engine/model.rs，52 op / 30 reply）
                                   ▼
                                   src/engine/core.rs   Engine：apply → WAL → 持久化 → 回包
                                   │  src/engine/apply.rs  语义实现（rename/锁/账本/分页/表约束）
@@ -239,12 +248,12 @@ test 现在分两档报：默认档（纯引擎）`cargo test --release` = **145
 | `src/engine/wal.rs` | 1062 | WAL 帧格式、CRC32、预分配、group commit、扫描/重放、`reset`，外加面向副本的只读交付入口 `deliver`（§6.6） |
 | `src/engine/core.rs` | 1364 | `Engine`：op 入口、durability 分档、checkpoint、`Stats`、只读入口 `exec_read`、副本侧的 `install_snapshot`/`replicate_records`、fencing token（`read_fence`/`raise_fence`/`promote`/`admit_epoch`，§6.6 切主）；外加快照探测与迁移（`probe_snapshot`/`migrate_snapshot`，§6.5） |
 | `src/engine/mem.rs` | 1637 | `State`（views/nodes/dentries/locks/refs/keys/audit/defs/place/tables/rows/row_index）+ `Log`；快照的版本闸门与两代读入口（`load` / `load_for_migration`） |
-| `src/engine/apply.rs` | 1300 | 51 个 op 里那 49 个的具体语义：环检测、nlink、租约过滤、分页游标、表形状校验与约束、副本拒写（两条握手 op 不进引擎，§4.4；这里只留一道 `EINVAL` 兜底） |
-| `src/engine/model.rs` | 2735 | `Op`/`Reply` 定义与 codec 实现（含 `WalBatch`/`SnapChunk` 尾部的 `epoch`） |
+| `src/engine/apply.rs` | 1412 | 52 个 op 里那 50 个的具体语义：环检测、硬链接引用计数、租约过滤、分页游标、表形状校验与约束、副本拒写（两条握手 op 不进引擎，§4.4；这里只留一道 `EINVAL` 兜底） |
+| `src/engine/model.rs` | 2778 | `Op`/`Reply` 定义与 codec 实现（含 `WalBatch`/`SnapChunk` 尾部的 `epoch` 与目录树的 `Link`） |
 | `src/engine/sha256.rs` | 365 | 自写的 SHA-256 / HMAC-SHA256 / 常数时间比对 —— 依赖门逼出来的（§11 第 7 条），正确性钉在 FIPS 180-4 与 RFC 4231 的已知向量上（§4.4） |
 | `src/net/server.rs` | 839 | `workers=1` 的 epoll 循环、连接生命周期、写回背压、周期任务（含追平 tick）；兼作两条路径共用的 `Conn`/`Slot` 构件 |
 | `src/net/multi.rs` | 923 | `workers>1`：N 条前端 worker + 唯一提交线程（路由闸门、按连接号回程、停机收尾） |
-| `src/net/auth.rs` | 505 | 接入认证：`Key`（读密钥 + MAC 派生）与 `Gate`（每连接一份的握手闸门），两条事件循环共用（§4.4） |
+| `src/net/auth.rs` | 506 | 接入认证：`Key`（读密钥 + MAC 派生）与 `Gate`（每连接一份的握手闸门），两条事件循环共用（§4.4） |
 | `src/net/replicate.rs` | 441 | 副本侧跟踪器 `Follower`：拉快照 → 追 WAL → gap 重装，连不上主退避重连；拒收被提掉权的旧主（`Error::Fence`）不退出、只抬计数（§6.6） |
 | `src/net/mail.rs` | 114 | 两者之间那条能被 `epoll` 唤醒的信箱（`Mutex<VecDeque>` + eventfd） |
 | `src/net/client.rs` | 145 | 同步客户端 + pipeline；带密钥时建连后先走一次握手，拿不到 `authed: true` 就 fail-closed（§4.4） |
@@ -304,8 +313,13 @@ payload = tag: u16 | 字段…            （Op / Reply 各自的 tag 空间，R
   “追加字段”用在既有 reply 上，于是 v5 副本解 v6 主会短读报错。这个代价是换来的：
   令牌不对的副本，宁可连不上也不能接。同样的理由让快照格式刻意不动（`SNAP_VERSION`
   仍 3）：令牌能随数据传播但不必被数据携带。
+  `6 → 6`（`v0.5.0`，**不升版本**）：只新增一个 op tag `Link`（0x002c），既有帧一个
+  字节没动、reply 集合没变。这是「纯追加」判据第一次用在 op 上：旧客户端不会发它，
+  旧服务端收到未知 tag 在 `decode` 的兜底那里回 `EINVAL` —— 两边都不会静默走进错误
+  分支。所以 `PROTOCOL_VERSION` 留在 6：旧服务端只是不认这条 op，而副本链路
+  （`WalFetch`/`SnapFetch`）根本不经过它，主与副本混版不受影响。
 
-### 4.2 op 分组（51 个）
+### 4.2 op 分组（52 个）
 
 | 组 | op |
 |----|----|
@@ -314,7 +328,7 @@ payload = tag: u16 | 字段…            （Op / Reply 各自的 tag 空间，R
 | 接入认证 | `AuthBegin` `AuthFinish` |
 | 视图 | `CreateView` `DropView` `ListViews` |
 | 名字/属性 | `Lookup` `Getattr` `Setattr` `ReadDir` `ReadDirPlus` |
-| 增删 | `Create` `Mkdir` `Symlink` `Readlink` `Unlink` `Rmdir` `Rename` |
+| 增删 | `Create` `Mkdir` `Symlink` `Link` `Readlink` `Unlink` `Rmdir` `Rename` |
 | 数据账本 | `RefLookup` `RefUp` `RefDown` |
 | 锁 | `LockQuery` `LockSet` |
 | 密钥 | `KeyCreate` `KeyGet` `KeyList` `KeyUpdate` `KeyCheck` |
@@ -322,14 +336,14 @@ payload = tag: u16 | 字段…            （Op / Reply 各自的 tag 空间，R
 | 定义/放置 | `DefPut` `DefGet` `DefList` `DefDel` `PlaceSet` `PlaceGet` `PlaceList` |
 | 通用表 | `TableCreate` `TableDrop` `TableGet` `TableList` `RowPut` `RowGet` `RowList` `RowDelete` `RowCount` |
 
-51 个 op 分**三档**，两个布尔判据（`is_readonly` / `is_control`）恰好切出三块，
+52 个 op 分**三档**，两个布尔判据（`is_readonly` / `is_control`）恰好切出三块，
 两两不交、并起来是全集：
 
 - **只读 22 个 = worker 可就地执行集**：`Ping` `ListViews` `Lookup` `Getattr`
   `Readlink` `ReadDir` `ReadDirPlus` `RefLookup` `LockQuery` `KeyGet` `KeyList` `KeyCheck`
   `AuditList` `DefGet` `DefList` `PlaceGet` `PlaceList` `TableGet` `TableList` `RowGet`
   `RowList` `RowCount`；
-- **真写 22 个**：`!is_readonly() && !is_control()`，全部要过 WAL；
+- **真写 23 个**：`!is_readonly() && !is_control()`，全部要过 WAL；
 - **控制面 7 个**：`Stats` `Checkpoint` `Shutdown` `WalFetch` `SnapFetch` `AuthBegin`
   `AuthFinish`。
 
@@ -341,12 +355,12 @@ payload = tag: u16 | 字段…            （Op / Reply 各自的 tag 空间，R
 位置在事件循环，比提交线程还靠前一层（§4.4）；把它归进只读档会更贴近「不碰状态」
 这句字面意思，但那会让 worker 以为可以在自己手里就地算它，而它必须**串行于同连接
 的状态机进度**（`Gate` 是每连接一份的可变状态）。三档的现值由
-`tests/read_scaling.rs::ops_partition_into_three_classes` 钉住（22/22/7）。
+`tests/read_scaling.rs::ops_partition_into_three_classes` 钉住（22/23/7）。
 
 - 只读那一档的划分不只是优化提示，**它是语义地基**：`Op::is_readonly()` 判错一条，
   就是把一次应当被确认的写丢在 worker 手里。`readonly_classification_matches_translate`
-  拿 51 个 op 的语料逐条跑 `translate`，断言「判为只读 ⇒ logs 必空」，同时钉住
-  51/22/29 这三个数 —— 加 op、改分派表，这里和测试必须一起动。语料里每条只读 op 都要
+  拿 52 个 op 的语料逐条跑 `translate`，断言「判为只读 ⇒ logs 必空」，同时钉住
+  52/22/30 这三个数 —— 加 op、改分派表，这里和测试必须一起动。语料里每条只读 op 都要
   真查到东西（`seed` 因此也建表灌行），否则「不产 logs」这句只在测「查不存在的表
   不产 logs」那种废话。
 - `Stats` 刻意**不在**只读集里：它不写 WAL，但它读的是 `Engine` 手里的计数器，而那些
@@ -497,7 +511,7 @@ with a handshake"`，它根本没被碰过，重发即可），切点之后要�
 
 1. **不防窃听**。握手之后的每一个字节仍是明文，CRC32 只判损坏。抓包的人拿不到
    密钥，但拿得到全部数据，也随时能 RST 掉这条连接。
-2. **不做授权**。过了握手的连接与今天一样拥有全部 51 个 op，包括 `Shutdown`。
+2. **不做授权**。过了握手的连接与今天一样拥有全部 52 个 op，包括 `Shutdown`。
    它是「一把钥匙开整扇门」，不是租户模型 —— 多租户、配额、审计归属仍在引擎
    之外（§8 第 13 条）。
 3. **不防字典攻击**。密钥必须是 32 字节随机值；从口令派生的话，抓一次握手就能
@@ -550,7 +564,7 @@ GC 拿它当唯一依据。
 
 | 语义 | 测试 |
 |------|------|
-| `rename` 原子替换同名目标；拒环（目录挂到自家子孙下 → `EINVAL`）与类型错配；自身改自身按 POSIX 是 no-op 成功而不是 `EEXIST`；`ENOTDIR` 优先于 `ENOENT`（`rename`/`unlink`/`rmdir` 三个入口同一口径：先验父节点是不是目录，再查名字）；`RENAME_NOREPLACE` 位目标存在则 `EEXIST` 且不动现场 | `rename_moves_and_overwrites`、`rename_rejects_cycles_and_type_mismatches`、`unlink_and_rename_report_the_last_holder_key`、`unlink_and_rmdir_report_enotdir_for_a_non_dir_parent` |
+| `rename` 原子替换同名目标；拒环（目录挂到自家子孙下 → `EINVAL`）与类型错配；自身改自身按 POSIX 是 no-op 成功而不是 `EEXIST` —— 包括两个名字指向**同一个 inode** 的情形（硬链接之后它会真的发生：不当 no-op 处理会把旧名字删掉，并留下一个没有第二个名字却 `nlink` 虚高的 inode）；`ENOTDIR` 优先于 `ENOENT`（`rename`/`unlink`/`rmdir` 三个入口同一口径：先验父节点是不是目录，再查名字）；`RENAME_NOREPLACE` 位目标存在则 `EEXIST` 且不动现场 | `rename_moves_and_overwrites`、`rename_rejects_cycles_and_type_mismatches`、`unlink_and_rename_report_the_last_holder_key`、`unlink_and_rmdir_report_enotdir_for_a_non_dir_parent`、`overwriting_one_of_several_links_only_drops_one_vote` |
 | `unlink`/`rmdir`/`rename` 的应答直接携带 GC 线索：内容对象**刚好**失去最后一个持有者时键原样带回，否则空串。判定必须与删 dentry 在同一个 op 里 —— 客户端自己 `Unlink` 后再 `RefLookup` 之间有窗口，别人重新引用同键就会让 GC 删掉还在用的字节 | `unlink_and_rename_report_the_last_holder_key` |
 | `mkdir`/`rmdir` 与 `nlink` 规则（非空目录不能 rmdir；`..` 计入 nlink） | `mkdir_rmdir_and_nlink_rules` |
 | 视图根 inode 不可被 lookup/rename/unlink 触达 | `view_root_cannot_be_reached_or_removed` |
@@ -572,6 +586,7 @@ GC 拿它当唯一依据。
 | 只能按主键或有索引的列列举（否则 `EINVAL`，不静默扫全表）；`limit = 0` 走默认页宽而不是「不限」 | 同上 |
 | `TableDrop` 级联掉行与二级索引，一条不剩；空内层表不留；`next_table_id` 不回收 | `generic_tables_keep_rows_and_rebuild_indexes`、`table_state_survives_checkpoint_and_reopen` |
 | 表与行走完全部四条持久化路径：WAL 重放、checkpoint 截断、`kill -9`、TCP 端到端 | `reopen_replays_wal_into_identical_state`、`control_plane_survives_sigkill`、`generic_table_and_readdir_plus_over_tcp` |
+| 硬链接：`Op::Link`（`v0.5.0`）给已有 inode 加第二根 dentry，两个名字指向同一个 ino、`nlink` 按引用计数增减、内容对象只在最后一个名字离开时下账。此前 `nlink` 只在目录意义上活动（`2 + 子目录数`）；现在文件与符号链接的 `nlink` 是真实引用计数，`Unlink` / `Rename` 覆盖 / `Symlink` upsert 三条路径都按「是不是最后一个名字」分流 —— 不是的话只减一票且**不下内容引用账**，应答里的空键保证调用方不会把还有人用的对象当孤儿回收。三条拒绝：目录 `EPERM`、名字已存在 `EEXIST`（`link(2)` 没有 upsert，`ln f f` 也是 `EEXIST`）、跨视图不成立（一个 op 只落在一个命名空间里） | `hard_links_share_the_inode_and_keep_bytes_alive`、`link_refusals_name_the_posix_errno`、`overwriting_one_of_several_links_only_drops_one_vote` |
 
 ### 5.3 明确**不**提供的东西
 
@@ -586,11 +601,12 @@ GC 拿它当唯一依据。
 - **「读不到未落盘的写」这种隔离**：状态在 fsync 之前就对全体读者可见（§8 第 16 条）。
   ack 之后读己之写成立，但「别人看不到还没落盘的写」不成立 —— 这不是疏漏，是
   「读不排 fsync」这一个选择的另一面。
-- **硬链接**：没有 `Link` op，一个 inode 只有一条目录项路径，`nlink` 只在目录意义上
-  活动（2 + 子目录数）。grovefs `MetaProvider::link_node` 接过来只能回 `EPERM`。
-  这个缺口的价码已实测：grovefs 的 POSIX/e2e 断言矩阵在 treedb 后端重放时，
-  唯一不能成立的就是硬链接那一节 10 条，它们记成 `SKIP`（问不了）而不是 `FAIL`
-  （跑坏了）——§10 阶段 C 1。
+- **硬链接的其余形态**：`Op::Link` 本身已提供（`v0.5.0`，语义与测试见 §5.2），
+  不提供的是这三样 —— 目录硬链接（`EPERM`，与 `link(2)` 同款；视图根是目录，因此天然
+  被挡）、`link` 的 upsert 变体（名字已存在一律 `EEXIST`）、跨视图链接（与 `Rename`
+  同一条边界）。接入侧那一步是 grovefs 的活：provider 仍钉 `v0.3.7`，`link_node` 仍回
+  `EPERM`，所以阶段 C 1 的 10 条 `[posix C]` 仍是 SKIP；重放结果要等那一侧升 pin 并
+  改成真发 `Op::Link` 之后实测，本仓不代替它报数。
 - **字节区间锁**：锁的 key 是 `(view, ino, owner)`，没有 `(start, end, pid)`。POSIX 记录锁
   要的是按区间合并/拆分的那套语义，这里给不了 —— provider 只能拒，不能假装支持。
 - **通用表只给 §4.2 那九条 op 的形状**（状态与定型见 §5.1）：没有类型、没有 JOIN 与跨表条件、没有范围/前缀
@@ -1947,7 +1963,7 @@ treedb 这一列**没有**在 `v0.3.7` 与 `v0.4.0` 上复跑：`v0.3.7` 只改�
 13. **接入面：认证是可选的，而且只管身份；没有授权、没有传输加密**。这条以前写的是
     「根本没有认证」，v5 之后要改成「补了一小块、剩下的仍然没有」（§4.4）。剩下的
     具体是四条：① **默认仍关** —— `--auth-key-file` 不给就是裸 TCP + 长度前缀 +
-    CRC32，`Client::connect` 连上就拿到全部 51 个 op 的权限，包括 `Shutdown` 与
+    CRC32，`Client::connect` 连上就拿到全部 52 个 op 的权限，包括 `Shutdown` 与
     `Checkpoint`；② **开了也是「一把钥匙开整扇门」** —— 过了握手的连接与其他连接
     权限完全相同，无租户、无配额、无按 op 分组；③ **不加密** —— 握手之后仍是
     明文，CRC32 只判损坏，抓包的人读得到全部数据也随时能 RST；④ **不证明「是当前
@@ -1994,8 +2010,8 @@ treedb 这一列**没有**在 `v0.3.7` 与 `v0.4.0` 上复跑：`v0.3.7` 只改�
 ## 9. 测试清单
 
 ```sh
-cargo test --release                            # 默认档（纯引擎），145 条（+1 ignored）
-cargo test --release --features postgres-compat # 加上过渡档，176 条（+7 ignored）
+cargo test --release                            # 默认档（纯引擎），148 条（+1 ignored）
+cargo test --release --features postgres-compat # 加上过渡档，179 条（+7 ignored）
 cargo test --release --lib                      # 只看引擎单测
 cargo test --release --test migrate              # 快照升级：11 条走 API + 3 条真进程跑 CLI（§6.5）
 cargo test --release --test scale_connections -- --ignored   # 万级连接重压（§7.6）；并发数由 TREEDB_CONNS 控制，本机到 25 000 为限（再高是客户端源端口不够）
@@ -2031,17 +2047,27 @@ gcc -O2 -pthread -o /tmp/lb_floor benches/lb_floor.c && /tmp/lb_floor 1 64 3   #
 
 | 目标 | 数量 | 覆盖 |
 |------|------|------|
-| `--lib` | **55**（+30 属 `postgres-compat`） | codec round-trip（全 tag：51 op / 30 reply）、**fetch 应答的两条长度/计数上限在 decode 处兼得**（`fetch_reply_bounds_are_enforced_on_decode`，§6.6）、**`Log` 全变体 round-trip**、**握手两条 op 的定长字段多一字节少一字节都拒**（`handshake_fixed_fields_reject_wrong_length`，§4.4）、**自写 SHA-256/HMAC 的已知向量 10 条**（FIPS 180-4 与 RFC 4231 逐条对表 + `ct_eq` 长度严格，`src/engine/sha256.rs`）、**`Key::load` 收哪三种形状拒哪三种**（`key_load_is_strict`：32 原始字节**一个字节都不剔**、hex 档忽略尾随换行、全空白与全零拒 —— 那条「不剔」是拿真密钥踩出来的，随机密钥末位正好是 ASCII 空白的概率是 1/64，§4.4）、**`Gate` 的四档进度与双向 MAC**（`gate_gates`、`gate_without_key_is_open`、`macs_are_directional_and_nonce_bound`、`key_debug_does_not_leak_bytes`）、CRC 已知向量、碎帧/超长帧、WAL 帧与截断重放、**预分配空洞重开**（`prealloc_padding_reopens_cleanly`）、**大批次不跳写**（`huge_batch_writes_every_record`）、**交付只到 durable 水位**（`deliver_stops_at_the_durable_watermark_not_the_logical_end`，§6.6 第一条口径）、**hint 命中与退回全扫**（`deliver_streams_forward_with_the_returned_hint` / `deliver_ignores_a_stale_or_absent_hint_and_still_lands_right`）、**跨滑动窗口不丢记录**、**max_bytes 是软上限**（至少给一条 + 逐轮恰好吃完整批）、**两代快照正文逐字节相同**（`legacy_snapshot_decodes_from_the_same_prefix`，§6.5 的前提）、**旧布局写回不能默默丢表**（`legacy_writer_refuses_to_drop_tables`）、**seq 跳号硬错**、状态快照保留 node key、**两层 dentry 与 kind 冗余过快照不坏**（`dentries_are_two_level_and_kind_survives_snapshot`，§7.10）、**通用表行与索引过快照不坏**（`generic_tables_keep_rows_and_rebuild_indexes`，§5.1）、缓冲压缩、租约过期边界、`default_workers` 上下界 |
-| `tests/engine_crud.rs` | **28** | §5.2 全部 POSIX 语义（含 GC 线索与 NOREPLACE）+ 控制面（密钥/审计/定义/放置）+ checkpoint 后重开 + 坏尾截断；本轮新增 6 条：4 条盖通用表（表形状校验与表名回收、行写边界/约束/CAS/flags、主键与索引列游标翻页、表状态过 checkpoint+重开），1 条盖 `ReadDirPlus` 与 `ReadDir`+`Getattr` 逐字段对齐，1 条盖 `Stats` 新字段；2026-11-20 又加 2 条：`a_data_dir_refuses_a_second_engine`（同一个目录开第二个引擎必须被拒，且 `drop` 后立刻可开）、`unlink_and_rmdir_report_enotdir_for_a_non_dir_parent`（§5.2 的 `ENOTDIR` 口径） |
+| `--lib` | **55**（+30 属 `postgres-compat`） | codec round-trip（全 tag：52 op / 30 reply）、**fetch 应答的两条长度/计数上限在 decode 处兼得**（`fetch_reply_bounds_are_enforced_on_decode`，§6.6）、**`Log` 全变体 round-trip**、**握手两条 op 的定长字段多一字节少一字节都拒**（`handshake_fixed_fields_reject_wrong_length`，§4.4）、**自写 SHA-256/HMAC 的已知向量 10 条**（FIPS 180-4 与 RFC 4231 逐条对表 + `ct_eq` 长度严格，`src/engine/sha256.rs`）、**`Key::load` 收哪三种形状拒哪三种**（`key_load_is_strict`：32 原始字节**一个字节都不剔**、hex 档忽略尾随换行、全空白与全零拒 —— 那条「不剔」是拿真密钥踩出来的，随机密钥末位正好是 ASCII 空白的概率是 1/64，§4.4）、**`Gate` 的四档进度与双向 MAC**（`gate_gates`、`gate_without_key_is_open`、`macs_are_directional_and_nonce_bound`、`key_debug_does_not_leak_bytes`）、CRC 已知向量、碎帧/超长帧、WAL 帧与截断重放、**预分配空洞重开**（`prealloc_padding_reopens_cleanly`）、**大批次不跳写**（`huge_batch_writes_every_record`）、**交付只到 durable 水位**（`deliver_stops_at_the_durable_watermark_not_the_logical_end`，§6.6 第一条口径）、**hint 命中与退回全扫**（`deliver_streams_forward_with_the_returned_hint` / `deliver_ignores_a_stale_or_absent_hint_and_still_lands_right`）、**跨滑动窗口不丢记录**、**max_bytes 是软上限**（至少给一条 + 逐轮恰好吃完整批）、**两代快照正文逐字节相同**（`legacy_snapshot_decodes_from_the_same_prefix`，§6.5 的前提）、**旧布局写回不能默默丢表**（`legacy_writer_refuses_to_drop_tables`）、**seq 跳号硬错**、状态快照保留 node key、**两层 dentry 与 kind 冗余过快照不坏**（`dentries_are_two_level_and_kind_survives_snapshot`，§7.10）、**通用表行与索引过快照不坏**（`generic_tables_keep_rows_and_rebuild_indexes`，§5.1）、缓冲压缩、租约过期边界、`default_workers` 上下界 |
+| `tests/engine_crud.rs` | **31** | §5.2 全部 POSIX 语义（含 GC 线索、NOREPLACE 与硬链接）+ 控制面（密钥/审计/定义/放置）+ checkpoint 后重开 + 坏尾截断；v0.5.0 新增 3 条硬链接：多名字共享 inode 与字节（含 `drop` 后重开仍是 `nlink = 2`）、五种拒绝各报对应 errno 且不动票数、覆盖其中一个名字只减一票；再往前新增 6 条：4 条盖通用表（表形状校验与表名回收、行写边界/约束/CAS/flags、主键与索引列游标翻页、表状态过 checkpoint+重开），1 条盖 `ReadDirPlus` 与 `ReadDir`+`Getattr` 逐字段对齐，1 条盖 `Stats` 新字段；2026-11-20 又加 2 条：`a_data_dir_refuses_a_second_engine`（同一个目录开第二个引擎必须被拒，且 `drop` 后立刻可开）、`unlink_and_rmdir_report_enotdir_for_a_non_dir_parent`（§5.2 的 `ENOTDIR` 口径） |
 | `tests/net_protocol.rs` | **11** | TCP 端到端：CRUD、碎帧、pipeline 保序、并发连接不串扰、超长帧只杀违规者、大回包流式读完、`--stats`/`--checkpoint`/`--shutdown`（含两个磁盘长度与协议版本）、优雅停服后同地址立刻重绑、**通用表 + readdirplus 走 TCP**（1000 行 pipeline、错误帧经网络回真实 errno、8 KiB 收缓冲下大应答完整接回） |
 | `tests/crash_recovery.rs` | **6** | §6.4 |
-| `tests/read_scaling.rs` | **8** | 只读分派表逐条对 `translate`（判错一条就是丢写；语料 51 条全变体，钉住 51/22/29 三个数）、**三档划分穷举且两两不交**（`ops_partition_into_three_classes`，22/22/7，§4.2 与副本拒写的判据同源）、`workers=1/8` 答复逐条相同（负载含表读与 `ReadDirPlus`，混合批里把 CAS 写夹在读之间）、每连接流内顺序、一写多读不读到半截状态、`ops_total` 记上 worker 就地算的读、并行档下 `kill -9` 已 ack 的写全在（目录写与表写逐条交错）、**fd 复用不会把上一任的应答塞给新任** |
+| `tests/read_scaling.rs` | **8** | 只读分派表逐条对 `translate`（判错一条就是丢写；语料 52 条全变体，钉住 52/22/30 三个数）、**三档划分穷举且两两不交**（`ops_partition_into_three_classes`，22/23/7，§4.2 与副本拒写的判据同源）、`workers=1/8` 答复逐条相同（负载含表读与 `ReadDirPlus`，混合批里把 CAS 写夹在读之间）、每连接流内顺序、一写多读不读到半截状态、`ops_total` 记上 worker 就地算的读、并行档下 `kill -9` 已 ack 的写全在（目录写与表写逐条交错）、**fd 复用不会把上一任的应答塞给新任** |
 | `tests/auth.rs` | **5** | §4.4 在线协议上的握手形状（MAC 的数学性质与闸门四档在 lib 单测里，不重复）：未握手的连接一个数据 op 也拿不到（**两种 worker 形状各一跑，两条路径拦截点不是同一处代码**）、错密钥被拒但不锁死 + 旧 MAC 重放不上 + 换对密钥能过、带密钥的客户端拒绝降级、未配密钥的服务端一次往返回 `authed: false`（这是 v5 客户端连 v4 形状不卡死的依据）、握手与数据 op 挤同批时**应答次序不能被打乱** |
 | `tests/replication.rs` | **14** | §6.6 的十二件事（十四条用例，端到端那一件两档各一条；主是真进程，副本是测试里的 `Engine` + `Follower`，只有最后三件起真 `treedb-standby`）：主写逐条收敛（ino/属性/readdir 与主对齐）、**主被 `kill -9` 后副本仍答读且不退出**（`replica_errors` 抬、`connected` 落 true→false）、**gap 触发分块重装快照**（4 KiB 块下 ≥ 2 块，且副本落盘的 `state.snap` 与主的逐字节相同）、**副本拒写在引擎层**（五个形状不同的写真 op 全 `EROFS` 且零 logs、零水位推进，而 `ListViews`/`Stats`/`Checkpoint` 放行）、**lag 中途为正、追平归零**（2 KiB/轮喂不饱一批）、**副本重启靠自己的日志接上**（`resyncs == 0`，快照+尾巴那条恢复路径）、端到端两档事件循环同一份断言（`workers=1`/`2`：线上 `EROFS`、`Stats` 新字段过线、追平后读到主的新写）、启动参数三道门（缺 `--primary` / 自己拉自己 / `--fetch-bytes 0` 均退出码 2）、**开了认证的主只有握得上手的副本追得动**（对密钥逐条收敛、错密钥不收敛）；v0.4.0 新增四条 fencing：令牌只升不降/落盘/坏文件不当 0、副本侧四档闸门（含“权力优先于新旧”与它的反面）、**真链路上提权后拒旧主的批**（状态不回滚、仍在答读、`replica_errors` 抬）、`--promote` 离线动作（不开端口、两次 0→1→2、与 `--primary` 同时给退出码 2） |
 | `tests/concurrency.rs` | 0（+7，整文件 feature 门控） | T1 之后整个文件在 `postgres-compat` 后面：无 PG 时跑「拨号失败不漏 live」（1 条，要 feature），其余 6 条 `#[ignore]` 需真实 PG。**它测的是共享池，不是引擎并发**（§7.8）|
 | `tests/scale_connections.rs` | 1（+1 ignored） | 1 000 连接 fd/RSS 断言每次跑；万级（`TREEDB_CONNS`，含 25 000）手动 |
 | `tests/independence.rs` | **3** | 独立性三把门：内核目录（`src/engine`、`src/net`）不出现客户端名字；`[dependencies]` 非 optional 项只能是 `libc` + `thiserror`；`postgres-compat` 不得进 `default`（§11 第 7 条） |
 | `tests/migrate.rs` | **14** | §6.5 那四条承诺。11 条直接打 API：v2 样本迁移后 `State` 逐字段相等且 WAL 文件字节不变、重开后每个语义面都能读到（密钥/审计/定义/放置/锁/引用）、尾巴 seq 照搬且发号接着走、幂等重跑不动当前目录、未知版本与「正文配不上版本位」都拒动且零改动、既有备份不被覆盖、迁完的目录能直接用通用表。3 条用 `env!("CARGO_BIN_EXE_treedb-migrate")` 起**真进程**钉退出码（10 / 1 / 0）与输出里的命令、备份路径、回滚步骤 |
+
+本轮（硬链接，`v0.5.0`）新加的三条回归锁（`tests/engine_crud.rs` 的「硬链接」一节）：
+`hard_links_share_the_inode_and_keep_bytes_alive`（两个名字一个 ino、`nlink` 记账、
+`Link` 不动引用账本、前两个名字离开时应答空键与账本不变、最后一个名字才把键带回、
+`drop` 后重开 `nlink` 仍对）、
+`link_refusals_name_the_posix_errno`（`EEXIST` 含 `ln f f`、目录 `EPERM`、源/父
+`ENOENT`、父是文件 `ENOTDIR`、名字带 `/` 的 `EINVAL`，且拒绝不改 `nlink`）、
+`overwriting_one_of_several_links_only_drops_one_vote`（`Rename` 覆盖与 `Symlink`
+upsert 各只减一票；另两个名字互相 `Rename` 按 POSIX 必须是 no-op —— 把那条早期
+返回拿掉，测试立刻红在「旧名字被删掉」上，这条是写用例时真踩出来的）。
 
 本轮（切主 / fencing，`v0.4.0`）新加的回归锁（全部在 `tests/replication.rs`）：
 `the_fence_is_monotonic_persisted_and_never_defaults_to_zero`（promote 与
@@ -2373,7 +2399,7 @@ spike 明确**没**做、也不在接入面上假装做的事 —— 一律返�
 
 | 缺口 | 现在的行为 | 为什么不能假装支持 |
 |---|---|---|
-| 硬链接 `link_node` | EPERM | 引擎没有 link op（§5.3） |
+| 硬链接 `link_node` | 引擎已能表达（`v0.5.0` 的 `Op::Link`，§5.2）；grovefs provider 仍回 EPERM | 两个仓各欠一半：引擎那半已闭合，接入那半要先升 pin 再改 `link_node`。在 provider 改成真发 `Op::Link` 之前，那里仍回 EPERM，阶段 C 1 的 10 条 `[posix C]` 也仍是 SKIP |
 | POSIX 字节区间锁 | EPERM / None | 引擎只有整 inode 锁（§5.3） |
 | `refs` 的字节量 | 恒 0 | 字节权威在数据面，size 也从数据面取 |
 | `view export` / `view import` | 拒绝 | dump reader 是 SQL 形状的，treedb 无等价物 |
@@ -2383,7 +2409,7 @@ spike 明确**没**做、也不在接入面上假装做的事 —— 一律返�
 | 定义/密钥/账户 | 行表全部在引擎（M3，无开关），定义仍在本地 SQLite | 密钥、审计、账户、授权**已在通用表上**（M1 2026-11-20，§11 第 13/14 条），M3 删掉了开关：treedb 档读写都走引擎，没跑过搬家命令的部署**拒绝启动**并点名 `control-migrate`（§11 第 15/16 条）。视图**定义**仍在本地（引擎没有定义表）；`Key*`/`Audit*` 那三个专用 op 仍是业务形状，不能当接入面（上文第 4 步）。迁法与切写步骤见下面阶段 C 4 |
 | ~~`view list` 的物理树~~ **已闭合**（2026-11-20，M1b） | `TreedbControlStore::list_physical` 回答「本地 ∪ 引擎的 `Op::ListViews`」 | 控制面枚举器只看本地 db 文件时，引擎里的基树在 `view list`/`store.info` 里都不存在（委派也因此无法解析）。修了 `list_physical`/`has_physical` 两处双答案，枚举与存在性判据同时看见引擎 |
 | HA / 快照传送 | 手工可做（不是自动化） | 接入面用不上它：§8 限制 6 现在是「有异步只读副本、无同步复制」。v0.4.0 起有了 `treedb-standby --promote` + fencing token（§6.6「切主」），但它是**人手动的一步离线动作**：不开服务、不自动选主、旧主靠人停。grovefs 要的「主挂了自动切副本」仍然没有 |
-| ~~path 依赖的分发方式~~ | 已定：按 tag 的 git 依赖 | grovefs 侧钉 `v0.3.7`（无同级克隆也能构建，实测）；本仓已到 `v0.4.0`。两者可以共存 —— `v0.4.0` 的线协议变更只在 `WalBatch`/`SnapChunk` 两个副本专用 reply 的尾部，grovefs 走的是普通 CRUD 与 `Stats`，那部分字节一个未动。要的是下次 bump 时把 pin 提到 `v0.4.0`，或直接跳过它等下一次有功能收益的版本 |
+| ~~path 依赖的分发方式~~ | 已定：按 tag 的 git 依赖 | grovefs 侧钉 `v0.3.7`（无同级克隆也能构建，实测）；本仓已到 `v0.5.0`。`v0.4.0` 与 `v0.5.0` 都不会逼它升级：前者的线协议变更只在 `WalBatch`/`SnapChunk` 两个副本专用 reply 的尾部，后者是纯追加的新 op tag（旧服务端回 `unknown op tag`），grovefs 走的普通 CRUD 与 `Stats` 字节一个未动。升 pin 的动机只有一个：把 `link_node` 接上真硬链接（上一行）。它不升，本仓不代替它报数 |
 
 ### 阶段 C（回归与灰度）
 1. ~~`posix`/`e2e` 那种全量断言矩阵还没在 treedb 上跑过~~ **已跑**（2026-11-20，
@@ -2413,8 +2439,11 @@ spike 明确**没**做、也不在接入面上假装做的事 —— 一律返�
    三元组只要动一下都记红 —— 多一条 FAIL（回归）、少一条断言（脚本退化）、
    skip 变小（缺口自己合上了，得重读文档再改契约）都会让这一行变红。一个永远红的
    格子等于没有格子；默认构建（没开 feature）落 INFO，不拉低 GREEN。
-   仍然没定价的：`Link` op（要动协议，§4.1 只能尾部追加 tag）、字节区间锁
-   （`locks` 那一套没重放）、以及 `edge`/`errors`/`concurrent` 等其余套件。
+   仍然没定价的：字节区间锁（`locks` 那一套没重放）、以及 `edge`/`errors`/
+   `concurrent` 等其余套件。`Link` op 原先列在这里，`v0.5.0` 已把它从「引擎没有」
+   变成「接入未接」（§5.2）：重放那一步要先在 grovefs 升 pin、把 `link_node` 从
+   `EPERM` 改成发 `Op::Link`，跑完才能把 `skip=10` 改成 0 —— 本仓只有引擎半边的
+   证据（31 条 engine_crud 里的三条硬链接用例），矩阵那半边等 grovefs 实测。
 2. 万级视图 mount + create + readdir 混打，对照 `pg_stat_activity`（旧）与
    `--stats`（新）两条路径的连接数、RSS、p99。
 3. ~~容灾演练：`kill -9` → 重启 → 已 ack 写全在（§6.4 已在 crate 内自动化，

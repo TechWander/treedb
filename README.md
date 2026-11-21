@@ -16,8 +16,8 @@ cargo build --release                                   # 默认档：依赖只�
 ./target/release/treedb-server --dir /var/lib/treedb --listen 127.0.0.1:7777
 ./target/release/treedb-bench --op lookup --conns 64 --pipeline 32 --secs 3
 
-cargo test --release                                    # 默认档 145 passed（引擎本体）
-cargo test --release --features postgres-compat        # 176 passed（含 PG 过渡档）
+cargo test --release                                    # 默认档 148 passed（引擎本体）
+cargo test --release --features postgres-compat        # 179 passed（含 PG 过渡档）
 bash benches/throughput_matrix.sh 3 1 2 3 4 5           # 五轴复现，输出进 benches/results/
 bash benches/sync_ratio.sh 3                           # 写路径机制：一次 fsync 摊了多少写
 bash benches/single_conn.sh 3                          # 单连接对标 PG（$PIPE=32 走批量档、$CONNS/$WORKERS 走并发档）
@@ -132,8 +132,9 @@ DESIGN.md §7（含 §7.8 那次全五轴复跑）。
 三组接口，每组都是定长的 op，逐条分组与只读/写划分见
 [DESIGN.md](DESIGN.md) §4.2：
 
-- **POSIX 元数据面**：视图（命名空间）、目录树、属性、符号链接、整 inode 锁、
-  内容引用账本（GC 的唯一依据）。没有数据面 —— 文件字节永远在客户端侧。
+- **POSIX 元数据面**：视图（命名空间）、目录树、属性、符号链接、硬链接（`v0.5.0`
+  的 `Op::Link`，多名字共享一个 inode，内容对象只在最后一个名字离开时下账）、
+  整 inode 锁、内容引用账本（GC 的唯一依据）。没有数据面 —— 文件字节永远在客户端侧。
 - **通用表一面**：`TableCreate`/`TableDrop`/`TableGet`/`TableList` + `RowPut`/`RowGet`/
   `RowList`/`RowDelete`/`RowCount`。列为不透明字节，可标唯一/索引列，写可带
   `PUT_IF_ABSENT`/`PUT_IF_EXISTS` 与按列 CAS。存在理由：接入方的表形（密钥、审计、
@@ -163,18 +164,19 @@ DESIGN.md §7（含 §7.8 那次全五轴复跑）。
 
 - **认证只管身份，授权与传输加密仍然没有**（§4.4、§8 第 13 条）。v5 起可以
   `--auth-key-file` 打开一次共享密钥的双向握手，但它默认关、而且过了握手的连接与
-  不开时一样拥有全部 51 个 op 的权限，包括 `Shutdown` 与 `Checkpoint`；握手之后仍是
+  不开时一样拥有全部 52 个 op 的权限，包括 `Shutdown` 与 `Checkpoint`；握手之后仍是
   裸 TCP + 长度前缀 + CRC32，而 CRC32 只判损坏。所以「谁能连上 + 谁持有这把密钥」
   = 「谁能改整个状态」，多租户、配额、审计归属必须在引擎之外做（grovefs 的
   apikey + 网关白名单就是这一层），或者把端口锁在回环/私有网段。副本对主那一侧
-  能证明「持有密钥」了，但**没有 fence**：脑裂后的旧主同样拿得出 MAC（§8 第 6 条②）。
+  能证明「持有密钥」了，`v0.4.0` 起也能认出被提掉权的旧主（`fence`，§6.6）；但
+  那只保护副本，不阻止旧主对自己的客户端继续服务。
 - **没有 PITR、没有 dump/load、没有增量与加密备份**（§8 第 14 条、§6.7）。checkpoint 会
   `wal.reset()`，历史切面不归档；运行中 `cp -a` 能起服、无撕裂，但切点不可控（实测比
   「拷贝前一刻」多 14 400 条 seq），所以它不是备份工具。
 - **没有 SQL、没有 JOIN/排序/范围谓词、没有用户可见事务、没有跨视图原子 op**（§5.3）。
   通用表只给「按唯一键取一行、按前缀列举个数」这一档机制，语义留给接入方。
 - **没有数据面**（§5.3）：文件字节永远在客户端侧，引擎只答元数据。也没有同步复制、
-  没有自动故障转移（`--promote` 还欠着，§11 第 4 条③）。
+  没有自动故障转移（`--promote` 只是手工一步的离线动作，不开服务、不选主，§6.6）。
 
 ## 独立性策略
 
@@ -192,7 +194,7 @@ DESIGN.md §7（含 §7.8 那次全五轴复跑）。
 
 | 路径 | 内容 |
 |------|------|
-| `src/engine/` | 线协议类型（`model.rs`，51 个 op / 30 个 Reply）、帧编码（`codec.rs`）、状态机（`mem.rs`）、应用与定序（`apply.rs`）、WAL/快照（`wal.rs`）、核心（`core.rs`）、自写的 SHA-256/HMAC（`sha256.rs`，§4.4） |
+| `src/engine/` | 线协议类型（`model.rs`，52 个 op / 30 个 Reply）、帧编码（`codec.rs`）、状态机（`mem.rs`）、应用与定序（`apply.rs`）、WAL/快照（`wal.rs`）、核心（`core.rs`）、自写的 SHA-256/HMAC（`sha256.rs`，§4.4） |
 | `src/net/` | 单线程事件循环（`server.rs`）、多前端 worker + 唯一提交线程（`multi.rs`）、跨线程信箱（`mail.rs`）、接入认证闸门（`auth.rs`，§4.4）、副本跟踪器（`replicate.rs`）、阻塞客户端（`client.rs`） |
 | `src/{pool,store,persist,schema,probe}.rs` | `postgres-compat` 过渡档 |
 | `src/bin/` | `treedb-server` / `treedb-bench` / `treedb-pgbench`（对照工具）/ `treedb-micro`（纯计算 + 分配计数）/ `treedb-migrate`（快照升级）/ `treedb-standby`（只读副本 + `--promote`）/ `treedb-demo` |

@@ -639,6 +639,23 @@ pub enum Op {
         uid: u32,
         gid: u32,
     },
+    /// 给已存在的 inode 再加一个目录项（POSIX `link(2)`）。
+    ///
+    /// `ino` 必须是本视图内的**非目录**节点（目录回 `EPERM`，与 POSIX 一致）；
+    /// 名字已存在回 `EEXIST`，不做 upsert —— `link(2)` 没有「替换」语义。
+    /// 成功后两个名字指向同一个 inode、`nlink` +1，内容对象（`data_ref`）不复制：
+    /// 这是与治理面「显示别名」（只改解析路径）和零拷贝导入（数据面共享字节）
+    /// 都不同的第三件事（§5.2）。
+    ///
+    /// 不带 `uid`/`gid`：`link(2)` 不改属主也不改任何 inode 属性，唯一变化是
+    /// 多一条 dentry 与 `nlink` +1。给一个用不上的身份字段只会让调用方以为
+    /// 它在做权限判断。
+    Link {
+        view: ViewId,
+        ino: Ino,
+        parent: Ino,
+        name: Vec<u8>,
+    },
     Readlink {
         view: ViewId,
         ino: Ino,
@@ -910,6 +927,8 @@ impl Op {
             Op::RowDelete { .. } => 0x0077,
             Op::RowCount { .. } => 0x0078,
             Op::ReadDirPlus { .. } => 0x002b,
+            // 目录树那一段 0x0020–0x002b 已排满，`Link` 取紧接着的下一个空位。
+            Op::Link { .. } => 0x002c,
             Op::WalFetch { .. } => 0x0080,
             Op::SnapFetch { .. } => 0x0081,
             Op::AuthBegin { .. } => 0x0090,
@@ -983,6 +1002,7 @@ impl Op {
             | Op::Create { .. }
             | Op::Mkdir { .. }
             | Op::Symlink { .. }
+            | Op::Link { .. }
             | Op::Unlink { .. }
             | Op::Rmdir { .. }
             | Op::Rename { .. }
@@ -1095,6 +1115,17 @@ impl Op {
                 w.bytes(target);
                 w.u32(*uid);
                 w.u32(*gid);
+            }
+            Op::Link {
+                view,
+                ino,
+                parent,
+                name,
+            } => {
+                w.u32(*view);
+                w.u64(*ino);
+                w.u64(*parent);
+                w.bytes(name);
             }
             Op::Unlink { view, parent, name } | Op::Rmdir { view, parent, name } => {
                 w.u32(*view);
@@ -1347,6 +1378,12 @@ impl Op {
                 parent: r.u64()?,
                 offset: r.u64()?,
                 limit: r.u32()?,
+            },
+            0x002c => Op::Link {
+                view: r.u32()?,
+                ino: r.u64()?,
+                parent: r.u64()?,
+                name: r.bytes()?,
             },
             0x0030 => Op::RefLookup { data_ref: r.bytes()? },
             0x0031 => Op::RefUp {
@@ -2270,6 +2307,12 @@ mod tests {
                 target: b"/a/b".to_vec(),
                 uid: 1,
                 gid: 2,
+            },
+            Op::Link {
+                view: 3,
+                ino: 7,
+                parent: 1,
+                name: b"s2".to_vec(),
             },
             Op::Unlink {
                 view: 3,
