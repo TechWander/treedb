@@ -142,6 +142,13 @@ pub struct ServerConfig {
     /// 没有任何位置可放，客户端也无从对应。要让客户端看到原因，看服务端
     /// 那行 `refused connection #N`（限速打印）。
     pub max_conn: usize,
+    /// WAL 归档目录（§6.11）。`None` = 不归档，与引入归档之前逐字一致。
+    ///
+    /// 开了之后每次 checkpoint 会先把要抹掉的那段日志与旧快照拷进这个目录，
+    /// 于是「回到某个秒」有了物料；归档失败会让 checkpoint 失败（fail-closed），
+    /// 因为历史不能静默丢。开关必须一直开着：中间关过一段，那几次 checkpoint
+    /// 就会在归档里留一个洞，`treedb-pitr` 越过它时会直接报缺口。
+    pub archive: Option<PathBuf>,
 }
 
 impl ServerConfig {
@@ -166,6 +173,8 @@ impl ServerConfig {
             auth: None,
             // 默认不限：v0.5 之前的实例没有这个概念，默认值一变就是行为变更。
             max_conn: 0,
+            // 默认不归档：额外一次字节搬运与一份磁盘占用，不该默认替用户决定。
+            archive: None,
         }
     }
 }
@@ -174,8 +183,12 @@ impl ServerConfig {
 /// 是为了让两条事件循环（单线程与多 worker）不可能一个开了副本、一个忘了。
 pub(crate) fn open_engine(cfg: &ServerConfig) -> Result<Engine> {
     match &cfg.replication {
-        Some(_) => Engine::open_replica(&cfg.dir, cfg.durability),
-        None => Engine::open(&cfg.dir, cfg.durability),
+        Some(_) => Engine::open_replica_with_archive(
+            &cfg.dir,
+            cfg.durability,
+            cfg.archive.clone(),
+        ),
+        None => Engine::open_with_archive(&cfg.dir, cfg.durability, cfg.archive.clone()),
     }
 }
 

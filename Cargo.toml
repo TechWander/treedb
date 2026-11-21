@@ -42,6 +42,13 @@ path = "src/bin/dump.rs"
 name = "treedb-load"
 path = "src/bin/load.rs"
 
+# 时间点恢复（§6.11）：把 server --archive-dir 攒下的 WAL 归档 + 活日志重放到
+# 任意一个已归档的水位，落成一个新数据目录。与 load 的分工是「日志粒度」对
+# 「dump 粒度」—— load 只能回到导出的那一刻，pitr 能回到归档覆盖的任意一条。
+[[bin]]
+name = "treedb-pitr"
+path = "src/bin/pitr.rs"
+
 # 在线导出：dump 读本地目录、要目录独占；backup 读在线主，两条腿都是主已经
 # 实现的只读 op（SnapFetch + WalFetch），所以主不停机也能拿到一致切面。
 # 产出与 dump 同格式（TDBDUMP1），`treedb-load` 直接吃得下。

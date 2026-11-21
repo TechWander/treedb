@@ -117,6 +117,7 @@ fn main() {
     let mut shutdown_only = false;
     let mut pid_file: Option<PathBuf> = None;
     let mut auth_key_file: Option<PathBuf> = None;
+    let mut archive: Option<PathBuf> = None;
     let mut format = "text".to_string();
     let mut format_given = false;
 
@@ -140,6 +141,7 @@ fn main() {
             "--flush-pipeline" => flush_pipeline = true,
             "--pid-file" => pid_file = Some(PathBuf::from(next(&mut i))),
             "--auth-key-file" => auth_key_file = Some(PathBuf::from(next(&mut i))),
+            "--archive-dir" => archive = Some(PathBuf::from(next(&mut i))),
             "--stats" => stats_only = true,
             "--format" => {
                 format = next(&mut i);
@@ -255,11 +257,12 @@ fn main() {
         // 副本会拿到一份没人测过的默认值。
         replication: None,
         auth,
+        archive: archive.clone(),
     };
     eprintln!(
         // 帧里没有版本位（§4.1），升级顺序又是硬约束，所以 banner 一开就把它摆出来：
         // 运维在两端对不上时第一眼就该看见。
-        "treedb-server pid={} listen={} dir={} protocol={} durability={} backlog={} max_conn={} workers={} auth={}",
+        "treedb-server pid={} listen={} dir={} protocol={} durability={} backlog={} max_conn={} workers={} auth={} archive={}",
         std::process::id(),
         addr,
         dir.display(),
@@ -268,7 +271,11 @@ fn main() {
         backlog,
         if max_conn == 0 { "unlimited".to_string() } else { max_conn.to_string() },
         workers,
-        if auth_on { "on" } else { "off" }
+        if auth_on { "on" } else { "off" },
+        match &archive {
+            Some(a) => a.display().to_string(),
+            None => "off".to_string(),
+        }
     );
     match serve(&cfg, &STOP, &LIVE) {
         Ok(rep) => {
@@ -327,6 +334,13 @@ treedb-server — 元数据引擎服务端（POSIX 元数据语义，客户端�
                              才值得打开。打开后 ack 语义不变（仍严格晚于落盘）。
   --auto-checkpoint-mb N     WAL 超此大小自动快照，默认 64（0 = 关闭）
   --pid-file PATH            启动后写入 pid，便于测试脚本 kill -9
+  --archive-dir PATH         开启 WAL 归档（§6.11）：每次 checkpoint 先把要抹掉的
+                             那段日志与旧快照拷进这个目录，然后才动源目录。
+                             给了它，`treedb-pitr` 才能回到任意一个已归档的水位；
+                             不给 = 不归档，与以前逐字一致。归档失败会让 checkpoint
+                             失败（历史不能静默丢），所以要给一个与数据目录不同的
+                             可写目录，并保证磁盘余量。开关要一直开着：中间关过一段，
+                             那几次 checkpoint 就会在归档里留一个洞。
   --auth-key-file PATH       启用接入认证（§4.4）：从文件读集群共享密钥，必须是
                              32 原始字节或 64 个十六进制字符（0/64 个零 = 没填的
                              模板，拒接）。不给这个 flag = 不认证，与 v4 逐字一致。

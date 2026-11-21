@@ -359,17 +359,47 @@ impl Wal {
     /// 尾部破损（短读/CRC 不符/len 越界）只停止；完好记录之间跳号则直接报错，
     /// 语义与 [`scan`] 一致，两条路径不能对同一个文件给出不一致的结论。
     pub fn replay(path: &Path, from_seq: u64) -> Result<Vec<Log>> {
+        let mut out = Vec::new();
+        Self::scan_each(path, from_seq, |_, body| {
+            out.push(Log::decode(&mut Rd::new(body))?);
+            Ok(true)
+        })?;
+        Ok(out)
+    }
+
+    /// 读全部完好记录，连 `seq` 一起给。
+    ///
+    /// [`replay`](Self::replay) 只回 `Vec<Log>`，调用方得从某个水位开始自己数
+    /// 序号；归档与 PITR 要按 seq 拼段、查缺口，数的机会都不该有 —— 所以这一
+    /// 口把序号一起交出来（§6.11）。
+    pub fn read_records(path: &Path) -> Result<Vec<(u64, Log)>> {
+        let mut out = Vec::new();
+        Self::scan_each(path, 0, |seq, body| {
+            out.push((seq, Log::decode(&mut Rd::new(body))?));
+            Ok(true)
+        })?;
+        Ok(out)
+    }
+
+    /// 逐条扫描 `path` 的完好记录，对 `seq > from_seq` 的调 `f`；`f` 回 `false`
+    /// 就提前停（归档只需扫到区间上界，没必要读完整份日志）。
+    ///
+    /// 三条边界与 [`Wal::replay`] 完全同源：尾部破损只停、完好记录之间跳号硬错、
+    /// `len == 0` 是预分配空洞。`replay` / `read_records` / [`copy_range`] 三个
+    /// 读口必须对同一个文件给出同一个结论，所以扫描只有这一份实现。
+    fn scan_each<F>(path: &Path, from_seq: u64, mut f: F) -> Result<()>
+    where
+        F: FnMut(u64, &[u8]) -> Result<bool>,
+    {
         if !path.exists() {
-            return Ok(Vec::new());
+            return Ok(());
         }
         let mut file = OpenOptions::new().read(true).open(path)?;
-        let mut out = Vec::new();
         let mut hdr = [0u8; HDR];
         let mut expect: Option<u64> = None;
         loop {
-            match read_exact_or_eof(&mut file, &mut hdr)? {
-                false => break,
-                true => {}
+            if !read_exact_or_eof(&mut file, &mut hdr)? {
+                break;
             }
             let seq = u64::from_le_bytes(hdr[0..8].try_into().unwrap());
             let crc = u32::from_le_bytes(hdr[8..12].try_into().unwrap());
@@ -399,13 +429,11 @@ impl Wal {
                 }
             }
             expect = Some(seq + 1);
-            if seq > from_seq {
-                let mut r = Rd::new(&body);
-                let log = Log::decode(&mut r)?;
-                out.push(log);
+            if seq > from_seq && !f(seq, &body)? {
+                break;
             }
         }
-        Ok(out)
+        Ok(())
     }
 
     /// 下一条要写的 seq。副本 apply 前用它验连续性：交付区间里跳号等于记录丢了。
@@ -734,6 +762,57 @@ impl Wal {
         self.durable_seq = last.max(seq);
         Ok(kept)
     }
+}
+
+/// 一次归档复制的如实报告：条数与首尾 seq。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Copied {
+    pub records: u64,
+    pub first: Option<u64>,
+    pub last: Option<u64>,
+}
+
+/// 把 `src` 里 `from < seq <= to` 的记录按帧原样拷进 `out`（新建/截断，不预分配）。
+///
+/// 用途只有一个：checkpoint 把 `(from, to]` 从活日志里抹掉之前，先把那一段
+/// 搬去归档目录（§6.11）。所以这里有两条比 [`Wal::replay`] 更严的约定：
+///
+/// - **第一条必须是 `from + 1`**。`from` 是快照水位，日志里 ≤ 它的记录本该
+///   早被上一次 checkpoint 抹掉；第一条不是它就说明段中间有洞，此时宁可让
+///   checkpoint 失败，也不产出一个「看起来连续」的归档 —— 后者要等到真做
+///   PITR 时才会发现，而那时候源日志已经没得对账了。
+/// - **写出后 `sync_all`**。调用方紧接着就 `reset` / `truncate_before` 抹掉
+///   源记录，归档没落稳就等于历史没了。
+pub fn copy_range(src: &Path, from: u64, to: u64, out: &Path) -> Result<Copied> {
+    let mut f = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(out)?;
+    f.set_len(0)?;
+    let mut c = Copied::default();
+    Wal::scan_each(src, from, |seq, body| {
+        if seq > to {
+            return Ok(false);
+        }
+        if c.first.is_none() && seq != from + 1 {
+            return Err(Error::Io(format!(
+                "wal archive gap in {}: segment starts at {seq} but the snapshot is at {from}",
+                src.display()
+            )));
+        }
+        f.write_all(&seq.to_le_bytes())?;
+        f.write_all(&crc32(body).to_le_bytes())?;
+        f.write_all(&(body.len() as u32).to_le_bytes())?;
+        f.write_all(&0u32.to_le_bytes())?;
+        f.write_all(body)?;
+        c.records += 1;
+        c.first.get_or_insert(seq);
+        c.last = Some(seq);
+        Ok(true)
+    })?;
+    f.sync_all()?;
+    Ok(c)
 }
 
 /// 把 `f` 的真实长度抬到 `target` 并保证那段空间可读为 0。

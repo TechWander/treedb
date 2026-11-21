@@ -18,6 +18,7 @@
 //! 文档），重启后状态由快照 + WAL 重放重建，不会留下半提交状态。
 
 use crate::engine::apply::translate;
+use crate::engine::archive::Archive;
 use crate::engine::codec::{Rd, W};
 use crate::engine::dump::Dump;
 use crate::engine::mem::{Log, State, SNAP_LEGACY_VERSION, SNAP_VERSION};
@@ -257,7 +258,7 @@ pub fn now_ms() -> i64 {
 /// 锁是 `LOCK_EX | LOCK_NB`，落在目录里的 `.lock` 上：非阻塞是因为“等另一个
 /// 实例退出”不是运维想要的语义（他会以为是卡住），而锁跟着 fd 走，进程怎么
 /// 死的（包括 `kill -9`）都自动释放。
-struct DirLock {
+pub(crate) struct DirLock {
     /// 只为持有 fd：`flock` 锁在 open file description 上，关掉即释放。
     _file: File,
     /// 注册表里的键，`Drop` 时据此摘除。
@@ -288,7 +289,7 @@ impl Drop for DirLock {
 }
 
 impl DirLock {
-    fn acquire(dir: &Path) -> Result<DirLock> {
+    pub(crate) fn acquire(dir: &Path) -> Result<DirLock> {
         // 规范化后再比：`./x`、`x`、软链指向的同一目录必须算同一个目录。
         let key = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
         if HELD
@@ -384,6 +385,8 @@ pub struct Engine {
     fence: u64,
     /// 数据目录的进程间互斥。字段只为活着（drop = 解锁）。
     _lock: DirLock,
+    /// WAL 归档目录（§6.11）。`None` = 不归档，行为与引入归档之前逐字一致。
+    archive: Option<PathBuf>,
     /// 正在后台编的一份快照（§8 第 7 条）。有它时自动档不再派新的；
     /// 退出、显式 checkpoint 与副本装快照都会先把它收掉。
     inflight: Option<Inflight>,
@@ -404,8 +407,13 @@ struct Inflight {
 /// 同时在追加 WAL 也没关系——只要 `upto` 之前的字节都落了盘（`durable_seq`
 /// 的定义），按帧顺序读到那里就是完整的。
 ///
-/// 失败只会留下「旧快照 + 更长的 WAL」，与崩溃恢复看到的形状一样。
-fn build_snapshot_from_disk(dir: &Path, upto: u64) -> Result<u64> {
+/// 无归档时失败只会留下「旧快照 + 更长的 WAL」，与崩溃恢复看到的形状一样。
+/// 开了归档（§6.11）则多一步：**在 `write_snapshot` 之前**把 `(snap_seq, upto]`
+/// 的 WAL 段与水位的 `state.snap` 拷进归档目录。顺序不可换——这一行之后的
+/// `state.snap` 已是水位 `upto` 的那一份，水位 `snap_seq` 那份的字节只在归档
+/// 里还活着；而归档失败要让整份快照失败，让 `truncate_before` 不执行，历史
+/// 不能因为「归档盘满了」而静默丢掉。
+fn build_snapshot_from_disk(dir: &Path, upto: u64, archive: Option<&Path>) -> Result<u64> {
     let snap_path = dir.join(SNAP_FILE);
     let (mut state, snap_seq) = if snap_path.exists() {
         let raw = std::fs::read(&snap_path)?;
@@ -433,6 +441,10 @@ fn build_snapshot_from_disk(dir: &Path, upto: u64) -> Result<u64> {
     for l in &logs {
         state.apply(l);
     }
+    // 归档必须在 `write_snapshot` 之前，理由见函数文档。
+    if let Some(ar) = archive {
+        Archive::new(ar).record(&dir.join(WAL_FILE), snap_seq, upto, &snap_path)?;
+    }
     write_snapshot(dir, &state, upto)?;
     Ok(upto)
 }
@@ -441,8 +453,9 @@ fn build_snapshot_from_disk(dir: &Path, upto: u64) -> Result<u64> {
 /// `rename` → 刷父目录。
 ///
 /// 同步 checkpoint、旁路快照与 `restore_dump` 共用这一处 —— 三条路径写下去的
-/// 字节必须同形，否则「换一种方式落盘」就会变成隐性格式分叉。
-fn write_snapshot(dir: &Path, state: &State, seq: u64) -> Result<()> {
+/// 字节必须同形，否则「换一种方式落盘」就会变成隐性格式分叉。PITR 的落点
+/// （§6.11）也走这一口，理由同一个。
+pub(crate) fn write_snapshot(dir: &Path, state: &State, seq: u64) -> Result<()> {
     let mut w = W::new();
     state.save_with_trailer(&mut w, seq);
     let buf = w.finish();
@@ -493,14 +506,13 @@ pub fn dump_dir(dir: &Path) -> Result<Dump> {
     Ok(Dump::of_state(&state, seq))
 }
 
-/// 离线导入：把一份 dump 写成一个**新的**数据目录。
+/// 新建一个「只含 `.lock`」的空目录并拿住锁：dump 导入与 PITR 的落点共用。
 ///
-/// 只落 `state.snap`（水位 = dump 的 seq），不写 WAL —— 导入后「快照之后没有
-/// 任何写」是字面意思。目标目录必须不存在、或只含本工具自己的 `.lock`：
-/// 往一个有数据的目录里合并不是导入，那是另一种（且没有契约的）操作。
-pub fn restore_dump(dir: &Path, d: &Dump) -> Result<()> {
+/// 返回的锁必须活到写完 —— 丢掉它就是允许第二个进程同时往同一个目录里写。
+/// 检查在动任何字节之前：拒绝时目标要么不存在、要么只多一个 `.lock`。
+pub(crate) fn open_restore_target(dir: &Path) -> Result<DirLock> {
     std::fs::create_dir_all(dir)?;
-    let _lock = DirLock::acquire(dir)?;
+    let lock = DirLock::acquire(dir)?;
     let mut foreign = Vec::new();
     for e in std::fs::read_dir(dir)? {
         let name = e?.file_name();
@@ -516,6 +528,16 @@ pub fn restore_dump(dir: &Path, d: &Dump) -> Result<()> {
             foreign[0]
         )));
     }
+    Ok(lock)
+}
+
+/// 离线导入：把一份 dump 写成一个**新的**数据目录。
+///
+/// 只落 `state.snap`（水位 = dump 的 seq），不写 WAL —— 导入后「快照之后没有
+/// 任何写」是字面意思。目标目录必须不存在、或只含本工具自己的 `.lock`：
+/// 往一个有数据的目录里合并不是导入，那是另一种（且没有契约的）操作。
+pub fn restore_dump(dir: &Path, d: &Dump) -> Result<()> {
+    let _lock = open_restore_target(dir)?;
     write_snapshot(dir, &d.state(), d.seq)
 }
 
@@ -525,6 +547,34 @@ impl Engine {
     /// 恢复顺序：读 `state.snap`（若有）→ 重放 `seq > snap_seq` 的 WAL
     /// 记录 → 截掉坏尾。空目录得到一个全新引擎。
     pub fn open(dir: &Path, durability: Durability) -> Result<Engine> {
+        Self::open_with_archive(dir, durability, None)
+    }
+
+    /// 同 [`Engine::open`]，外加一个 WAL 归档目录（§6.11）。
+    ///
+    /// 归档目录在这里就建出来、而且要求它不等于数据目录：不可写与「归档跟
+    /// 快照抢同一个目录」都要在开局暴露成启动错误，而不是等到第一次 checkpoint
+    /// 才把服务打下来 —— 那时进程里已经有未归档的历史。
+    pub fn open_with_archive(
+        dir: &Path,
+        durability: Durability,
+        archive: Option<PathBuf>,
+    ) -> Result<Engine> {
+        if let Some(a) = &archive {
+            Archive::new(a).ensure()?;
+            let same = match (a.canonicalize(), dir.canonicalize()) {
+                (Ok(x), Ok(y)) => x == y,
+                _ => false,
+            };
+            if same {
+                return Err(Error::Config(format!(
+                    "archive dir {} is the data directory itself: archive segment names would \
+                     get mixed into the directory that `dump_dir` / `pitr_restore` scan for \
+                     other files; give the archive its own directory",
+                    a.display()
+                )));
+            }
+        }
         let t0 = std::time::Instant::now();
         std::fs::create_dir_all(dir)?;
         // 先拿锁再读一个字节：与另一个实例抢同一份 WAL 的重放是这里唯一
@@ -582,6 +632,7 @@ impl Engine {
                 elapsed_ms: t0.elapsed().as_millis() as u64,
             },
             _lock: lock,
+            archive,
             inflight: None,
         };
         // Stats 反映本进程服务量，故不把恢复期的重放计入 ops/writes；
@@ -593,6 +644,11 @@ impl Engine {
 
     pub fn dir(&self) -> &Path {
         &self.dir
+    }
+
+    /// 归档目录（没开归档 = `None`）。
+    pub fn archive_dir(&self) -> Option<&Path> {
+        self.archive.as_deref()
     }
 
     /// 本目录当前的 fencing token（从未被提升过 = 0）。
@@ -674,7 +730,20 @@ impl Engine {
     /// - checkpoint 能把 WAL 长度控住，不然只靠日志的副本运行一天就
     ///   拖着一个与主同大的日志文件。
     pub fn open_replica(dir: &Path, durability: Durability) -> Result<Engine> {
-        let mut eng = Self::open(dir, durability)?;
+        Self::open_replica_with_archive(dir, durability, None)
+    }
+
+    /// 同 [`Engine::open_replica`]，外加归档目录（§6.11）。
+    ///
+    /// 副本自己也 checkpoint（§6.6 的第三条理由），所以它同样需要归档：否则
+    /// 副本上的「回到某一刻」只能做到最后一次 checkpoint，而那正是副本被用来
+    /// 顶位时最想回溯的那个时间点。
+    pub fn open_replica_with_archive(
+        dir: &Path,
+        durability: Durability,
+        archive: Option<PathBuf>,
+    ) -> Result<Engine> {
+        let mut eng = Self::open_with_archive(dir, durability, archive)?;
         eng.replica = true;
         eng.stats.replica = true;
         Ok(eng)
@@ -943,6 +1012,12 @@ impl Engine {
     /// （重放 + 全量编码 + 写盘 + fsync）全在后台，所以本轮停顿与状态大小
     /// 无关 —— 这是与 [`Engine::checkpoint`] 那条 stop-the-round 路径的区别。
     ///
+    /// 归档（§6.11）也在那个线程里做，而且排在 `write_snapshot` 之前：拷段与
+    /// 拷旧快照都是 O(日志 + 状态) 的字节搬运，搬到提交线程上等于把「停顿与
+    /// 状态大小无关」这条性质当场取消。放进后台的代价只有一条：归档失败会让
+    /// 这份快照一起失败（`checkpoint_poll` 把错抛给事件循环），而那时
+    /// `truncate_before` 尚未执行，历史仍然完整。
+    ///
     /// 已经有一份在路上时直接返回 `false`：让它编完更划算，硬插一份只会
     /// 两份抢同一个 `state.snap.tmp`。
     pub fn checkpoint_start(&mut self) -> Result<bool> {
@@ -956,9 +1031,10 @@ impl Engine {
             return Ok(false);
         }
         let dir = self.dir.clone();
+        let archive = self.archive.clone();
         let handle = std::thread::Builder::new()
             .name("treedb-snap".into())
-            .spawn(move || build_snapshot_from_disk(&dir, seq))
+            .spawn(move || build_snapshot_from_disk(&dir, seq, archive.as_deref()))
             .map_err(|e| Error::Io(format!("spawn background snapshot: {e}")))?;
         self.inflight = Some(Inflight { seq, handle });
         Ok(true)
@@ -1010,6 +1086,12 @@ impl Engine {
     /// 顺序：state.save → tmp → fsync(tmp) → rename → fsync(dir) → wal.reset。
     /// 任一步崩溃都只可能留下「旧快照 + 更长的 WAL」，重放仍能还原。
     ///
+    /// 开了归档（§6.11）则在上面全部动作**之前**先拷一份 `(snap_seq, seq]` 与
+    /// 水位 `snap_seq` 的快照。这条路径本来就在停轮，归档的搬运不能从中挑出
+    /// 去（后台那份的收口已经等完了），而顺序不能换：`rename` 之后旧快照的
+    /// 字节就没了，`wal.reset` 之后那段日志也没了。归档失败则整次 checkpoint
+    /// 失败，源目录一个字节不动。
+    ///
     /// 自动档不走这里（§8 第 7 条）：它在轮与轮之间派 [`Engine::checkpoint_start`]，
     /// 只在本函数里停轮一口气编完。开编前先把在路上的那份收掉：两份抢同一个
     /// tmp，而且收得晚的那份会把水位往回带。
@@ -1018,6 +1100,14 @@ impl Engine {
         // 水位取当前已 durable 的 seq：内存可能比磁盘更靠前（本轮 commit
         // 尚未发生），把未落盘的记录当成"快照已覆盖"会丢数据。
         let seq = self.wal.durable_seq();
+        if let Some(ar) = &self.archive {
+            Archive::new(ar).record(
+                self.wal.path(),
+                self.snap_seq,
+                seq,
+                &self.dir.join(SNAP_FILE),
+            )?;
+        }
         let mut w = W::new();
         {
             // 快照只需要一个一致的时间切面：读锁挡住写者 apply 就够了，不需要

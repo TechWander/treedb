@@ -16,6 +16,7 @@
 //! 只出现在过渡档（[`crate::pool`] / [`crate::store`] / [`crate::persist`]）。
 
 pub mod apply;
+pub mod archive;
 pub mod codec;
 pub mod core;
 pub mod dump;
@@ -24,6 +25,7 @@ pub mod model;
 pub mod sha256;
 pub mod wal;
 
+pub use archive::{pitr_restore, plan_pitr, Archive, PitrPlan};
 pub use codec::{Rd, W};
 pub use core::{
     dump_dir, migrate_snapshot, now_ms, probe_snapshot, read_fence, restore_dump, Durability,
