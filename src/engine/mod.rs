@@ -25,8 +25,8 @@ pub mod wal;
 
 pub use codec::{Rd, W};
 pub use core::{
-    migrate_snapshot, now_ms, probe_snapshot, Durability, Engine, EngineStats, MigrationOutcome,
-    SnapshotInfo,
+    migrate_snapshot, now_ms, probe_snapshot, read_fence, Durability, Engine, EngineStats,
+    MigrationOutcome, SnapshotInfo, FENCE_FILE,
 };
 pub use mem::{Log, State, SNAP_LEGACY_VERSION, SNAP_MAGIC, SNAP_TRAIL, SNAP_TRAIL_LEGACY, SNAP_VERSION};
 pub use model::{Names, Op, Reply, NONCE_LEN};
@@ -54,7 +54,14 @@ pub const MAX_FRAME: u32 = 8 * 1024 * 1024;
 /// （`Challenge` / `AuthOk`），见 §4.4。同样是只追加不改旧值，而且**服务端没启用
 /// 认证时一个握手 op 也不会发**，所以 v4 客户端对 v5 服务端逐字照旧 ——
 /// 这一版的兼容缺口比 v4 那条窄：`Stats` 的字段布局没动。
-pub const PROTOCOL_VERSION: u16 = 5;
+///
+/// v6 给 `WalBatch` / `SnapChunk` 的**尾部**各加一个 `epoch`（fencing token，
+/// §6.6 第 3 条）。这一版是**不兼容**的：两个应答各自多一个 u64，v5 的副本解
+/// v6 的主会短读报错（大声失败，符合预期），v6 的副本解 v5 的主同样短读。
+/// 也就是说追加字段在这里换不来跨版本可用 —— 但换来了更重要的东西：一个
+/// 令牌不对的副本，宁可连不上也不能接。所以升级时主与副本一起换，先换主、
+/// 副本会经历一段 `primary answered Err` / 短读重试，直到自身也被换掉。
+pub const PROTOCOL_VERSION: u16 = 6;
 /// 帧头长度：payload 字节数（u32 小端，不含头）。
 pub const FRAME_HDR: usize = 4;
 

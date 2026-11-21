@@ -44,6 +44,14 @@ pub enum Error {
     /// 「能自动重来」与「得报出去让人看」。
     #[error("replication gap: {0}")]
     Gap(String),
+
+    /// 对端的 fencing token 比自己小：对面是一个已经被提掉权的旧主（§6.6 第 3 条）。
+    ///
+    /// 与 `Gap` 分开的理由是运维动作完全不同：`Gap` 是「跟不上了」（自动重装快照），
+    /// 这一条是「连错主了」（改 `--primary` 指到新主，或者把对面那个旧主停掉）。
+    /// 拿 `Io` 的文案去区分这两件事，等于让调用方猜。
+    #[error("fenced: {0}")]
+    Fence(String),
 }
 
 // 这两个 `From` 只为过渡档服务：`Error::Pg`/`Error::Mirror` 存的是字面量串，

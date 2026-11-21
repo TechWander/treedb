@@ -15,7 +15,15 @@
 //! 之外的怪状态。
 //!
 //! 监控走 `treedb-server --listen <副本地址> --stats`：副本会多打一行
-//! `replica = yes (...)`，里面有 lag、重装次数和失败次数。
+//! `replica = yes (...)`，里面有 lag、重装次数和失败次数。本进程自己的 fencing
+//! token 只在本副本的启动 banner 里（`fence=N`）—— `Stats` 的字段布局这一版
+//! 刻意没动，免得再挖一个“旧客户端静默丢尾部字段”的坑（§4.1）。
+//!
+//! 同一个二进制还带一个**离线**动作：`treedb-standby --dir D --promote` 把 D 的
+//! fencing token 抬一格后退出，不开服务（§6.6 第 3 条）。切主因此是两步：先停
+//! 旧主，再 promote 副本目录，最后用 `treedb-server` 把新主开起来。为什么不做成
+//! “就地变成可写服务端”：那样同一条命令行里 `--primary` 与提升的语义会互相
+//! 矛盾，而且提升之后的第一件事往往是把旧主停掉，不该被隐式决定。
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -47,6 +55,7 @@ fn main() {
     let mut workers: usize = 0;
     let mut pid_file: Option<PathBuf> = None;
     let mut auth_key_file: Option<PathBuf> = None;
+    let mut promote = false;
 
     let mut i = 1;
     while i < args.len() {
@@ -70,6 +79,7 @@ fn main() {
             "--workers" => workers = num("--workers", &next(&mut i), workers),
             "--pid-file" => pid_file = Some(PathBuf::from(next(&mut i))),
             "--auth-key-file" => auth_key_file = Some(PathBuf::from(next(&mut i))),
+            "--promote" => promote = true,
             "-h" | "--help" => {
                 println!("{}", HELP);
                 return;
@@ -80,6 +90,54 @@ fn main() {
             }
         }
         i += 1;
+    }
+
+    // `--promote`：把这份副本目录提成主（DESIGN.md §6.6 第 3 条）。
+    //
+    // 它**不起服务**，只改盘上的一个数然后退出：提升是运维动作，什么时候把
+    // 新主开起来、客户端什么时候改地址，都不该被这个命令隐式决定。做成
+    // “就地变成可写服务端”的话，`--primary` 这个参数在同一份命令里语义会
+    // 自相矛盾（既追别人又当主），而且提升后的第一件事往往是把旧主停掉。
+    if promote {
+        if primary.is_some() {
+            eprintln!("--promote does not follow anything: drop --primary (this dir becomes the primary)\n\n{HELP}");
+            std::process::exit(2);
+        }
+        let durability = parse_durability(&durability);
+        let mut eng = match treedb::engine::Engine::open(&dir, durability) {
+            Ok(e) => e,
+            Err(e) => {
+                // 目录被一个活着的实例占着（另一个进程 / 另一个副本）：提升它会
+                // 让两个进程对“谁是主”有两种答案。直接拒。
+                eprintln!("treedb-standby --promote: cannot open {}: {e}", dir.display());
+                std::process::exit(1);
+            }
+        };
+        let was = eng.fence();
+        let snap_seq = eng.recovery().snap_seq;
+        let wal_records = eng.recovery().wal_records;
+        match eng.promote() {
+            Ok(now) => {
+                println!(
+                    "promoted {}: fence {was} -> {now} (snap_seq {snap_seq}, {wal_records} wal recs replayed)",
+                    dir.display()
+                );
+                println!(
+                    "this directory is now the highest-ranked copy; start a primary on it with\n  \
+                     treedb-server --dir {} --listen HOST:PORT",
+                    dir.display()
+                );
+                println!(
+                    "any replica still pointed at the OLD primary will refuse its batches \
+                     (its fence is {now}) until it is repointed here"
+                );
+                return;
+            }
+            Err(e) => {
+                eprintln!("treedb-standby --promote: {e}");
+                std::process::exit(1);
+            }
+        }
     }
 
     let Some(p) = primary else {
@@ -154,8 +212,20 @@ fn main() {
     cfg.replication = Some(rcfg.clone());
     cfg.auth = auth;
 
+    // 令牌要进 banner，但引擎在 `serve` 里才打开（`open` 会抢目录锁）。
+    // 直接读那个小文件：它和引擎启动时读的是同一个函数，所以 banner 上
+    // 这个数与随后 `Engine::open` 拿到的值不会不一致。读坏了就退出 ——
+    // 这和引擎的选择一致（坏令牌不当 0 用），也避免了“banner 打 0、
+    // 服务却起不来”这种看起来像 bug 的输出。
+    let fence = match treedb::engine::read_fence(&dir) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("treedb-standby: {e}");
+            std::process::exit(1);
+        }
+    };
     eprintln!(
-        "treedb-standby pid={} listen={} dir={} primary={} protocol={} interval={} ms fetch={} B workers={} auth={}",
+        "treedb-standby pid={} listen={} dir={} primary={} protocol={} interval={} ms fetch={} B workers={} auth={} fence={}",
         std::process::id(),
         addr,
         dir.display(),
@@ -164,7 +234,8 @@ fn main() {
         interval_ms,
         fetch_bytes,
         workers,
-        if auth_on { "on" } else { "off" }
+        if auth_on { "on" } else { "off" },
+        fence
     );
     match serve(&cfg, &STOP, &LIVE) {
         Ok(rep) => {
@@ -249,6 +320,18 @@ treedb-standby — 只读副本（pull 式日志传送，DESIGN.md §6.6）
   --workers N                前端 worker 线程数，默认 0 = auto。只扩展读；写永远
                              被引擎以 EROFS 挡掉，不会到提交线程
   --pid-file PATH            启动后写入 pid
+  --promote                  不开服务：只把本目录的 fencing token 抬到“见过的最大值
+                             + 1”然后退出（§6.6 第 3 条）。跑完之后用
+                             treedb-server --dir <同一个目录> 把新主开起来。
+                             不要同时给 --primary：提升一个目录与“跟在谁后面”
+                             是两件事，同时给会自相矛盾。
+                             旧主如果还活着，它自己不会知道已被换掉，也不会停止对
+                             客户端服务 —— fencing 只让副本拒收它的批，挡不住它的
+                             读者。所以旧主必须真停掉（或者把它的客户端改指到新
+                             主），而不是只靠抬令牌。
+                             也别把新主的 fence 文件改小：那等于把旧主的权又开回来。
+                             任何仍指着旧主的副本会拒收它的批（日志里报
+                             `is fenced out`），需要改指到新主。
   --auth-key-file PATH       集群共享密钥（§4.4），一个 flag 管两头：对主握手，
                              并要求连到本副本的读者也握手。不给 = 不认证。
                              密钥必须与主的 `--auth-key-file` 是同一把，否则表

@@ -1673,16 +1673,26 @@ pub enum Reply {
         durable_seq: u64,
         snap_seq: u64,
         gap: bool,
+        /// 主的 fencing token（§6.6 第 3 条）。副本用它挡被提掉权的旧主；
+        /// 语义与 [`Reply::SnapChunk::epoch`] 同一个数（主的 `fence`）。
+        epoch: u64,
     },
     /// [`Op::SnapFetch`] 的应答：`state.snap` 从 `offset` 起的一段。
     ///
     /// `total` 是整份快照的字节数（副本据此知道下完没有），`snap_seq` 是这份快照
     /// 的水位，起代际标签的作用：分块下载中途它变了，说明主的快照被 checkpoint
     /// 换过一代，手里这几块拼起来也不是同一份，只能整份重下。
+    ///
+    /// `epoch` 是主的 **fencing token**（§6.6 第 3 条）：单调递增的「谁有权写」
+    /// 令牌，每次 `treedb-standby --promote` 加一。副本拿它与自己目录里的令牌比：
+    /// 更小的主一律拒收（那是被提掉权的旧主），更大的主接受并把自己的令牌抬上去。
+    /// 放在快照这条路上而不是只放在 `WalBatch` 上，因为「只有快照可拉」恰恰是副本
+    /// 落后最多、最容易被旧主骗回去的时刻。
     SnapChunk {
         bytes: Vec<u8>,
         total: u64,
         snap_seq: u64,
+        epoch: u64,
     },
     /// [`Op::AuthBegin`] 的应答：服务端挑战值。收到它就是「本实例启用了
     /// 认证，请交回 MAC」；`proto` 是服务端的线协议版本，碰巧也是全协议里
@@ -1904,6 +1914,7 @@ impl Reply {
                 durable_seq,
                 snap_seq,
                 gap,
+                epoch,
             } => {
                 w.u16(0x0180);
                 w.u32(records.len() as u32);
@@ -1915,16 +1926,19 @@ impl Reply {
                 w.u64(*durable_seq);
                 w.u64(*snap_seq);
                 w.bool(*gap);
+                w.u64(*epoch);
             }
             Reply::SnapChunk {
                 bytes,
                 total,
                 snap_seq,
+                epoch,
             } => {
                 w.u16(0x0181);
                 w.bytes(bytes);
                 w.u64(*total);
                 w.u64(*snap_seq);
+                w.u64(*epoch);
             }
             Reply::Challenge {
                 server_nonce,
@@ -2131,12 +2145,14 @@ impl Reply {
                     durable_seq: r.u64()?,
                     snap_seq: r.u64()?,
                     gap: r.bool()?,
+                    epoch: r.u64()?,
                 }
             }
             0x0181 => Reply::SnapChunk {
                 bytes: r.bytes_bounded(crate::engine::MAX_FRAME)?,
                 total: r.u64()?,
                 snap_seq: r.u64()?,
+                epoch: r.u64()?,
             },
             0x0190 => Reply::Challenge {
                 server_nonce: fixed_bytes(r)?,
@@ -2588,6 +2604,7 @@ mod tests {
                 durable_seq: 42,
                 snap_seq: 40,
                 gap: false,
+                epoch: 3,
             },
             // 空交付也得能往返：这是空闲副本每一轮拿到的那个应答。
             Reply::WalBatch {
@@ -2597,16 +2614,19 @@ mod tests {
                 durable_seq: 42,
                 snap_seq: 40,
                 gap: true,
+                epoch: 0,
             },
             Reply::SnapChunk {
                 bytes: vec![7; 64],
                 total: 4096,
                 snap_seq: 40,
+                epoch: 3,
             },
             Reply::SnapChunk {
                 bytes: Vec::new(),
                 total: 0,
                 snap_seq: 0,
+                epoch: 0,
             },
             Reply::Challenge {
                 server_nonce: [0x11; NONCE_LEN],

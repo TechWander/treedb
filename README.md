@@ -16,8 +16,8 @@ cargo build --release                                   # 默认档：依赖只�
 ./target/release/treedb-server --dir /var/lib/treedb --listen 127.0.0.1:7777
 ./target/release/treedb-bench --op lookup --conns 64 --pipeline 32 --secs 3
 
-cargo test --release                                    # 默认档 141 passed（引擎本体）
-cargo test --release --features postgres-compat        # 172 passed（含 PG 过渡档）
+cargo test --release                                    # 默认档 145 passed（引擎本体）
+cargo test --release --features postgres-compat        # 176 passed（含 PG 过渡档）
 bash benches/throughput_matrix.sh 3 1 2 3 4 5           # 五轴复现，输出进 benches/results/
 bash benches/sync_ratio.sh 3                           # 写路径机制：一次 fsync 摊了多少写
 bash benches/single_conn.sh 3                          # 单连接对标 PG（$PIPE=32 走批量档、$CONNS/$WORKERS 走并发档）
@@ -55,6 +55,23 @@ bash benches/handshake_cost.sh 20000                   # 接入握手的代价�
 目录里有什么就先用什么：冷启动先向主要一份快照，之后按 seq 追 WAL；追上之前对读的
 答案是「空库」而不是报错。写拿 `EROFS`，主挂了副本照答读。拉取式、异步、
 无读己之写 —— 边界与没做到的四条见 [DESIGN.md](DESIGN.md) §6.6。
+
+切主是**两步**，中间那一步是这个命令（v0.4.0）：
+
+```sh
+# 1. 停掉旧主（fencing 挡不住旧主对自己的客户端服务，必须真停）
+./target/release/treedb-standby --dir /var/lib/treedb-replica --promote
+#    promoted /var/lib/treedb-replica: fence 0 -> 1 (snap_seq 412, 4180 wal recs replayed)
+# 2. 把提示出来的命令跑起来，把客户端地址改过去
+./target/release/treedb-server --dir /var/lib/treedb-replica --listen 0.0.0.0:7777
+```
+
+`--promote` **不开服务**，只把目录里那个 `fence` 文件抬一格然后退出 —— 什么时候
+开新主、客户端什么时候改地址，不该被一条命令隐式决定。旧主交来的批会被副本按
+`fence` 拒掉（日志里 `is fenced out`，`replica_errors` 跟着涨），所以拿错主是
+看得见的而不是静默回滚。它与 `--primary` 不能同时给（一个目录既追别人又当主
+是自相矛盾的，退出码 2）。边界同见 §6.6「切主」：不自动选主、旧主要人停、
+令牌不保护从未追过新主的副本。
 
 `--workers N` 把只读 op 摊到 N 条前端线程上并行；写永远由唯一提交线程定序，
 group commit 不丢。默认按核数给：`min(8, 核数/2)`（1–3 核机器算出来仍是 1，与旧
@@ -136,7 +153,8 @@ DESIGN.md §7（含 §7.8 那次全五轴复跑）。
   引擎没有连接数上限常量，卡它的是服务端 `RLIMIT_NOFILE` 与客户端源端口空间（§7.6）。
 - **持久性与备份面**：CRC32 WAL + 快照 checkpoint + 崩溃重放（§6.1/§6.2），优雅停服
   自带最后一次 checkpoint。备份可用的形状有三种且都跑过（§6.7）：停服后 `cp -a` 目录、
-  `treedb-standby` 拉一份持续追平的异地镜像（那个目录可以直接当还原点起服）、
+  `treedb-standby` 拉一份持续追平的异地镜像（那个目录可以直接当还原点起服，
+  v0.4.0 起还能用 `treedb-standby --promote` 把它合法地提成主）、
   `treedb-migrate` 处理快照格式跨代。`--durability` 三档：`group`（默认，一轮一次
   fsync、跨连接合并）/ `always`（同一个提交点，单连接下自然退化成每 op 一次盘）/
   `never`（会丢一个窗口）。
@@ -177,7 +195,7 @@ DESIGN.md §7（含 §7.8 那次全五轴复跑）。
 | `src/engine/` | 线协议类型（`model.rs`，51 个 op / 30 个 Reply）、帧编码（`codec.rs`）、状态机（`mem.rs`）、应用与定序（`apply.rs`）、WAL/快照（`wal.rs`）、核心（`core.rs`）、自写的 SHA-256/HMAC（`sha256.rs`，§4.4） |
 | `src/net/` | 单线程事件循环（`server.rs`）、多前端 worker + 唯一提交线程（`multi.rs`）、跨线程信箱（`mail.rs`）、接入认证闸门（`auth.rs`，§4.4）、副本跟踪器（`replicate.rs`）、阻塞客户端（`client.rs`） |
 | `src/{pool,store,persist,schema,probe}.rs` | `postgres-compat` 过渡档 |
-| `src/bin/` | `treedb-server` / `treedb-bench` / `treedb-pgbench`（对照工具）/ `treedb-micro`（纯计算 + 分配计数）/ `treedb-migrate`（快照升级）/ `treedb-standby`（只读副本）/ `treedb-demo` |
+| `src/bin/` | `treedb-server` / `treedb-bench` / `treedb-pgbench`（对照工具）/ `treedb-micro`（纯计算 + 分配计数）/ `treedb-migrate`（快照升级）/ `treedb-standby`（只读副本 + `--promote`）/ `treedb-demo` |
 | `tests/` | `engine_crud` `net_protocol` `read_scaling` `replication` `auth` `crash_recovery` `migrate` `scale_connections` `independence`（默认档全部要跑）；`concurrency` 属过渡档 |
 | `benches/` | 五轴矩阵脚本与历史/复跑原始输出 |
 | `DESIGN.md` | 选型判据、协议字节布局、语义边界、五轴实测、已知限制、接入路径与下一步 |

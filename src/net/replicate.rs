@@ -201,6 +201,7 @@ impl Follower {
                 durable_seq,
                 snap_seq,
                 gap,
+                epoch,
             } => {
                 eng.note_replica_progress(durable_seq);
                 self.hint_off = next_off;
@@ -213,7 +214,7 @@ impl Follower {
                 if records.is_empty() {
                     return Ok(());
                 }
-                match eng.replicate_records(base_seq, &records) {
+                match eng.replicate_records(base_seq, &records, epoch) {
                     Ok(_) => Ok(()),
                     // 交付接不上号：本地缺一段（比如副本自己的目录比主老）。
                     // 提示作废，走重装快照那条路 —— 它比从中间补洞诚实。
@@ -221,6 +222,22 @@ impl Follower {
                         // `start_resync` 自己会把提示清掉：上一代的偏移在新日志里
                         // 没有意义。
                         self.start_resync(snap_seq);
+                        Ok(())
+                    }
+                    // 对面是被提掉权的旧主（§6.6 第 3 条）：本地已经提升过，
+                    // 这一批哪怕接得上也不能收。不退出也不重试 —— 这是配置错，
+                    // 不是链路错：每次退避后重问、把错误计数抬上去，让
+                    // `--stats` 里那行 `replica_errors` 自己说话。
+                    Err(Error::Fence(m)) => {
+                        eng.note_replica_error();
+                        if self.backoff_ms == self.cfg.interval_ms.max(1) {
+                            eprintln!(
+                                "treedb-standby: primary {} is fenced out: {m}",
+                                self.cfg.primary
+                            );
+                        }
+                        self.backoff_ms = (self.backoff_ms * 2).min(BACKOFF_MAX_MS);
+                        self.client = None;
                         Ok(())
                     }
                     // 解码不过 / 往返不一致：两代格式分叉或线上坏了，不是能靠
@@ -262,8 +279,13 @@ impl Follower {
                 return Ok(());
             }
         };
-        let (bytes, total, gen) = match rep {
-            Reply::SnapChunk { bytes, total, snap_seq } => (bytes, total, snap_seq),
+        let (bytes, total, gen, epoch) = match rep {
+            Reply::SnapChunk {
+                bytes,
+                total,
+                snap_seq,
+                epoch,
+            } => (bytes, total, snap_seq, epoch),
             Reply::Err { code, msg } => {
                 eng.note_replica_error();
                 let m = String::from_utf8_lossy(&msg).into_owned();
@@ -308,7 +330,23 @@ impl Follower {
         // 收齐了。`install_snapshot` 会顺手把 WAL 截到这份快照的水位，之后第一
         // 次 `step_wal` 要的 `want_seq` 正好是主那侧还在的最早一条。
         let buf = std::mem::take(&mut self.snap.as_mut().unwrap().buf);
-        eng.install_snapshot(&buf)?;
+        match eng.install_snapshot(&buf, epoch) {
+            Ok(_) => {}
+            // 快照来自被提掉权的旧主：丢掉这份下载，下一轮重问。同样是配置错，
+            // 不是链路错（§6.6 第 3 条）。
+            Err(Error::Fence(m)) => {
+                eng.note_replica_error();
+                eprintln!(
+                    "treedb-standby: primary {} served a fenced snapshot: {m}",
+                    self.cfg.primary
+                );
+                self.snap = None;
+                self.client = None;
+                self.backoff_ms = (self.backoff_ms * 2).min(BACKOFF_MAX_MS);
+                return Ok(());
+            }
+            Err(e) => return Err(e),
+        }
         eng.note_replica_resync();
         self.snap = None;
         self.hint_off = WAL_HINT_NONE;

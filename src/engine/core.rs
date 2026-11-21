@@ -86,8 +86,40 @@ pub const SNAP_FILE: &str = "state.snap";
 pub const WAL_FILE: &str = "treedb.wal";
 /// 数据目录互斥锁文件名（[`DirLock`]）。
 pub const LOCK_FILE: &str = ".lock";
+/// fencing token 文件名（§6.6 第 3 条）：内容是一个十进制整数 + `\n`。
+///
+/// 它不在快照里，也不在 WAL 里 —— 故意做成一个独立的、人眼能 `cat` 的小文件：
+/// ① 提升它不需要碰任何数据面字节格式（`SNAP_VERSION` 仍是 3）；
+/// ② 冷拷贝/副本目录自然带着它走；
+/// ③ 一个目录被人误当“空白副本”重用之前，`cat fence` 就能看见它已经被提升过。
+/// 代价是它不在 WAL 的事务边界里 —— 但 fencing 的用处就是“比数据更早一步知道
+/// 谁有权写”，它先落盘、再由数据追上，这个顺序是刻意的。
+pub const FENCE_FILE: &str = "fence";
 /// 上一代快照的备份文件名（迁移工具写，见 [`migrate_snapshot`]）。
 pub const SNAP_BACKUP: &str = "state.snap.v2.bak";
+
+/// 读数据目录的 fencing token。文件不存在 = 0（从未被提升过）。
+///
+/// 内容不合法直接报错而不是当作 0：一个坏掉的令牌被读成 0，等于把一个已被
+/// 提升过的目录重新降级成可被旧主驱动的副本，而这种错只能在脑裂时暴露。
+///
+/// 公开是因为 `treedb-standby` 要在 `serve` 之前把令牌打进 banner，而那时
+/// 引擎还没打开（[`Engine::open`] 会去抢目录锁）；读一个小文件不需要那把锁。
+pub fn read_fence(dir: &Path) -> Result<u64> {
+    let path = dir.join(FENCE_FILE);
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(Error::Io(format!("read {}: {e}", path.display()))),
+    };
+    raw.trim().parse::<u64>().map_err(|e| {
+        Error::Config(format!(
+            "{} is not a fencing token ({e}): refusing to start on an unknown fence \
+             (a corrupt token must not read as 0 — that would re-enable a demoted primary)",
+            path.display()
+        ))
+    })
+}
 
 /// 引擎自报状态，`Op::Stats` 的载荷，也是 `treedb-server` 健康检查的来源。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -345,6 +377,9 @@ pub struct Engine {
     replica: bool,
     /// 主最近一次 `WalBatch` 报上来的 durable 水位，只为算 `replica_lag`。
     replica_primary: u64,
+    /// fencing token（§6.6 第 3 条）：本目录「是谁在写、写到第几任」的令牌。
+    /// 启动时从 [`FENCE_FILE`] 读，副本见到更大的值会抬上去（先落盘再使用）。
+    fence: u64,
     /// 数据目录的进程间互斥。字段只为活着（drop = 解锁）。
     _lock: DirLock,
 }
@@ -360,6 +395,10 @@ impl Engine {
         // 先拿锁再读一个字节：与另一个实例抢同一份 WAL 的重放是这里唯一
         // 会真把数据弄坏的行为。
         let lock = DirLock::acquire(dir)?;
+        // 令牌文件必须在任何“看起来能当空白目录用”的判断之前读：把它当成 0
+        // 重启一个已被提升过的目录，等于把 fencing 默默解除了。内容不合法就是
+        // 启动错误（退出码 2），不给“猜一个默认值”的口子。
+        let fence = read_fence(dir)?;
         let snap_path = dir.join(SNAP_FILE);
         let mut state = State::new();
         let mut snap_seq = 0u64;
@@ -400,6 +439,7 @@ impl Engine {
             external_ops: Arc::new(AtomicU64::new(0)),
             replica: false,
             replica_primary: 0,
+            fence,
             recovery: Recovery {
                 snap_seq,
                 wal_records: replayed.len() as u64,
@@ -417,6 +457,72 @@ impl Engine {
 
     pub fn dir(&self) -> &Path {
         &self.dir
+    }
+
+    /// 本目录当前的 fencing token（从未被提升过 = 0）。
+    pub fn fence(&self) -> u64 {
+        self.fence
+    }
+
+    /// 把令牌抬到 `to`（**只升不降**），先把文件落盘再改内存值。
+    ///
+    /// 顺序不可换：先改内存再落盘，一次崩溃就会留下「本进程按新令牌追过数据、
+    /// 重启后又回到旧令牌」的目录与磁盘不一致。反过来只会保守——令牌已经高
+    /// 于数据，重启后它只会更不愿意接受旧主。
+    pub fn raise_fence(&mut self, to: u64) -> Result<u64> {
+        if to <= self.fence {
+            return Ok(self.fence);
+        }
+        let tmp = self.dir.join(format!("{FENCE_FILE}.tmp"));
+        {
+            let mut f = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&tmp)?;
+            f.write_all(format!("{to}\n").as_bytes())?;
+            f.sync_all()?;
+        }
+        std::fs::rename(&tmp, self.dir.join(FENCE_FILE))?;
+        if let Ok(d) = File::open(&self.dir) {
+            let _ = d.sync_all();
+        }
+        self.fence = to;
+        Ok(to)
+    }
+
+    /// `treedb-standby --promote` 的引擎侧：把令牌抬到「本目录见过的最大值 + 1」。
+    ///
+    /// “见过的最大值”就是本目录落盘的那个数 —— 副本每接受一个更高令牌的主
+    /// 都会先把它落盘。于是“提升后的令牌必定大于任何驱动过本目录的主”是**由
+    /// 落盘顺序保证的**，而不是靠调用方记得传对参数。
+    pub fn promote(&mut self) -> Result<u64> {
+        // 到顶就报错，不能 `saturating_add` 之后交给 `raise_fence` 去“成功返回不
+        // 变的令牌”——那会让调用方以为切主完成，而令牌其实一格没动，旧主仍能
+        // 通过闸门。这个分支跑不到，但它的失败模式正好是 fencing 唯一要防的事。
+        let next = self.fence.checked_add(1).ok_or_else(|| {
+            Error::Config("fencing token is at u64::MAX: cannot promote any further".into())
+        })?;
+        self.raise_fence(next)
+    }
+
+    /// 副本侧的令牌闸门：`epoch` 小于本地就是被提掉权的旧主。
+    ///
+    /// 大于本地时**先把令牌落盘再吃它的数据**（§6.6 第 3 条）。
+    fn admit_epoch(&mut self, epoch: u64, what: &str) -> Result<()> {
+        if epoch < self.fence {
+            return Err(Error::Fence(format!(
+                "{what} carries fencing token {epoch}, this directory is at {} — refusing a \
+                 demoted primary (this dir was promoted; point the replica at the new primary)",
+                self.fence
+            )));
+        }
+        if epoch > self.fence {
+            let was = self.fence;
+            self.raise_fence(epoch)?;
+            eprintln!("replica: fencing token {was} -> {epoch} (the primary was promoted)");
+        }
+        Ok(())
     }
 
     /// 以**只读副本**身份打开一个数据目录（§6.6）。
@@ -703,6 +809,7 @@ impl Engine {
                 durable_seq: durable,
                 snap_seq: self.snap_seq,
                 gap: true,
+                epoch: self.fence,
             };
         }
         match self.wal.deliver(want_seq, hint_off, max_bytes) {
@@ -713,6 +820,7 @@ impl Engine {
                 durable_seq: durable,
                 snap_seq: self.snap_seq,
                 gap: false,
+                epoch: self.fence,
             },
             Err(e) => Reply::err(errno::EIO, e.to_string()),
         }
@@ -731,6 +839,7 @@ impl Engine {
                 bytes,
                 total,
                 snap_seq: self.snap_seq,
+                epoch: self.fence,
             },
             Err(e) => Reply::err(errno::EIO, e.to_string()),
         }
@@ -783,15 +892,31 @@ impl Engine {
     ///
     /// 拒绝水位回退：`seq < 本地 snap_seq` 等于把已有的更新状态换成旧的。主的
     /// 快照水位只前进不回退，看到回退只能是把两代拼错了，宁可报错。
-    pub fn install_snapshot(&mut self, bytes: &[u8]) -> Result<u64> {
+    ///
+    /// **一例外，且只有一种（§6.6 第 3 条）：对端的 fencing token 更大。** 这时
+    /// “旧”不代表“被提掉权”：新主是从别处提升的，它的令牌更大、它的数据就是
+    /// 权威，哪怕 seq 更小（旧主以前跑得更快）。反之令牌更小的对端一律拒收 ——
+    /// 那才是真的脑裂回滚。所以判据不是“谁更新”，而是“谁有权写”，权力相同
+    /// 时才比新旧。
+    pub fn install_snapshot(&mut self, bytes: &[u8], epoch: u64) -> Result<u64> {
+        let was = self.fence;
+        self.admit_epoch(epoch, "snapshot")?;
         // 先切尾巴（顺带验主的 crc32）：传输层保的是“字节到了”，不保“字节没
         // 被改”；这里错一个比特比整份重下来贵得多，宁可在入库口就拒。
         let (body, seq) = State::snapshot_split(bytes)?;
         if seq < self.snap_seq {
-            return Err(Error::Io(format!(
-                "snapshot generation {seq} is behind the local watermark {}; refusing to rewind",
+            if epoch <= was {
+                return Err(Error::Io(format!(
+                    "snapshot generation {seq} is behind the local watermark {} at the same \
+                     fencing token {epoch}; refusing to rewind",
+                    self.snap_seq
+                )));
+            }
+            eprintln!(
+                "replica: taking snapshot seq {seq} below the local watermark {} — \
+                 fencing token {was} -> {epoch} says the new primary outranks this one",
                 self.snap_seq
-            )));
+            );
         }
         let fresh = State::load(&mut Rd::new(body))?;
         *write_of(&self.state) = fresh;
@@ -831,7 +956,15 @@ impl Engine {
     /// 事：内容没坏，两代编码格式没分叉。
     ///
     /// 不看 `durability`：副本的 WAL 就是它的崩溃依恃，每批一次 fsync 不可省。
-    pub fn replicate_records(&mut self, base_seq: u64, payloads: &[Vec<u8>]) -> Result<u64> {
+    pub fn replicate_records(
+        &mut self,
+        base_seq: u64,
+        payloads: &[Vec<u8>],
+        epoch: u64,
+    ) -> Result<u64> {
+        // 令牌闸门在任何字节落地之前：一条来自被提掉权的旧主的记录，哪怕
+        // seq 接得上，也不得进本目录的 WAL。
+        self.admit_epoch(epoch, "wal batch")?;
         if payloads.is_empty() {
             return Ok(self.wal.durable_seq());
         }

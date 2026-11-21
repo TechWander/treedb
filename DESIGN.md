@@ -9,7 +9,7 @@
 自己的仓里；本仓唯一与 PostgreSQL 有关的东西是默认关掉的 `postgres-compat` 脚手架，
 而这条约束有测试守着（`tests/independence.rs`，详见 §11 第 7 条）。
 
-**状态**：v0.3.7。引擎本体已落地并跑完五轴验收（§7.8 是 2026-11-19 的全轴复跑）；
+**状态**：v0.4.0。引擎本体已落地并跑完五轴验收（§7.8 是 2026-11-19 的全轴复跑）；
 已建 git 仓推 `origin`(gitee) + `github` 两远端。0.3.0 之后的一批全在**读轴**上：
 量具口径对称化（§9.1 第 3 条）、默认前端 worker 按核数（§8 第 1 条）、目录项两层表
 + kind 冗余（§7.10）；那一批**线协议、WAL 与快照的字节格式一个字节没动**（当时
@@ -71,10 +71,18 @@ fsync/checkpoint、`--durability` 与数值旗标一律 fail-closed；背压时�
 SQLite3，24 格）写成文，并给 `final.tsv` 补了生成器与两条对账脚本 —— 上一版那张表是
 手搓拼出来的，`p50`/`p99` 被拼成了一列而形状完全像真数字。
 
-test 现在分两档报：默认档（纯引擎）`cargo test --release` = **141 passed**（55 lib +
-28 engine_crud + 14 migrate + 11 net_protocol + 10 replication + 8 read_scaling +
+`v0.3.7` 之后是**切主**一轮（§6.6「切主」那一节，收掉 §11 第 4 条②③）：
+**fencing token** 落在一个 `fence` 文件里，主在 `WalBatch` / `SnapChunk` 尾部把它带
+下去，副本拒收令牌更小的对端、见到更大的先把令牌落盘再吃数据；`treedb-standby
+--promote` 是对目录的离线动作（令牌 +1 后打印下一步命令，不起服务）。**这一轮动了
+线协议且不兼容**：`PROTOCOL_VERSION` 5 → 6（op/reply 计数不变，仍是 51 op / 30 reply，
+两个既有 reply 各多一个 `u64`），`SNAP_VERSION` 仍 3 —— 令牌故意不进快照也不进 WAL，
+所以旧快照零迁移。定版 `v0.4.0`。
+
+test 现在分两档报：默认档（纯引擎）`cargo test --release` = **145 passed**（55 lib +
+28 engine_crud + 14 migrate + 14 replication + 11 net_protocol + 8 read_scaling +
 6 crash_recovery + 5 auth + 3 independence + 1 scale_connections，10k 那条仍 `#[ignore]`）；
-`--features postgres-compat` = **172 passed**，多出的 31 条 = 过渡档自己的 30 条单测 +
+`--features postgres-compat` = **176 passed**，多出的 31 条 = 过渡档自己的 30 条单测 +
 `concurrency.rs` 里那条
 不需要 PG 的拨号用例（剩下 6 条要真 PG，默认 `#[ignore]`，不计入 passed）。即 PG 只出现在
 `postgres-compat` 后面的 `src/pool`、`src/store`、
@@ -229,18 +237,18 @@ test 现在分两档报：默认档（纯引擎）`cargo test --release` = **141
 | 文件 | 行 | 职责 |
 |------|----|------|
 | `src/engine/wal.rs` | 1062 | WAL 帧格式、CRC32、预分配、group commit、扫描/重放、`reset`，外加面向副本的只读交付入口 `deliver`（§6.6） |
-| `src/engine/core.rs` | 1111 | `Engine`：op 入口、durability 分档、checkpoint、`Stats`、只读入口 `exec_read`、副本侧的 `install_snapshot`/`replicate_records`；外加快照探测与迁移（`probe_snapshot`/`migrate_snapshot`，§6.5） |
+| `src/engine/core.rs` | 1364 | `Engine`：op 入口、durability 分档、checkpoint、`Stats`、只读入口 `exec_read`、副本侧的 `install_snapshot`/`replicate_records`、fencing token（`read_fence`/`raise_fence`/`promote`/`admit_epoch`，§6.6 切主）；外加快照探测与迁移（`probe_snapshot`/`migrate_snapshot`，§6.5） |
 | `src/engine/mem.rs` | 1637 | `State`（views/nodes/dentries/locks/refs/keys/audit/defs/place/tables/rows/row_index）+ `Log`；快照的版本闸门与两代读入口（`load` / `load_for_migration`） |
 | `src/engine/apply.rs` | 1300 | 51 个 op 里那 49 个的具体语义：环检测、nlink、租约过滤、分页游标、表形状校验与约束、副本拒写（两条握手 op 不进引擎，§4.4；这里只留一道 `EINVAL` 兜底） |
-| `src/engine/model.rs` | 2715 | `Op`/`Reply` 定义与 codec 实现 |
+| `src/engine/model.rs` | 2735 | `Op`/`Reply` 定义与 codec 实现（含 `WalBatch`/`SnapChunk` 尾部的 `epoch`） |
 | `src/engine/sha256.rs` | 365 | 自写的 SHA-256 / HMAC-SHA256 / 常数时间比对 —— 依赖门逼出来的（§11 第 7 条），正确性钉在 FIPS 180-4 与 RFC 4231 的已知向量上（§4.4） |
 | `src/net/server.rs` | 839 | `workers=1` 的 epoll 循环、连接生命周期、写回背压、周期任务（含追平 tick）；兼作两条路径共用的 `Conn`/`Slot` 构件 |
 | `src/net/multi.rs` | 923 | `workers>1`：N 条前端 worker + 唯一提交线程（路由闸门、按连接号回程、停机收尾） |
 | `src/net/auth.rs` | 505 | 接入认证：`Key`（读密钥 + MAC 派生）与 `Gate`（每连接一份的握手闸门），两条事件循环共用（§4.4） |
-| `src/net/replicate.rs` | 403 | 副本侧跟踪器 `Follower`：拉快照 → 追 WAL → gap 重装，连不上主退避重连（§6.6）；开认证时对主先握手 |
+| `src/net/replicate.rs` | 441 | 副本侧跟踪器 `Follower`：拉快照 → 追 WAL → gap 重装，连不上主退避重连；拒收被提掉权的旧主（`Error::Fence`）不退出、只抬计数（§6.6） |
 | `src/net/mail.rs` | 114 | 两者之间那条能被 `epoll` 唤醒的信箱（`Mutex<VecDeque>` + eventfd） |
 | `src/net/client.rs` | 145 | 同步客户端 + pipeline；带密钥时建连后先走一次握手，拿不到 `authed: true` 就 fail-closed（§4.4） |
-| `src/bin/{server,bench,pgbench,micro,migrate,standby,demo}.rs` | 2047 | 可执行入口；`pgbench` 是 PG 对照器，`migrate` 是快照升级工具（§6.5），`standby` 是只读副本（§6.6）；三个面向网络的入口共用 `--auth-key-file` |
+| `src/bin/{server,bench,pgbench,micro,migrate,standby,demo}.rs` | 2188 | 可执行入口；`pgbench` 是 PG 对照器，`migrate` 是快照升级工具（§6.5），`standby` 是只读副本兼 `--promote`（§6.6）；三个面向网络的入口共用 `--auth-key-file` |
 | `benches/throughput_matrix.sh` | 188 | 五轴吞吐矩阵（§7 的数据来源） |
 | `benches/rehearse_migrate.sh` | 147 | 快照升级的真机彩排：旧 tag → 当前树，逐格核四条承诺与回滚窗口（§6.5 的外部效度） |
 | `benches/single_conn.sh` | 99 | 单连接与并发档对标（§7.11）：treedb 默认档 vs 私有 PG 集群，`$PIPE` 选一问一答还是批量、`$CONNS`/`$WORKERS` 选形状，逐格附带引擎自计的 fsync 计数 |
@@ -249,6 +257,7 @@ test 现在分两档报：默认档（纯引擎）`cargo test --release` = **141
 | `benches/three_way.sh` | 170 | 三臂同口径对照（§7.13）：treedb / PG 12 / SQLite3，24 格；头部七条口径与「不按 pipeline 乘」的计数判据都写在脚本里 |
 | `benches/three_way_table.py` | 118 | 由两份原始采集重算 §7.13 引用的 `final.tsv`；`--check` 对账、`--selftest` 自带三处注入错（上一版表是手搓 one-liner，把 p50/p99 拼成了一列） |
 | `benches/doc_table_check.py` | 95 | 把 §7.13 的 markdown 表与 `final.tsv` 逐格对账（24×14），`--selftest` 验证它真的会红 |
+| `benches/promote_smoke.sh` | 66 | 切主的活体验证（§6.6「切主」）：主 → 副本 → 被锁时拒提升 → 提升 → 用新主起服 → 旧主回魂被令牌更高的副本拒收；四个端口 7101–7104，不碰默认 7777 |
 
 行是 `wc -l`，含各文件自己的 `mod tests`（旧版这张表是历史快照，已与代码脱开的
 那几个文件本轮按实测回填）。
@@ -273,7 +282,7 @@ payload = tag: u16 | 字段…            （Op / Reply 各自的 tag 空间，R
 - 错误：`Reply::Err { code: u16, msg }`，`code` 就是 POSIX `errno`。
 - **帧里没有版本位**（v1 定形时就没给，现在也不能塞 —— 塞进去就把旧客户端的
   整个 payload 偏移挪了两位）。版本只能靠 `Stats.proto_version` 在第一次握手后
-  查到，当前 `PROTOCOL_VERSION = 5`。升级顺序因此是硬约束：**先升服务端，后升客户端**。
+  查到，当前 `PROTOCOL_VERSION = 6`。升级顺序因此是硬约束：**先升服务端，后升客户端**。
   新客户端解旧服务端的帧会短读报错（能看见），旧客户端解新服务端的帧会**静默丢掉
   尾部字段**（看不见）—— 后者正是 `SNAP_VERSION` 那道闸门在磁盘上防的事，线上没有
   等价物，只能靠顺序。
@@ -289,6 +298,12 @@ payload = tag: u16 | 字段…            （Op / Reply 各自的 tag 空间，R
   `EngineStats` 也没加长** —— 所以这次连“静默丢尾部字段”都不存在：一个 v4 客户端
   只要不去发那两条新 op（它也不知道这两个 tag），它对 v5 服务端的每一格读写都
   与对 v4 服务端逐字相同。开关默认关正是为此（§4.4）。
+  `5 → 6`（§6.6「切主」）**不兼容**：`Reply::WalBatch`（0x0180）与 `Reply::SnapChunk`
+  （0x0181）尾部各多一个 `u64`（`epoch` / fencing token）。op 与 reply 的条数一个
+  没变（仍是 51 op / 30 reply），但两个**既有** reply 的长短变了 —— 这是第一次把
+  “追加字段”用在既有 reply 上，于是 v5 副本解 v6 主会短读报错。这个代价是换来的：
+  令牌不对的副本，宁可连不上也不能接。同样的理由让快照格式刻意不动（`SNAP_VERSION`
+  仍 3）：令牌能随数据传播但不必被数据携带。
 
 ### 4.2 op 分组（51 个）
 
@@ -488,7 +503,9 @@ with a handshake"`，它根本没被碰过，重发即可），切点之后要�
 3. **不防字典攻击**。密钥必须是 32 字节随机值；从口令派生的话，抓一次握手就能
    离线试口令（所以 `Key::load` 在长度上不留余地）。
 4. **不证明「是当前那个主」**。它只证明对端持有密钥；脑裂后旧主同样持有密钥，
-   照样能应答握手。fencing token 仍然欠着（§11 第 4 条②③）。
+   照样能应答握手。把两者分开看：**副本侧**现在有了 fencing token（§6.6「切
+   主」），令牌更小的对端一律拒收；**客户端侧**没有 —— 客户端不会去问“你是第几
+   任主”，一个已被换掉的旧主照旧服务它自己的读者/写者。所以切主仍然必须真停旧主。
 
 ---
 
@@ -793,7 +810,96 @@ checkpoint 之后 64 888 → 41 512 有损）。最近一次原始输出在
   没法监控，后者让它拖着一个与主同大的日志。
 - **`install_snapshot` 拒绝水位回退**：主交来的快照代际比自己低，只能是连错了主
   或把两代拼错了。这是整个设计里唯一让进程退出的错误 —— 继续服务一份谁也不认的
-  状态比停下来更坏。
+  状态比停下来更坏。**一例外，见下一节「切主」：对端的令牌更大时，权力优先于新旧。**
+
+#### 切主：fencing token 与 `--promote`（v0.4.0）
+
+上一小节那套东西有一个洞：副本不知道自己跟的是不是“当前那个主”。旧主被替换
+后照样能应答 `WalFetch`，副本照样把它交来的记录当成真相 —— 两代状态就这样被
+同一个副本接在一起了。切主需要的是一个**单调、可持久、能随数据传播**的比较量。
+
+**令牌住在 `<dir>/fence`，是一个十进制整数 + 换行。**
+
+它不在快照里，也不在 WAL 里（`SNAP_VERSION` 仍是 3），这不是偷懒而是刻意的：
+① 提升它不需要碰任何数据面字节格式，旧快照零迁移；② 冷拷贝一个目录时它自然
+跟着走；③ 一个目录被人误当“空白副本”重用之前，`cat fence` 就能看见它已经被提
+升过。代价写在明处：它不在 WAL 的事务边界里 —— 但 fencing 的用处就是“比数据
+更早一步知道谁有权写”，先落盘、再由数据追上，这个顺序是设计的一部分。
+
+**传输：两个既有 reply 的尾部各多一个 `epoch`。**
+
+`Reply::WalBatch` 与 `Reply::SnapChunk` 末尾各带主的 `fence`。为什么快照路也要
+带：一条只走 `SnapFetch` 的重装路径（冷启动副本、gap 之后）如果拿不到令牌，就
+正好绕过了闸门。`PROTOCOL_VERSION` 因此 5 → 6，而且这次是**不兼容**升级：
+两个 reply 各多一个 `u64`，v5 的副本解 v6 的主会短读报错（大声失败，符合预期）。
+上位记的那句「追加字段可以跨版本」在这里不成立 —— 换来的是一件事：令牌不对的
+副本，宁可连不上也不能接。升级时主与副本一起换。
+
+**副本侧的三条规则（`Engine::admit_epoch`）：**
+
+| 对端令牌 | 动作 | 为什么 |
+|---------|------|--------|
+| 更小 | `Error::Fence`，一个字节不许落地 | 这是一个已经被提掉权的旧主。`net::replicate` 把它当**配置错**而不是链路错：抬 `replica_errors`、退避重连、不退出、也不重装快照 |
+| 更大 | **先把令牌落盘，再吃数据** | 顺序不可换：先吃数据后落盘，一次崩溃就留下“按新令牌追过数据、重启又回到旧令牌”的目录。反过来只会保守 |
+| 相同 | 正常路径 | 令牌相同才轮到比新旧（`seq` 回退仍然拒绝） |
+
+`Error::Fence` 单开一个变体而不是复用 `Gap`：运维动作完全不同 —— `Gap` 是「跟不
+上了」（自动重装快照），`Fence` 是「连错主了」（改 `--primary` 或停掉旧主）。拿错
+误文案去区分这两件事，等于让调用方猜。
+
+**`install_snapshot` 的例外：权力优先于新旧。**
+
+原来的规则是“快照代际比自己低就拒”。有令牌之后这条要拆成两半：令牌更小时一律
+拒（那才是真的脑裂回滚）；令牌**更大**时，哪怕快照更旧也接受 —— 新主是从别处提
+升的，它的令牌更大、它的数据就是权威，旧主以前跑得快不代表它还有权。所以判据
+不是“谁更新”，而是“谁有权写”，权力相同时才比新旧。这一条在测试里连同它的
+反面（同令牌下回退仍被拒）一起钉住。
+
+**`treedb-standby --promote` 是对目录的离线动作，不起服务。**
+
+它把令牌抬到「本目录见过的最大值 + 1」然后退出，打印接下来要执行的命令。不就地
+变成可写服务端，有两个理由：① 提升是运维动作，什么时候开新主、客户端什么时候
+改地址，不该被这条命令隐式决定；② 同一条命令行里同时给 `--primary` 与 `--promote`
+会自相矛盾（既追别人又当主），所以同时给直接退出码 2。
+
+“提升后的令牌必定大于任何驱动过本目录的主”是**由落盘顺序保证的**，不是靠调用方
+记得传对参数：副本每接受一个更高令牌的主，第一件事就是把它落盘。
+
+令牌到 `u64::MAX` 时提升**报错**而不是返回原地不动的值（`checked_add`，不是
+`saturating_add`）：后者会让调用方看到“提升成功”而令牌一格未动，旧主仍能过闸门 ——
+这个分支实际上永远跑不到，但它恰好是 fencing 唯一要防的那类静默失败。
+
+**它挡不住什么（诚实边界）：**
+
+1. **旧主照旧对自己的客户端服务**。fencing 只在副本侧生效 —— 它不阻止旧主接写，
+   只保证副本不会把旧主的写当成真相。所以切主必须真停旧主，抬令牌不能替代停机。
+2. **只保护「曾经被提升过的目录」**。一个从未追过新主的副本令牌仍是 0，把它指
+   回旧主它照收 —— 而这恰好不是脑裂回滚的形态：回滚的风险在于“已经有目录拥有
+   更高权力并且已经按它答过读”，那类目录的令牌一定更高。
+3. **不提供自动故障转移**。谁提升、什么时候提升，仍是人（或外层编排）的决定。
+4. **没有租约/心跳**。旧主不知道自己的权被拿走；要让它自己发现，得再加一层会
+   话期与续租，那是另一套机制（§8 第 6 条③）。
+
+四条测试钉住这一节：`the_fence_is_monotonic_persisted_and_never_defaults_to_zero`
+（只升不降 / 落盘 / 坏文件不当 0）、`a_replica_obeys_the_fence_on_snapshots_and_
+batches`（四档闸门，含“权力优先于新旧”与它的反面）、
+`a_promoted_replica_refuses_its_old_primary_over_the_wire`（真链路上拒旧主、状态不
+回滚、仍在答读）、`the_promote_flag_bumps_the_fence_without_serving`（离线动作与两
+个拒绝面）。
+
+**活体验证**（2026-11-21，`benches/promote_smoke.sh`，不进回归板）：主 A 写 2 s →
+副本 B 追平（`nodes` 14 710、`lag 0`、banner `fence=0`）→ B 还活着时 `--promote`
+退出码 1（目录锁，错误里带持锁 pid）→ 停 B 后 `--promote` 打 `fence 0 -> 1`、
+`cat fence` 是 1 → 拿 B 起服：`nodes` 与提升前一致、`create` 14 863 ops/s 零错
+（提升真的解除了 `EROFS`）→ 旧主 A 回魂继续收写（`seq` 44 122 → 88 471），而拿着
+同一份数据、`fence` 为 1 的 C 去追它：`nodes`/`seq` 一格未动、`replica_errors` 45、
+`lag` 44 349、日志是 `is fenced out: wal batch carries fencing token 0, this
+directory is at 1`。这一条同时演示了边界 1：A 并没有因为被换掉而停止服务。
+
+同一脚本隔一会儿再跑一次，结论逐条相同而数值每次不同（`nodes` 13 743、`create`
+13 977 ops/s、A 的 `seq` 41 221 → 85 441、`replica_errors` 44）—— 所以上面那串
+数是**那一次的样本**，脚本钉的是关系（追平后 `lag 0`、提升恰好抬一格、被锁时
+退出码 1、旧主被拒且副本状态不动），不是具体计数。
 
 #### tick 住在提交线程里
 
@@ -826,11 +932,11 @@ committer，`workers = 1` 时是轮末周期任务）。两档跑的是同一份
 1. **异步，不保证读到已确认的写**。副本能读到多少取决于上一次 tick 到哪。要
    「读己之写」的客户端必须继续读主，或者自己等 `lag == 0`（这一手很弱，因为
    `lag` 是上次往返的快照而不是未来承诺）。
-2. **有主身份认证（§4.4，可选），但没有 fence**。开了 `--auth-key-file` 之后，副本至少
-   能证明「我对面这个端口后面的人持有集群密钥」；但脑裂后的旧主同样持有密钥，
-   `install_snapshot` 拒绝水位回退也只能挡住「连到了一个更旧的主」这一种错配，挡不住
-   「两个同代但互不知情的主各自被一个副本跟着」。定序仍然只在单主上成立，切主必须
-   先把旧主真停掉。
+2. **有主身份认证（§4.4，可选），且 v0.4.0 起有 fencing token**。“切主”那一节
+   已经说完全了：令牌更小的对端一律拒，所以一个被提过权的副本不会再被旧主驱动。
+   剩下的是两道门：① 旧主自己不知道权被拿走（无租约/心跳），仍对自己的客户端
+   服务；② 一个**从未追过新主**的副本令牌仍是 0，指回旧主它照收。两条都指向同一
+   句部署约束：切主必须真停旧主，抬令牌不能替代停机。
 3. **`SnapFetch` 把整个元数据状态交出去**，`WalFetch` 交出全部尚未截进的写。引擎
    本来就假定这个端口在受控网络内（任何客户端都能 `ListViews`/`RowList`），所以
    这不新增一类暴露面 —— 但它把「端口只能对内」这条部署约束的重要性抬高了。
@@ -848,7 +954,7 @@ committer，`workers = 1` 时是轮末周期任务）。两档跑的是同一份
 |------|------|--------------------------------------|--------------|
 | **冷备份** | 写 → `SIGTERM` 优雅停服 → `cp -a` → 从拷贝起服 | nodes 13 968 / dentries 13 936 / refs 0 / seq 41 872 **逐项相等 ✓** | 能，RPO = 停服那一刻 |
 | **热拷贝** | 写入进行中 `cp -a`，源端继续跑 | 拷贝前一刻 seq 41 872、拷完源端 89 536、还原出来 **56 272** | **不能当备份工具用**：能起服、无撕裂、状态自洽，但切点落在写入流中间（比「拷贝前一刻」多 14 400 条）—— 无法承诺还原到哪一刻，也无法向调用方报 RPO |
-| **副本目录** | 主写 → `treedb-standby` 追平 → 把副本目录当普通主起服 | nodes/dentries/refs/seq 与主 **一致 ✓**（当时 `lag 0`、`resyncs 1`、`errors 0`） | 数据面等价于一份可持续追平的异地镜像；但**这不是提升**：没有 fence，旧主必须确认真停（§11 第 4 条③的 `--promote` 还欠着） |
+| **副本目录** | 主写 → `treedb-standby` 追平 → 把副本目录当普通主起服 | nodes/dentries/refs/seq 与主 **一致 ✓**（当时 `lag 0`、`resyncs 1`、`errors 0`） | 数据面等价于一份持续追平的异地镜像；**这一档当时不是提升**（那时没有 fence，旧主必须确认真停）。v0.4.0 起提升有了名字：`treedb-standby --promote` 抬令牌（§6.6「切主」） |
 
 三条顺带量出来的行为，都容易踩：
 
@@ -920,8 +1026,8 @@ open file description 走，进程怎么死的（包括 `kill -9`）都自动释
 ## 7. 性能实测（五轴）
 
 口径提醒：本节各节里的「本轮」指**它所记录的那一轮**（v0.3.1 读轴、v0.3.2 写轴），
-不是本文开头那句 v0.3.7 —— 从 v0.3.3 起那四批（能力面、快照迁移、日志传送、接入
-认证）都没改过数据面，所以本节数字一个没重跑；**例外是 §7.11**（`v0.3.5` 上重测的
+不是本文开头那句 v0.4.0 —— 从 v0.3.3 起那五批（能力面、快照迁移、日志传送、接入
+认证、切主）都没改过稳态读写路径，所以本节数字一个没重跑；**例外是 §7.11**（`v0.3.5` 上重测的
 单连接格）与**§7.13**（`v0.3.6` 上新增的三臂同口径一轮）。本轮新量的那两列（握手开/关）
 不混进本节，它们单独落在
 §4.4 末表与 `benches/results/handshake_cost.log`；与本轮同批跑的受控 A/B
@@ -1697,8 +1803,10 @@ fsync 账（§7.9），但机制不同；每格都从空状态起跑（treedb �
 环境：同一台机（128 核，Linux 5.4.0-216），同一块 xfs 盘（`/dev/sdb1`，MR9361-8i，
 `ROTA=1` 机械盘阵列，裸 fsync 3.8–4.6 ms —— 所以下面写轴的量级全部由 fsync 定）；
 treedb `v0.3.6` 零旗标默认档（`workers=8`，`dur=group`）；PG 12.22；SQLite 3.31.1。
-treedb 这一列**没有**在 `v0.3.7` 上复跑：那一版只改失败路径（快照 crc、目录 flock、
-启动参数闸门、停服报错、背压掩码、`ENOTDIR`），稳态提交路径与 §7.9 量的那条一字未动，
+treedb 这一列**没有**在 `v0.3.7` 与 `v0.4.0` 上复跑：`v0.3.7` 只改失败路径（快照 crc、目录 flock、
+启动参数闸门、停服报错、背压掩码、`ENOTDIR`），`v0.4.0` 只给两个**副本专用**的 reply
+尾部加了一个 `u64`（`WalBatch`/`SnapChunk`，主客通信里的 CRUD 一个字节未动）；两版
+的稳态提交路径与 §7.9 量的那条一字未动，
 唯一新增的稳态成本是 checkpoint 时多算一遍 `crc32`（不在 3 s 计时窗内）。
 
 `p50`/`p99` 单位 µs；`vs PG` / `vs SQLite` 是**同行 ops/s 之比**，> 1 表示 treedb 快。
@@ -1801,11 +1909,12 @@ treedb 这一列**没有**在 `v0.3.7` 上复跑：那一版只改失败路径�
    由 FUSE 层自己维护，引擎不参与。
 5. **无跨视图原子 op、无用户可见事务**（§5.3）。
 6. **有异步只读副本，无同步复制**（§6.6）：`refs` 账本和 WAL 仍是单主，副本只是
-   同一份日志的第二个消费者。三条具体边界：① 副本**不保证读到已确认的写**，
+   同一份日志的第二个消费者。四条具体边界：① 副本**不保证读到已确认的写**，
    要「读己之写」的客户端仍得读主；② 主身份认证只能证明「对端持有这把密钥」（§4.4，
-   且默认关），没有 fence，`install_snapshot`
-   只拒绝「水位往回走」这一种错配，切主必须先把旧主真停掉；③ 没有自动故障
-   转移 —— 主没了副本只是继续答读，不会把自己提上去。写扩展也不因副本而变
+   且默认关）；③ **fencing token 只在副本侧生效**（v0.4.0，§6.6「切主」）：副本拒收
+   被提掉权的旧主，但旧主自己不知道权被拿走，它对自己的客户端照旧服务，所以切主
+   必须真停旧主；④ 没有自动故障转移 —— 主没了副本只是继续答读，不会把自己提上
+   去，`--promote` 是人手动的一步（它不起服务，只抬令牌）。写扩展也不因副本而变
    （第 1 条第 ③ 项那句仍成立）。HA 要拿上层继续用 PG 做权威仍是另一条路（过渡档现状）。
 7. **`checkpoint` 是 stop-the-round**：快照在提交线程里同步生成，期间不接新写。
    `workers=1` 时整个循环停住；`workers>1` 时前端仍能就地服务纯读（快照只持**读锁**，
@@ -1842,7 +1951,9 @@ treedb 这一列**没有**在 `v0.3.7` 上复跑：那一版只改失败路径�
     `Checkpoint`；② **开了也是「一把钥匙开整扇门」** —— 过了握手的连接与其他连接
     权限完全相同，无租户、无配额、无按 op 分组；③ **不加密** —— 握手之后仍是
     明文，CRC32 只判损坏，抓包的人读得到全部数据也随时能 RST；④ **不证明「是当前
-    那个主」**（第 6 条②③）。所以「谁能连到这个端口 + 谁持有这把密钥」还是等于
+    那个主」** —— 这是 v0.4.0 之后要分两半看的一条（第 6 条③）：副本侧有 fencing
+    token 了，**客户端侧仍然没有**，一个不会去问“你是第几任主”的客户端照旧能连上
+    一个已被换掉的旧主。所以「谁能连到这个端口 + 谁持有这把密钥」还是等于
     「谁能改整个状态」：多租户、配额、审计归属仍得在**引擎之外**做（grovefs 的
     apikey 与网关白名单就是这一层的现状），或者把端口锁在本机回环/私有网段里 ——
     `--listen` 默认就是 `127.0.0.1:7777`。也没有 TLS，没有 Unix socket 选项。视图名
@@ -1850,8 +1961,9 @@ treedb 这一列**没有**在 `v0.3.7` 上复跑：那一版只改失败路径�
 14. **备份能力就到 §6.7 那三形状，不再多**。具体边界：无 PITR（`checkpoint` 会
     `wal.reset()`，历史切面不归档）；无 dump/load、无增量备份、无加密备份；运行中
     `cp -a` 拷不到撕裂尾但切点不可控（实测：比拷贝前一刻多 14 400 条 seq），所以它不是
-    备份工具；副本目录可以当还原点，但没有 fence 也没有 `--promote`，拿它顶替主是
-    手工操作（第 6 条②③）。
+    备份工具；副本目录可以当还原点，且从 v0.4.0 起有了 `treedb-standby --promote`
+    这条提升路径（§6.6「切主」），但它只抬令牌、不开服务，旧主还得人确认停掉（第
+    6 条③）。
 15. **treedb 后端的连接池是「每进程」共享，池大小就是跨视图并发上限**（§7.12）。
     默认 `GROVEFS_TREEDB_CONNS = 4` 条长连接服务该进程里的**全部**视图，
     `TreedbStore` 不再各持一份 —— 这才是「10 000 视图 4 条连接」能成立的原因，但也
@@ -1882,8 +1994,8 @@ treedb 这一列**没有**在 `v0.3.7` 上复跑：那一版只改失败路径�
 ## 9. 测试清单
 
 ```sh
-cargo test --release                            # 默认档（纯引擎），141 条（+1 ignored）
-cargo test --release --features postgres-compat # 加上过渡档，172 条（+7 ignored）
+cargo test --release                            # 默认档（纯引擎），145 条（+1 ignored）
+cargo test --release --features postgres-compat # 加上过渡档，176 条（+7 ignored）
 cargo test --release --lib                      # 只看引擎单测
 cargo test --release --test migrate              # 快照升级：11 条走 API + 3 条真进程跑 CLI（§6.5）
 cargo test --release --test scale_connections -- --ignored   # 万级连接重压（§7.6）；并发数由 TREEDB_CONNS 控制，本机到 25 000 为限（再高是客户端源端口不够）
@@ -1892,6 +2004,7 @@ bash benches/throughput_matrix.sh 3             # 五轴吞吐矩阵（默认只
 bash benches/default_check.sh                   # 零旗标默认档同格重跑 5 次（§7.5）
 bash benches/ab_layout.sh <基线 rev>            # 受控 A/B：只换服务端二进制（§7.10）
 bash benches/handshake_cost.sh 20000            # 接入认证的代价：建连风暴 + 稳态两臂（§4.4）
+bash benches/promote_smoke.sh                   # 切主的活体验证：提升 → 新主起服 → 旧主被拒（§6.6 切主）
 bash benches/sync_ratio.sh 3                    # 一次 fsync 摊了几次写（§7.9）
 bash benches/ab_durability.sh <基线 rev>        # 写轴 A/B：持久化档的吞吐与尾延迟（§7.9 第 3 条）
 bash benches/probe_srv.sh                       # 服务端吃了几核（/proc 计数，§7.5）
@@ -1924,13 +2037,24 @@ gcc -O2 -pthread -o /tmp/lb_floor benches/lb_floor.c && /tmp/lb_floor 1 64 3   #
 | `tests/crash_recovery.rs` | **6** | §6.4 |
 | `tests/read_scaling.rs` | **8** | 只读分派表逐条对 `translate`（判错一条就是丢写；语料 51 条全变体，钉住 51/22/29 三个数）、**三档划分穷举且两两不交**（`ops_partition_into_three_classes`，22/22/7，§4.2 与副本拒写的判据同源）、`workers=1/8` 答复逐条相同（负载含表读与 `ReadDirPlus`，混合批里把 CAS 写夹在读之间）、每连接流内顺序、一写多读不读到半截状态、`ops_total` 记上 worker 就地算的读、并行档下 `kill -9` 已 ack 的写全在（目录写与表写逐条交错）、**fd 复用不会把上一任的应答塞给新任** |
 | `tests/auth.rs` | **5** | §4.4 在线协议上的握手形状（MAC 的数学性质与闸门四档在 lib 单测里，不重复）：未握手的连接一个数据 op 也拿不到（**两种 worker 形状各一跑，两条路径拦截点不是同一处代码**）、错密钥被拒但不锁死 + 旧 MAC 重放不上 + 换对密钥能过、带密钥的客户端拒绝降级、未配密钥的服务端一次往返回 `authed: false`（这是 v5 客户端连 v4 形状不卡死的依据）、握手与数据 op 挤同批时**应答次序不能被打乱** |
-| `tests/replication.rs` | **10** | §6.6 的九件事（十条用例，端到端那一件两档各一条；主是真进程，副本是测试里的 `Engine` + `Follower`，只有最后三条起真 `treedb-standby`）：主写逐条收敛（ino/属性/readdir 与主对齐）、**主被 `kill -9` 后副本仍答读且不退出**（`replica_errors` 抬、`connected` 落 true→false）、**gap 触发分块重装快照**（4 KiB 块下 ≥ 2 块，且副本落盘的 `state.snap` 与主的逐字节相同）、**副本拒写在引擎层**（五个形状不同的写真 op 全 `EROFS` 且零 logs、零水位推进，而 `ListViews`/`Stats`/`Checkpoint` 放行）、**lag 中途为正、追平归零**（2 KiB/轮 喂不饱一批）、**副本重启靠自己的日志接上**（`resyncs == 0`，快照+尾巴那条恢复路径）、端到端两档事件循环同一份断言（`workers=1`/`2`：线上 `EROFS`、`Stats` 新字段过线、追平后读到主的新写）、启动参数三道门（缺 `--primary` / 自己拉自己 / `--fetch-bytes 0` 均退出码 2）、**开了认证的主只有握得上手的副本追得动**（对密钥逐条收敛、错密钥不收敛） |
+| `tests/replication.rs` | **14** | §6.6 的十二件事（十四条用例，端到端那一件两档各一条；主是真进程，副本是测试里的 `Engine` + `Follower`，只有最后三件起真 `treedb-standby`）：主写逐条收敛（ino/属性/readdir 与主对齐）、**主被 `kill -9` 后副本仍答读且不退出**（`replica_errors` 抬、`connected` 落 true→false）、**gap 触发分块重装快照**（4 KiB 块下 ≥ 2 块，且副本落盘的 `state.snap` 与主的逐字节相同）、**副本拒写在引擎层**（五个形状不同的写真 op 全 `EROFS` 且零 logs、零水位推进，而 `ListViews`/`Stats`/`Checkpoint` 放行）、**lag 中途为正、追平归零**（2 KiB/轮喂不饱一批）、**副本重启靠自己的日志接上**（`resyncs == 0`，快照+尾巴那条恢复路径）、端到端两档事件循环同一份断言（`workers=1`/`2`：线上 `EROFS`、`Stats` 新字段过线、追平后读到主的新写）、启动参数三道门（缺 `--primary` / 自己拉自己 / `--fetch-bytes 0` 均退出码 2）、**开了认证的主只有握得上手的副本追得动**（对密钥逐条收敛、错密钥不收敛）；v0.4.0 新增四条 fencing：令牌只升不降/落盘/坏文件不当 0、副本侧四档闸门（含“权力优先于新旧”与它的反面）、**真链路上提权后拒旧主的批**（状态不回滚、仍在答读、`replica_errors` 抬）、`--promote` 离线动作（不开端口、两次 0→1→2、与 `--primary` 同时给退出码 2） |
 | `tests/concurrency.rs` | 0（+7，整文件 feature 门控） | T1 之后整个文件在 `postgres-compat` 后面：无 PG 时跑「拨号失败不漏 live」（1 条，要 feature），其余 6 条 `#[ignore]` 需真实 PG。**它测的是共享池，不是引擎并发**（§7.8）|
 | `tests/scale_connections.rs` | 1（+1 ignored） | 1 000 连接 fd/RSS 断言每次跑；万级（`TREEDB_CONNS`，含 25 000）手动 |
 | `tests/independence.rs` | **3** | 独立性三把门：内核目录（`src/engine`、`src/net`）不出现客户端名字；`[dependencies]` 非 optional 项只能是 `libc` + `thiserror`；`postgres-compat` 不得进 `default`（§11 第 7 条） |
 | `tests/migrate.rs` | **14** | §6.5 那四条承诺。11 条直接打 API：v2 样本迁移后 `State` 逐字段相等且 WAL 文件字节不变、重开后每个语义面都能读到（密钥/审计/定义/放置/锁/引用）、尾巴 seq 照搬且发号接着走、幂等重跑不动当前目录、未知版本与「正文配不上版本位」都拒动且零改动、既有备份不被覆盖、迁完的目录能直接用通用表。3 条用 `env!("CARGO_BIN_EXE_treedb-migrate")` 起**真进程**钉退出码（10 / 1 / 0）与输出里的命令、备份路径、回滚步骤 |
 
-本轮（问题清单 F1–F8，`v0.3.7`）新加的回归锁：
+本轮（切主 / fencing，`v0.4.0`）新加的回归锁（全部在 `tests/replication.rs`）：
+`the_fence_is_monotonic_persisted_and_never_defaults_to_zero`（promote 与
+`raise_fence` 都只升不降；重启后令牌还在；`fence` 文件内容非法则拒启而不是读成
+0）、
+`a_replica_obeys_the_fence_on_snapshots_and_batches`（四档：更大令牌接受并先落盘、
+更大令牌下允许 seq 回退、同令牌下旧快照仍拒、更小令牌的批一个字不许进且不动
+令牌）、
+`a_promoted_replica_refuses_its_old_primary_over_the_wire`（提权后旧主的新写只在它
+自己那儿生效；副本 `replica_errors` 抬升、状态逐字段未变、仍在答读、`tick` 不退出）、
+`the_promote_flag_bumps_the_fence_without_serving`（`--promote` 不开监听口、连跑
+两次 0→1→2、与 `--primary` 同时给退出码 2 且不改令牌）。
+上一轮（问题清单 F1–F8，`v0.3.7`）新加的回归锁：
 `snapshot_trailer_carries_crc_and_accepts_the_legacy_shape`（lib：新尾巴带 crc 且能回读、旧 8 字节尾巴仍能开，§6.8）、
 `checkpoint_writes_a_crc_trailer_and_reopens_cleanly`（migrate：checkpoint 产物的尾巴以 magic 收尾）、
 `corrupted_snapshot_body_is_refused_at_open`（migrate：正文翻一个 bit 就拒启，不再拿前缀状态起服）、
@@ -2207,7 +2331,9 @@ treedb-server --dir /var/lib/treedb --listen 127.0.0.1:7777  # 新二进制现�
   `GROVEFS_JOIN_KEY_FILE`/`GROVEFS_ROSTER_KEY_FILE` 同规：密钥字节永不进 argv），
   四条 `Client::connect` 全改 `connect_auth`。没设 = 不握手（协议 v5 的默认档），
   设了但读不到 = 每次 open 都失败，不静默降级成不认证。§11 第 4 条 ② 那句
-  「已补一半」的客户端这一半补上了；**仍没有 fence**，握手只证明对端持有这把密钥。
+  「已补一半」的客户端这一半补上了。fence 在**副本侧**随后也补上了（v0.4.0，§6.6
+  「切主」），但交接面的客户端不参与：grovefs 只读「谁是当前主」这一个问题，它拿到
+  的答案是部署给的地址。
 - **崩溃演练已跑**（2026-11-20）：挂载点活着时 `kill -9` 引擎、同 dir 同 port 重开，
   已 ack 的元数据全在、恢复不需要重启任何进程 —— 逐条实测与那次一并照出来的**错误
   errno**（读侧回答 `ENOENT`，当日已在 grovefs 仓闭合）见下面阶段 C 3 与 §11 第 11 条。
@@ -2256,8 +2382,8 @@ spike 明确**没**做、也不在接入面上假装做的事 —— 一律返�
 | ~~readdir 的属性~~ **已闭合**（2026-11-20） | provider 改用 `ReadDirPlus` | 原写法准确：协议面 2026-11-19 就闭合了，缺的是调用。两臂实测（同一份 `du` 走完一棵树，配方 grovefs `.build-bin/bench_treedb_readdir.sh`，引擎侧计数器读 `--stats`）：引擎应用的 op 数 3000 条时 **3006 → 6**、20000 条时 **20023 → 23**；把引擎放到每段 2 ms 延迟的 TCP 代理后面墙钟 **256 ms → 52 ms**，同机 loopback 上 106 vs 88 ms（三次分布重叠，量不出差别）。**这项收益的单位是往返**，本机测试恰好把它藏起来，所以两个数都得写。语义零回归：阶段 C 1 那套矩阵改前改后都是 `pass=39 fail=0 skip=10` |
 | 定义/密钥/账户 | 行表全部在引擎（M3，无开关），定义仍在本地 SQLite | 密钥、审计、账户、授权**已在通用表上**（M1 2026-11-20，§11 第 13/14 条），M3 删掉了开关：treedb 档读写都走引擎，没跑过搬家命令的部署**拒绝启动**并点名 `control-migrate`（§11 第 15/16 条）。视图**定义**仍在本地（引擎没有定义表）；`Key*`/`Audit*` 那三个专用 op 仍是业务形状，不能当接入面（上文第 4 步）。迁法与切写步骤见下面阶段 C 4 |
 | ~~`view list` 的物理树~~ **已闭合**（2026-11-20，M1b） | `TreedbControlStore::list_physical` 回答「本地 ∪ 引擎的 `Op::ListViews`」 | 控制面枚举器只看本地 db 文件时，引擎里的基树在 `view list`/`store.info` 里都不存在（委派也因此无法解析）。修了 `list_physical`/`has_physical` 两处双答案，枚举与存在性判据同时看见引擎 |
-| HA / 快照传送 | 启动即拒绝 | 接入面用不上它：§8 限制 6 现在是「有异步只读副本、无同步复制」，而 grovefs 要的是「主挂了切副本」—— 那一步没有提升路径（§11 第 4 条③） |
-| ~~path 依赖的分发方式~~ | 已定：按 tag 的 git 依赖 | 钉 `v0.3.7`（随定版前移），无同级克隆也能构建（实测） |
+| HA / 快照传送 | 手工可做（不是自动化） | 接入面用不上它：§8 限制 6 现在是「有异步只读副本、无同步复制」。v0.4.0 起有了 `treedb-standby --promote` + fencing token（§6.6「切主」），但它是**人手动的一步离线动作**：不开服务、不自动选主、旧主靠人停。grovefs 要的「主挂了自动切副本」仍然没有 |
+| ~~path 依赖的分发方式~~ | 已定：按 tag 的 git 依赖 | grovefs 侧钉 `v0.3.7`（无同级克隆也能构建，实测）；本仓已到 `v0.4.0`。两者可以共存 —— `v0.4.0` 的线协议变更只在 `WalBatch`/`SnapChunk` 两个副本专用 reply 的尾部，grovefs 走的是普通 CRUD 与 `Stats`，那部分字节一个未动。要的是下次 bump 时把 pin 提到 `v0.4.0`，或直接跳过它等下一次有功能收益的版本 |
 
 ### 阶段 C（回归与灰度）
 1. ~~`posix`/`e2e` 那种全量断言矩阵还没在 treedb 上跑过~~ **已跑**（2026-11-20，
@@ -2403,7 +2529,7 @@ spike 明确**没**做、也不在接入面上假装做的事 —— 一律返�
    只插不改（`PUT_IF_ABSENT`）、条件更新（`RowPut{cond_col, cond_val}`，`RowDelete` 同）。
    `UPDATE api_keys SET revoked_at=? WHERE id=? AND revoked_at IS NULL` 落成
    `RowPut(key=id, cond_col=revoked_at, cond_val="")`，而且**只有这一种**正确写法：
-   `RowPut` 是整行覆盖（§5.2），所以「只改一列」必须是 读 → 改 → 带 CAS 写回，CAS
+   `RowPut` 是整行覆盖（§5.2），所以「只改一列」必须是读 → 改 → 带 CAS 写回，CAS
    不命中回 `EAGAIN`。撤销/过期/只读这些判断今天就不在 SQL 里（`fetch_key` 把行取回来
    交给 `authenticate_for`/`live_state` 判），所以「没有范围谓词」这一条**不挡**鉴权路径。
 
@@ -2581,9 +2707,10 @@ spike 明确**没**做、也不在接入面上假装做的事 —— 一律返�
    接下去要动的三项，按价值排序：① 传送吞吐与它对主 p99 的影响都没实测（现在
    手里只有算术上界），要的是冷启动下载速率、稳态追平速率、每 tick 占住提交线程
    多久这三格；② ~~没有主身份认证~~ **已补一半**（§4.4）：共享密钥双向握手能证明
-   「对端持有这把密钥」，但**仍没有 fence**，脑裂后的旧主同样持有密钥、照样能应答
-   握手，多主错配还是只能靠部署挡住；③ 没有提升
-   路径（`--promote`），副本坏了只能新起一个主重拉。
+   「对端持有这把密钥」；③ ~~没有提升路径（`--promote`）~~ **已完成**（v0.4.0，
+   §6.6「切主」）：`fence` 文件 + 两个 reply 尾部的 `epoch` + `--promote`，副本
+   拒收被提掉权的旧主。仍缺的是「旧主自己知道权被拿走」那道门（要租约/心跳），
+   以及自动故障转移 —— 二者都不在近期计划里。
 5. ~~**接入 spike**~~ **已完成并端到端跑通**（grovefs 实验分支
    `exp/treedb-integration`，用户 2026-11-19 授权），结果与缺口清单见 §10 阶段 B
    末节。与本节原写法有两处偏离，原因已写进 §10：CLI 入口用
@@ -2609,7 +2736,9 @@ spike 明确**没**做、也不在接入面上假装做的事 —— 一律返�
    一处不剩；往返省下多少见 §10 阶段 B 末缺口表那一行（op 数 3006 → 6）。当时写的
    「而它钉 `v0.3.2`」也已过时；2026-11-21 grovefs 侧提到 `v0.3.7`（提交 `a8fcfae`，
    只动 `Cargo.toml` / `Cargo.lock` 两行，无适配改动；`test_treedb.sh` 在该分支实测
-   **53/0**）。
+   **53/0**）。本仓随后到了 `v0.4.0`（切主），但那一版的线协议变更只在两个副本专用
+   的 reply 尾部，grovefs 那条路径不受影响 —— 所以 grovefs 仍钉 `v0.3.7` 是有意的，
+   不是漏升级（§10 阶段 B 末表最后一行）。
 7. **独立性审计：treedb 是一个数据库项目，不是 GroveFS 的一个模块**。用户定的约束
    是：grovefs 的业务语义不得漏进引擎内核，为 grovefs 做的适配一律留在 grovefs 仓里
    拦在 feature 门后，treedb 对外只讲通用元数据引擎接口。本轮对着代码校了一遍，

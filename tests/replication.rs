@@ -4,6 +4,11 @@
 //! 副本拒写（引擎档与线协议档各一档）、lag 计数的可观测性、`treedb-standby`
 //! 这个二进制端到端跑通。
 //!
+//! 最后四组是 fencing token（§6.6 第 3 条）：令牌自身的只升不降 / 副本侧对快照
+//! 与批的闸门 / 提权后在线上拒旧主 / `--promote` 这个离线动作。切主是这套东西
+//! 唯一的存在理由，而它恰恰是平时跑不到的那条路径 —— 所以单独一组，不混在
+//! 追平用例里。
+//!
 //! 前五条刻意**不起副本进程**：主是真进程（走真网络、真 group commit），副本
 //! 是测试进程里的 `Engine` + `Follower`。这样"追平逻辑对不对"与"两个进程怎么
 //! 拼起来"分开失败。第六条才把 `treedb-standby` 拉起来，覆盖线协议上的
@@ -22,7 +27,8 @@ use std::time::{Duration, Instant};
 use tempfile::TempDir;
 use treedb::engine::core::SNAP_FILE;
 use treedb::engine::model::{errno, Kind, Node, Op, Reply};
-use treedb::engine::{Durability, Engine};
+use treedb::engine::{Durability, Engine, FENCE_FILE};
+use treedb::error::Error;
 use treedb::net::auth::Key;
 use treedb::net::client::Client;
 use treedb::net::replicate::{Follower, FollowerProgress, ReplicaCfg};
@@ -812,4 +818,251 @@ impl Drop for Standby {
             let _ = c.wait();
         }
     }
+}
+
+// ---------------------------------------------- fencing token（§6.6 第 3 条）
+
+/// `submit` 版的成功断言：写 op 会产出日志，不能用只读那个 `ok`。
+fn apply_ok(e: &mut Engine, op: &Op) -> Reply {
+    match e.submit(op) {
+        Ok(Reply::Err { code, msg }) => {
+            panic!("{op:?} → errno {code} ({})", String::from_utf8_lossy(&msg))
+        }
+        Ok(r) => r,
+        Err(e) => panic!("{op:?} → {e}"),
+    }
+}
+
+/// 造一份可装的快照：一个视图 + `files` 个文件，checkpoint 后返回字节与视图 id。
+///
+/// 直接读 `state.snap` 而不是重新编码：副本真正收到的是主的文件原件，
+/// 测试也该拿同一份字节，否则 `install_snapshot` 的 crc 尾巴校验就绕过去了。
+fn snapshot_of(tag: &str, view: &str, files: u32) -> (TempDir, Vec<u8>, u32) {
+    let (tmp, dir) = read_only_dir(tag);
+    let (bytes, vid) = {
+        // 必须用 Always：`Never` 走 `append_nodur`，`durable_seq()` 一直是 0，
+        // checkpoint 于是写出一份水位为 0 的快照 —— 测不到「旧/新」这个维度。
+        let mut e = Engine::open(&dir, Durability::Always).expect("open snapshot source");
+        let vid = view_id(apply_ok(&mut e, &Op::CreateView { name: view.into() }));
+        for i in 0..files {
+            apply_ok(
+                &mut e,
+                &Op::Create {
+                    view: vid,
+                    parent: 1,
+                    name: format!("f{i}").into_bytes(),
+                    mode: 0o644,
+                    uid: 1,
+                    gid: 1,
+                },
+            );
+        }
+        e.checkpoint().expect("checkpoint");
+        let bytes = std::fs::read(dir.join(SNAP_FILE)).expect("read state.snap");
+        (bytes, vid)
+    };
+    (tmp, bytes, vid)
+}
+
+/// 令牌只升不降、跟着目录走、坏文件不许读成 0。
+///
+/// 三件事各自护着一个口子：只升不降防“提过权的目录又被旧主驱动”；落盘防
+/// “崩溃后回到旧令牌”；坏文件报错防“一个坏字节就把 fencing 解除了”。
+#[test]
+fn the_fence_is_monotonic_persisted_and_never_defaults_to_zero() {
+    let (_tmp, dir) = read_only_dir("fence-mono");
+    {
+        let mut e = Engine::open(&dir, Durability::Never).expect("open");
+        assert_eq!(e.fence(), 0, "新目录从未被提升过，令牌是 0");
+        assert_eq!(e.promote().expect("promote"), 1);
+        assert_eq!(e.promote().expect("promote"), 2);
+        assert_eq!(e.raise_fence(7).expect("raise"), 7);
+        assert_eq!(e.raise_fence(3).expect("raise"), 7, "降令牌必须被忽略");
+        assert_eq!(e.fence(), 7);
+    }
+    let path = dir.join(FENCE_FILE);
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("fence file").trim(),
+        "7",
+        "令牌要落成一个人眼能 cat 的十进制"
+    );
+    {
+        let e = Engine::open(&dir, Durability::Never).expect("reopen");
+        assert_eq!(e.fence(), 7, "重启后令牌必须还在");
+    }
+    std::fs::write(&path, b"seven\n").expect("write");
+    match Engine::open(&dir, Durability::Never) {
+        Err(Error::Config(m)) => assert!(m.contains("fencing token"), "{m}"),
+        Err(e) => panic!("坏令牌应是 Config 错，得到 {e}"),
+        Ok(_) => panic!("坏令牌必须拒绝启动：读成 0 等于把 fencing 默默解除"),
+    }
+}
+
+/// 副本侧的闸门：更大的令牌先落盘再吃数据，更小的令牌一个字都不许进。
+///
+/// 四档：
+/// ① 令牌 1 的快照 → 接受，令牌落盘为 1；
+/// ② 令牌 5 的**旧**快照 → 接受（权力优先于新旧，允许 seq 回退）；
+/// ③ 同一令牌下的旧快照 → 拒收（这才是真的回滚）；
+/// ④ 令牌 0 的批 → 拒收，令牌不上抬，状态一个字节不动。
+#[test]
+fn a_replica_obeys_the_fence_on_snapshots_and_batches() {
+    let (_tmp_a, snap_big, vid) = snapshot_of("fence-src-a", "a", 3);
+    let (_tmp_b, snap_small, _) = snapshot_of("fence-src-b", "b", 0);
+
+    let (_rtmp, rdir) = read_only_dir("fence-rep");
+    let mut r = replica(&rdir);
+    assert_eq!(r.fence(), 0);
+
+    // ① 令牌更大：接受，并且**先**把令牌落到盘上。
+    let seq_big = r.install_snapshot(&snap_big, 1).expect("install at epoch 1");
+    assert_eq!(r.fence(), 1);
+    assert_eq!(
+        std::fs::read_to_string(rdir.join(FENCE_FILE)).unwrap().trim(),
+        "1",
+        "吃掉数据之前令牌必须已经落地（否则崩一下就回到旧令牌了）"
+    );
+    lookup(&mut r, vid, "f0");
+
+    // ② 令牌 5 > 本地 1：哪怕快照更旧也接受 —— 新主可能从别处提权，
+    //    它的数据就是权威。这是“权力优先于新旧”这条例外的唯一形态。
+    let seq_small = r
+        .install_snapshot(&snap_small, 5)
+        .expect("a higher token outranks a newer snapshot");
+    assert!(
+        seq_small < seq_big,
+        "这一档要真的回退水位，否则测不到例外（big {seq_big} / small {seq_small}）"
+    );
+    assert_eq!(r.fence(), 5);
+    match r.exec(&Op::Lookup {
+        view: vid,
+        parent: 1,
+        name: b"f0".to_vec(),
+    }) {
+        (_, Reply::Err { code: errno::ENOENT, .. }) => {}
+        (_, other) => panic!("回退后的状态应该是旧那份（没有 f0），得到 {other:?}"),
+    }
+
+    // ③ 同一令牌下回退：拒绝。
+    let (_rtmp2, rdir2) = read_only_dir("fence-rep2");
+    let mut r2 = replica(&rdir2);
+    assert_eq!(r2.install_snapshot(&snap_big, 5).expect("install"), seq_big);
+    match r2.install_snapshot(&snap_small, 5) {
+        Err(Error::Io(m)) => assert!(m.contains("rewind"), "{m}"),
+        other => panic!("同令牌下的旧快照必须被拒，得到 {other:?}"),
+    }
+
+    // ④ 令牌 0 的批：拒收，且不碰令牌、不碰状态。
+    let before = r.state_snapshot();
+    match r.replicate_records(1, &[b"whatever".to_vec()], 0) {
+        Err(Error::Fence(_)) => {}
+        other => panic!("旧令牌的批必须被拒，得到 {other:?}"),
+    }
+    assert_eq!(r.fence(), 5, "被拒的批不该把令牌改小或改大");
+    assert_eq!(r.state_snapshot(), before, "被拒的批一个字节都不许进");
+}
+
+/// 提权之后，仍在追旧主的副本拒收它的批：不退出、不推进、错误计数抬起来。
+///
+/// 这是 fencing 在真实链路上的样子 —— 它不阻止旧主继续对**自己的**客户端
+/// 服务（那是停掉旧主的运维动作），只保证**副本**不会把旧主的新写当成真相。
+#[test]
+fn a_promoted_replica_refuses_its_old_primary_over_the_wire() {
+    let srv = Server::start("group");
+    let vid = seed_primary(&srv, "fenced", 5);
+
+    let (_tmp, dir) = read_only_dir("fenced-rep");
+    let mut eng = replica(&dir);
+    let mut f = Follower::new(fcfg(&srv.addr, 1, 1 << 20));
+    converge(&mut f, &mut eng, &srv.log_text());
+    assert_eq!(eng.fence(), 0, "追平本身不碰令牌");
+
+    // 提权：这份目录成了更高的那一任。
+    assert_eq!(eng.promote().expect("promote"), 1);
+
+    // 旧主不知道已被换掉，照旧接写。
+    let mut pc = srv.client();
+    okc(
+        &mut pc,
+        &Op::Create {
+            view: vid,
+            parent: 1,
+            name: b"ghost".to_vec(),
+            mode: 0o644,
+            uid: 9,
+            gid: 9,
+        },
+    );
+
+    let before = eng.state_snapshot();
+    for _ in 0..30 {
+        std::thread::sleep(Duration::from_millis(5));
+        f.tick(&mut eng)
+            .expect("fencing 不是致命错误：退出会让这份副本比旧主更不可用");
+    }
+    let p = f.progress(&mut eng);
+    assert!(
+        p.errors >= 1,
+        "拒收必须体现在 replica_errors 上，否则监控看不出主配错了：{p:?}"
+    );
+    assert_eq!(eng.state_snapshot(), before, "旧主的批不许改本地状态");
+    assert_eq!(eng.fence(), 1, "拒收不该把令牌再往上抬");
+    // 仍在答读：这才是“不退出”那句的判据。
+    assert_eq!(lookup(&mut eng, vid, "f0").uid, 1000);
+}
+
+/// `--promote` 是对目录的**离线**操作：不开端口、令牌 +1、打印下一步命令。
+#[test]
+fn the_promote_flag_bumps_the_fence_without_serving() {
+    let (_tmp, dir) = read_only_dir("promote-cli");
+    // 先当一次副本，让目录与令牌都是真实的。
+    {
+        let _e = replica(&dir);
+    }
+    let addr = free_addr();
+    let out = Command::new(env!("CARGO_BIN_EXE_treedb-standby"))
+        .args(["--promote", "--dir"])
+        .arg(&dir)
+        .args(["--listen", &addr])
+        .output()
+        .expect("spawn --promote");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "--promote failed: {}\n{stdout}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(stdout.contains("fence 0 -> 1"), "{stdout}");
+    assert_eq!(
+        std::fs::read_to_string(dir.join(FENCE_FILE)).unwrap().trim(),
+        "1"
+    );
+    assert!(
+        !Client::ping(&addr),
+        "--promote 只改盘上的一个数，不该把监听口开起来"
+    );
+
+    // 再提一次：第 2 任。令牌只往前走，不能因为“提过了”就停在那里。
+    let out = Command::new(env!("CARGO_BIN_EXE_treedb-standby"))
+        .args(["--promote", "--dir"])
+        .arg(&dir)
+        .output()
+        .expect("spawn --promote twice");
+    assert!(out.status.success());
+    assert!(String::from_utf8_lossy(&out.stdout).contains("fence 1 -> 2"));
+
+    // 同时给 --primary 是自相矛盾的两件事：拒绝而不是默默忽略其中一个。
+    let st = Command::new(env!("CARGO_BIN_EXE_treedb-standby"))
+        .args(["--promote", "--primary", "127.0.0.1:1", "--dir"])
+        .arg(&dir)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("spawn");
+    assert_eq!(st.code(), Some(2), "--promote 与 --primary 不能同时给");
+    assert_eq!(
+        std::fs::read_to_string(dir.join(FENCE_FILE)).unwrap().trim(),
+        "2",
+        "被拒的那一次不许改令牌"
+    );
 }
