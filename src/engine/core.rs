@@ -19,6 +19,7 @@
 
 use crate::engine::apply::translate;
 use crate::engine::codec::{Rd, W};
+use crate::engine::dump::Dump;
 use crate::engine::mem::{Log, State, SNAP_LEGACY_VERSION, SNAP_VERSION};
 use crate::engine::model::{Op, Reply};
 use crate::engine::wal::{log_payload, Wal};
@@ -432,8 +433,18 @@ fn build_snapshot_from_disk(dir: &Path, upto: u64) -> Result<u64> {
     for l in &logs {
         state.apply(l);
     }
+    write_snapshot(dir, &state, upto)?;
+    Ok(upto)
+}
+
+/// 把一份状态写成 `state.snap`：正文与水位一起编码，`.tmp` → `fsync` →
+/// `rename` → 刷父目录。
+///
+/// 同步 checkpoint、旁路快照与 `restore_dump` 共用这一处 —— 三条路径写下去的
+/// 字节必须同形，否则「换一种方式落盘」就会变成隐性格式分叉。
+fn write_snapshot(dir: &Path, state: &State, seq: u64) -> Result<()> {
     let mut w = W::new();
-    state.save_with_trailer(&mut w, upto);
+    state.save_with_trailer(&mut w, seq);
     let buf = w.finish();
     let tmp = dir.join(format!("{SNAP_FILE}.tmp"));
     {
@@ -445,11 +456,67 @@ fn build_snapshot_from_disk(dir: &Path, upto: u64) -> Result<u64> {
         f.write_all(&buf)?;
         f.sync_all()?;
     }
-    std::fs::rename(&tmp, snap_path)?;
+    std::fs::rename(&tmp, dir.join(SNAP_FILE))?;
     if let Ok(d) = File::open(dir) {
         let _ = d.sync_all();
     }
-    Ok(upto)
+    Ok(())
+}
+
+/// 离线导出：持目录锁，读「快照 + 能重放到的全部 WAL」，产出一份逻辑 dump。
+///
+/// 与 [`Engine::open`] 的恢复路径同语义（所以它也会带上未 durable 的记录），
+/// 但**不写任何字节**：dump 不应该因为「看一眼」就把一个只读盘变成可写盘。
+pub fn dump_dir(dir: &Path) -> Result<Dump> {
+    if !dir.is_dir() {
+        return Err(Error::Config(format!(
+            "{} is not a data directory",
+            dir.display()
+        )));
+    }
+    // 持锁 = 要求目录独占：服务在跑时这里会拒，而不是读一份撕裂的组合。
+    let _lock = DirLock::acquire(dir)?;
+    let snap_path = dir.join(SNAP_FILE);
+    let (mut state, snap_seq) = if snap_path.exists() {
+        let raw = std::fs::read(&snap_path)?;
+        let (body, seq) = State::snapshot_split(&raw)?;
+        (State::load(&mut Rd::new(body))?, seq)
+    } else {
+        (State::new(), 0u64)
+    };
+    let logs = Wal::replay(&dir.join(WAL_FILE), snap_seq)?;
+    for l in &logs {
+        state.apply(l);
+    }
+    // 日志记录 seq 连续（跳号是硬错，重放已经报过），所以水位就是快照 + 条数。
+    let seq = snap_seq + logs.len() as u64;
+    Ok(Dump::of_state(&state, seq))
+}
+
+/// 离线导入：把一份 dump 写成一个**新的**数据目录。
+///
+/// 只落 `state.snap`（水位 = dump 的 seq），不写 WAL —— 导入后「快照之后没有
+/// 任何写」是字面意思。目标目录必须不存在、或只含本工具自己的 `.lock`：
+/// 往一个有数据的目录里合并不是导入，那是另一种（且没有契约的）操作。
+pub fn restore_dump(dir: &Path, d: &Dump) -> Result<()> {
+    std::fs::create_dir_all(dir)?;
+    let _lock = DirLock::acquire(dir)?;
+    let mut foreign = Vec::new();
+    for e in std::fs::read_dir(dir)? {
+        let name = e?.file_name();
+        if name != LOCK_FILE {
+            foreign.push(name);
+        }
+    }
+    if !foreign.is_empty() {
+        return Err(Error::Config(format!(
+            "refusing to restore into {}: it already has {} entrie(s), first is {:?}",
+            dir.display(),
+            foreign.len(),
+            foreign[0]
+        )));
+    }
+    write_snapshot(dir, &d.state(), d.seq)
 }
 
 impl Engine {

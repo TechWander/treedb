@@ -16,8 +16,8 @@ cargo build --release                                   # 默认档：依赖只�
 ./target/release/treedb-server --dir /var/lib/treedb --listen 127.0.0.1:7777
 ./target/release/treedb-bench --op lookup --conns 64 --pipeline 32 --secs 3
 
-cargo test --release                                    # 默认档 150 passed（引擎本体）
-cargo test --release --features postgres-compat        # 181 passed（含 PG 过渡档）
+cargo test --release                                    # 默认档 159 passed（引擎本体）
+cargo test --release --features postgres-compat        # 190 passed（含 PG 过渡档）
 bash benches/throughput_matrix.sh 3 1 2 3 4 5           # 五轴复现，输出进 benches/results/
 bash benches/sync_ratio.sh 3                           # 写路径机制：一次 fsync 摊了多少写
 bash benches/single_conn.sh 3                          # 单连接对标 PG（$PIPE=32 走批量档、$CONNS/$WORKERS 走并发档）
@@ -43,6 +43,20 @@ bash benches/handshake_cost.sh 20000                   # 接入握手的代价�
 四条承诺、回滚窗口与为什么不在启动路径上开「自动兼容读」的口子，见
 [DESIGN.md](DESIGN.md) §6.5；`bash benches/rehearse_migrate.sh v0.3.2` 拿真旧二进制
 把整条链（造旧目录 → 迁移 → 开门 → 回滚）复算一遍。
+
+要把一份数据搬到别的机器/别的目录，用逻辑 dump（停服后两侧都独占目录）：
+
+```sh
+./target/release/treedb-dump --dir /var/lib/treedb --out /backup/treedb.dump
+./target/release/treedb-load --in /backup/treedb.dump            # 只体检：解码 + 打规模
+./target/release/treedb-load --in /backup/treedb.dump --dir /srv/treedb-new
+```
+
+dump 走的是日志标签表（`Log`，1..=22）而不是内部快照格式，所以它跨版本、跨机器能读；
+容器自带 CRC32 与三个 `next_*` 计数器。load 只写 `state.snap`（水位 = dump 的 seq）、
+不写 WAL，目标目录必须为空。导出是确定性的：`dump → load → dump` 字节相同。
+格式与实测（82 888 节点：dump 279 ms / 11.65 MB，还原快照与源逐字节相同）见
+[DESIGN.md](DESIGN.md) §6.9。
 
 只读副本是另一个二进制，它不需要主做任何配置：
 
@@ -152,11 +166,12 @@ DESIGN.md §7（含 §7.8 那次全五轴复跑）。
   `TCP_NODELAY` + keepalive 空闲 60 s、探活 10 s×3（客户端崩了不会长期占 fd）。多条
   连接只共享一个状态机：锁按**连接号**归属（不用会被复用的 fd），死连接的锁由租约过期回收。
   引擎没有连接数上限常量，卡它的是服务端 `RLIMIT_NOFILE` 与客户端源端口空间（§7.6）。
-- **持久性与备份面**：CRC32 WAL + 快照 checkpoint + 崩溃重放（§6.1/§6.2），优雅停服
-  自带最后一次 checkpoint。备份可用的形状有三种且都跑过（§6.7）：停服后 `cp -a` 目录、
+- **持久性与备份面**：CRC32 WAL + 快照 checkpoint + 崩溃重放（§6.1/§6.2），优雅
+  停服自带最后一次 checkpoint。备份可用的形状有四种且都跑过（§6.7/§6.9）：停服后 `cp -a` 目录、
   `treedb-standby` 拉一份持续追平的异地镜像（那个目录可以直接当还原点起服，
   v0.4.0 起还能用 `treedb-standby --promote` 把它合法地提成主）、
-  `treedb-migrate` 处理快照格式跨代。`--durability` 三档：`group`（默认，一轮一次
+  `treedb-migrate` 处理快照格式跨代、`treedb-dump`/`treedb-load` 做离线逻辑导出与重建。
+  `--durability` 三档：`group`（默认，一轮一次
   fsync、跨连接合并）/ `always`（同一个提交点，单连接下自然退化成每 op 一次盘）/
   `never`（会丢一个窗口）。
 
@@ -170,10 +185,10 @@ DESIGN.md §7（含 §7.8 那次全五轴复跑）。
   apikey + 网关白名单就是这一层），或者把端口锁在回环/私有网段。副本对主那一侧
   能证明「持有密钥」了，`v0.4.0` 起也能认出被提掉权的旧主（`fence`，§6.6）；但
   那只保护副本，不阻止旧主对自己的客户端继续服务。
-- **没有 PITR、没有 dump/load、没有增量与加密备份**（§8 第 14 条、§6.7）。checkpoint 会
-  抹掉水位以下的日志（同步档 `wal.reset()`、自动档 `truncate_before()`），历史切面
-  不归档；运行中 `cp -a` 能起服、无撕裂，但切点不可控（实测比
-  「拷贝前一刻」多 14 400 条 seq），所以它不是备份工具。
+- **没有 PITR、没有增量与加密备份**（§8 第 14 条、§6.7）。`treedb-dump`/`treedb-load`
+  是停服的整份导出，不是在线热备；checkpoint 会抹掉水位以下的日志（同步档
+  `wal.reset()`、自动档 `truncate_before()`），历史切面不归档；运行中 `cp -a` 能起服、
+  无撕裂，但切点不可控（实测比「拷贝前一刻」多 14 400 条 seq），所以它不是备份工具。
 - **没有 SQL、没有 JOIN/排序/范围谓词、没有用户可见事务、没有跨视图原子 op**（§5.3）。
   通用表只给「按唯一键取一行、按前缀列举个数」这一档机制，语义留给接入方。
 - **没有数据面**（§5.3）：文件字节永远在客户端侧，引擎只答元数据。也没有同步复制、
@@ -195,11 +210,11 @@ DESIGN.md §7（含 §7.8 那次全五轴复跑）。
 
 | 路径 | 内容 |
 |------|------|
-| `src/engine/` | 线协议类型（`model.rs`，52 个 op / 30 个 Reply）、帧编码（`codec.rs`）、状态机（`mem.rs`）、应用与定序（`apply.rs`）、WAL/快照（`wal.rs`）、核心（`core.rs`）、自写的 SHA-256/HMAC（`sha256.rs`，§4.4） |
+| `src/engine/` | 线协议类型（`model.rs`，52 个 op / 30 个 Reply）、帧编码（`codec.rs`）、状态机（`mem.rs`）、应用与定序（`apply.rs`）、WAL/快照（`wal.rs`）、核心（`core.rs`）、离线 dump 容器（`dump.rs`，§6.9）、自写的 SHA-256/HMAC（`sha256.rs`，§4.4） |
 | `src/net/` | 单线程事件循环（`server.rs`）、多前端 worker + 唯一提交线程（`multi.rs`）、跨线程信箱（`mail.rs`）、接入认证闸门（`auth.rs`，§4.4）、副本跟踪器（`replicate.rs`）、阻塞客户端（`client.rs`） |
 | `src/{pool,store,persist,schema,probe}.rs` | `postgres-compat` 过渡档 |
-| `src/bin/` | `treedb-server` / `treedb-bench` / `treedb-pgbench`（对照工具）/ `treedb-micro`（纯计算 + 分配计数）/ `treedb-migrate`（快照升级）/ `treedb-standby`（只读副本 + `--promote`）/ `treedb-demo` |
-| `tests/` | `engine_crud` `net_protocol` `read_scaling` `replication` `auth` `crash_recovery` `migrate` `scale_connections` `independence`（默认档全部要跑）；`concurrency` 属过渡档 |
+| `src/bin/` | `treedb-server` / `treedb-bench` / `treedb-pgbench`（对照工具）/ `treedb-micro`（纯计算 + 分配计数）/ `treedb-migrate`（快照升级）/ `treedb-standby`（只读副本 + `--promote`）/ `treedb-dump` + `treedb-load`（离线逻辑导出与重建）/ `treedb-demo` |
+| `tests/` | `engine_crud` `net_protocol` `read_scaling` `replication` `auth` `crash_recovery` `migrate` `dump_restore` `scale_connections` `independence`（默认档全部要跑）；`concurrency` 属过渡档 |
 | `benches/` | 五轴矩阵脚本与历史/复跑原始输出 |
 | `DESIGN.md` | 选型判据、协议字节布局、语义边界、五轴实测、已知限制、接入路径与下一步 |
 

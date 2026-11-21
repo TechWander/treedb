@@ -18,6 +18,7 @@
 pub mod apply;
 pub mod codec;
 pub mod core;
+pub mod dump;
 pub mod mem;
 pub mod model;
 pub mod sha256;
@@ -25,9 +26,10 @@ pub mod wal;
 
 pub use codec::{Rd, W};
 pub use core::{
-    migrate_snapshot, now_ms, probe_snapshot, read_fence, Durability, Engine, EngineStats,
-    MigrationOutcome, SnapshotInfo, FENCE_FILE,
+    dump_dir, migrate_snapshot, now_ms, probe_snapshot, read_fence, restore_dump, Durability,
+    Engine, EngineStats, MigrationOutcome, SnapshotInfo, FENCE_FILE,
 };
+pub use dump::{Dump, DumpCounts, DUMP_MAGIC, DUMP_VERSION};
 pub use mem::{Log, State, SNAP_LEGACY_VERSION, SNAP_MAGIC, SNAP_TRAIL, SNAP_TRAIL_LEGACY, SNAP_VERSION};
 pub use model::{Names, Op, Reply, NONCE_LEN};
 pub use wal::Wal;

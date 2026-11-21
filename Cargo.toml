@@ -31,6 +31,17 @@ path = "src/bin/standby.rs"
 name = "treedb-migrate"
 path = "src/bin/migrate.rs"
 
+# 离线搬运：逻辑 dump 与重建（§6.7）。与 migrate 的分工是「内部布局」对
+# 「逻辑内容」—— migrate 只能喂同一代二进制，dump 只依赖日志标签（1..=22）。
+# 两个命令共用 `engine::dump`，一写一读，是这对工具的完整闭环。
+[[bin]]
+name = "treedb-dump"
+path = "src/bin/dump.rs"
+
+[[bin]]
+name = "treedb-load"
+path = "src/bin/load.rs"
+
 [[bin]]
 name = "treedb-bench"
 path = "src/bin/bench.rs"
