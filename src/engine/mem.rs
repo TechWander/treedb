@@ -169,6 +169,19 @@ pub enum Log {
         table: u32,
         key: Vec<u8>,
     },
+    /// 给表追加一列（§5.1 的 alter）：`def` 是**追加后的整张形状**。
+    ///
+    /// 记整张 def 而不是「只记新列」，是为了幂等：同一条日志重放两次，第二次
+    /// 列数差为 0，只把形状对齐一次，不重复补行、不重复入索引。`apply` 按
+    /// 「旧形状 → 新形状」的列数差把每一行补齐成空字节（空串本就是一个合法
+    /// 列值），并把新加且带索引的列补进 `row_index`。
+    ///
+    /// 快照与 dump 里都没有它：两者存的是 def + 行本身，载入时 `index_row`
+    /// 会按新 def 自然重建出新增列的索引项。
+    AddColumn {
+        id: u32,
+        def: TableDef,
+    },
     /// 一个原子批：内部逐条等价于把 `logs` 展开后依次 `apply`，但它自己
     /// **只占一条 WAL 记录**（一个 CRC）。[`crate::engine::model::Op::Batch`]
     /// 的「崩溃原子」就靠这一层 —— §6.2 的坏尾丢弃以记录为单位，一条记录
@@ -204,6 +217,7 @@ const LOG_DEL_TABLE: u8 = 20;
 const LOG_PUT_ROW: u8 = 21;
 const LOG_DEL_ROW: u8 = 22;
 const LOG_BATCH: u8 = 23;
+const LOG_ADD_COLUMN: u8 = 24;
 
 /// 一条 [`Log::Batch`] 能装多少条子日志。
 ///
@@ -333,6 +347,11 @@ impl Log {
                 w.u32(*table);
                 w.bytes(key);
             }
+            Log::AddColumn { id, def } => {
+                w.u8(LOG_ADD_COLUMN);
+                w.u32(*id);
+                def.encode(w);
+            }
             Log::Batch { logs } => {
                 w.u8(LOG_BATCH);
                 w.u32(logs.len() as u32);
@@ -433,6 +452,10 @@ impl Log {
             LOG_DEL_ROW => Log::DelRow {
                 table: r.u32()?,
                 key: r.bytes()?,
+            },
+            LOG_ADD_COLUMN => Log::AddColumn {
+                id: r.u32()?,
+                def: TableDef::decode(r)?,
             },
             LOG_BATCH => {
                 let n = r.u32()? as usize;
@@ -697,6 +720,42 @@ impl State {
                 // 空内层表不留，与 `dentries` 同规矩（否则 `rows.len()` 会谎报表数）。
                 if self.rows.get(table).map(|m| m.is_empty()).unwrap_or(false) {
                     self.rows.remove(table);
+                }
+            }
+            Log::AddColumn { id, def } => {
+                // 表名以 `table_by_id` 为准：日志里的 def 是翻译层从旧 def 复制
+                // 出来的，名字本该一致；这里不信它，也就不会把一条坏日志变成改名。
+                let Some(name) = self.table_by_id.get(id).cloned() else {
+                    return;
+                };
+                let Some(meta) = self.tables.get(name.as_slice()) else {
+                    return;
+                };
+                let old_n = meta.def.columns.len();
+                let new_n = def.columns.len();
+                let mut new_def = def.clone();
+                new_def.name = name.clone();
+                self.tables.insert(
+                    name,
+                    TableMeta {
+                        id: *id,
+                        def: new_def,
+                    },
+                );
+                if new_n <= old_n {
+                    return; // 幂等重放：行已经是这个宽度
+                }
+                let added: Vec<u32> = (old_n as u32..new_n as u32)
+                    .filter(|c| def.columns[*c as usize].indexed())
+                    .collect();
+                if let Some(m) = self.rows.get_mut(id) {
+                    for row in m.values_mut() {
+                        row.cols.resize(new_n, Vec::new());
+                        for &c in &added {
+                            self.row_index
+                                .insert((*id, c, row.cols[c as usize].clone(), row.key.clone()), ());
+                        }
+                    }
                 }
             }
         }
@@ -1406,6 +1465,17 @@ mod tests {
                 },
             },
             Log::DelTable { id: 4, name: b"kv".to_vec() },
+            Log::AddColumn {
+                id: 4,
+                def: TableDef {
+                    name: b"kv".to_vec(),
+                    columns: vec![
+                        ColumnDef { name: b"a".to_vec(), flags: COL_UNIQUE },
+                        ColumnDef { name: b"b".to_vec(), flags: 0 },
+                        ColumnDef { name: b"c".to_vec(), flags: COL_INDEX },
+                    ],
+                },
+            },
             Log::PutRow {
                 table: 4,
                 row: RowRec { key: b"k1".to_vec(), cols: vec![b"v1".to_vec(), Vec::new()] },

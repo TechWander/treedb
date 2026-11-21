@@ -791,6 +791,22 @@ pub enum Op {
         name: Vec<u8>,
     },
     TableList,
+    /// 给已有表**追加一列**（只能追加到末尾；不能改名、删列或改已有列的标志）。
+    ///
+    /// 三条语义：① 旧行按新宽度补齐，补出来的列值是**空字节** —— 空串本来就是
+    /// 一个合法列值，所以引擎不承诺「能区分补出来的空值与显式写入的空值」；
+    /// ② 整次变更只产一条 `Log::AddColumn`（一条 WAL 记录），所以崩溃切片上
+    /// 「新形状 + 全部旧行都变宽」与「整次没发生」二选一；③ 快照格式与
+    /// `SNAP_VERSION` 不动 —— 旧行变宽是行里多一个字节串，不是新的表结构。
+    ///
+    /// 拒绝四类：表不存在 `ENOENT`；列名空或超长 `EINVAL`/`ENAMETOOLONG`、
+    /// 与已有列重名 `EINVAL`；已经 64 列 `EINVAL`；`COL_UNIQUE` 一律 `EINVAL` ——
+    /// 引擎没有回填值，非空表上已有的空值会立刻把唯一约束踩破（要唯一列就在
+    /// 建表时一次给全）。
+    TableAddColumn {
+        table: Vec<u8>,
+        column: ColumnDef,
+    },
     /// 写一行：键不存在则插入，存在则**整体覆盖**（不给列 = 该列被清成空字节）。
     /// 列数与 def 不符 → `EINVAL`；唯一列撞值 → `EEXIST`；条件不命中 → `EAGAIN`。
     RowPut {
@@ -975,6 +991,7 @@ impl Op {
             Op::TableDrop { .. } => 0x0071,
             Op::TableGet { .. } => 0x0072,
             Op::TableList => 0x0073,
+            Op::TableAddColumn { .. } => 0x007b,
             Op::RowPut { .. } => 0x0074,
             Op::RowGet { .. } => 0x0075,
             Op::RowList { .. } => 0x0076,
@@ -1080,6 +1097,7 @@ impl Op {
             | Op::PlaceSet { .. }
             | Op::TableCreate { .. }
             | Op::TableDrop { .. }
+            | Op::TableAddColumn { .. }
             | Op::RowPut { .. }
             | Op::RowDelete { .. }
             | Op::WalFetch { .. }
@@ -1285,6 +1303,10 @@ impl Op {
             Op::PlaceGet { view } => w.bytes(view),
             Op::TableCreate { def } => def.encode(w),
             Op::TableDrop { name } | Op::TableGet { name } => w.bytes(name),
+            Op::TableAddColumn { table, column } => {
+                w.bytes(table);
+                column.encode(w);
+            }
             Op::RowPut {
                 table,
                 key,
@@ -1544,6 +1566,10 @@ impl Op {
             0x0071 => Op::TableDrop { name: r.bytes()? },
             0x0072 => Op::TableGet { name: r.bytes()? },
             0x0073 => Op::TableList,
+            0x007b => Op::TableAddColumn {
+                table: r.bytes()?,
+                column: ColumnDef::decode(r)?,
+            },
             0x0074 => {
                 let table = r.bytes()?;
                 let key = r.bytes()?;
@@ -2578,6 +2604,13 @@ mod tests {
             Op::TableDrop { name: b"kv".to_vec() },
             Op::TableGet { name: b"kv".to_vec() },
             Op::TableList,
+            Op::TableAddColumn {
+                table: b"kv".to_vec(),
+                column: ColumnDef {
+                    name: b"d".to_vec(),
+                    flags: COL_INDEX,
+                },
+            },
             Op::RowPut {
                 table: b"kv".to_vec(),
                 key: b"k1".to_vec(),

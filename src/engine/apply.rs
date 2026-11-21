@@ -11,8 +11,8 @@ use crate::engine::mem::{DENT_KIND_UNKNOWN, Log, State, TableMeta};
 use std::collections::BTreeMap;
 use std::ops::Bound;
 use crate::engine::model::{
-    errno, AuditRec, DataRef, DefRec, Ino, LockRec, Names, Node, NodeAttr, RefRec, Reply, RowRec,
-    TableDef, ViewId, ViewMeta, Kind, Op, MAX_BATCH_OPS, MAX_COLUMNS, PUT_IF_ABSENT,
+    errno, AuditRec, ColumnDef, DataRef, DefRec, Ino, LockRec, Names, Node, NodeAttr, RefRec,
+    Reply, RowRec, TableDef, ViewId, ViewMeta, Kind, Op, MAX_BATCH_OPS, MAX_COLUMNS, PUT_IF_ABSENT,
     PUT_IF_EXISTS,
     DEL_IF_EXISTS, COND_NONE, RENAME_NOREPLACE, ROW_KEY_MAX, ROW_PK, SA_ATIME, SA_DATA_REF,
     SA_GID, SA_MODE, SA_MTIME, SA_SIZE, SA_UID, TABLE_NAME_MAX,
@@ -47,6 +47,21 @@ fn dead_view(s: &State, view: ViewId) -> bool {
     view_meta(s, view).is_none()
 }
 
+/// 单列的合法性（不看与其它列的关系）：名字非空、长度有上界。建表与追加列
+/// 共用这一道，免得两条路径对「什么是一个合法的列名」各说各话。
+fn bad_column_def(c: &ColumnDef) -> Option<Reply> {
+    if c.name.is_empty() {
+        return Some(Reply::err(errno::EINVAL, "empty column name"));
+    }
+    if c.name.len() > TABLE_NAME_MAX {
+        return Some(Reply::err(
+            errno::ENAMETOOLONG,
+            format!("column name over {TABLE_NAME_MAX} bytes"),
+        ));
+    }
+    None
+}
+
 /// 通用表的 def 合法性。返回一条 `Reply::Err` 就代表不合法，调用方直接回。
 ///
 /// 这里只查**形状**：名字非空、长度有上界、列数在 1..=上限、列名不重。
@@ -71,14 +86,8 @@ fn bad_def(def: &TableDef) -> Option<Reply> {
     // 所以宁可在建表时就拒。
     let mut seen: Vec<&[u8]> = Vec::with_capacity(def.columns.len());
     for c in &def.columns {
-        if c.name.is_empty() {
-            return Some(Reply::err(errno::EINVAL, "empty column name"));
-        }
-        if c.name.len() > TABLE_NAME_MAX {
-            return Some(Reply::err(
-                errno::ENAMETOOLONG,
-                format!("column name over {TABLE_NAME_MAX} bytes"),
-            ));
+        if let Some(r) = bad_column_def(c) {
+            return Some(r);
         }
         if seen.contains(&c.name.as_slice()) {
             return Some(Reply::err(
@@ -1408,6 +1417,58 @@ pub fn translate(s: &State, now: i64, op: &Op) -> (Vec<Log>, Reply) {
                 Reply::Ok,
             ),
         },
+        // 只能追加到末尾：改名/删列/改已有标志都不在这里 —— 它们要么改变
+        // 行宽（删列得迁移每一行），要么得复用已有索引（改标志），都不是
+        // 一条 `AddColumn` 能承担的。
+        Op::TableAddColumn { table, column } => {
+            let Some(t) = s.tables.get(table) else {
+                return (vec![], no_table(table));
+            };
+            if let Some(r) = bad_column_def(column) {
+                return (vec![], r);
+            }
+            if t.def.columns.iter().any(|c| c.name == column.name) {
+                return (
+                    vec![],
+                    Reply::err(
+                        errno::EINVAL,
+                        format!(
+                            "column {} already exists",
+                            String::from_utf8_lossy(&column.name)
+                        ),
+                    ),
+                );
+            }
+            if t.def.columns.len() >= MAX_COLUMNS {
+                return (
+                    vec![],
+                    Reply::err(
+                        errno::EINVAL,
+                        format!("table already has {MAX_COLUMNS} columns"),
+                    ),
+                );
+            }
+            if column.unique() {
+                // 引擎不做回填：非空表上已有的空值会立刻踩破唯一约束，空表上
+                // 也没必要分两步走 —— 要唯一列就在建表时一次给全。
+                return (
+                    vec![],
+                    Reply::err(
+                        errno::EINVAL,
+                        "cannot add a COL_UNIQUE column: no value to backfill existing rows",
+                    ),
+                );
+            }
+            let mut def = t.def.clone();
+            def.columns.push(column.clone());
+            (
+                vec![Log::AddColumn {
+                    id: t.id,
+                    def: def.clone(),
+                }],
+                Reply::Table(Some(def)),
+            )
+        }
         Op::RowPut {
             table,
             key,
