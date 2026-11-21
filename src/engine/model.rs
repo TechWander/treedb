@@ -404,6 +404,15 @@ pub const MAX_COLUMNS: usize = 64;
 /// 就预分配百亿元素。超限直接拒帧，不截断。
 pub const MAX_TABLE_ITEMS: usize = 1_000_000;
 
+/// 一个 [`Op::Batch`] 最多装多少条子 op。
+///
+/// 上界不是为了「协议装不下」，而是两笔合在一起：含写的批要在写锁里
+/// `clone` 一份 `State` 当预演副本，批越宽这次拷贝（以及锁的持有时间）越长；
+/// 应答还要把每条的应答都带回去。64 条够「一次 rename + 若干条 setattr」这一档，
+/// 更大的批量应该由调用方自己分轮 —— 分摊 fsync 本来就有 pipeline 那条路（§7.9），
+/// `Batch` 多出来的是跨 op 的可见性与原子性，不是吞吐。
+pub const MAX_BATCH_OPS: usize = 64;
+
 /// `RowList` / `RowCount` 的 `column` 保留值：按主键序遍历全表，`value` 忽略。
 pub const ROW_PK: u32 = u32::MAX;
 /// `RowPut` / `RowDelete` 的 `cond_col` 保留值：不带条件。
@@ -845,6 +854,33 @@ pub enum Op {
         value: Vec<u8>,
     },
 
+    // ---- 跨 op 的原子批 ----
+    /// 一批子 op：**要么全生效，要么一条都不生效**。
+    ///
+    /// 三个语义点：
+    ///
+    /// 1. **顺序可见**：子 op 按数组顺序执行，后一条能看到前一条的写。所以
+    ///    「create 一个文件、再 `Setattr` 它」这种依赖前序结果的批合法 —— 这正是
+    ///    它与「几条 op 拼成 pipeline 一起发」的区别：pipeline 只摊 fsync（§7.9），
+    ///    既不提供跨 op 的可见性，也不提供原子性。
+    /// 2. **崩溃原子**：整批的 `Log` 装进**一条** WAL 记录（`Log::Batch` 容器），
+    ///    一条记录一个 CRC —— §6.2「坏尾整条丢弃」因此只可能整批丢，不可能只留
+    ///    前几条。这比单 op 的多条 `Log` 更强：后者在同一个 fsync 里只是**运行期**
+    ///    原子，崩溃切片上仍可能只落前几条。
+    /// 3. **失败即整批不落**：任何一条回 [`Reply::Err`]，本 op 原样回那条的
+    ///    `code`，`msg` 前缀写清是第几条；一条 `Log` 都不产，内存状态不动。
+    ///
+    /// 拒绝四类：空批、超过 [`MAX_BATCH_OPS`] 条、嵌套（子 op 不许再是 `Batch`，
+    /// 解码与翻译两层各拦一道）、控制面 op（[`Op::is_control`] —— 它们要的不是
+    /// `State`，而 `Checkpoint` 还会在批中间把 WAL 截掉，原子性就没了）。
+    ///
+    /// 成本：含写的批要在写锁里 `clone` 一份 `State` 当预演副本（`translate` 对
+    /// 状态只读，预演只能落在副本上，失败时真状态一个字节没被动过）。批越宽、
+    /// 状态越大，这一份拷贝越贵 —— 与「省几轮往返」是同一笔账的两端。
+    Batch {
+        ops: Vec<Op>,
+    },
+
     // ---- readdir 带属性 ----
     /// 与 [`Op::ReadDir`] 同一份目录页，只是每条目录项把属性一起带回。
     ///
@@ -945,6 +981,8 @@ impl Op {
             Op::RowDelete { .. } => 0x0077,
             Op::RowCount { .. } => 0x0078,
             Op::RowRange { .. } => 0x0079,
+            // 通用表那一段的最后一个空位 0x007a 给原子批（全局动作，不分段）。
+            Op::Batch { .. } => 0x007a,
             Op::ReadDirPlus { .. } => 0x002b,
             // 目录树那一段 0x0020–0x002b 已排满，`Link` 取紧接着的下一个空位。
             Op::Link { .. } => 0x002c,
@@ -990,6 +1028,11 @@ impl Op {
     /// `translate(&State, ..)` 根本拿不到。三档的划分见 [`Op::is_control`]。
     pub fn is_readonly(&self) -> bool {
         match self {
+            // 批是**全只读时才只读**：一条写就把整批判进提交线程。这条递归
+            // 让「纯读批」照旧吃 worker 并行与副本放行，而含写的批一定落回
+            // 单线程路径 —— 与单 op 的判据同一个句号（[`Op::is_control`] 的
+            // 三档划分不变，`Batch` 恒不是控制面）。
+            Op::Batch { ops } => ops.iter().all(|o| o.is_readonly()),
             Op::Ping
             | Op::ListViews
             | Op::Lookup { .. }
@@ -1312,6 +1355,12 @@ impl Op {
                 w.u32(*column);
                 w.bytes(value);
             }
+            Op::Batch { ops } => {
+                w.u32(ops.len() as u32);
+                for o in ops {
+                    o.encode(w);
+                }
+            }
             Op::WalFetch { want_seq, hint_off, max_bytes } => {
                 w.u64(*want_seq);
                 w.u64(*hint_off);
@@ -1327,7 +1376,18 @@ impl Op {
     }
 
     pub fn decode(r: &mut Rd) -> Result<Op> {
+        Self::decode_depth(r, 0)
+    }
+
+    /// `depth` = 已经套了几层 [`Op::Batch`]。子 op 不许再是 `Batch`，所以只有
+    /// 0 与 1 两个取值。这道结构性拒绝放在解码里、而不是只放 `translate`：解码
+    /// 递归没有上界的话，一条精心构造的深嵌套帧能让服务端在解帧阶段爆栈 ——
+    /// 那是崩溃，连 `EINVAL` 都回不出去。
+    fn decode_depth(r: &mut Rd, depth: u8) -> Result<Op> {
         let tag = r.u16()?;
+        if depth > 0 && tag == 0x007a {
+            return Err(Error::Codec("nested batch op is not allowed".into()));
+        }
         let op = match tag {
             0x0001 => Op::Ping,
             0x0002 => Op::Stats,
@@ -1538,6 +1598,23 @@ impl Op {
                 after_key: r.bytes()?,
                 limit: r.u32()?,
             },
+            // 条数上界在**解码**这里报错（Codec 错 = 断连），而不是等 `translate`
+            // 回 EINVAL：`Vec::with_capacity(n)` 拿吃一个敌意计数就是内存放大，
+            // 而正常客户端不会送超过 `MAX_BATCH_OPS` 的批（那一档由翻译层回
+            // EINVAL，两条路对合法请求不交叉）。
+            0x007a => {
+                let n = r.u32()? as usize;
+                if n > MAX_BATCH_OPS {
+                    return Err(Error::Codec(format!(
+                        "batch carries {n} ops, over MAX_BATCH_OPS={MAX_BATCH_OPS}"
+                    )));
+                }
+                let mut ops = Vec::with_capacity(n);
+                for _ in 0..n {
+                    ops.push(Self::decode_depth(r, depth + 1)?);
+                }
+                Op::Batch { ops }
+            }
             // 两个长度上限（`WAL_FETCH_MAX` / `SNAP_CHUNK_MAX`）**不在这里拦**：
             // 越界的解码会连带断连（解码失败在事件循环里就是 `drop_conn`），
             // 而「你要得太多」是个该回 EINVAL 的参数问题，不是协议坏了 ——
@@ -1740,6 +1817,13 @@ pub enum Reply {
     },
     /// `RowCount`。
     Count(u64),
+    /// 一批子应答：与 [`Op::Batch`] 的 `ops` **逐位对应、长度相等**。
+    ///
+    /// 一条子 op 失败时不会走到这里 —— 整批回一个 [`Reply::Err`]（`msg`
+    /// 里带下标），所以拿到 `Batch` 就意味着每一条都成功了。
+    ///
+    /// 嵌套不存在：子应答不许再是 `Batch`（解码拦住，判据同 `Op` 那侧）。
+    Batch { replies: Vec<Reply> },
     Stats(Box<crate::engine::core::EngineStats>),
     /// [`Op::WalFetch`] 的应答：`records` 是 WAL 记录的 payload **原字节**，按
     /// seq 升序且连续，`records[i]` 的 seq 就是 `base_seq + i`。
@@ -1986,6 +2070,13 @@ impl Reply {
                 w.u16(0x0174);
                 w.u64(*n);
             }
+            Reply::Batch { replies } => {
+                w.u16(0x01a0);
+                w.u32(replies.len() as u32);
+                for r in replies {
+                    r.encode(w);
+                }
+            }
             Reply::Stats(s) => {
                 w.u16(0x0102);
                 s.encode(w);
@@ -2040,7 +2131,15 @@ impl Reply {
     }
 
     pub fn decode(r: &mut Rd) -> Result<Reply> {
+        Self::decode_depth(r, 0)
+    }
+
+    /// 与 [`Op::decode_depth`] 同一个理由：应答也是递归结构，给一个上界。
+    fn decode_depth(r: &mut Rd, depth: u8) -> Result<Reply> {
         let tag = r.u16()?;
+        if depth > 0 && tag == 0x01a0 {
+            return Err(Error::Codec("nested batch reply is not allowed".into()));
+        }
         let rep = match tag {
             0x0100 => Reply::Ok,
             0x0101 => Reply::Pong,
@@ -2208,6 +2307,19 @@ impl Reply {
                 }
             }
             0x0174 => Reply::Count(r.u64()?),
+            0x01a0 => {
+                let n = r.u32()? as usize;
+                if n > MAX_BATCH_OPS {
+                    return Err(Error::Codec(format!(
+                        "batch reply carries {n} entries, over MAX_BATCH_OPS={MAX_BATCH_OPS}"
+                    )));
+                }
+                let mut replies = Vec::with_capacity(n);
+                for _ in 0..n {
+                    replies.push(Self::decode_depth(r, depth + 1)?);
+                }
+                Reply::Batch { replies }
+            }
             0x0180 => {
                 let n = r.u32()? as usize;
                 if n > MAX_FETCH_RECORDS {
@@ -2503,6 +2615,22 @@ mod tests {
                 column: ROW_PK,
                 value: Vec::new(),
             },
+            // ---- 原子批 ----
+            // 子 op 故意混一条只读进去：编码/解码只关心形状，不为「只读还是写」分叉。
+            Op::Batch {
+                ops: vec![
+                    Op::Mkdir {
+                        view: 3,
+                        parent: 1,
+                        name: b"d".to_vec(),
+                        mode: 0o755,
+                        uid: 7,
+                        gid: 8,
+                    },
+                    Op::Getattr { view: 3, ino: 9 },
+                ],
+            },
+            Op::Batch { ops: Vec::new() },
             // ---- readdir 带属性 ----
             Op::ReadDirPlus {
                 view: 3,
@@ -2673,6 +2801,16 @@ mod tests {
                 end: true,
             },
             Reply::Count(7),
+            Reply::Batch {
+                replies: vec![
+                    Reply::Ok,
+                    Reply::Err {
+                        code: 22,
+                        msg: b"x".to_vec(),
+                    },
+                    Reply::Pong,
+                ],
+            },
             Reply::DirentsPlus {
                 inos: vec![2, 3],
                 kinds: vec![0, 1],

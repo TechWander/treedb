@@ -740,7 +740,12 @@ impl Engine {
     /// 调用方（事件循环）负责在一轮结束后把本轮所有 logs 交给
     /// [`Engine::commit_batch`]，再把 reply 写回对应连接。
     pub fn exec(&mut self, op: &Op) -> (Vec<Log>, Reply) {
-        self.stats.ops_total += 1;
+        // 批内的子 op 也各算一次：不这么做的话一个 64 条的批在 `Stats` 里只值 1，
+        // 吞吐读数与实际处理的请求量差两个数量级。
+        self.stats.ops_total += match op {
+            Op::Batch { ops } => 1 + ops.len() as u64,
+            _ => 1,
+        };
         match op {
             Op::Ping => (vec![], Reply::Pong),
             Op::Stats => (vec![], Reply::Stats(Box::new(self.snapshot_stats()))),

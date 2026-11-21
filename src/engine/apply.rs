@@ -12,7 +12,8 @@ use std::collections::BTreeMap;
 use std::ops::Bound;
 use crate::engine::model::{
     errno, AuditRec, DataRef, DefRec, Ino, LockRec, Names, Node, NodeAttr, RefRec, Reply, RowRec,
-    TableDef, ViewId, ViewMeta, Kind, Op, MAX_COLUMNS, PUT_IF_ABSENT, PUT_IF_EXISTS,
+    TableDef, ViewId, ViewMeta, Kind, Op, MAX_BATCH_OPS, MAX_COLUMNS, PUT_IF_ABSENT,
+    PUT_IF_EXISTS,
     DEL_IF_EXISTS, COND_NONE, RENAME_NOREPLACE, ROW_KEY_MAX, ROW_PK, SA_ATIME, SA_DATA_REF,
     SA_GID, SA_MODE, SA_MTIME, SA_SIZE, SA_UID, TABLE_NAME_MAX,
 };
@@ -279,6 +280,111 @@ fn last_holder(rows: &BTreeMap<DataRef, RefRec>, d: &DataRef) -> DataRef {
     match rows.get(d) {
         Some(r) if r.count == 0 => d.clone(),
         _ => Vec::new(),
+    }
+}
+
+/// [`Op::Batch`] 的翻译：整批要么产出**一条**容器日志，要么一条都不产。
+///
+/// 预演必须落在 `State` 的副本上：本层对状态只读，而批内第 i 条要看到前 i 条
+/// 的效果 —— 唯一的办法是把前面那几条 `apply` 进一份副本。全只读的批不碰副本
+/// （没有 `Log` 可 apply），也就不付这次拷贝。
+///
+/// 失败时真状态一个字节没被动过：副本是局部变量，直接丢掉 —— 这是「不需要
+/// undo 日志」的全部原因，也是这条路径能在 `translate` 这种纯函数里成立的前提。
+/// 代价则很具体：含写的批在写锁里拷一份 `State`，批越宽、状态越大越贵。
+fn batch(s: &State, now: i64, ops: &[Op]) -> (Vec<Log>, Reply) {
+    if ops.is_empty() {
+        return (vec![], Reply::err(errno::EINVAL, "empty batch"));
+    }
+    // 解码层已拦过一道（那里报 Codec 错 = 断连，因为要先防内存放大）；
+    // 这一道管的是代码里结构化的构造，以及给客户端一个可读的 EINVAL。
+    if ops.len() > MAX_BATCH_OPS {
+        return (
+            vec![],
+            Reply::err(
+                errno::EINVAL,
+                format!(
+                    "batch carries {} ops, over MAX_BATCH_OPS={MAX_BATCH_OPS}",
+                    ops.len()
+                ),
+            ),
+        );
+    }
+    for (i, o) in ops.iter().enumerate() {
+        if o.is_control() {
+            return (
+                vec![],
+                Reply::err(
+                    errno::EINVAL,
+                    format!("batch op #{i} is a control-plane op (see Op::is_control)"),
+                ),
+            );
+        }
+        if matches!(o, Op::Batch { .. }) {
+            return (
+                vec![],
+                Reply::err(errno::EINVAL, format!("batch op #{i} is itself a batch")),
+            );
+        }
+    }
+    let mut replies: Vec<Reply> = Vec::with_capacity(ops.len());
+    // 纯读批：没有副作用，直接在真状态上逐条翻译，不付拷贝。
+    if ops.iter().all(|o| o.is_readonly()) {
+        for (i, o) in ops.iter().enumerate() {
+            let (_, r) = translate(s, now, o);
+            if matches!(r, Reply::Err { .. }) {
+                return (vec![], batch_fail(i, r));
+            }
+            replies.push(r);
+        }
+        return (vec![], Reply::Batch { replies });
+    }
+    // 含写的批：预演落在副本上。整批共用一个 `now` —— 同一次提交里的几条
+    // `Setattr` 应该看到同一个时间戳；逐条各取一次会让「同一时刻」在毫秒边界上
+    // 碎开，也会让同一批重放两次得到不同结果。
+    let mut scratch = s.clone();
+    let mut logs: Vec<Log> = Vec::new();
+    for (i, o) in ops.iter().enumerate() {
+        let (ls, r) = translate(&scratch, now, o);
+        if matches!(r, Reply::Err { .. }) {
+            return (vec![], batch_fail(i, r));
+        }
+        // 单向自检：只读 op 产日志就说明 `is_readonly` 判错了（反向不成立：
+        // 幂等的 `RowDelete` 不存在的行也是「非只读、零日志」）。
+        if !ls.is_empty() && o.is_readonly() {
+            return (
+                vec![],
+                Reply::err(
+                    errno::EIO,
+                    format!("batch op #{i} produced logs but is classified readonly"),
+                ),
+            );
+        }
+        for l in &ls {
+            scratch.apply(l);
+        }
+        logs.extend(ls);
+        replies.push(r);
+    }
+    // 整批都没有效果（全部幂等空转）：不产容器，也就不占一条 WAL 记录。
+    if logs.is_empty() {
+        return (vec![], Reply::Batch { replies });
+    }
+    (vec![Log::Batch { logs }], Reply::Batch { replies })
+}
+
+/// 把子 op 的 errno 抬成整批的失败，`msg` 前缀写清是第几条。
+///
+/// `code` 原样搬：调用方拿到的还是那个 `ENOENT` / `EEXIST`，而不是一个模糊的
+/// 「批失败」—— 能不能重试、要不要换个名字，都靠这个码。
+fn batch_fail(i: usize, r: Reply) -> Reply {
+    match r {
+        Reply::Err { code, msg } => {
+            let mut m = format!("batch op #{i}: ").into_bytes();
+            m.extend_from_slice(&msg);
+            Reply::Err { code, msg: m }
+        }
+        other => other,
     }
 }
 
@@ -1423,6 +1529,9 @@ pub fn translate(s: &State, now: i64, op: &Op) -> (Vec<Log>, Reply) {
                 Reply::Ok,
             )
         }
+
+        // ---- 跨 op 的原子批 ----
+        Op::Batch { ops } => batch(s, now, ops),
 
         // 由 Engine 直接应答的控制 op 不落到这里。
         Op::Ping

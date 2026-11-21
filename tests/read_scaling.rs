@@ -95,7 +95,7 @@ fn rowput(table: &str, key: &str, val: &str, cond_col: u32, cond_val: &str) -> O
     }
 }
 
-/// 53 个 op 变体的语料，每条都带能让它走到真实分支的参数（视图/文件名/表名
+/// 54 个 op 变体的语料，每条都带能让它走到真实分支的参数（视图/文件名/表名
 /// 取自下面 `seed` 播好的状态，所以视图 id 由调用方递进来）。加新 op 必须同时
 /// 补这里 —— 最后两个计数断言就是报警器。
 fn corpus(v: u32) -> Vec<Op> {
@@ -170,6 +170,16 @@ fn corpus(v: u32) -> Vec<Op> {
         Op::RowCount { table: name("seed-table"), column: 1, value: name("x") },
         // ---- readdir 带属性 ----
         Op::ReadDirPlus { view: v, parent: 1, offset: 0, limit: 100 },
+        // ---- 跨 op 的原子批 ----
+        // 含写的批：判据是 `is_readonly` 递归，一条写就把整批归进「真写」。
+        // 子 op 选的就是「批内后一条读前一条写的对象」这个形状，批的语义在
+        // `tests/batch.rs`，这里只要它在三档里落对档。
+        Op::Batch {
+            ops: vec![
+                Op::Mkdir { view: v, parent: 1, name: name("batch-dir"), mode: 0o755, uid: 1, gid: 1 },
+                Op::RowGet { table: name("seed-table"), key: name("r1") },
+            ],
+        },
         // ---- 日志传送 ----
         // 参数取真值形状：`want_seq=1` 在种子状态下确实还没被截进快照，
         // 走的是交付而不是 gap 那条支路。
@@ -250,9 +260,9 @@ fn readonly_classification_matches_translate() {
         }
     }
     let cs_len = cs.len();
-    assert_eq!(cs_len, 53, "op 语料必须覆盖全部变体");
+    assert_eq!(cs_len, 54, "op 语料必须覆盖全部变体");
     assert_eq!(ro, 23, "只读 op 数变了：分派表、这里和 DESIGN.md §4.2 分组表要一起改");
-    assert_eq!(wr, 30, "非只读 op 数变了：同上");
+    assert_eq!(wr, 31, "非只读 op 数变了：同上");
 }
 
 /// 三档划分必须穷举且两两不交：只读 / 真写 / 控制面。
@@ -277,8 +287,8 @@ fn ops_partition_into_three_classes() {
     }
     assert_eq!(
         (ro, wr, ctl),
-        (23, 23, 7),
-        "三档的分布：只读 23 / 真写 23 / 控制面 7（Stats、Checkpoint、Shutdown、WalFetch、\
+        (23, 24, 7),
+        "三档的分布：只读 23 / 真写 24 / 控制面 7（Stats、Checkpoint、Shutdown、WalFetch、\
          SnapFetch、AuthBegin、AuthFinish）"
     );
     // 语料覆盖全部变体，因此三档之和就是 op 总数。

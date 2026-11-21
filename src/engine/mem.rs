@@ -169,6 +169,16 @@ pub enum Log {
         table: u32,
         key: Vec<u8>,
     },
+    /// 一个原子批：内部逐条等价于把 `logs` 展开后依次 `apply`，但它自己
+    /// **只占一条 WAL 记录**（一个 CRC）。[`crate::engine::model::Op::Batch`]
+    /// 的「崩溃原子」就靠这一层 —— §6.2 的坏尾丢弃以记录为单位，一条记录
+    /// 要么整条重放，要么整条丢。
+    ///
+    /// 不进快照也不进 dump：两者都是「把空状态重放成源状态的最小日志序列」，
+    /// 容器不是最小形式。只有 `Op::Batch` 会产出它。
+    Batch {
+        logs: Vec<Log>,
+    },
 }
 
 const LOG_PUT_VIEW: u8 = 1;
@@ -193,6 +203,14 @@ const LOG_PUT_TABLE: u8 = 19;
 const LOG_DEL_TABLE: u8 = 20;
 const LOG_PUT_ROW: u8 = 21;
 const LOG_DEL_ROW: u8 = 22;
+const LOG_BATCH: u8 = 23;
+
+/// 一条 [`Log::Batch`] 能装多少条子日志。
+///
+/// 与 `MAX_BATCH_OPS` 不是同一个数：那 64 条子 op 每一条都能产出好几条 `Log`
+/// （create = inode + dentry + 父目录属性），所以这里给的是一个数量级更宽的界。
+/// 它的作用只有两个：解码侧 `Vec::with_capacity` 的上限，以及嵌套递归的终止。
+const MAX_BATCH_LOGS: usize = 4096;
 
 impl Log {
     pub fn encode(&self, w: &mut W) {
@@ -315,11 +333,28 @@ impl Log {
                 w.u32(*table);
                 w.bytes(key);
             }
+            Log::Batch { logs } => {
+                w.u8(LOG_BATCH);
+                w.u32(logs.len() as u32);
+                for l in logs {
+                    l.encode(w);
+                }
+            }
         }
     }
 
     pub fn decode(r: &mut Rd) -> Result<Log> {
+        Self::decode_depth(r, 0)
+    }
+
+    /// `depth` = 已经套了几层 `Batch`。容器不许嵌套（与 `Op::Batch` 同一条
+    /// 界）：解码递归没有上界的话，一条敌意 WAL 记录能让重放爆栈 —— 那是把
+    /// 「日志坏了」升级成「服务起不来」。
+    fn decode_depth(r: &mut Rd, depth: u8) -> Result<Log> {
         let t = r.u8()?;
+        if depth > 0 && t == LOG_BATCH {
+            return Err(Error::Codec("nested batch log is not allowed".into()));
+        }
         let log = match t {
             LOG_PUT_VIEW => Log::PutView {
                 name: r.bytes()?,
@@ -399,6 +434,19 @@ impl Log {
                 table: r.u32()?,
                 key: r.bytes()?,
             },
+            LOG_BATCH => {
+                let n = r.u32()? as usize;
+                if n > MAX_BATCH_LOGS {
+                    return Err(Error::Codec(format!(
+                        "batch log carries {n} entries, over MAX_BATCH_LOGS={MAX_BATCH_LOGS}"
+                    )));
+                }
+                let mut logs = Vec::with_capacity(n);
+                for _ in 0..n {
+                    logs.push(Self::decode_depth(r, depth + 1)?);
+                }
+                Log::Batch { logs }
+            }
             x => return Err(Error::Codec(format!("unknown log tag {x}"))),
         };
         Ok(log)
@@ -487,6 +535,13 @@ impl State {
 
     pub fn apply(&mut self, log: &Log) {
         match log {
+            // 容器只是把「一条记录」与「多条变更」分开，语义上完全等于逐条 apply。
+            // 幂等性跟着子日志走：重放同一条容器两次与重放子日志两次同一个结果。
+            Log::Batch { logs } => {
+                for l in logs {
+                    self.apply(l);
+                }
+            }
             Log::PutView { name, meta } => {
                 self.view_by_id.insert(meta.id, name.clone());
                 if meta.id >= self.next_view_id {
@@ -1356,6 +1411,14 @@ mod tests {
                 row: RowRec { key: b"k1".to_vec(), cols: vec![b"v1".to_vec(), Vec::new()] },
             },
             Log::DelRow { table: 4, key: b"k1".to_vec() },
+            // 容器：子日志要跨变体，才能证明「嵌套只拦容器、不拦普通日志」。
+            Log::Batch {
+                logs: vec![
+                    Log::PutNode { view: 3, node: node(5, 1, b"d", Kind::Dir) },
+                    Log::DelRow { table: 4, key: b"k2".to_vec() },
+                ],
+            },
+            Log::Batch { logs: Vec::new() },
         ];
         for log in &logs {
             let mut w = W::new();

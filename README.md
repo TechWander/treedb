@@ -16,8 +16,8 @@ cargo build --release                                   # 默认档：依赖只�
 ./target/release/treedb-server --dir /var/lib/treedb --listen 127.0.0.1:7777
 ./target/release/treedb-bench --op lookup --conns 64 --pipeline 32 --secs 3
 
-cargo test --release                                    # 默认档 172 passed（引擎本体）
-cargo test --release --features postgres-compat        # 203 passed（含 PG 过渡档）
+cargo test --release                                    # 默认档 180 passed（引擎本体）
+cargo test --release --features postgres-compat        # 211 passed（含 PG 过渡档）
 bash benches/throughput_matrix.sh 3 1 2 3 4 5           # 五轴复现，输出进 benches/results/
 bash benches/sync_ratio.sh 3                           # 写路径机制：一次 fsync 摊了多少写
 bash benches/single_conn.sh 3                          # 单连接对标 PG（$PIPE=32 走批量档、$CONNS/$WORKERS 走并发档）
@@ -66,7 +66,7 @@ bash benches/bench_rows.sh                             # 通用表九条路径�
 checkpoint 追过了头会整份重来（`--retries` 默认 3）。仍是整份一次性导出，不是持续
 追赶 —— 要镜像用 `treedb-standby`（§6.10）。
 
-dump 走的是日志标签表（`Log`，1..=22）而不是内部快照格式，所以它跨版本、跨机器能读；
+dump 走的是日志标签表（`Log`，1..=22；容器 23 不进 dump）而不是内部快照格式，所以它跨版本、跨机器能读；
 容器自带 CRC32 与三个 `next_*` 计数器。load 只写 `state.snap`（水位 = dump 的 seq）、
 不写 WAL，目标目录必须为空。导出是确定性的：`dump → load → dump` 字节相同。
 格式与实测（82 888 节点：dump 279 ms / 11.65 MB，还原快照与源逐字节相同）见
@@ -213,7 +213,7 @@ DESIGN.md §7（含 §7.8 那次全五轴复跑）。
 
 - **认证只管身份，授权与传输加密仍然没有**（§4.4、§8 第 13 条）。v5 起可以
   `--auth-key-file` 打开一次共享密钥的双向握手，但它默认关、而且过了握手的连接与
-  不开时一样拥有全部 53 个 op 的权限，包括 `Shutdown` 与 `Checkpoint`；握手之后仍是
+  不开时一样拥有全部 54 个 op 的权限，包括 `Shutdown` 与 `Checkpoint`；握手之后仍是
   裸 TCP + 长度前缀 + CRC32，而 CRC32 只判损坏。所以「谁能连上 + 谁持有这把密钥」
   = 「谁能改整个状态」，多租户、配额、审计归属必须在引擎之外做（grovefs 的
   apikey + 网关白名单就是这一层），或者把端口锁在回环/私有网段。副本对主那一侧
@@ -224,8 +224,10 @@ DESIGN.md §7（含 §7.8 那次全五轴复跑）。
   checkpoint 会抹掉水位以下的日志（同步档
   `wal.reset()`、自动档 `truncate_before()`），历史切面不归档；运行中 `cp -a` 能起服、
   无撕裂，但切点不可控（实测比「拷贝前一刻」多 14 400 条 seq），所以它不是备份工具。
-- **没有 SQL、没有 JOIN/排序/范围谓词、没有用户可见事务、没有跨视图原子 op**（§5.3）。
+- **没有 SQL、没有 JOIN/排序/范围谓词、没有用户可见事务**（§5.3）。
   通用表只给「按唯一键取一行、按前缀列举个数」这一档机制，语义留给接入方。
+  `Op::Batch` 提供的是**请求级原子批**（一个请求里多条 op 顺序可见、全有全无、崩溃整批），
+  不是 `BEGIN`/`COMMIT` 那种会话事务。
 - **没有数据面**（§5.3）：文件字节永远在客户端侧，引擎只答元数据。也没有同步复制、
   没有自动故障转移（`--promote` 只是手工一步的离线动作，不开服务、不选主，§6.6）。
 
@@ -245,11 +247,11 @@ DESIGN.md §7（含 §7.8 那次全五轴复跑）。
 
 | 路径 | 内容 |
 |------|------|
-| `src/engine/` | 线协议类型（`model.rs`，53 个 op / 30 个 Reply）、帧编码（`codec.rs`）、状态机（`mem.rs`）、应用与定序（`apply.rs`）、WAL/快照（`wal.rs`）、核心（`core.rs`）、离线 dump 容器（`dump.rs`，§6.9）、自写的 SHA-256/HMAC（`sha256.rs`，§4.4） |
+| `src/engine/` | 线协议类型（`model.rs`，54 个 op / 31 个 Reply）、帧编码（`codec.rs`）、状态机（`mem.rs`）、应用与定序（`apply.rs`）、WAL/快照（`wal.rs`）、核心（`core.rs`）、离线 dump 容器（`dump.rs`，§6.9）、自写的 SHA-256/HMAC（`sha256.rs`，§4.4） |
 | `src/net/` | 单线程事件循环（`server.rs`）、多前端 worker + 唯一提交线程（`multi.rs`）、跨线程信箱（`mail.rs`）、接入认证闸门（`auth.rs`，§4.4）、副本跟踪器（`replicate.rs`）、阻塞客户端（`client.rs`） |
 | `src/{pool,store,persist,schema,probe}.rs` | `postgres-compat` 过渡档 |
 | `src/bin/` | `treedb-server` / `treedb-bench` / `treedb-pgbench`（对照工具）/ `treedb-micro`（纯计算 + 分配计数）/ `treedb-migrate`（快照升级）/ `treedb-standby`（只读副本 + `--promote`）/ `treedb-dump` + `treedb-load`（离线逻辑导出与重建）/ `treedb-backup`（在线一致快照）/ `treedb-demo` |
-| `tests/` | `engine_crud` `net_protocol` `read_scaling` `replication` `auth` `crash_recovery` `migrate` `dump_restore` `backup_online` `scale_connections` `independence`（默认档全部要跑）；`concurrency` 属过渡档 |
+| `tests/` | `engine_crud` `net_protocol` `read_scaling` `replication` `auth` `crash_recovery` `migrate` `dump_restore` `backup_online` `batch` `scale_connections` `independence`（默认档全部要跑）；`concurrency` 属过渡档 |
 | `benches/` | 五轴矩阵脚本与历史/复跑原始输出；通用表的九条 `row*` 路径基准在 `bench_rows.sh`（§7.15） |
 | `DESIGN.md` | 选型判据、协议字节布局、语义边界、五轴实测、已知限制、接入路径与下一步 |
 
