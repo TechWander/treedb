@@ -89,3 +89,187 @@
               所以结论以 p50/p90 + 吞吐为准
 说明    负载发生器与主同机（loopback），副本在第二台机上走真实链路；
         A/B 的唯一差别是主是否为副本提供 WAL/快照，故差值归因于复制开销本身。
+# —— 下面两组是同一晚的 A/B 对拍：同一脚本、同一对机器，只换副本二进制。
+#    [1] 改前 d660e77（--fetch-bytes 定长）、[2] 改后 486f5e1（落后时块长自增）。
+
+=============== 2026-11-22 10:42:38  副本跨机传送（rev d660e77 定长 1 MiB（改前），§6.6 边界 5）
+链路    gfs2（8 核，virtio）：裸 TCP 512 MiB = 903 MiB/s；dd|ssh = 204 MiB/s（受 ssh 加密限制）
+盘      gfs2：4 KiB fsync 84 次/s、宿主同口径 fsync 412 次/s（副本每轮一次 fsync，这一行就是追赶速率的天花板）
+口径    下载字节 = 快照字节 + WAL 逻辑长度；快照块长 = --fetch-bytes（定长），WAL 块长从它起步、\n        落后多个块长时翻倍（≤ WAL_FETCH_MAX，见 §6.6「追赶块长」）；副本 4 worker、interval 20 ms
+轮数    3（每轮重新造数据；[3] 的 A/B 从同一份种子目录派生，写入量逐字节相同）
+
+--------------- 第 1/3 轮
+
+[1] 跨机冷启动：主 nodes=222880 seq=668128，下载 33301712 B（快照 23961744 + WAL 9339968）
+  主      op=create conns=64 threads=64 pipeline=32 → 25347 ops/s over 8.77s | lat us: p50=1052 p90=2311 p99=23957 max=29634 | errors=0
+  副本    1 MiB/块起（默认，WAL 段可自增）（1048576 B/轮）：端到端 1300 ms（装快照那一轮 693376 µs）
+          端到端 24.43 MiB/s；扣掉装快照 ≈ 52.35 MiB/s
+  远端    recovered 0 wal recs (43 ms, snap 0) | accepted 13 refused 0 peak 1 | rounds 50 worst 693376 us | ops 12 writes 0 syncs 0 avg 0 us | checkpoints 1 | replica applied 3744 lag 0 resyncs 1 errors 0
+  副本    4 MiB/块（WAL_FETCH_MAX）（4194304 B/轮）：端到端 588 ms（装快照那一轮 443627 µs）
+          端到端 54.01 MiB/s；扣掉装快照 ≈ 219.98 MiB/s
+  远端    recovered 0 wal recs (34 ms, snap 0) | accepted 5 refused 0 peak 1 | rounds 30 worst 443627 us | ops 4 writes 0 syncs 0 avg 0 us | checkpoints 1 | replica applied 3744 lag 0 resyncs 1 errors 0
+
+[2] 跨机追赶：副本停（远端目录停在 seq 668128），主攒 8s 的 WAL（--auto-checkpoint-mb 0）
+  主      op=create conns=64 threads=64 pipeline=32 → 50085 ops/s over 8.04s | lat us: p50=1064 p90=2080 p99=2504 max=3651 | errors=0
+  堆积    seq 668128 → 1876864（+1208736 条，WAL 逻辑 +91831008 B，≈ 76.0 B/条）
+  副本    追 1208736 条 / 7464 ms → 161942 条/s，≈ 11.74 MiB/s（字节按 76.0 B/条估算）
+  远端    最坏一轮 620473 µs
+
+[3] 副本对主 p99：A=无副本、B=副本在追积压；两边同种子、同写入量
+  主 A（无副本，第 1 轮）：p50 1210 / p90 2065 / p99 3146 µs、46622 ops/s
+          op=create conns=64 threads=64 pipeline=32 → 46622 ops/s over 6.03s | lat us: p50=1210 p90=2065 p99=3146 max=3179 | errors=0
+  主 B（副本在追，第 1 轮）：p50 1186 / p90 1907 / p99 2858 µs、49855 ops/s
+          op=create conns=64 threads=64 pipeline=32 → 49855 ops/s over 6.03s | lat us: p50=1186 p90=1907 p99=2858 max=3463 | errors=0
+          副本同期 lag 中位 2209705、最大 2293120（25 个采样，200 ms/个）
+  本轮    p50 -2%（1210 → 1186 µs）、p90 -8%（2065 → 1907）、p99 -9%（3146 → 2858）、吞吐 +7%（46622 → 49855 ops/s）
+
+--------------- 第 2/3 轮
+
+[1] 跨机冷启动：主 nodes=199904 seq=599200，下载 28953744 B（快照 22697232 + WAL 6256512）
+  主      op=create conns=64 threads=64 pipeline=32 → 24722 ops/s over 8.07s | lat us: p50=1207 p90=7576 p99=21311 max=21410 | errors=0
+  副本    1 MiB/块起（默认，WAL 段可自增）（1048576 B/轮）：端到端 994 ms（装快照那一轮 501786 µs）
+          端到端 27.78 MiB/s；扣掉装快照 ≈ 56.10 MiB/s
+  远端    recovered 0 wal recs (34 ms, snap 0) | accepted 11 refused 0 peak 1 | rounds 49 worst 501786 us | ops 10 writes 0 syncs 0 avg 0 us | checkpoints 1 | replica applied 0 lag 0 resyncs 1 errors 0
+  副本    4 MiB/块（WAL_FETCH_MAX）（4194304 B/轮）：端到端 602 ms（装快照那一轮 501205 µs）
+          端到端 45.87 MiB/s；扣掉装快照 ≈ 273.95 MiB/s
+  远端    recovered 0 wal recs (47 ms, snap 0) | accepted 4 refused 0 peak 1 | rounds 28 worst 501205 us | ops 3 writes 0 syncs 0 avg 0 us | checkpoints 1 | replica applied 0 lag 0 resyncs 1 errors 0
+
+[2] 跨机追赶：副本停（远端目录停在 seq 599200），主攒 8s 的 WAL（--auto-checkpoint-mb 0）
+  主      op=create conns=64 threads=64 pipeline=32 → 41929 ops/s over 8.15s | lat us: p50=1223 p90=1994 p99=7058 max=9906 | errors=0
+  堆积    seq 599200 → 1624288（+1025088 条，WAL 逻辑 +77877408 B，≈ 76.0 B/条）
+  副本    追 1025088 条 / 6546 ms → 156598 条/s，≈ 11.35 MiB/s（字节按 76.0 B/条估算）
+  远端    最坏一轮 396305 µs
+
+[3] 副本对主 p99：A=无副本、B=副本在追积压；两边同种子、同写入量
+  主 B（副本在追，第 2 轮）：p50 1321 / p90 2150 / p99 2968 µs、45656 ops/s
+          op=create conns=64 threads=64 pipeline=32 → 45656 ops/s over 6.04s | lat us: p50=1321 p90=2150 p99=2968 max=4666 | errors=0
+          副本同期 lag 中位 2343238、最大 2453476（25 个采样，200 ms/个）
+  主 A（无副本，第 2 轮）：p50 1065 / p90 2063 / p99 2642 µs、49978 ops/s
+          op=create conns=64 threads=64 pipeline=32 → 49978 ops/s over 6.03s | lat us: p50=1065 p90=2063 p99=2642 max=4548 | errors=0
+  本轮    p50 +24%（1065 → 1321 µs）、p90 +4%（2063 → 2150）、p99 +12%（2642 → 2968）、吞吐 -9%（49978 → 45656 ops/s）
+
+--------------- 第 3/3 轮
+
+[1] 跨机冷启动：主 nodes=205984 seq=617440，下载 30273808 B（快照 22793488 + WAL 7480320）
+  主      op=create conns=64 threads=64 pipeline=32 → 24325 ops/s over 8.45s | lat us: p50=1067 p90=5034 p99=24220 max=25700 | errors=0
+  副本    1 MiB/块起（默认，WAL 段可自增）（1048576 B/轮）：端到端 1008 ms（装快照那一轮 531160 µs）
+          端到端 28.64 MiB/s；扣掉装快照 ≈ 60.55 MiB/s
+  远端    recovered 0 wal recs (47 ms, snap 0) | accepted 10 refused 0 peak 1 | rounds 48 worst 531160 us | ops 9 writes 0 syncs 0 avg 0 us | checkpoints 1 | replica applied 6144 lag 0 resyncs 1 errors 0
+  副本    4 MiB/块（WAL_FETCH_MAX）（4194304 B/轮）：端到端 680 ms（装快照那一轮 534352 µs）
+          端到端 42.46 MiB/s；扣掉装快照 ≈ 198.23 MiB/s
+  远端    recovered 0 wal recs (34 ms, snap 0) | accepted 5 refused 0 peak 1 | rounds 30 worst 534352 us | ops 4 writes 0 syncs 0 avg 0 us | checkpoints 1 | replica applied 6144 lag 0 resyncs 1 errors 0
+
+[2] 跨机追赶：副本停（远端目录停在 seq 617440），主攒 8s 的 WAL（--auto-checkpoint-mb 0）
+  主      op=create conns=64 threads=64 pipeline=32 → 51777 ops/s over 8.03s | lat us: p50=1102 p90=1921 p99=2442 max=2945 | errors=0
+  堆积    seq 617440 → 1865440（+1248000 条，WAL 逻辑 +94835360 B，≈ 76.0 B/条）
+  副本    追 1248000 条 / 6632 ms → 188179 条/s，≈ 13.64 MiB/s（字节按 76.0 B/条估算）
+  远端    最坏一轮 211518 µs
+
+[3] 副本对主 p99：A=无副本、B=副本在追积压；两边同种子、同写入量
+  主 A（无副本，第 3 轮）：p50 1127 / p90 2076 / p99 2488 µs、48734 ops/s
+          op=create conns=64 threads=64 pipeline=32 → 48734 ops/s over 6.03s | lat us: p50=1127 p90=2076 p99=2488 max=3147 | errors=0
+  主 B（副本在追，第 3 轮）：p50 1304 / p90 2130 / p99 2765 µs、46415 ops/s
+          op=create conns=64 threads=64 pipeline=32 → 46415 ops/s over 6.04s | lat us: p50=1304 p90=2130 p99=2765 max=2860 | errors=0
+          副本同期 lag 中位 2232988、最大 2339511（25 个采样，200 ms/个）
+  本轮    p50 +16%（1127 → 1304 µs）、p90 +3%（2076 → 2130）、p99 +11%（2488 → 2765）、吞吐 -5%（48734 → 46415 ops/s）
+
+汇总    n=3（每轮 A/B 同种子、同写入量）
+        p50   A 1127 µs（1065–1210）→ B 1304 µs（1186–1321） = +16%
+        p90   A 2065 µs（2063–2076）→ B 2130 µs（1907–2150） = +3%
+        p99   A 2642 µs（2488–3146）→ B 2858 µs（2765–2968） = +8%
+        吞吐  A 48734 ops/s（46622–49978）→ B 46415 ops/s（45656–49855） = -5%
+        读数  p50/p90/吞吐逐轮稳定（分布整体平移）；p99 是单点分位，宿主后台回写会抬高它，
+              所以结论以 p50/p90 + 吞吐为准
+说明    负载发生器与主同机（loopback），副本在第二台机上走真实链路；
+        A/B 的唯一差别是主是否为副本提供 WAL/快照，故差值归因于复制开销本身。
+
+=============== 2026-11-22 10:47:58  副本跨机传送（rev 486f5e1 自适应块长（改后），§6.6 边界 5）
+链路    gfs2（8 核，virtio）：裸 TCP 512 MiB = 1630 MiB/s；dd|ssh = 207 MiB/s（受 ssh 加密限制）
+盘      gfs2：4 KiB fsync 140 次/s、宿主同口径 fsync 464 次/s（副本每轮一次 fsync，这一行就是追赶速率的天花板）
+口径    下载字节 = 快照字节 + WAL 逻辑长度；快照块长 = --fetch-bytes（定长），WAL 块长从它起步、\n        落后多个块长时翻倍（≤ WAL_FETCH_MAX，见 §6.6「追赶块长」）；副本 4 worker、interval 20 ms
+轮数    3（每轮重新造数据；[3] 的 A/B 从同一份种子目录派生，写入量逐字节相同）
+
+--------------- 第 1/3 轮
+
+[1] 跨机冷启动：主 nodes=189600 seq=568288，下载 31263408 B（快照 22719344 + WAL 8544064）
+  主      op=create conns=64 threads=64 pipeline=32 → 23526 ops/s over 8.04s | lat us: p50=1359 p90=6994 p99=16730 max=16763 | errors=0
+  副本    1 MiB/块起（默认，WAL 段可自增）（1048576 B/轮）：端到端 1389 ms（装快照那一轮 449860 µs）
+          端到端 21.47 MiB/s；扣掉装快照 ≈ 31.75 MiB/s
+  远端    recovered 0 wal recs (36 ms, snap 0) | accepted 18 refused 0 peak 1 | rounds 68 worst 449860 us | ops 17 writes 0 syncs 0 avg 0 us | checkpoints 1 | replica applied 0 lag 0 resyncs 1 errors 0
+  副本    4 MiB/块（WAL_FETCH_MAX）（4194304 B/轮）：端到端 491 ms（装快照那一轮 427696 µs）
+          端到端 60.72 MiB/s；扣掉装快照 ≈ 470.98 MiB/s
+  远端    recovered 0 wal recs (69 ms, snap 0) | accepted 4 refused 0 peak 1 | rounds 28 worst 427696 us | ops 3 writes 0 syncs 0 avg 0 us | checkpoints 1 | replica applied 0 lag 0 resyncs 1 errors 0
+
+[2] 跨机追赶：副本停（远端目录停在 seq 568288），主攒 8s 的 WAL（--auto-checkpoint-mb 0）
+  主      op=create conns=64 threads=64 pipeline=32 → 51267 ops/s over 8.05s | lat us: p50=1065 p90=2068 p99=2344 max=2996 | errors=0
+  堆积    seq 568288 → 1806688（+1238400 条，WAL 逻辑 +94124928 B，≈ 76.0 B/条）
+  副本    追 1238400 条 / 3669 ms → 337531 条/s，≈ 24.46 MiB/s（字节按 76.0 B/条估算）
+  远端    最坏一轮 213451 µs
+
+[3] 副本对主 p99：A=无副本、B=副本在追积压；两边同种子、同写入量
+  主 A（无副本，第 1 轮）：p50 1080 / p90 1944 / p99 3151 µs、50363 ops/s
+          op=create conns=64 threads=64 pipeline=32 → 50363 ops/s over 6.03s | lat us: p50=1080 p90=1944 p99=3151 max=3530 | errors=0
+  主 B（副本在追，第 1 轮）：p50 1432 / p90 2146 / p99 3239 µs、43068 ops/s
+          op=create conns=64 threads=64 pipeline=32 → 43068 ops/s over 6.04s | lat us: p50=1432 p90=2146 p99=3239 max=3374 | errors=0
+          副本同期 lag 中位 1752435、最大 2193688（25 个采样，200 ms/个）
+  本轮    p50 +33%（1080 → 1432 µs）、p90 +10%（1944 → 2146）、p99 +3%（3151 → 3239）、吞吐 -14%（50363 → 43068 ops/s）
+
+--------------- 第 2/3 轮
+
+[1] 跨机冷启动：主 nodes=195264 seq=585280，下载 29116720 B（快照 21011792 + WAL 8104928）
+  主      op=create conns=64 threads=64 pipeline=32 → 24188 ops/s over 8.05s | lat us: p50=1187 p90=7533 p99=21448 max=21472 | errors=0
+  副本    1 MiB/块起（默认，WAL 段可自增）（1048576 B/轮）：端到端 1514 ms（装快照那一轮 505332 µs）
+          端到端 18.34 MiB/s；扣掉装快照 ≈ 27.53 MiB/s
+  远端    recovered 0 wal recs (30 ms, snap 0) | accepted 20 refused 0 peak 1 | rounds 71 worst 505332 us | ops 19 writes 0 syncs 0 avg 0 us | checkpoints 1 | replica applied 0 lag 0 resyncs 1 errors 0
+  副本    4 MiB/块（WAL_FETCH_MAX）（4194304 B/轮）：端到端 532 ms（装快照那一轮 440616 µs）
+          端到端 52.20 MiB/s；扣掉装快照 ≈ 303.86 MiB/s
+  远端    recovered 0 wal recs (27 ms, snap 0) | accepted 4 refused 0 peak 1 | rounds 28 worst 440616 us | ops 3 writes 0 syncs 0 avg 0 us | checkpoints 1 | replica applied 0 lag 0 resyncs 1 errors 0
+
+[2] 跨机追赶：副本停（远端目录停在 seq 585280），主攒 8s 的 WAL（--auto-checkpoint-mb 0）
+  主      op=create conns=64 threads=64 pipeline=32 → 51558 ops/s over 8.03s | lat us: p50=1078 p90=2054 p99=2327 max=2689 | errors=0
+  堆积    seq 585280 → 1827616（+1242336 条，WAL 逻辑 +94428480 B，≈ 76.0 B/条）
+  副本    追 1242336 条 / 4781 ms → 259849 条/s，≈ 18.83 MiB/s（字节按 76.0 B/条估算）
+  远端    最坏一轮 266783 µs
+
+[3] 副本对主 p99：A=无副本、B=副本在追积压；两边同种子、同写入量
+  主 B（副本在追，第 2 轮）：p50 1258 / p90 2350 / p99 4886 µs、43737 ops/s
+          op=create conns=64 threads=64 pipeline=32 → 43737 ops/s over 6.05s | lat us: p50=1258 p90=2350 p99=4886 max=6536 | errors=0
+          副本同期 lag 中位 1756243、最大 2201149（25 个采样，200 ms/个）
+  主 A（无副本，第 2 轮）：p50 1107 / p90 2063 / p99 3107 µs、49609 ops/s
+          op=create conns=64 threads=64 pipeline=32 → 49609 ops/s over 6.04s | lat us: p50=1107 p90=2063 p99=3107 max=3529 | errors=0
+  本轮    p50 +14%（1107 → 1258 µs）、p90 +14%（2063 → 2350）、p99 +57%（3107 → 4886）、吞吐 -12%（49609 → 43737 ops/s）
+
+--------------- 第 3/3 轮
+
+[1] 跨机冷启动：主 nodes=199008 seq=596512，下载 29552080 B（快照 21603152 + WAL 7948928）
+  主      op=create conns=64 threads=64 pipeline=32 → 23501 ops/s over 8.45s | lat us: p50=1170 p90=7855 p99=25931 max=25955 | errors=0
+  副本    1 MiB/块起（默认，WAL 段可自增）（1048576 B/轮）：端到端 1098 ms（装快照那一轮 513141 µs）
+          端到端 25.67 MiB/s；扣掉装快照 ≈ 48.19 MiB/s
+  远端    recovered 0 wal recs (17 ms, snap 0) | accepted 12 refused 0 peak 1 | rounds 50 worst 513141 us | ops 11 writes 0 syncs 0 avg 0 us | checkpoints 1 | replica applied 6144 lag 0 resyncs 1 errors 0
+  副本    4 MiB/块（WAL_FETCH_MAX）（4194304 B/轮）：端到端 592 ms（装快照那一轮 420935 µs）
+          端到端 47.61 MiB/s；扣掉装快照 ≈ 164.75 MiB/s
+  远端    recovered 0 wal recs (37 ms, snap 0) | accepted 6 refused 0 peak 1 | rounds 30 worst 420935 us | ops 5 writes 0 syncs 0 avg 0 us | checkpoints 1 | replica applied 6144 lag 0 resyncs 1 errors 0
+
+[2] 跨机追赶：副本停（远端目录停在 seq 596512），主攒 8s 的 WAL（--auto-checkpoint-mb 0）
+  主      op=create conns=64 threads=64 pipeline=32 → 51742 ops/s over 8.03s | lat us: p50=1064 p90=1923 p99=2665 max=3052 | errors=0
+  堆积    seq 596512 → 1843168（+1246656 条，WAL 逻辑 +94716992 B，≈ 76.0 B/条）
+  副本    追 1246656 条 / 5146 ms → 242257 条/s，≈ 17.56 MiB/s（字节按 76.0 B/条估算）
+  远端    最坏一轮 415978 µs
+
+[3] 副本对主 p99：A=无副本、B=副本在追积压；两边同种子、同写入量
+  主 A（无副本，第 3 轮）：p50 1090 / p90 1816 / p99 3875 µs、52973 ops/s
+          op=create conns=64 threads=64 pipeline=32 → 52973 ops/s over 6.06s | lat us: p50=1090 p90=1816 p99=3875 max=4935 | errors=0
+  主 B（副本在追，第 3 轮）：p50 1507 / p90 2453 / p99 3600 µs、40583 ops/s
+          op=create conns=64 threads=64 pipeline=32 → 40583 ops/s over 6.03s | lat us: p50=1507 p90=2453 p99=3600 max=9674 | errors=0
+          副本同期 lag 中位 1781265、最大 2238487（25 个采样，200 ms/个）
+  本轮    p50 +38%（1090 → 1507 µs）、p90 +35%（1816 → 2453）、p99 -7%（3875 → 3600）、吞吐 -23%（52973 → 40583 ops/s）
+
+汇总    n=3（每轮 A/B 同种子、同写入量）
+        p50   A 1090 µs（1080–1107）→ B 1432 µs（1258–1507） = +31%
+        p90   A 1944 µs（1816–2063）→ B 2350 µs（2146–2453） = +21%
+        p99   A 3151 µs（3107–3875）→ B 3600 µs（3239–4886） = +14%
+        吞吐  A 50363 ops/s（49609–52973）→ B 43068 ops/s（40583–43737） = -14%
+        读数  p50/p90/吞吐逐轮稳定（分布整体平移）；p99 是单点分位，宿主后台回写会抬高它，
+              所以结论以 p50/p90 + 吞吐为准
+说明    负载发生器与主同机（loopback），副本在第二台机上走真实链路；
+        A/B 的唯一差别是主是否为副本提供 WAL/快照，故差值归因于复制开销本身。
