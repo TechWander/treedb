@@ -26,7 +26,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 use treedb::engine::core::SNAP_FILE;
-use treedb::engine::model::{errno, Kind, Node, Op, Reply, MAX_BATCH_OPS, WAL_FETCH_MAX};
+use treedb::engine::model::{
+    errno, Kind, Node, Op, Reply, MAX_BATCH_OPS, SA_MODE, WAL_FETCH_MAX,
+};
+use treedb::engine::wal::crc32;
 use treedb::engine::{Durability, Engine, FENCE_FILE};
 use treedb::error::Error;
 use treedb::net::auth::Key;
@@ -636,6 +639,179 @@ fn the_snapshot_chunk_ramps_while_downloading_and_returns_to_cfg() {
         p.fetch_bytes
     );
     assert!(lookup(&mut eng, vid, &format!("f{}", N - 1)).ino > 0);
+}
+
+/// 换代时已下的前缀能不能留着：`SnapFetch { len: 0 }` 是探针，回 `SnapPrefix`。
+///
+/// 判据只能是对内容说的：`prefix_crc` 必须等于快照文件前 `min(offset,total)`
+/// 字节的 crc32，与副本自己算的那个逐位相同。越界（`offset >= total`）不是错，
+/// 截到整份为止。
+#[test]
+fn a_snapshot_probe_reports_the_prefix_crc() {
+    let srv = Server::start("group");
+    seed_primary(&srv, "rprobe", 200);
+    let mut c = srv.client();
+    okc(&mut c, &Op::Checkpoint);
+    let raw = std::fs::read(srv.dir().join(SNAP_FILE)).expect("primary snapshot");
+    let total = raw.len() as u64;
+
+    let half = total / 2;
+    let beyond = total + 4096;
+    for off in [0u64, 1, 4096, half, total, beyond] {
+        match okc(&mut c, &Op::SnapFetch { offset: off, len: 0 }) {
+            Reply::SnapPrefix {
+                prefix_crc, total: t, ..
+            } => {
+                assert_eq!(t, total, "offset {off}: total 必须报整份长度");
+                let n = (off as usize).min(raw.len());
+                assert_eq!(
+                    prefix_crc,
+                    crc32(&raw[..n]),
+                    "offset {off}: 前缀 crc 必须覆盖前 {n} B"
+                );
+            }
+            other => panic!("len == 0 应回 SnapPrefix，得到 {other:?}"),
+        }
+    }
+    // 同一个偏移的普通取块不变：探针只是 `len == 0` 这一档的意思变了。
+    match okc(&mut c, &Op::SnapFetch { offset: half, len: 4096 }) {
+        Reply::SnapChunk { bytes, total: t, .. } => {
+            assert_eq!(t, total);
+            assert_eq!(bytes, &raw[half as usize..half as usize + bytes.len()]);
+        }
+        other => panic!("len > 0 应回 SnapChunk，得到 {other:?}"),
+    }
+}
+
+/// 下载途中主换代：已下的前缀能留下就接着下，不能留才从 0 重来。
+///
+/// 这条把改动钉在「主在下载期间又 checkpoint 了一次」那条路上：它把最后一个
+/// 文件改个 mode 再落快照 —— 节点按 `(view, ino)` 排，最大的 ino 落在正文末尾，
+/// 所以换代只动了尾巴，已下的前缀整体可复用。
+fn generation_change_mid_download(reuse: bool) -> (FollowerProgress, Vec<u8>, Vec<u8>) {
+    const CFG: u32 = 8 * 1024;
+    const N: u32 = 4_000;
+    const PER: u32 = MAX_BATCH_OPS as u32;
+
+    let srv = Server::start("group");
+    let mut c = srv.client();
+    let vid = view_id(okc(
+        &mut c,
+        &Op::CreateView {
+            name: if reuse { "rkeep" } else { "rdrop" }.into(),
+        },
+    ));
+    for start in (0..N).step_by(PER as usize) {
+        let ops = (start..start + PER)
+            .map(|i| Op::Create {
+                view: vid,
+                parent: 1,
+                name: format!("f{i}").into_bytes(),
+                mode: 0o640,
+                uid: 1000 + i,
+                gid: 100,
+            })
+            .collect();
+        okc(&mut c, &Op::Batch { ops });
+    }
+    okc(&mut c, &Op::Checkpoint);
+    let snap_len = match okc(&mut c, &Op::Stats) {
+        Reply::Stats(s) => s.snap_bytes,
+        other => panic!("expected Stats, got {other:?}"),
+    };
+    assert!(
+        snap_len > 16 * CFG as u64,
+        "这条用例要在一份大快照中途换代：got {snap_len} B"
+    );
+
+    let (_tmp, dir) = read_only_dir("rep");
+    let mut eng = replica(&dir);
+    let mut f = Follower::new(fcfg(&srv.addr, 1, CFG));
+
+    // 先下几块：块长已经开始翻倍，说明至少拿满过一块、后面还剩下不少。
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        std::thread::sleep(Duration::from_millis(2));
+        f.tick(&mut eng).expect("tick must not be fatal");
+        let p = f.progress(&mut eng);
+        if p.downloading && p.fetch_bytes > CFG {
+            break;
+        }
+        assert!(Instant::now() < deadline, "下载没有推进：{p:?}");
+    }
+
+    if reuse {
+        // 改正文末尾那个节点：前缀不动，只动尾巴。
+        let last = node(okc(
+            &mut c,
+            &Op::Lookup {
+                view: vid,
+                parent: 1,
+                name: format!("f{}", N - 1).into(),
+            },
+        ))
+        .ino;
+        okc(
+            &mut c,
+            &Op::Setattr {
+                view: vid,
+                ino: last,
+                valid: SA_MODE,
+                mode: 0o600,
+                uid: 0,
+                gid: 0,
+                size: 0,
+                atime: 0,
+                mtime: 0,
+                data_ref: Vec::new(),
+                ref_bytes: 0,
+            },
+        );
+    } else {
+        // 再加一个文件：`nodes` 的条数变了，正文从很前面就分叉。
+        okc(
+            &mut c,
+            &Op::Create {
+                view: vid,
+                parent: 1,
+                name: b"zzz".to_vec(),
+                mode: 0o644,
+                uid: 7,
+                gid: 7,
+            },
+        );
+    }
+    okc(&mut c, &Op::Checkpoint);
+
+    let p = converge(&mut f, &mut eng, &srv.log_text());
+    let mine = std::fs::read(dir.join(SNAP_FILE)).expect("replica snapshot");
+    let theirs = std::fs::read(srv.dir().join(SNAP_FILE)).expect("primary snapshot");
+    (p, mine, theirs)
+}
+
+/// 换代的改动落在正文末尾：已下的前缀逐字节相同，crc 对得上，接着下。
+#[test]
+fn a_snapshot_generation_change_keeps_the_downloaded_prefix() {
+    let (p, mine, theirs) = generation_change_mid_download(true);
+    assert!(
+        p.snap_reused > 0,
+        "换代之后一格前缀都没留下（restarts {}）",
+        p.snap_restarts
+    );
+    assert_eq!(p.snap_restarts, 0, "可复用的前缀不该被判成整份重下");
+    assert_eq!(p.resyncs, 1, "换代不是新的一次重装");
+    assert_eq!(mine, theirs, "拼出来的快照必须与主的逐字节相同");
+}
+
+/// 反面：换代改动落在正文开头，前缀对不上就只能从 0 重来 —— 宁可白拉一轮，
+/// 也不拼一份谁都不认识的快照。
+#[test]
+fn a_snapshot_generation_change_with_a_different_prefix_restarts() {
+    let (p, mine, theirs) = generation_change_mid_download(false);
+    assert_eq!(p.snap_reused, 0, "crc 对不上就不能留");
+    assert_eq!(p.snap_restarts, 1, "前缀作废必须记一次整份重下");
+    assert_eq!(p.resyncs, 1, "重下不算新的一次重装");
+    assert_eq!(mine, theirs, "拼出来的快照必须与主的逐字节相同");
 }
 
 /// 端到端：`treedb-standby` 进程 + 真客户端。线协议上的 `EROFS` 与

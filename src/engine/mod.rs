@@ -65,6 +65,13 @@ pub const MAX_FRAME: u32 = 8 * 1024 * 1024;
 /// 也就是说追加字段在这里换不来跨版本可用 —— 但换来了更重要的东西：一个
 /// 令牌不对的副本，宁可连不上也不能接。所以升级时主与副本一起换，先换主、
 /// 副本会经历一段 `primary answered Err` / 短读重试，直到自身也被换掉。
+///
+/// 那条「加 Reply 变体要 +1」已被收窄（§4.1）：**只追加、不改旧帧**时不用动
+/// 版本号 —— 旧客户端不会发新 op，也不会收到新 reply。前四例是 `Link` /
+/// `RowRange` / `Batch`+`Reply::Batch` / `TableAddColumn`，第五例是
+/// `SnapFetch { len: 0 }` 的探针答复 `Reply::SnapPrefix`（0x0182）：旧副本从不发
+/// `len == 0`（`--fetch-bytes 0` 启动时就拒），旧主对它回一个空 `SnapChunk`，
+/// 新副本认出这个答复就退回整份重下。
 pub const PROTOCOL_VERSION: u16 = 6;
 /// 帧头长度：payload 字节数（u32 小端，不含头）。
 pub const FRAME_HDR: usize = 4;

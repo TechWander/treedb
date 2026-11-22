@@ -1200,6 +1200,19 @@ impl Engine {
                 format!("snapshot chunk of {len} bytes over {SNAP_CHUNK_MAX}"),
             );
         }
+        if len == 0 {
+            // 探针（见 `Reply::SnapPrefix`）：不交字节，只答前缀的 crc32。它只
+            // 在副本发现换代时发一次，常规路径一个字节都不多算。
+            return match self.snap_prefix_crc(offset) {
+                Ok((prefix_crc, total)) => Reply::SnapPrefix {
+                    prefix_crc,
+                    total,
+                    snap_seq: self.snap_seq,
+                    epoch: self.fence,
+                },
+                Err(e) => Reply::err(errno::EIO, e.to_string()),
+            };
+        }
         match self.snap_chunk(offset, len) {
             Ok((bytes, total)) => Reply::SnapChunk {
                 bytes,
@@ -1211,14 +1224,57 @@ impl Engine {
         }
     }
 
+    /// `state.snap` 前 `min(offset, total)` 字节的 crc32（连同整份长度）。
+    ///
+    /// 分块喂 [`crc32_update`] 而不是把前缀读成一整块：探针的 `offset` 就是副本
+    /// 已经下过的量，冷启动里它可能接近整份快照 —— 为算一个校验和再复制一份同
+    /// 等大小的内存没有意义。结果与 `crc32(&raw[..min(offset,total)])` 逐位相同，
+    /// 链式调用只是把同一个循环分成几截。
+    fn snap_prefix_crc(&self, offset: u64) -> Result<(u32, u64)> {
+        use crate::engine::wal::crc32_update;
+        use std::io::Read;
+        let path = self.dir.join(SNAP_FILE);
+        let mut f = match File::open(&path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((0, 0)),
+            Err(e) => return Err(Error::Io(format!("open {}: {e}", path.display()))),
+        };
+        let total = f.metadata()?.len();
+        let mut left = offset.min(total);
+        let mut c = 0xFFFF_FFFFu32;
+        let mut buf = vec![0u8; (1 << 20).min(left.max(1) as usize)];
+        while left > 0 {
+            let want = (buf.len() as u64).min(left) as usize;
+            let mut got = 0usize;
+            while got < want {
+                match f.read(&mut buf[got..want]) {
+                    Ok(0) => break,
+                    Ok(n) => got += n,
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(e) => return Err(Error::Io(format!("read {}: {e}", path.display()))),
+                }
+            }
+            // 文件被截短：按已读到的算。副本那一侧比的是「它自己的前缀」与
+            // 「这个数」，对不上它就从 0 重下 —— 这里不报错，因为「换了一代」
+            // 本来就是这一条的常态。
+            if got == 0 {
+                break;
+            }
+            c = crc32_update(c, &buf[..got]);
+            left -= got as u64;
+        }
+        Ok((!c, total))
+    }
+
     /// 从 `state.snap` 的 `offset` 读至多 `len` 字节，返回 (字节, 整份长度)。
     ///
     /// 越过文件尾是短读不是错：副本按 `total` 判下完没有。跨代的拼接由
     /// `snap_seq` 兑：checkpoint 换过快照文件，本函数给出的就是新代的水位，
-    /// 副本看到它变了会整份重下 —— 手里那几块来自旧 inode 也一起丢掉，
-    /// 代价是**已经下过的那几十块全部作废**（不是只白下最后一块；2026-11-22 的
-    /// 追踪里一次 1 MiB 档冷启动为此白拉 3 MiB），好处是不会拼出一份两个时代
-    /// 都不属于的快照。所以下载窗口越短越安全 —— 块长自增在这件事上也是帮忙的。
+    /// 副本看到它变了会先探一次前缀（[`Engine::snap_prefix_crc`]）：能接上就
+    /// 接着下，接不上才整份重下 —— 而不是一律把已下的几十块全丢掉（2026-11-22
+    /// 的追踪里，一次 1 MiB 档冷启动为此白拉 3 MiB）。这样做的好处是不会拼出
+    /// 一份两个时代都不属于的快照，而代价只剩「前缀真的变了」的那一次。所以
+    /// 下载窗口越短越安全 —— 块长自增在这件事上也是帮忙的。
     ///
     /// 用 `seek` + `read` 循环而不是 `read_exact`：后两者之间文件可能被换掉，
     /// 短读要照实交出去，不该把一次正常的重下载报成 `EIO`。

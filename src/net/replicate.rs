@@ -85,6 +85,12 @@ pub struct Follower {
     /// 快照下载段也用它（此时「积压」是还没下完的字节）：冷启动的 tick 数就等于
     /// 块数，一段 28 MB 的快照在 1 MiB 档下要 28 轮，块长放开后 <10 轮。
     cur_bytes: u32,
+    /// 换代时从手里那半份里**留下来**的字节（累计）与整份重下的次数。
+    ///
+    /// 只给测试与 `progress` 看，不进 `Stats`：后者是线协议的一帧，加字段就得
+    /// 抬 `PROTOCOL_VERSION`（§4.1），而这两个数的读者只有运维和用例。
+    snap_reused: u64,
+    snap_restarts: u64,
 }
 
 /// 快照下载的中间状态。
@@ -136,6 +142,8 @@ impl Follower {
             hint_off: WAL_HINT_NONE,
             snap: None,
             cur_bytes,
+            snap_reused: 0,
+            snap_restarts: 0,
         }
     }
 
@@ -320,10 +328,14 @@ impl Follower {
     /// 装完快照之前先把整份下下来。每次 tick 下一块，块长与 WAL 段共用一条规则
     /// （见 [`next_fetch_bytes`]）：从 `--fetch-bytes` 起步，剩余还多于 4 个块长就
     /// 翻倍，封顶 `WAL_FETCH_MAX`。
+    ///
+    /// 下载途中主又 checkpoint 一次（`snap_seq` 变了）是设计里的正常分支：两代
+    /// 的字节不能拼，但**已下过的前缀未必作废** —— 换代时先问主一次前缀 crc
+    /// （[`Follower::probe_prefix`]），能接上就接着下，接不上才从 0 重来。
     fn step_snapshot(&mut self, eng: &mut Engine) -> Result<()> {
-        let (off, cap) = {
+        let (off, cap, seen) = {
             let dl = self.snap.as_ref().expect("step_snapshot 只在下载态调用");
-            (dl.off, self.cur_bytes)
+            (dl.off, self.cur_bytes, dl.gen)
         };
         let rep = match self.call(&Op::SnapFetch { offset: off, len: cap }) {
             Ok(r) => r,
@@ -352,27 +364,47 @@ impl Follower {
                 )));
             }
         };
+        if total == 0 {
+            // gap 意味着主至少做过一次 checkpoint，它因此必然有快照文件。
+            // 真拿到 0 只可能是文件被人删了 —— 这不是能自动重来的东西，
+            // 但也不该把副本打死：它手上的状态仍然自洽，先停在这里等它回来。
+            eng.note_replica_error();
+            eprintln!(
+                "treedb-standby: primary {} reports snapshot seq {gen} but serves 0 bytes; resync stays pending",
+                self.cfg.primary
+            );
+            return Ok(());
+        }
+        // 代际变了（或这是第一块）：换代之后的字节不能与换代之前的拼在一起。
+        // 已下的前缀能不能留下，由主算一次 crc 说 —— 而不是由版本号或长度猜：
+        // 两代正文的公共前缀不在协议里承诺。
+        let keep = if seen == Some(gen) {
+            off
+        } else if off == 0 {
+            0
+        } else {
+            match self.probe_prefix(off, gen, total) {
+                Ok(k) => k,
+                Err(e) => {
+                    self.fail_round(eng, "snapshot probe", &e);
+                    return Ok(());
+                }
+            }
+        };
         {
             let dl = self.snap.as_mut().expect("下载态");
-            if total == 0 {
-                // gap 意味着主至少做过一次 checkpoint，它因此必然有快照文件。
-                // 真拿到 0 只可能是文件被人删了 —— 这不是能自动重来的东西，
-                // 但也不该把副本打死：它手上的状态仍然自洽，先停在这里等它回来。
-                eng.note_replica_error();
-                eprintln!(
-                    "treedb-standby: primary {} reports snapshot seq {gen} but serves 0 bytes; resync stays pending",
-                    self.cfg.primary
-                );
-                return Ok(());
-            }
             if dl.gen != Some(gen) {
-                // 代际变了（或这是第一块）：换代之后的字节不能与换代之前的拼在
-                // 一起，整份重来。主这边一次 checkpoint 就能撞上位，这是设计里
-                // 的正常分支，所以只数 `replica_resyncs`，不报错误。
-                dl.buf.clear();
-                dl.off = 0;
+                // 换代：截到能留的那段（可能为 0），代际标签改成新的。只数
+                // `snap_restarts` / `snap_reused`，不报错误 —— 主这边一次
+                // checkpoint 就能撞上位，这是设计里的正常分支。
+                dl.buf.truncate(keep as usize);
+                dl.off = keep;
                 dl.gen = Some(gen);
-                return Ok(());
+                if keep != off {
+                    // 这一块是按旧偏移取的，起点接不上新前缀，丢掉等下一轮。
+                    return Ok(());
+                }
+                // 走到这里：前缀整个留住了，手里这一块刚好接在它后面。
             }
             dl.buf.extend_from_slice(&bytes);
             dl.off = dl.off.saturating_add(bytes.len() as u64);
@@ -419,6 +451,55 @@ impl Follower {
         // `step_wal` 会再收到 gap，再装一次。`replica_resyncs` 涨不停就是这个
         // 信号（追不上），不是这里能就地解决的。
         Ok(())
+    }
+
+    /// 换代之后问主一次：手里这 `off` 字节的前缀在新的一代里是否逐字节相同。
+    ///
+    /// 返回可以留用的前缀长度。发出的是 `SnapFetch { offset: off, len: 0 }` ——
+    /// `len == 0` 在协议里本来就是个空读，这一笔给它加了「顺便把前缀 crc 报上来」
+    /// 的意思（[`Reply::SnapPrefix`]）。旧主不认识这个语义，会回一个空
+    /// `SnapChunk`：任何非 `SnapPrefix` 的答复都当「不能留」，退回整份重下 ——
+    /// 代价是一轮白拉，而不是拼出一份谁都不认识的快照。
+    ///
+    /// 两种「对不上」都归零：主已经在算下一代的途中（`snap_seq` 或长度与本块
+    /// 不符），或 crc 不同。返回 0 让调用方从 0 重来。
+    fn probe_prefix(&mut self, off: u64, gen: u64, total: u64) -> Result<u64> {
+        let rep = self.call(&Op::SnapFetch { offset: off, len: 0 })?;
+        let keep = match rep {
+            Reply::SnapPrefix {
+                prefix_crc,
+                total: ptotal,
+                snap_seq: pgen,
+                ..
+            } if pgen == gen && ptotal == total => {
+                let keep = off.min(total);
+                let mine = {
+                    let dl = self.snap.as_ref().expect("下载态");
+                    let n = keep.min(dl.buf.len() as u64) as usize;
+                    crate::engine::wal::crc32(&dl.buf[..n])
+                };
+                if mine == prefix_crc {
+                    keep
+                } else {
+                    0
+                }
+            }
+            _ => 0,
+        };
+        if keep == 0 {
+            self.snap_restarts += 1;
+            eprintln!(
+                "treedb-standby: snapshot generation moved to {gen}, no usable prefix in the \
+                 {off} B already downloaded; restarting from 0"
+            );
+        } else {
+            self.snap_reused += keep;
+            eprintln!(
+                "treedb-standby: snapshot generation moved to {gen}; keeping {keep} of {off} B \
+                 already downloaded"
+            );
+        }
+        Ok(keep)
     }
 
     /// 开始一次快照重装。gap 不是错，是「跟不上」，所以这里不抬
@@ -487,6 +568,8 @@ impl Follower {
             connected: self.client.is_some(),
             downloading: self.snap.is_some(),
             fetch_bytes: self.cur_bytes,
+            snap_reused: self.snap_reused,
+            snap_restarts: self.snap_restarts,
         }
     }
 
@@ -517,6 +600,10 @@ pub struct FollowerProgress {
     pub downloading: bool,
     /// 下一轮实际要的负载上限（追赶时会大于配置值，见 [`next_fetch_bytes`]）。
     pub fetch_bytes: u32,
+    /// 快照换代时留下来的字节（累计）与整份重下的次数。两个数只在下载阶段
+    /// 会动；它们不进 `Stats`（那会改线协议），是给用例与排查用的。
+    pub snap_reused: u64,
+    pub snap_restarts: u64,
 }
 
 #[cfg(test)]

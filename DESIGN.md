@@ -123,11 +123,11 @@ checkpoint 在抹掉 `(from, to]` 之前把这一段原始帧与即将被覆盖�
 按「不改写已推引用」的纪律保留现状：Cargo 解析 git 依赖只看 tag/rev 与 lock 里的
 hash，不看这个字段，所以不影响任何构建；下一次带 API 变更的发版重新对齐。
 
-test 现在分两档报：默认档（纯引擎）`cargo test --release` = **202 passed / 1 ignored**（69 lib +
-35 engine_crud + 14 migrate + 16 replication + 11 net_protocol + 9 pitr + 8 read_scaling
+test 现在分两档报：默认档（纯引擎）`cargo test --release` = **205 passed / 1 ignored**（69 lib +
+35 engine_crud + 14 migrate + 19 replication + 11 net_protocol + 9 pitr + 8 read_scaling
 + 7 crash_recovery + 6 batch + 5 auth + 5 observe + 5 table_alter + 4 dump_restore +
 3 backup_online + 3 independence + 1 large_reply + 1 scale_connections，10k 那条仍
-`#[ignore]`）；`--features postgres-compat` = **233 passed / 7 ignored**，多出的 31 条 = 过渡档自己的 30 条单测 +
+`#[ignore]`）；`--features postgres-compat` = **236 passed / 7 ignored**，多出的 31 条 = 过渡档自己的 30 条单测 +
 `concurrency.rs` 里那条
 不需要 PG 的拨号用例（剩下 6 条要真 PG，默认 `#[ignore]`，不计入 passed）。即 PG 只出现在
 `postgres-compat` 后面的 `src/pool`、`src/store`、
@@ -366,7 +366,12 @@ payload = tag: u16 | 字段…            （Op / Reply 各自的 tag 空间，R
   所以永远收不到 0x01a0；旧服务端收到 0x007a 在 `decode` 兜底回 `EINVAL`。`EngineStats`
   没动、既有帧没动，所以版本留在 6。`6 → 6`（第四例，`TableAddColumn` 0x007b）：与第二例
   同型 —— 只加一个 op tag，**连 reply 都没加**（复用 `Reply::Table(Some(def))`，回的是追加后的
-  整张形状）。四条先例合起来把「什么时候必须升版本」收窄成一句：
+  整张形状）。`6 → 6`（第五例，`Reply::SnapPrefix` 0x0182 / `SnapFetch { len: 0 }` 探针）：
+  与第三例同型，但方向反过来 —— 这次**没加 op**，复用 `SnapFetch` 的空读（`len == 0` 原本
+  就是个合法的「读 0 字节」请求），只加了一个 reply tag。旧副本从不发 `len == 0`
+  （`--fetch-bytes 0` 启动即拒），旧主对空读回的是空 `SnapChunk`（0x0181）而不是 0x0182
+  —— 新副本拿到非 `SnapPrefix` 的答复就当「前缀不可留」，退回整份重下。两个方向都没有
+  静默分支。五条先例合起来把「什么时候必须升版本」收窄成一句：
   **只有既有帧的字段顺序/长度变了，或者 `EngineStats` 加长了，才必须 +1**；新增 op /
   reply tag 本身不是理由。
 
@@ -1316,9 +1321,75 @@ WAL 段用主报的 `durable_seq` 差折算字节，快照段直接是「整份�
 19.43 MiB/s（中位 21.87，同轮极差就有 26%，不与上一笔的 18.83 比大小），
 p50 +14% / p90 +15% / 吞吐 −13%，与上一笔的代价同量级。
 
-一件没做的：换代重下没有复用已下过的前缀。协议 `SnapFetch{offset,len}` 本身支持按
-offset 续取，缺的是「换代后什么条件下可以接着用」的判据（两代正文的公共前缀不在
-协议里承诺），这一笔没动。
+下一笔（下面「换代重下：前缀复用」）把这里那次追踪里的 3 MiB 白拉补上了：判据是
+主算的前缀 crc，不是版本号或长度。
+
+#### 换代重下：前缀复用（`Reply::SnapPrefix`，2026-11-22）
+
+上一条追踪里那场「下载 12.6 MB 时换代、先下的 ~3 MiB 作废」就是这一笔要治的东西。
+老做法是 `buf.clear(); off = 0`：换代一律整份重下 —— 简单、不会拼错，但把已经收下的
+字节全扔了。协议早就支持按 offset 续取（`SnapFetch{offset, len}`），缺的是判据：
+**新的一代与手里那份的公共前缀到哪里为止**。两代正文的公共前缀不在协议里承诺
+（`nodes` 区一改就从很前面分叉），所以不能按版本号或长度猜。
+
+判据做成一次显式探针：副本发现 `SnapChunk.snap_seq` 变了，先发
+`SnapFetch { offset: 已下字节数, len: 0 }`（`len == 0` 原本就是合法的空读），主回
+`Reply::SnapPrefix { prefix_crc, total, snap_seq, epoch }` —— `prefix_crc` 是
+`state.snap` 前 `min(offset, total)` 字节的 crc32，与快照尾巴那个校验和同一个函数
+（`crc32_update` 分 1 MiB 链式喂，不为一个校验和再复制一份同等大小的内存）。副本拿
+自己 `buf` 的前缀算一遍 crc32：相等就 `truncate(keep)` 接着下，不等就归零重来。
+`snap_seq`/`total` 与当前块不符也归零 —— 主可能正在算下一代。
+
+安全边界有三条，缺一条都不敢这么写：
+
+1. **判据是对内容的**，不是对时间的：crc 相等意味着那 N 个字节两代逐字节相同，不存在
+   「猜错前缀」这一档；
+2. **装快照那一步仍验尾部 crc**（§6.8）：即便探针在某处出了错，拼出来的字节也不
+   可能被静默装进去 —— 最坏是一次 `EIO`，不是一份谁都不认识的快照；
+3. **混版双向安全**：旧主不认识 `len == 0` 的新意思，回空 `SnapChunk`；新副本把任何
+   非 `SnapPrefix` 的答复当「不可留」处理（§4.1 第五例，`PROTOCOL_VERSION` 留 6）。
+
+`src/net/replicate.rs` 的落点是 `step_snapshot` 里的 `keep` 三支（同代 `off`、首块 0、
+换代走 `probe_prefix`）与 `Follower` 的两个计数 `snap_reused` / `snap_restarts`
+（只在测试侧可见，`--stats` 没加字段 —— 理由同上一笔）。两条 eprintln 是给现场用的：
+`keeping X of Y B already downloaded` / `no usable prefix in the Y B ... restarting from 0`。
+
+**集成用例**（`tests/replication.rs` 三条）：
+
+- `a_snapshot_probe_reports_the_prefix_crc`：offset 0 / 1 / 4096 / 一半 / 整份 / 越界
+  六个点上 `prefix_crc == crc32(&raw[..n])`，且 `len > 0` 仍回 `SnapChunk`；
+- `a_snapshot_generation_change_keeps_the_downloaded_prefix`：4000 条 `Batch` 播种、
+  8 KiB 块、下一截后改最后一个节点的 `mode` 再 checkpoint —— 前缀整体可复用，
+  `snap_reused > 0`、`snap_restarts == 0`、`resyncs == 1`，两份快照逐字节相同；
+- `a_snapshot_generation_change_with_a_different_prefix_restarts`：同形状但新建一个文件
+  （`nodes` 条数变了）—— `snap_reused == 0`、`snap_restarts == 1`，仍然收敛、逐字节相同。
+
+**同机实测**（`benches/replica_redo.sh 40 3`，原始输出 `benches/results/replica_redo.log`）。
+口径：两臂同一份种子（119 万节点、快照 131 MB）；副本从 0 起跑，起跑 500 ms 后把主侧
+WAL 推过 1 MB 触发**一次**换代；量「副本进程起 → lag 0」的墙钟，每臂三轮取中位。
+
+| 形状（换代负载） | 老 `c5ff0b7`（整份重下） | 新（探针 + 前缀复用） |
+|---|---|---|
+| `rowput`（改动落在快照尾部） | 13 700 / 13 730 / 13 062 ms，中位 **13 207** | 9 899 / 10 123 / 10 036 ms，中位 **10 036** |
+| `create`（`nodes` 条数变了） | 13 462 / 12 667 / 12 680 ms，中位 **12 680** | 12 451 / 13 009 / 12 883 ms，中位 **12 883** |
+
+`rowput` **1.32×**（13 207 → 10 036 ms）。三轮都留下了一整段已下的前缀：51.0 / 63.0 /
+51.0 MiB（34–42%）—— 剩下一半以上没下，换算成下载时间 2.7–3.3 s，与实际省的 3.17 s
+对得上。`create` 三轮
+都在 47–55 MiB 处判「不可用」并从 0 重来（`整份重下 1`），时间比 0.98× —— **这一格是
+判据的反面证据，不是性能数字**。
+
+**为什么要给副本限速**（`benches/throttle.py`）：本机 localhost 上 131 MB 快照约 1.5 s
+就下完，而主侧一次 checkpoint 的编码要 3–5 s —— 不限速时换代永远落在下载结束之后，
+两臂都只是「装完再 gap 一次」，测不到这一笔。代理把下行压到 20 MB/s（低于编码速率），
+换代就必然落在下载中段。**跨机没有跑**：上一笔的跨机读数显示快照段在 gfs2 上的方差比
+省下的还大，这一格的正收益需要「下载 > 编码」这个形状，跨机本来就更容易成立，但那是
+推断，不是实测。
+
+一件没做的：探针按 crc 只判「前缀全等」，不做「二分找最长公共前缀」—— 前半段相同、
+后半段分叉的形状（比如在很靠前的目录里加一个条目）仍要整份重下。二分要多发 O(log n)
+次往返，而 `nodes` 区的任何改动都会让前缀在中段断掉，收益面比 `rowput` 这种尾部改动小
+得多；留到有真实形状需要时再说。
 
 ### 6.7 备份与还原（实测三形状，2026-11-19）
 
@@ -2908,7 +2979,7 @@ gcc -O2 -pthread -o /tmp/lb_floor benches/lb_floor.c && /tmp/lb_floor 1 64 3   #
 | `tests/batch.rs` | **6** | §5.1「原子批」的六面：批内顺序可见（`create` 后直接对刚分配的 ino `setattr`，`apply_seq` 只 +1）、一条失败整批不落且父目录三个属性逐字段不变（`msg` 带 `batch op #<i>: `，失败批预留的 ino 被回收）、通用表上同样原子（唯一索引冲突让整批零行）、**整批只占一条 WAL 记录**（把末条记录截到 payload 一半，重开后批内三个子 op 全不在而批前的视图仍在）、纯读批零日志且应答与逐条单发逐字段相等、空/超限/嵌套/控制面四种拒都在 `translate` 层给 `EINVAL` 且在解码层也能拦住越界与嵌套 |
 | `tests/table_alter.rs` | **5** | §5.1「追加列」的五面：旧行全被拉宽到新宽度且新增的 `COL_INDEX` 列索引里每行都有一项（索引计数 `row_index.len()` 把唯一列隐含的索引也算进去）、五类拒绝（不存在/重名/已满 64 列/空名/`COL_UNIQUE`）逐条核 errno 且 `apply_seq` 不动（零日志）、**只占一条 WAL 记录**（从 payload 中间截断重开后仍是旧宽度、旧列一个不少）、`Checkpoint` 与 `dump → restore` 之后新列/旧数据/索引都在且接着能写、同一条 `Log::AddColumn` 手动 `apply` 两次与一次等价 |
 | `tests/auth.rs` | **5** | §4.4 在线协议上的握手形状（MAC 的数学性质与闸门四档在 lib 单测里，不重复）：未握手的连接一个数据 op 也拿不到（**两种 worker 形状各一跑，两条路径拦截点不是同一处代码**）、错密钥被拒但不锁死 + 旧 MAC 重放不上 + 换对密钥能过、带密钥的客户端拒绝降级、未配密钥的服务端一次往返回 `authed: false`（这是 v5 客户端连 v4 形状不卡死的依据）、握手与数据 op 挤同批时**应答次序不能被打乱** |
-| `tests/replication.rs` | **16** | §6.6 的十二件事（十六条用例，端到端那一件两档各一条；主是真进程，副本是测试里的 `Engine` + `Follower`，只有最后三件起真 `treedb-standby`）：主写逐条收敛（ino/属性/readdir 与主对齐）、**主被 `kill -9` 后副本仍答读且不退出**（`replica_errors` 抬、`connected` 落 true→false）、**gap 触发分块重装快照**（4 KiB 块下 ≥ 2 块，且副本落盘的 `state.snap` 与主的逐字节相同）、**副本拒写在引擎层**（五个形状不同的写真 op 全 `EROFS` 且零 logs、零水位推进，而 `ListViews`/`Stats`/`Checkpoint` 放行）、**lag 中途为正、追平归零**（2 KiB/轮喂不饱一批）、**副本重启靠自己的日志接上**（`resyncs == 0`，快照+尾巴那条恢复路径）、端到端两档事件循环同一份断言（`workers=1`/`2`：线上 `EROFS`、`Stats` 新字段过线、追平后读到主的新写）、启动参数三道门（缺 `--primary` / 自己拉自己 / `--fetch-bytes 0` 均退出码 2）、**开了认证的主只有握得上手的副本追得动**（对密钥逐条收敛、错密钥不收敛）；v0.4.0 新增四条 fencing：令牌只升不降/落盘/坏文件不当 0、副本侧四档闸门（含“权力优先于新旧”与它的反面）、**真链路上提权后拒旧主的批**（状态不回滚、仍在答读、`replica_errors` 抬）、`--promote` 离线动作（不开端口、两次 0→1→2、与 `--primary` 同时给退出码 2）；2026-11-22 新增 `the_fetch_block_ramps_while_catching_up_and_returns_to_cfg`（64 条/批播 8 192 个文件，`--fetch-bytes` 32 KiB 下块长峰值放大到 1 MiB、收敛后回落到 32 KiB）；同日把同一条规则铺到快照段：`the_snapshot_chunk_ramps_while_downloading_and_returns_to_cfg`（8 KiB 起、4 000 条批量播出 > 8 个块长的快照，下载途中块长涨过配置值且不超 4 MiB，轮数少于定长下的块数，装完落回 8 KiB） |
+| `tests/replication.rs` | **19** | §6.6 的十三件事（十九条例，端到端那一件两档各一条；主是真进程，副本是测试里的 `Engine` + `Follower`，只有最后三件起真 `treedb-standby`）：主写逐条收敛（ino/属性/readdir 与主对齐）、**主被 `kill -9` 后副本仍答读且不退出**（`replica_errors` 抬、`connected` 落 true→false）、**gap 触发分块重装快照**（4 KiB 块下 ≥ 2 块，且副本落盘的 `state.snap` 与主的逐字节相同）、**副本拒写在引擎层**（五个形状不同的写真 op 全 `EROFS` 且零 logs、零水位推进，而 `ListViews`/`Stats`/`Checkpoint` 放行）、**lag 中途为正、追平归零**（2 KiB/轮喂不饱一批）、**副本重启靠自己的日志接上**（`resyncs == 0`，快照+尾巴那条恢复路径）、端到端两档事件循环同一份断言（`workers=1`/`2`：线上 `EROFS`、`Stats` 新字段过线、追平后读到主的新写）、启动参数三道门（缺 `--primary` / 自己拉自己 / `--fetch-bytes 0` 均退出码 2）、**开了认证的主只有握得上手的副本追得动**（对密钥逐条收敛、错密钥不收敛）；v0.4.0 新增四条 fencing：令牌只升不降/落盘/坏文件不当 0、副本侧四档闸门（含“权力优先于新旧”与它的反面）、**真链路上提权后拒旧主的批**（状态不回滚、仍在答读、`replica_errors` 抬）、`--promote` 离线动作（不开端口、两次 0→1→2、与 `--primary` 同时给退出码 2）；2026-11-22 新增 `the_fetch_block_ramps_while_catching_up_and_returns_to_cfg`（64 条/批播 8 192 个文件，`--fetch-bytes` 32 KiB 下块长峰值放大到 1 MiB、收敛后回落到 32 KiB）；同日把同一条规则铺到快照段：`the_snapshot_chunk_ramps_while_downloading_and_returns_to_cfg`（8 KiB 起、4 000 条批量播出 > 8 个块长的快照，下载途中块长涨过配置值且不超 4 MiB，轮数少于定长下的块数，装完落回 8 KiB）；同日再补三条快照换代：`a_snapshot_probe_reports_the_prefix_crc`（六个 offset 上 `prefix_crc == crc32(&raw[..n])`）、`a_snapshot_generation_change_keeps_the_downloaded_prefix`（改尾部节点的 `mode` 再 checkpoint：`snap_reused > 0`、`snap_restarts == 0`、两份快照逐字节相同）、`a_snapshot_generation_change_with_a_different_prefix_restarts`（新建文件：`snap_restarts == 1`，仍然收敛） |
 | `tests/concurrency.rs` | 0（+7，整文件 feature 门控） | T1 之后整个文件在 `postgres-compat` 后面：无 PG 时跑「拨号失败不漏 live」（1 条，要 feature），其余 6 条 `#[ignore]` 需真实 PG。**它测的是共享池，不是引擎并发**（§7.8）|
 | `tests/scale_connections.rs` | 1（+1 ignored） | 1 000 连接 fd/RSS 断言每次跑；万级（`TREEDB_CONNS`，含 25 000）手动 |
 | `tests/independence.rs` | **3** | 独立性三把门：内核目录（`src/engine`、`src/net`）不出现客户端名字；`[dependencies]` 非 optional 项只能是 `libc` + `thiserror`；`postgres-compat` 不得进 `default`（§11 第 7 条） |

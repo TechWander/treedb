@@ -923,9 +923,12 @@ pub enum Op {
     },
     /// 分块读主的 `state.snap`。副本两处在用它：冷启动要追上主的 WAL 起点，
     /// 以及主 checkpoint 把自己缺的那段截掉之后的重同步。
+    ///
+    /// `len == 0` 是**探针**：不交字节，只答前缀 crc（[`Reply::SnapPrefix`]），
+    /// 供换代时判断「已下的半份还能不能接着用」。这一档在旧主上只是空读。
     SnapFetch {
         offset: u64,
-        /// 上限 [`SNAP_CHUNK_MAX`]，超了 `EINVAL`。
+        /// 上限 [`SNAP_CHUNK_MAX`]，超了 `EINVAL`。`0` = 探针。
         len: u32,
     },
 
@@ -1887,6 +1890,27 @@ pub enum Reply {
         snap_seq: u64,
         epoch: u64,
     },
+    /// [`Op::SnapFetch`] 的**探针**应答：`len == 0` 时主不交字节，只答
+    /// `state.snap` 前 `min(offset, total)` 字节的 crc32。
+    ///
+    /// 它只为一件事存在：换代之后判断「手里已经下的那半份还能不能接着用」。
+    /// 两代快照出自同一个编码器，状态只挪了一点点时前缀往往逐字节相同 —— 但
+    /// 协议**不承诺**公共前缀，所以判据只能是内容：副本拿自己已下前缀的 crc32
+    /// 与它比，相同就截到 `min(offset,total)` 接着下，不同就从 0 重来。
+    ///
+    /// 为什么另起一个 tag 而不是给 [`Reply::SnapChunk`] 加字段：后者会让**既有**
+    /// 帧变长，按 §4.1 的判据必须把 `PROTOCOL_VERSION` 抬到 7；而旧副本从不发
+    /// `len == 0`（`--fetch-bytes 0` 启动时就拒），旧主收到 `len == 0` 回一个空
+    /// `SnapChunk`，新副本认出这个答复就退回整份重下 —— 两个方向都安全，于是
+    /// 版本留在 6。
+    SnapPrefix {
+        /// `state.snap` 前 `min(offset, total)` 字节的 crc32（IEEE，与快照尾巴
+        /// 那个校验和同一个函数）。
+        prefix_crc: u32,
+        total: u64,
+        snap_seq: u64,
+        epoch: u64,
+    },
     /// [`Op::AuthBegin`] 的应答：服务端挑战值。收到它就是「本实例启用了
     /// 认证，请交回 MAC」；`proto` 是服务端的线协议版本，碰巧也是全协议里
     /// 唯一一处「在相信任何字节之前就拿到对端版本」的口子（§4.1）。
@@ -2140,6 +2164,18 @@ impl Reply {
                 w.u64(*snap_seq);
                 w.u64(*epoch);
             }
+            Reply::SnapPrefix {
+                prefix_crc,
+                total,
+                snap_seq,
+                epoch,
+            } => {
+                w.u16(0x0182);
+                w.u32(*prefix_crc);
+                w.u64(*total);
+                w.u64(*snap_seq);
+                w.u64(*epoch);
+            }
             Reply::Challenge {
                 server_nonce,
                 proto,
@@ -2371,6 +2407,12 @@ impl Reply {
             }
             0x0181 => Reply::SnapChunk {
                 bytes: r.bytes_bounded(crate::engine::MAX_FRAME)?,
+                total: r.u64()?,
+                snap_seq: r.u64()?,
+                epoch: r.u64()?,
+            },
+            0x0182 => Reply::SnapPrefix {
+                prefix_crc: r.u32()?,
                 total: r.u64()?,
                 snap_seq: r.u64()?,
                 epoch: r.u64()?,
@@ -2896,6 +2938,13 @@ mod tests {
                 total: 0,
                 snap_seq: 0,
                 epoch: 0,
+            },
+            // 换代探针的应答：`len == 0` 的那条路。
+            Reply::SnapPrefix {
+                prefix_crc: 0xdead_beef,
+                total: 4096,
+                snap_seq: 40,
+                epoch: 3,
             },
             Reply::Challenge {
                 server_nonce: [0x11; NONCE_LEN],
