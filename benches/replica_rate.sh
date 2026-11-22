@@ -192,13 +192,15 @@ SNAPB=$(s_num "$P1" snapshot 3)
 WALB=$(s_num "$P1" wal 3)
 BYTES=$((SNAPB + WALB))
 log "  主      nodes=$NODES seq=$SEQ snapshot=$SNAP_SEQ snap_bytes=$SNAPB wal_logical=$WALB"
-log "  口径    下载字节 = 快照 + WAL 逻辑长度（不含逐块协议头）；快照块长 = --fetch-bytes"
-cold_start $CHUNK "1 MiB/块（默认）"
+log "  口径    下载字节 = 快照 + WAL 逻辑长度（不含逐块协议头）；块长从 --fetch-bytes 起步，"
+log "          快照段与 WAL 段共用自增规则（§6.6「追赶块长」）"
+cold_start $CHUNK "1 MiB/块起（默认，两段都可自增）"
 MS1=$R_MS
 cold_start 4194304 "4 MiB/块（WAL_FETCH_MAX）"
 MS4=$R_MS
 if [ "$MS1" -gt 0 ]; then
-    log "  结论    端到端 4 MiB/块是 1 MiB/块的 $(awk -v a="$MS1" -v b="$MS4" 'BEGIN{printf "%.2f", a/b}')×（${MS1} → ${MS4} ms）；块长只影响传输段，端到端被装快照主导"
+    log "  结论    端到端 4 MiB/块是 1 MiB/块的 $(awk -v a="$MS1" -v b="$MS4" 'BEGIN{printf "%.2f", a/b}')×（${MS1} → ${MS4} ms）；"
+    log "          自增把 1 MiB 档拉到 4 MiB 档附近，剩下的差是装快照那一轮"
 fi
 
 # [2] 追赶：副本停着、主关掉自动 checkpoint 攒一段 WAL，再放副本追。

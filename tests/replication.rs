@@ -555,6 +555,89 @@ fn the_fetch_block_ramps_while_catching_up_and_returns_to_cfg() {
     assert!(lookup(&mut eng, vid, &format!("f{}", N - 1)).ino > 0);
 }
 
+/// 快照下载段吃的是同一条规则。冷启动的 tick 数就等于块数（下一块之前不再等
+/// 一个间隔），所以不翻倍的话 28 MB 的快照就是 28 个 tick，而传输本身在真链路上
+/// 只占其中一小截。
+///
+/// 判据四条：下载途中出现过比配置值大的块长、峰值不越协议上限、块数明显少于
+/// 「按配置值切」的块数、装完并追平后回到配置值。
+#[test]
+fn the_snapshot_chunk_ramps_while_downloading_and_returns_to_cfg() {
+    const CFG: u32 = 8 * 1024;
+    const N: u32 = 4_000;
+    const PER: u32 = MAX_BATCH_OPS as u32;
+
+    let srv = Server::start("group");
+    let mut c = srv.client();
+    let vid = view_id(okc(&mut c, &Op::CreateView { name: "rsnap".into() }));
+    for start in (0..N).step_by(PER as usize) {
+        let ops = (start..start + PER)
+            .map(|i| Op::Create {
+                view: vid,
+                parent: 1,
+                name: format!("f{i}").into_bytes(),
+                mode: 0o640,
+                uid: 1000 + i,
+                gid: 100,
+            })
+            .collect();
+        okc(&mut c, &Op::Batch { ops });
+    }
+    // 落一次快照：这一条要的是「整份下载」，不是 WAL 追赶。
+    okc(&mut c, &Op::Checkpoint);
+    let snap_len = match okc(&mut c, &Op::Stats) {
+        Reply::Stats(s) => s.snap_bytes,
+        other => panic!("expected Stats, got {other:?}"),
+    };
+    assert!(
+        snap_len > 8 * CFG as u64,
+        "快照得明显大于 8 个块长，触发条件才轮得到：got {snap_len} B"
+    );
+
+    let (_tmp, dir) = read_only_dir("rep");
+    let mut eng = replica(&dir);
+    let mut f = Follower::new(fcfg(&srv.addr, 1, CFG));
+
+    let mut max_seen = 0u32;
+    let mut rounds = 0u64;
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let p = loop {
+        std::thread::sleep(Duration::from_millis(2));
+        f.tick(&mut eng).expect("tick must never be fatal here");
+        let p = f.progress(&mut eng);
+        // 只看下载态的块长：装完之后紧接着的 WAL 追赶是另一段，不属这条用例。
+        if p.downloading {
+            rounds += 1;
+            max_seen = max_seen.max(p.fetch_bytes);
+        }
+        if p.primary_seq > 0 && p.lag == 0 && !p.downloading {
+            break p;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "replica never converged (block {max_seen}, {rounds} rounds, {p:?})\n{}",
+            srv.log_text()
+        );
+    };
+
+    assert!(
+        max_seen > CFG,
+        "快照没下完还剩很多，块长却一直停在配置值 {CFG}（峰值 {max_seen}）"
+    );
+    assert!(max_seen <= WAL_FETCH_MAX, "峰值 {max_seen} 越过了协议上限");
+    let fixed_rounds = snap_len.div_ceil(CFG as u64);
+    assert!(
+        rounds < fixed_rounds,
+        "快照 {snap_len} B / 块长 {CFG} 该比按块长切少：{rounds} vs {fixed_rounds} 轮"
+    );
+    assert_eq!(
+        p.fetch_bytes, CFG,
+        "追平后应当退回配置值，got {}（峰值 {max_seen}）",
+        p.fetch_bytes
+    );
+    assert!(lookup(&mut eng, vid, &format!("f{}", N - 1)).ino > 0);
+}
+
 /// 端到端：`treedb-standby` 进程 + 真客户端。线协议上的 `EROFS` 与
 /// `Stats` 里那组新字段的真实编解码只在这一组里被覆盖。
 ///

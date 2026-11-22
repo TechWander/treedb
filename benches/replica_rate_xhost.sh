@@ -297,7 +297,8 @@ blank
 log "=============== $(date '+%F %T')  副本跨机传送（rev $REVSHOW，§6.6 边界 5）"
 log "链路    $PEER（${PEER_NPROC:-?} 核，virtio）：裸 TCP 512 MiB = $RAWTCP MiB/s；dd|ssh = $NETRATE MiB/s（受 ssh 加密限制）"
 log "盘      $PEER：4 KiB fsync ${DSYNC_RATE:-n/a} 次/s、宿主同口径 fsync ${HDSYNC_RATE:-n/a} 次/s（副本每轮一次 fsync，这一行就是追赶速率的天花板）"
-log "口径    下载字节 = 快照字节 + WAL 逻辑长度；快照块长 = --fetch-bytes（定长），WAL 块长从它起步、\n        落后多个块长时翻倍（≤ WAL_FETCH_MAX，见 §6.6「追赶块长」）；副本 4 worker、interval 20 ms"
+log "口径    下载字节 = 快照字节 + WAL 逻辑长度；块长从 --fetch-bytes 起步、落后多个块长时"
+log "        翻倍（≤ WAL_FETCH_MAX，见 §6.6「追赶块长」）；快照段与 WAL 段共用这条规则，副本 4 worker、interval 20 ms"
 log "轮数    $RUNS（每轮重新造数据；[3] 的 A/B 从同一份种子目录派生，写入量逐字节相同）"
 
 for r in $(seq 1 "$RUNS"); do
@@ -318,7 +319,7 @@ for r in $(seq 1 "$RUNS"); do
     blank
     log "[1] 跨机冷启动：主 nodes=$(sn nodes 3) seq=$SEQ，下载 $BYTES B（快照 $SNAPB + WAL $WALB）"
     log "  主      $SEED"
-    cold_start $CHUNK "1 MiB/块起（默认，WAL 段可自增）"
+    cold_start $CHUNK "1 MiB/块起（默认，两段都可自增）"
     cold_start 4194304 "4 MiB/块（WAL_FETCH_MAX）"
 
     # ---- [2] 追赶：副本停着，主攒 WAL ----

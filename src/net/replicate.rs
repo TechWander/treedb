@@ -34,8 +34,9 @@ pub struct ReplicaCfg {
     pub primary: SocketAddr,
     /// 两次 tick 之间的最小间隔。它决定稳态下副本对主的最多问数频率。
     pub interval_ms: u64,
-    /// 一次 `WalFetch` 要的负载上限。超过 [`WAL_FETCH_MAX`] 主会回 `EINVAL`，
-    /// 所以这里不校验，让主那侧说话。
+    /// 一次取块的**下限**。WAL 段与快照段共用它，落后多个块长时按
+    /// [`next_fetch_bytes`] 自己翻倍、稳定后落回这里。超过 [`WAL_FETCH_MAX`]
+    /// 主会回 `EINVAL`，所以这里不校验，让主那侧说话。
     pub max_bytes: u32,
     /// 一次往来的读写超时。事件循环里跑，不能没有上限。
     pub timeout_ms: u64,
@@ -55,7 +56,8 @@ impl ReplicaCfg {
             // 把副本的稳态 lag 抬到肉眼可见。
             interval_ms: 20,
             // 1 MB / 轮：`WAL_FETCH_MAX` 的 1/4。稳态下每轮只有一两次往返，
-            // 但一次 tick 占住循环的时间得压得住；真要快点追就让 interval 小。
+            // 但一次 tick 占住循环的时间得压得住；落后时块长会自己翻倍，所以
+            // 这个值是「稳态一轮多大」而不是「最快能多快」。
             max_bytes: 1 << 20,
             timeout_ms: 5_000,
             auth: None,
@@ -79,6 +81,9 @@ pub struct Follower {
     snap: Option<SnapDl>,
     /// 本轮实际要的负载上限。平时等于 [`ReplicaCfg::max_bytes`]，与主差得
     /// 远时按 [`next_fetch_bytes`] 翻倍，追回积压之后自己降回去。
+    ///
+    /// 快照下载段也用它（此时「积压」是还没下完的字节）：冷启动的 tick 数就等于
+    /// 块数，一段 28 MB 的快照在 1 MiB 档下要 28 轮，块长放开后 <10 轮。
     cur_bytes: u32,
 }
 
@@ -104,6 +109,8 @@ const RAMP_LAG_ROUNDS: u64 = 4;
 /// [`WAL_FETCH_MAX`]）；只要拿不满（= 已经追上）就退回 `cfg`。
 ///
 /// `cfg` 永远是下限，所以 `--fetch-bytes` 仍然是「稳态一轮多大」的旋钮。
+/// WAL 段与快照段共用这一条规则，区别只在「积压」的量出去哪儿取：WAL 段是主
+/// 报的 `durable_seq` 差（折成字节），快照段直接是「整份还剩多少没下」。
 ///
 /// 为什么是块长而不是频率：一轮的固定开销（一次往返 + 一次 commit/fsync）与块长
 /// 无关，块长翻倍就把同一笔开销摊到两倍字节上。同机实测（86–96 MB / 113–127
@@ -310,11 +317,13 @@ impl Follower {
         }
     }
 
-    /// 装完快照之前先把整份下下来。每次 tick 下一块，块长 = `max_bytes`。
+    /// 装完快照之前先把整份下下来。每次 tick 下一块，块长与 WAL 段共用一条规则
+    /// （见 [`next_fetch_bytes`]）：从 `--fetch-bytes` 起步，剩余还多于 4 个块长就
+    /// 翻倍，封顶 `WAL_FETCH_MAX`。
     fn step_snapshot(&mut self, eng: &mut Engine) -> Result<()> {
         let (off, cap) = {
             let dl = self.snap.as_ref().expect("step_snapshot 只在下载态调用");
-            (dl.off, self.cfg.max_bytes)
+            (dl.off, self.cur_bytes)
         };
         let rep = match self.call(&Op::SnapFetch { offset: off, len: cap }) {
             Ok(r) => r,
@@ -368,6 +377,15 @@ impl Follower {
             dl.buf.extend_from_slice(&bytes);
             dl.off = dl.off.saturating_add(bytes.len() as u64);
             if dl.off < total {
+                // 「还剩多少没下」就是这一段的积压。不翻倍的话，冷启动的耗时
+                // 直接等于块数 × 间隔：28 MB 的快照在 1 MiB/轮的默认值下要 28 个
+                // tick，其中传输只占很小一部分。
+                self.cur_bytes = next_fetch_bytes(
+                    self.cur_bytes,
+                    self.cfg.max_bytes,
+                    bytes.len() as u64,
+                    total - dl.off,
+                );
                 return Ok(());
             }
         }
@@ -394,6 +412,9 @@ impl Follower {
         eng.note_replica_resync();
         self.snap = None;
         self.hint_off = WAL_HINT_NONE;
+        // 装完就回落到下限：紧接的 WAL 追赶会按当时的积压自己再放大，而“配置值
+        // 是下限”这个承诺不该因为刚跑过快照段就变成“上一个快照块多大就一直多大”。
+        self.cur_bytes = self.cfg.max_bytes;
         // 本地水位装到这一代，主却可能已经又 checkpoint 过一次：那种情况下一轮
         // `step_wal` 会再收到 gap，再装一次。`replica_resyncs` 涨不停就是这个
         // 信号（追不上），不是这里能就地解决的。
@@ -410,6 +431,9 @@ impl Follower {
             );
         }
         self.hint_off = WAL_HINT_NONE;
+        // 两段都从下限起步：上一段（WAL）可能已经把块长顶到 4 MiB，直接带进
+        // 快照段会让一次冷启动的第一轮就扛上一整个大块，而它未必是最后几块。
+        self.cur_bytes = self.cfg.max_bytes;
         self.snap = Some(SnapDl {
             buf: Vec::new(),
             off: 0,
