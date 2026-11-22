@@ -26,7 +26,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 use treedb::engine::core::SNAP_FILE;
-use treedb::engine::model::{errno, Kind, Node, Op, Reply};
+use treedb::engine::model::{errno, Kind, Node, Op, Reply, MAX_BATCH_OPS, WAL_FETCH_MAX};
 use treedb::engine::{Durability, Engine, FENCE_FILE};
 use treedb::error::Error;
 use treedb::net::auth::Key;
@@ -487,6 +487,72 @@ fn the_lag_counter_moves_and_then_returns_to_zero() {
     let p = converge(&mut f, &mut eng, &srv.log_text());
     assert_eq!(p.lag, 0, "追平后 lag 必须归零");
     assert!(lookup(&mut eng, vid, "f199").ino > 0);
+}
+
+/// 块长在追赶时自己放大，追平后退回 `--fetch-bytes`（它是下限，不是定值）。
+///
+/// 造一份「远大于 4 个块长」的积压 + 一个很小的块长，ramp 的触发条件与
+/// 回落条件就都能在几轮里看到。三件事各自断言：途中出现过比配置值大的
+/// 块长、峰值不越协议上限、收敛后回到配置值。
+///
+/// 用 `Op::Batch` 播种而不是逐条 `Create`：group commit 下一条串行 RPC 要
+/// 等一次 fsync，几千条就耍到分钟级；批宽取协议上限 [`MAX_BATCH_OPS`]，
+/// 128 次往返就能铺完。
+#[test]
+fn the_fetch_block_ramps_while_catching_up_and_returns_to_cfg() {
+    const CFG: u32 = 32 * 1024;
+    const N: u32 = 8_192;
+    const PER: u32 = MAX_BATCH_OPS as u32;
+
+    let srv = Server::start("group");
+    let mut c = srv.client();
+    let vid = view_id(okc(&mut c, &Op::CreateView { name: "rramp".into() }));
+    for start in (0..N).step_by(PER as usize) {
+        let ops = (start..start + PER)
+            .map(|i| Op::Create {
+                view: vid,
+                parent: 1,
+                name: format!("f{i}").into_bytes(),
+                mode: 0o640,
+                uid: 1000 + i,
+                gid: 100,
+            })
+            .collect();
+        okc(&mut c, &Op::Batch { ops });
+    }
+
+    let (_tmp, dir) = read_only_dir("rep");
+    let mut eng = replica(&dir);
+    let mut f = Follower::new(fcfg(&srv.addr, 1, CFG));
+
+    let mut max_seen = 0u32;
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let p = loop {
+        std::thread::sleep(Duration::from_millis(2));
+        f.tick(&mut eng).expect("tick must never be fatal here");
+        let p = f.progress(&mut eng);
+        max_seen = max_seen.max(p.fetch_bytes);
+        if p.primary_seq > 0 && p.lag == 0 && !p.downloading {
+            break p;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "replica never converged (max block {max_seen}, {p:?})\n{}",
+            srv.log_text()
+        );
+    };
+
+    assert!(
+        max_seen > CFG,
+        "积压是块长的很多倍，块长却一直停在配置值 {CFG}（峰值 {max_seen}）"
+    );
+    assert!(max_seen <= WAL_FETCH_MAX, "峰值 {max_seen} 越过了协议上限");
+    assert_eq!(
+        p.fetch_bytes, CFG,
+        "追平后应当退回配置值，got {}（峰值 {max_seen}）",
+        p.fetch_bytes
+    );
+    assert!(lookup(&mut eng, vid, &format!("f{}", N - 1)).ino > 0);
 }
 
 /// 端到端：`treedb-standby` 进程 + 真客户端。线协议上的 `EROFS` 与

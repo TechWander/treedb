@@ -77,6 +77,9 @@ pub struct Follower {
     hint_off: u64,
     /// 正在整份下载主那侧的快照。这一状态里不拉 WAL：装完快照之后水位才接得上。
     snap: Option<SnapDl>,
+    /// 本轮实际要的负载上限。平时等于 [`ReplicaCfg::max_bytes`]，与主差得
+    /// 远时按 [`next_fetch_bytes`] 翻倍，追回积压之后自己降回去。
+    cur_bytes: u32,
 }
 
 /// 快照下载的中间状态。
@@ -91,9 +94,33 @@ struct SnapDl {
 
 const BACKOFF_MAX_MS: u64 = 2_000;
 
+/// 追赶时开始放大块长的滞后量，单位是「配置块长的倍数」。
+///
+/// 取 4 而不是 1：只落后一两块时放大块长，白白把一轮拉长到上百毫秒，
+/// 而读延迟的代价当场就付了；真正值得抢的是「落后好几个块长」的积压。
+const RAMP_LAG_ROUNDS: u64 = 4;
+
+/// 自适应块长：一轮拿满了预算 **且** 主那边还剩多个块长的积压时翻倍（上限
+/// [`WAL_FETCH_MAX`]）；只要拿不满（= 已经追上）就退回 `cfg`。
+///
+/// `cfg` 永远是下限，所以 `--fetch-bytes` 仍然是「稳态一轮多大」的旋钮。
+///
+/// 为什么是块长而不是频率：一轮的固定开销（一次往返 + 一次 commit/fsync）与块长
+/// 无关，块长翻倍就把同一笔开销摊到两倍字节上。同机实测（86–96 MB / 113–127
+/// 万条积压）：定长 1 MiB **16.31** MiB/s，自适应 **30.66** MiB/s（1.88×，
+/// 中位；§6.6 末段有逐轮明细）。
+fn next_fetch_bytes(cur: u32, cfg: u32, batch_bytes: u64, backlog_bytes: u64) -> u32 {
+    let floor = cfg.clamp(1, WAL_FETCH_MAX);
+    if batch_bytes < floor as u64 || backlog_bytes <= RAMP_LAG_ROUNDS * floor as u64 {
+        return floor;
+    }
+    cur.max(floor).saturating_mul(2).min(WAL_FETCH_MAX)
+}
+
 impl Follower {
     pub fn new(cfg: ReplicaCfg) -> Self {
         let backoff_ms = cfg.interval_ms.max(1);
+        let cur_bytes = cfg.max_bytes;
         Follower {
             cfg,
             client: None,
@@ -101,6 +128,7 @@ impl Follower {
             backoff_ms,
             hint_off: WAL_HINT_NONE,
             snap: None,
+            cur_bytes,
         }
     }
 
@@ -183,7 +211,7 @@ impl Follower {
         let op = Op::WalFetch {
             want_seq: want,
             hint_off: self.hint_off,
-            max_bytes: self.cfg.max_bytes,
+            max_bytes: self.cur_bytes,
         };
         let rep = match self.call(&op) {
             Ok(r) => r,
@@ -212,8 +240,24 @@ impl Follower {
                     return Ok(());
                 }
                 if records.is_empty() {
+                    // 已跟上：块长退回配置值。追赶时放大是为了抢回积压；稳态下
+                    // 一轮占住事件循环上百毫秒只是在伤自己的读延迟。
+                    self.cur_bytes = self.cfg.max_bytes;
                     return Ok(());
                 }
+                let batch_bytes: u64 = records.iter().map(|r| r.len() as u64).sum();
+                let last_seq = base_seq + records.len() as u64 - 1;
+                let behind = durable_seq.saturating_sub(last_seq);
+                // 用本批的字节/条均值把「还差多少条」折成「还差多少字节」：
+                // WAL 里每条字节数差一个量级（目录项 vs 节点），拿条数当量度
+                // 会让触发点随工作负载飘。
+                let avg = (batch_bytes / records.len() as u64).max(1);
+                self.cur_bytes = next_fetch_bytes(
+                    self.cur_bytes,
+                    self.cfg.max_bytes,
+                    batch_bytes,
+                    behind.saturating_mul(avg),
+                );
                 match eng.replicate_records(base_seq, &records, epoch) {
                     Ok(_) => Ok(()),
                     // 交付接不上号：本地缺一段（比如副本自己的目录比主老）。
@@ -418,6 +462,7 @@ impl Follower {
             errors: s.replica_errors,
             connected: self.client.is_some(),
             downloading: self.snap.is_some(),
+            fetch_bytes: self.cur_bytes,
         }
     }
 
@@ -446,4 +491,76 @@ pub struct FollowerProgress {
     pub errors: u64,
     pub connected: bool,
     pub downloading: bool,
+    /// 下一轮实际要的负载上限（追赶时会大于配置值，见 [`next_fetch_bytes`]）。
+    pub fetch_bytes: u32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{next_fetch_bytes, WAL_FETCH_MAX};
+
+    const MIB: u32 = 1 << 20;
+
+    /// 没拿满 = 已经追上。哪怕主那边还剩一点，也不放大：稳态一轮就该是配置值。
+    #[test]
+    fn unsaturated_round_falls_back_to_cfg() {
+        // 主说自己还剩一整个 WAL_FETCH_MAX 的积压，但这一轮只拿到半块。
+        let got = next_fetch_bytes(4 * MIB, MIB, (MIB / 2) as u64, (4 * MIB) as u64);
+        assert_eq!(got, MIB);
+    }
+
+    /// 拿满了但只落后一两块：不值得把一轮拉长，退回配置值。
+    #[test]
+    fn shallow_lag_stays_at_cfg() {
+        for rounds in 0..=super::RAMP_LAG_ROUNDS {
+            let backlog = rounds * MIB as u64;
+            let got = next_fetch_bytes(4 * MIB, MIB, MIB as u64, backlog);
+            assert_eq!(got, MIB, "lag {rounds} rounds must not ramp");
+        }
+    }
+
+    /// 拿满 + 欠账超过阈值：逐级翻倍，到 `WAL_FETCH_MAX` 封顶。
+    #[test]
+    fn deep_lag_ramps_to_the_cap() {
+        let deep = 64 * MIB as u64;
+        let mut cur = MIB;
+        let mut seen = Vec::new();
+        for _ in 0..8 {
+            cur = next_fetch_bytes(cur, MIB, MIB as u64, deep);
+            seen.push(cur);
+        }
+        assert_eq!(&seen[..3], &[2 * MIB, 4 * MIB, 4 * MIB]);
+        assert_eq!(cur, WAL_FETCH_MAX, "must stop at the protocol ceiling");
+    }
+
+    /// 配置值本身就是上限（或超了）：没有可放大的空间，原样返回上限。
+    #[test]
+    fn cfg_at_ceiling_never_grows_past_it() {
+        let deep = 64 * (WAL_FETCH_MAX as u64);
+        let got = next_fetch_bytes(WAL_FETCH_MAX, WAL_FETCH_MAX, WAL_FETCH_MAX as u64, deep);
+        assert_eq!(got, WAL_FETCH_MAX);
+        // 配置值超过协议上限：取上限，绝不把非法值送上线（主会回 EINVAL）。
+        let got = next_fetch_bytes(2 * WAL_FETCH_MAX, 2 * WAL_FETCH_MAX, 0, deep);
+        assert_eq!(got, WAL_FETCH_MAX);
+    }
+
+    /// 不变量：结果恒在 `[floor, WAL_FETCH_MAX]`，`floor` 至少 1。
+    /// `check_cfg` 会挡掉 `max_bytes == 0`，这里只保证这个纯函数自己不产出 0。
+    #[test]
+    fn result_is_always_within_floor_and_ceiling() {
+        for &cfg in &[0u32, 1, 4096, MIB, WAL_FETCH_MAX, WAL_FETCH_MAX + 1] {
+            let floor = cfg.clamp(1, WAL_FETCH_MAX);
+            for &cur in &[0u32, 1, 4096, MIB, WAL_FETCH_MAX] {
+                for &batch in &[0u64, 1, floor as u64, WAL_FETCH_MAX as u64] {
+                    for &backlog in &[0u64, floor as u64, 8 * floor as u64, u64::MAX] {
+                        let got = next_fetch_bytes(cur, cfg, batch, backlog);
+                        assert!(
+                            got >= floor && got <= WAL_FETCH_MAX,
+                            "cfg {cfg} cur {cur} batch {batch} backlog {backlog} -> {got}"
+                        );
+                    }
+                }
+            }
+        }
+    }
 }

@@ -16,8 +16,8 @@ cargo build --release                                   # 默认档：依赖只�
 ./target/release/treedb-server --dir /var/lib/treedb --listen 127.0.0.1:7777
 ./target/release/treedb-bench --op lookup --conns 64 --pipeline 32 --secs 3
 
-cargo test --release                                    # 默认档 195 passed / 1 ignored（引擎本体）
-cargo test --release --features postgres-compat        # 226 passed / 7 ignored（含 PG 过渡档）
+cargo test --release                                    # 默认档 201 passed / 1 ignored（引擎本体）
+cargo test --release --features postgres-compat        # 232 passed / 7 ignored（含 PG 过渡档）
 bash benches/throughput_matrix.sh 3 1 2 3 4 5           # 五轴复现，输出进 benches/results/
 bash benches/sync_ratio.sh 3                           # 写路径机制：一次 fsync 摊了多少写
 bash benches/single_conn.sh 3                          # 单连接对标 PG（$PIPE=32 走批量档、$CONNS/$WORKERS 走并发档）
@@ -133,6 +133,11 @@ dump 走的是日志标签表（`Log`，1..=24；`LOG_BATCH` 23 与 `LOG_ADD_COL
 `--fetch-bytes 4194304` 时 0.40–0.47 s），攒下 37 MB 积压 1.9–2.2 s 追平，
 主 4.8–5.2 万 `create`/s 时副本 lag 中位 0.6–2.4 万条、峰值 4.5 万条，停写后
 135–150 ms 归零；追平期间副本 `ping` 的 p50 不动、p99 +11%…+28%。
+
+`--fetch-bytes` 现在是**下限而不是定值**：落后多个块长时块长自己翻倍（封顶 4 MiB），
+追平后退回配置值，所以稳态读延迟不受影响。同一份 86–96 MB 积压：定长 1 MiB
+16.31 MiB/s、自适应 30.66 MiB/s（中位，**1.88×**）；代价只是落后时最坏一轮占住
+提交线程的时间翻倍（15.8–16.1 → 29.1–38.3 ms），见 [DESIGN.md](DESIGN.md) §6.6 末段。
 
 跨机（`bash benches/replica_rate_xhost.sh 3`，副本在第二台机上，主与负载发生器在宿主，
 中间是真 virtio 链路，裸 TCP 1838 MiB/s）：冷启动 1 MiB/块 1006–1254 ms、

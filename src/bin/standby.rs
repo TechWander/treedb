@@ -309,9 +309,11 @@ treedb-standby — 只读副本（pull 式日志传送，DESIGN.md §6.6）
                              可以直接跟主的比对
   --listen HOST:PORT         对客户端的监听地址，默认 127.0.0.1:7778
   --interval-ms N            两次追平之间的最小间隔，默认 20。下载快照期间不限频
-  --fetch-bytes N            一次往来的负载上限（字节），默认 1048576，上限看
-                             协议里的 WAL_FETCH_MAX。追得慢就调大，但一次 tick
-                             会占住副本的事件循环一轮
+  --fetch-bytes N            稳态每轮的负载上限（字节），默认 1048576，上限看
+                             协议里的 WAL_FETCH_MAX。它是**下限而不是定值**：落后
+                             多个块长时块长自动翻倍（封顶 WAL_FETCH_MAX），追平
+                             后自己退回这个值（§6.6）。调大它 = 稳态也一次拿更
+                             多，一轮占住事件循环更久
   --timeout-ms N             到主的连接与读写超时，默认 5000。事件循环里跑，
                              必须有上限，否则一个不答话的主会把读全钉死
   --durability NAME          group（默认）| always | never。副本的 WAL 记的是主

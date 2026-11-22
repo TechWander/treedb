@@ -123,11 +123,11 @@ checkpoint 在抹掉 `(from, to]` 之前把这一段原始帧与即将被覆盖�
 按「不改写已推引用」的纪律保留现状：Cargo 解析 git 依赖只看 tag/rev 与 lock 里的
 hash，不看这个字段，所以不影响任何构建；下一次带 API 变更的发版重新对齐。
 
-test 现在分两档报：默认档（纯引擎）`cargo test --release` = **195 passed / 1 ignored**（64 lib +
-35 engine_crud + 14 migrate + 14 replication + 11 net_protocol + 9 pitr + 8 read_scaling
+test 现在分两档报：默认档（纯引擎）`cargo test --release` = **201 passed / 1 ignored**（69 lib +
+35 engine_crud + 14 migrate + 15 replication + 11 net_protocol + 9 pitr + 8 read_scaling
 + 7 crash_recovery + 6 batch + 5 auth + 5 observe + 5 table_alter + 4 dump_restore +
 3 backup_online + 3 independence + 1 large_reply + 1 scale_connections，10k 那条仍
-`#[ignore]`）；`--features postgres-compat` = **226 passed / 7 ignored**，多出的 31 条 = 过渡档自己的 30 条单测 +
+`#[ignore]`）；`--features postgres-compat` = **232 passed / 7 ignored**，多出的 31 条 = 过渡档自己的 30 条单测 +
 `concurrency.rs` 里那条
 不需要 PG 的拨号用例（剩下 6 条要真 PG，默认 `#[ignore]`，不计入 passed）。即 PG 只出现在
 `postgres-compat` 后面的 `src/pool`、`src/store`、
@@ -1164,8 +1164,12 @@ committer，`workers = 1` 时是轮末周期任务）。两档跑的是同一份
    1.85–2.03×，4 MiB/块还是唯一有效的旋钮。② **链路远未跑满**：4 MiB 档传输段
    199–351 MiB/s，而裸 TCP 有 1838 MiB/s；1 MiB 档只有 49–58 MiB/s，是被 `--interval-ms 20`
    的「一轮一块」封顶（1 MiB / 20 ms = 50 MiB/s）—— 与 §11 第 4 条那个算术上界完全对得上。
-   ③ **跨机追赶比同机低 15–20%**（14.6–15.2 vs 17.0–18.7 MiB/s），但依旧不是网络：
-   卡在副本每轮一次 fsync（gfs2 132 次/s vs 宿主 384 次/s），换块长也无益。④ **副本
+   ③ **跨机追赶比同机低 15–20%**（14.6–15.2 vs 17.0–18.7 MiB/s）。这一句原先还接着
+   半句「卡在副本每轮一次 fsync，换块长也无益」—— **2026-11-22 的同机 A/B 推翻了它**：
+   一轮的固定开销（一次往返 + 一次 commit/fsync）与块长无关，块长翻倍就把同一笔开销
+   摊到两倍字节上（定长 1 MiB 16.31 MiB/s → 自适应块长 30.66 MiB/s，见本节末「追赶
+   块长」）。真正的上限是「每轮固定开销 ÷ 块长」，不是 fsync 次数本身；4 KiB fsync
+   132 次/s 只说小写慢，不说大写也慢。④ **副本
    在追对主的中位延迟是实打的**：p50 +27…+40%、p90 +15…+27%、吞吐 −12…−19%，三轮
    同向且分布整体平移；p99 也涨但分散（+14 / +19 / +32%），因为它是单点分位，宿主
    后台回写会单独抬高它 —— 结论以 p50/p90 + 吞吐为准。⑤ 这一格是**最坏形状**：副本
@@ -1186,6 +1190,46 @@ committer，`workers = 1` 时是轮末周期任务）。两档跑的是同一份
    网络形状：连发四个 4 MiB `SnapFetch` 再读，16 MiB 应答必然超过 `tcp_wmem` 上限 4 MiB，
    `write` 一定短写返回 `WouldBlock`。摘掉修复实测 **8.45 s 读超时跑红**（错误签名与
    跨机现场逐字相同），恢复后 **0.23 s 过**。
+
+#### 追赶块长：落后时自己放大（2026-11-22）
+
+`--fetch-bytes` 原来是「一轮就是这么大」。定因时把一轮拆成四段（fetch 往返 /
+decode+encode 校验 / commit = 写 + fsync / apply），同机约 100 MB（121–129 万条）
+积压、用一份临时 env 门控计时（已移除，不在树里）量到：1 MiB/轮时
+fetch 18.8% / dec 8.5% / **commit 59.3%** / apply 13.4%，73.9 ms 一轮；换成 4 MiB/轮
+则一轮 139.7 ms、13.45 → 27.31 MiB/s（2.03×），四段占比 25.3 / 10.6 / 46.9 / 17.2%。
+
+读法只有一条：**一轮的固定开销（一次往返 + 一次 commit/fsync）与块长无关**。所以
+「追得慢就调大 `--fetch-bytes`」这个旋钮本身没错，错的是把它做成定值 —— 稳态需要
+小轮（一轮占住事件循环，读延迟当场付账），追赶需要大轮。
+
+现在的规则在 `src/net/replicate.rs::next_fetch_bytes`（纯函数 ＋ 5 条单测）：
+
+- 一轮**拿满**预算 **且** 主那边按本批「字节/条」均值折算的积压 > 4 个配置块长
+  → 块长翻倍，封顶 `WAL_FETCH_MAX`（4 MiB）；
+- 拿不满、或收到空批 → 退回 `--fetch-bytes`。配置值因此是**下限**，稳态读延迟
+  不被牺牲（集成用例 `the_fetch_block_ramps_while_catching_up_and_returns_to_cfg`
+  同时钉住「途中放大」与「追平后回落」）；
+- 阈值取 4 个块长而不是 1：只落后一两块时放大，白白把一轮拉长到上百毫秒，而那时
+  并没有值得抢的积压。
+
+**实测（同机 loopback，改前/改后同一个临时探针，`.spot/` 未入库；改前那一组是把
+本次改动暂存掉、重新编译后同脚本重跑）**：
+
+| 形状 | 1 MiB 定长（改前） | 自适应（改后） |
+|---|---|---|
+| 追赶 86–96 MB / 113–127 万条 | 16.31 / 15.82 / 16.22 / 17.43 / 16.49 MiB/s（中位 **16.31**），22.4–24.1 万条/s | 34.53 / 30.68 / 30.73 / 29.71 / 30.09 / 30.66（中位 **30.66**），41.0–47.7 万条/s |
+| 追平窗口内对副本 `ping`（8 连接） | p50 26–28 / p99 45–87 µs、max 15.8–16.1 ms | p50 20–25 / p99 42–45 µs、max 29.1–38.3 ms |
+| 静置 `ping`（对照） | p50 19–25 / p99 40 µs | p50 20–23 / p99 43–46 µs |
+
+**1.88×**（中位 16.31 → 30.66 MiB/s）。读侧 p50/p99 两组重叠（40–87 µs 的抖动就是
+噪声），4 worker 下读本来就不走提交线程；可分辨的代价只在 `max`：一轮最长占住提交
+线程的时间翻倍（15.8–16.1 → 29.1–38.3 ms）—— 落后很多时用一次长轮换更大的追赶
+速度，这是这笔交易的全部内容。
+
+两件没做的：① 块长只在测试侧可见（`FollowerProgress::fetch_bytes`），`--stats` 那行
+没加字段（要动 `Reply::Stats` 的编码，收益不够）；② 跨机的同口径 A/B 没重跑 ——
+跨机那三格是改前测的，这里只说同机。
 
 ### 6.7 备份与还原（实测三形状，2026-11-19）
 
@@ -2094,10 +2138,11 @@ dentries: BTreeMap<(ViewId, Ino, Vec<u8>), Ino>
 - **两次独立跑的可信区间不一样**：另一次（工具化前的临时脚本）量到 1.64 / 1.77 /
   1.45 / 1.44。w=1 那两档复现到 ±4 %，**可以直接引**；w=8 那两档摆动 1.2–1.5×
   （64 条连接分摊到 8 个 worker 本身就是噪声源），只报区间不报小数。
-- **剩下的头一个**：一页仍有 **104 次堆分配**，其中 100 次是 `Reply::Dirents.names`
-  每个名字一个 `Vec<u8>`。要再往下砍，得让应答直接往连接 `tx` 里编，不要中间造
-  `Vec<Vec<u8>>`。这条排在 §11 的通用表能力之后：端到端默认档已经领先 PG 2.9×，
-  它不再是短板。
+- **~~剩下的头一个~~ 已闭合（2026-11-19，`8e4a4bf`）**：当时一页仍有 **104 次堆分配**，
+  其中 100 次是 `Reply::Dirents.names` 每个名字一个 `Vec<u8>`。改成一块扁平 `blob` +
+  每项起点（`Names`）之后，每页分配固定 **5 次、与 limit 无关**，micro 边际
+  42 → 10.6 ns/条、端到端 readdir **+53%**（§7.5 ③）。再往下只有「直接编进连接
+  `tx`」这一档，只把 5 次压到 2–3 次，已在噪声里。
 
 **顺带被证伪的另一个假设**：`never` 档每 `sync_ms` 无条件 `sync_now()`，怀疑它在
 机械盘上白付 fsync（矩阵 `/data` 那格比 `/tmp` 探针低就是这么解释过的）。加了
@@ -2763,7 +2808,7 @@ gcc -O2 -pthread -o /tmp/lb_floor benches/lb_floor.c && /tmp/lb_floor 1 64 3   #
 
 | 目标 | 数量 | 覆盖 |
 |------|------|------|
-| `--lib` | **64**（+30 属 `postgres-compat`） | codec round-trip（全 tag：55 op / 31 reply）、**fetch 应答的两条长度/计数上限在 decode 处兼得**（`fetch_reply_bounds_are_enforced_on_decode`，§6.6）、**`Log` 全变体 round-trip**、**握手两条 op 的定长字段多一字节少一字节都拒**（`handshake_fixed_fields_reject_wrong_length`，§4.4）、**自写 SHA-256/HMAC 的已知向量 10 条**（FIPS 180-4 与 RFC 4231 逐条对表 + `ct_eq` 长度严格，`src/engine/sha256.rs`）、**`Key::load` 收哪三种形状拒哪三种**（`key_load_is_strict`：32 原始字节**一个字节都不剔**、hex 档忽略尾随换行、全空白与全零拒 —— 那条「不剔」是拿真密钥踩出来的，随机密钥末位正好是 ASCII 空白的概率是 1/64，§4.4）、**`Gate` 的四档进度与双向 MAC**（`gate_gates`、`gate_without_key_is_open`、`macs_are_directional_and_nonce_bound`、`key_debug_does_not_leak_bytes`）、CRC 已知向量、碎帧/超长帧、WAL 帧与截断重放、**预分配空洞重开**（`prealloc_padding_reopens_cleanly`）、**大批次不跳写**（`huge_batch_writes_every_record`）、**交付只到 durable 水位**（`deliver_stops_at_the_durable_watermark_not_the_logical_end`，§6.6 第一条口径）、**hint 命中与退回全扫**（`deliver_streams_forward_with_the_returned_hint` / `deliver_ignores_a_stale_or_absent_hint_and_still_lands_right`）、**跨滑动窗口不丢记录**、**max_bytes 是软上限**（至少给一条 + 逐轮恰好吃完整批）、**两代快照正文逐字节相同**（`legacy_snapshot_decodes_from_the_same_prefix`，§6.5 的前提）、**旧布局写回不能默默丢表**（`legacy_writer_refuses_to_drop_tables`）、**seq 跳号硬错**、状态快照保留 node key、**两层 dentry 与 kind 冗余过快照不坏**（`dentries_are_two_level_and_kind_survives_snapshot`，§7.10）、**通用表行与索引过快照不坏**（`generic_tables_keep_rows_and_rebuild_indexes`，§5.1）、缓冲压缩、租约过期边界、**快照收尾只切割水位以下的记录**（`truncate_before_drops_the_covered_prefix_and_keeps_the_tail`，§8 第 7 条）、**dump 容器的四条自测**（全域往返逐字段相等、容器头独占三个 `next_*`、编解码字节稳定且 CRC 拓坏必拒、未知容器版本点名拒，§6.9）、`default_workers` 上下界 |
+| `--lib` | **69**（+30 属 `postgres-compat`） | codec round-trip（全 tag：55 op / 31 reply）、**fetch 应答的两条长度/计数上限在 decode 处兼得**（`fetch_reply_bounds_are_enforced_on_decode`，§6.6）、**`Log` 全变体 round-trip**、**握手两条 op 的定长字段多一字节少一字节都拒**（`handshake_fixed_fields_reject_wrong_length`，§4.4）、**自写 SHA-256/HMAC 的已知向量 10 条**（FIPS 180-4 与 RFC 4231 逐条对表 + `ct_eq` 长度严格，`src/engine/sha256.rs`）、**`Key::load` 收哪三种形状拒哪三种**（`key_load_is_strict`：32 原始字节**一个字节都不剔**、hex 档忽略尾随换行、全空白与全零拒 —— 那条「不剔」是拿真密钥踩出来的，随机密钥末位正好是 ASCII 空白的概率是 1/64，§4.4）、**`Gate` 的四档进度与双向 MAC**（`gate_gates`、`gate_without_key_is_open`、`macs_are_directional_and_nonce_bound`、`key_debug_does_not_leak_bytes`）、CRC 已知向量、碎帧/超长帧、WAL 帧与截断重放、**预分配空洞重开**（`prealloc_padding_reopens_cleanly`）、**大批次不跳写**（`huge_batch_writes_every_record`）、**交付只到 durable 水位**（`deliver_stops_at_the_durable_watermark_not_the_logical_end`，§6.6 第一条口径）、**hint 命中与退回全扫**（`deliver_streams_forward_with_the_returned_hint` / `deliver_ignores_a_stale_or_absent_hint_and_still_lands_right`）、**跨滑动窗口不丢记录**、**max_bytes 是软上限**（至少给一条 + 逐轮恰好吃完整批）、**两代快照正文逐字节相同**（`legacy_snapshot_decodes_from_the_same_prefix`，§6.5 的前提）、**旧布局写回不能默默丢表**（`legacy_writer_refuses_to_drop_tables`）、**seq 跳号硬错**、状态快照保留 node key、**两层 dentry 与 kind 冗余过快照不坏**（`dentries_are_two_level_and_kind_survives_snapshot`，§7.10）、**通用表行与索引过快照不坏**（`generic_tables_keep_rows_and_rebuild_indexes`，§5.1）、缓冲压缩、租约过期边界、**快照收尾只切割水位以下的记录**（`truncate_before_drops_the_covered_prefix_and_keeps_the_tail`，§8 第 7 条）、**dump 容器的四条自测**（全域往返逐字段相等、容器头独占三个 `next_*`、编解码字节稳定且 CRC 拓坏必拒、未知容器版本点名拒，§6.9）、`default_workers` 上下界、**自适应块长五条**（`net::replicate::tests`：拿不满/浅滞后→配置值、深滞后逐级翻倍并封顶、配置值即上限、以及「恒在 [floor, WAL_FETCH_MAX]」的不变量） |
 | `tests/engine_crud.rs` | **35** | §5.2 全部 POSIX 语义（含 GC 线索、NOREPLACE 与硬链接）+ 控制面（密钥/审计/定义/放置）+ checkpoint 后重开 + 坏尾截断；v0.5.0 新增 3 条硬链接：多名字共享 inode 与字节（含 `drop` 后重开仍是 `nlink = 2`）、五种拒绝各报对应 errno 且不动票数、覆盖其中一个名字只减一票；再往前新增 6 条：4 条盖通用表（表形状校验与表名回收、行写边界/约束/CAS/flags、主键与索引列游标翻页、表状态过 checkpoint+重开），1 条盖 `ReadDirPlus` 与 `ReadDir`+`Getattr` 逐字段对齐，1 条盖 `Stats` 新字段；2026-11-20 又加 2 条：`a_data_dir_refuses_a_second_engine`（同一个目录开第二个引擎必须被拒，且 `drop` 后立刻可开）、`unlink_and_rmdir_report_enotdir_for_a_non_dir_parent`（§5.2 的 `ENOTDIR` 口径）；2026-11-21 又加 2 条旁路快照：`background_snapshot_costs_a_dispatch_not_a_pause`（派工 37.5 µs vs 停轮 23.2 ms @ 20 000 节点，且取水位之后的尾巴必须活过 `truncate_before`）、`explicit_checkpoint_drains_the_background_one_first`（同步 checkpoint 先收掉在编那份，不许两份抢同一个 `.tmp`） |
 | `tests/net_protocol.rs` | **11** | TCP 端到端：CRUD、碎帧、pipeline 保序、并发连接不串扰、超长帧只杀违规者、大回包流式读完、`--stats`/`--checkpoint`/`--shutdown`（含两个磁盘长度与协议版本）、优雅停服后同地址立刻重绑、**通用表 + readdirplus 走 TCP**（1000 行 pipeline、错误帧经网络回真实 errno、8 KiB 收缓冲下大应答完整接回） |
 | `tests/dump_restore.rs` | **4** | §6.9 的目录级闭环：真造一份「每张表都有内容」的状态（视图/目录/文件/硬链接/符号链接/锁/引用/密钥/审计/定义/放置/两张表与行）→ 同步 checkpoint → 再写两条尾巴 → `dump_dir` → 落文件读回 → 导进新目录 → `Engine::open` 重开逐字段相等、`snap_seq == dump.seq`、`wal_records == 0`；**再从目标目录导一次比字节**（确定性）；第二条钉拒绝路径（非空目标拒且一个字节不动、空目录可导、服务在跑时 dump 被锁拒且释放后可导）；第三条钉零票引用不进 dump、`Kind` 与冗余 `Dent::kind` 过重建不变；第四条起**真进程**钉两个命令的退出码契约（0 完成 / 1 拒绝且不动字节 / 2 参数不全，含改一个字节后的 CRC 拒收与「锁解除后立即可导」） |
@@ -2774,7 +2819,7 @@ gcc -O2 -pthread -o /tmp/lb_floor benches/lb_floor.c && /tmp/lb_floor 1 64 3   #
 | `tests/batch.rs` | **6** | §5.1「原子批」的六面：批内顺序可见（`create` 后直接对刚分配的 ino `setattr`，`apply_seq` 只 +1）、一条失败整批不落且父目录三个属性逐字段不变（`msg` 带 `batch op #<i>: `，失败批预留的 ino 被回收）、通用表上同样原子（唯一索引冲突让整批零行）、**整批只占一条 WAL 记录**（把末条记录截到 payload 一半，重开后批内三个子 op 全不在而批前的视图仍在）、纯读批零日志且应答与逐条单发逐字段相等、空/超限/嵌套/控制面四种拒都在 `translate` 层给 `EINVAL` 且在解码层也能拦住越界与嵌套 |
 | `tests/table_alter.rs` | **5** | §5.1「追加列」的五面：旧行全被拉宽到新宽度且新增的 `COL_INDEX` 列索引里每行都有一项（索引计数 `row_index.len()` 把唯一列隐含的索引也算进去）、五类拒绝（不存在/重名/已满 64 列/空名/`COL_UNIQUE`）逐条核 errno 且 `apply_seq` 不动（零日志）、**只占一条 WAL 记录**（从 payload 中间截断重开后仍是旧宽度、旧列一个不少）、`Checkpoint` 与 `dump → restore` 之后新列/旧数据/索引都在且接着能写、同一条 `Log::AddColumn` 手动 `apply` 两次与一次等价 |
 | `tests/auth.rs` | **5** | §4.4 在线协议上的握手形状（MAC 的数学性质与闸门四档在 lib 单测里，不重复）：未握手的连接一个数据 op 也拿不到（**两种 worker 形状各一跑，两条路径拦截点不是同一处代码**）、错密钥被拒但不锁死 + 旧 MAC 重放不上 + 换对密钥能过、带密钥的客户端拒绝降级、未配密钥的服务端一次往返回 `authed: false`（这是 v5 客户端连 v4 形状不卡死的依据）、握手与数据 op 挤同批时**应答次序不能被打乱** |
-| `tests/replication.rs` | **14** | §6.6 的十二件事（十四条用例，端到端那一件两档各一条；主是真进程，副本是测试里的 `Engine` + `Follower`，只有最后三件起真 `treedb-standby`）：主写逐条收敛（ino/属性/readdir 与主对齐）、**主被 `kill -9` 后副本仍答读且不退出**（`replica_errors` 抬、`connected` 落 true→false）、**gap 触发分块重装快照**（4 KiB 块下 ≥ 2 块，且副本落盘的 `state.snap` 与主的逐字节相同）、**副本拒写在引擎层**（五个形状不同的写真 op 全 `EROFS` 且零 logs、零水位推进，而 `ListViews`/`Stats`/`Checkpoint` 放行）、**lag 中途为正、追平归零**（2 KiB/轮喂不饱一批）、**副本重启靠自己的日志接上**（`resyncs == 0`，快照+尾巴那条恢复路径）、端到端两档事件循环同一份断言（`workers=1`/`2`：线上 `EROFS`、`Stats` 新字段过线、追平后读到主的新写）、启动参数三道门（缺 `--primary` / 自己拉自己 / `--fetch-bytes 0` 均退出码 2）、**开了认证的主只有握得上手的副本追得动**（对密钥逐条收敛、错密钥不收敛）；v0.4.0 新增四条 fencing：令牌只升不降/落盘/坏文件不当 0、副本侧四档闸门（含“权力优先于新旧”与它的反面）、**真链路上提权后拒旧主的批**（状态不回滚、仍在答读、`replica_errors` 抬）、`--promote` 离线动作（不开端口、两次 0→1→2、与 `--primary` 同时给退出码 2） |
+| `tests/replication.rs` | **15** | §6.6 的十二件事（十五条用例，端到端那一件两档各一条；主是真进程，副本是测试里的 `Engine` + `Follower`，只有最后三件起真 `treedb-standby`）：主写逐条收敛（ino/属性/readdir 与主对齐）、**主被 `kill -9` 后副本仍答读且不退出**（`replica_errors` 抬、`connected` 落 true→false）、**gap 触发分块重装快照**（4 KiB 块下 ≥ 2 块，且副本落盘的 `state.snap` 与主的逐字节相同）、**副本拒写在引擎层**（五个形状不同的写真 op 全 `EROFS` 且零 logs、零水位推进，而 `ListViews`/`Stats`/`Checkpoint` 放行）、**lag 中途为正、追平归零**（2 KiB/轮喂不饱一批）、**副本重启靠自己的日志接上**（`resyncs == 0`，快照+尾巴那条恢复路径）、端到端两档事件循环同一份断言（`workers=1`/`2`：线上 `EROFS`、`Stats` 新字段过线、追平后读到主的新写）、启动参数三道门（缺 `--primary` / 自己拉自己 / `--fetch-bytes 0` 均退出码 2）、**开了认证的主只有握得上手的副本追得动**（对密钥逐条收敛、错密钥不收敛）；v0.4.0 新增四条 fencing：令牌只升不降/落盘/坏文件不当 0、副本侧四档闸门（含“权力优先于新旧”与它的反面）、**真链路上提权后拒旧主的批**（状态不回滚、仍在答读、`replica_errors` 抬）、`--promote` 离线动作（不开端口、两次 0→1→2、与 `--primary` 同时给退出码 2）；2026-11-22 新增 `the_fetch_block_ramps_while_catching_up_and_returns_to_cfg`（64 条/批播 8 192 个文件，`--fetch-bytes` 32 KiB 下块长峰值放大到 1 MiB、收敛后回落到 32 KiB） |
 | `tests/concurrency.rs` | 0（+7，整文件 feature 门控） | T1 之后整个文件在 `postgres-compat` 后面：无 PG 时跑「拨号失败不漏 live」（1 条，要 feature），其余 6 条 `#[ignore]` 需真实 PG。**它测的是共享池，不是引擎并发**（§7.8）|
 | `tests/scale_connections.rs` | 1（+1 ignored） | 1 000 连接 fd/RSS 断言每次跑；万级（`TREEDB_CONNS`，含 25 000）手动 |
 | `tests/independence.rs` | **3** | 独立性三把门：内核目录（`src/engine`、`src/net`）不出现客户端名字；`[dependencies]` 非 optional 项只能是 `libc` + `thiserror`；`postgres-compat` 不得进 `default`（§11 第 7 条） |
@@ -3623,11 +3668,12 @@ spike 明确**没**做、也不在接入面上假装做的事 —— 一律返�
      把整套用例切到流水线路径）。原判据里的「p99 ≤ 8 ms / 12 k ops/s」在本机不可达，
      因为瓶颈是 64 连接轮转（每 op 一次 fsync、1.3 ms），与是否异步无关 —— 那两个
      数字依赖的是「一轮能合并多少写」，那是批大小的取舍，不是流水线能给的。
-9. **dirents 应答直接编进连接发送缓冲**（§7.10 剩下那一条）：一页仍有 104 次堆
-   分配，100 次来自 `Reply::Dirents.names` 的逐名 `Vec<u8>`。改造点是 encode 侧
-   往调用方给的 `&mut Vec<u8>` 直接写，而不是先造一个 `Vec<Vec<u8>>`。收益只能
-   估（100 次 alloc ≈ 每页 2–3 µs，没实测），所以它排在第 2 条之后（第 6 条已闭合）：
-   默认档读轴已经领先 PG 2.9×，这里不再是短板。
+9. ~~**dirents 应答直接编进连接发送缓冲**~~ **陈旧条目，前提已经不成立**：这条当初
+   的靶子是「`Reply::Dirents.names` 逐名一个 `Vec<u8>`，一页 104 次分配里 100 次来自
+   它」。但 `Names` 早已改成扁平缓冲（`src/engine/model.rs`，名字连着放 + 偏移表），
+   `8e4a4bf` 把每页分配从 104 降到 **5**，边际成本 42 → 10.6 ns/条，端到端 readdir
+   +53%（并发档 +25%，§7.5 ③ 有 micro A/B 表）。剩下的「再直接编进发送缓冲」只把
+   5 次压到 2–3 次，量级已经在噪声里 —— 不再当改进项排。
 10. **两件收尾的活，前一件已完成，后一件仍是本轮主动留下的**：
     - ~~**快照迁移工具**~~ **已完成**（`v0.3.4`，§6.5）：`SNAP_VERSION` 2 → 3 把旧数据
       目录挡在门外那句「升级等于重建」现在有出路了 —— `treedb-migrate` 读旧布局、
