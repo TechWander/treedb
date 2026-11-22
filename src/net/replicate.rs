@@ -188,8 +188,8 @@ impl Follower {
         let rep = match self.call(&op) {
             Ok(r) => r,
             // 传输层断了：丢连接、计数、下轮重连。已有的状态照旧可答读。
-            Err(_) => {
-                self.fail_round(eng, "wal fetch");
+            Err(e) => {
+                self.fail_round(eng, "wal fetch", &e);
                 return Ok(());
             }
         };
@@ -274,8 +274,8 @@ impl Follower {
         };
         let rep = match self.call(&Op::SnapFetch { offset: off, len: cap }) {
             Ok(r) => r,
-            Err(_) => {
-                self.fail_round(eng, "snapshot fetch");
+            Err(e) => {
+                self.fail_round(eng, "snapshot fetch", &e);
                 return Ok(());
             }
         };
@@ -374,12 +374,20 @@ impl Follower {
         });
     }
 
-    /// 一次往来的传输层失败：断连接、计数、下次重连。
-    fn fail_round(&mut self, eng: &mut Engine, what: &str) {
+    /// 一轮失败：丢连接、计数、按退避重连。
+    ///
+    /// 错误本体必须打出来 —— 只写「primary lost」会让跨机故障没法归因：
+    /// 超时、对端 RST、协议不符在运维眼里长得一模一样，而它们要改的东西
+    /// 完全不同（调 --timeout-ms / 查网络 / 查版本）。退避期只在第一次打印，
+    /// 避免每轮刷屏。
+    fn fail_round(&mut self, eng: &mut Engine, what: &str, e: &Error) {
         self.client = None;
         eng.note_replica_error();
         if self.backoff_ms == self.cfg.interval_ms.max(1) {
-            eprintln!("treedb-standby: {what} failed, primary {} lost", self.cfg.primary);
+            eprintln!(
+                "treedb-standby: {what} failed, primary {} lost ({e})",
+                self.cfg.primary
+            );
         }
         self.backoff_ms = (self.backoff_ms * 2).min(BACKOFF_MAX_MS);
     }

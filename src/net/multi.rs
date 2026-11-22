@@ -472,6 +472,14 @@ fn worker_loop(
                 continue;
             }
             if ops.is_empty() {
+                // 纯 `EPOLLOUT`（上一个回包把 socket 写满了，这一轮只是「能写了」的
+                // 通知）也会落到这里，因为这类事件本来就没有可读字节。早期实现在
+                // 这里直接 `continue`：写出那一块被跳过，用户态剩下的半个回包就再也
+                // 发不出去 —— 电平触发的 `EPOLLOUT` 还会每轮都来，事件循环变成空转。
+                // 实测形状：跨机拉 1 MiB 快照块时副本只能拿到前 ~110 KiB，之后一直
+                // 读到 `--timeout-ms` 超时（同机 loopback 因为缓冲区一次能吃下整帧，
+                // 根本没走过这条路径，所以一直没有暴露）。
+                flush_on_write(&mut conns, &mut by_id, ep, fd, bits, cnt)?;
                 continue;
             }
 
@@ -577,14 +585,8 @@ fn worker_loop(
                 }
             }
 
-            if bits & libc::EPOLLOUT as u32 != 0 {
-                if let Some(c) = conns.get_mut(&fd) {
-                    if c.flush().is_err() {
-                        drop_conn(&mut conns, &mut by_id, ep, fd, cnt);
-                        continue;
-                    }
-                    c.rearm(ep)?;
-                }
+            if !flush_on_write(&mut conns, &mut by_id, ep, fd, bits, cnt)? {
+                continue;
             }
             if conns
                 .get(&fd)
@@ -628,6 +630,33 @@ fn worker_loop(
     }
     unsafe { libc::close(ep) };
     Ok(())
+}
+
+/// 处理一条连接的 `EPOLLOUT`：接着写、写完把掩码对齐。
+///
+/// 返回 `false` 表示连接在这一步被关掉（写错误），调用方应立即 `continue`。
+/// 之所以抽成一个函数：这条尾巴在两个地方需要 —— 正常事件处理的末尾，以及
+/// 「本轮没有可读字节」的分支（那就是纯 `EPOLLOUT`，跳过它的大回包会永远
+/// 停在用户态）。
+fn flush_on_write(
+    conns: &mut HashMap<i32, Conn>,
+    by_id: &mut HashMap<u64, i32>,
+    ep: i32,
+    fd: i32,
+    bits: u32,
+    cnt: &Arc<Counters>,
+) -> Result<bool> {
+    if bits & libc::EPOLLOUT as u32 == 0 {
+        return Ok(true);
+    }
+    if let Some(c) = conns.get_mut(&fd) {
+        if c.flush().is_err() {
+            drop_conn(conns, by_id, ep, fd, cnt);
+            return Ok(false);
+        }
+        c.rearm(ep)?;
+    }
+    Ok(true)
 }
 
 /// 把 committer 交回的一批成品帧按序填进该连接的 `Slot::Await`。
