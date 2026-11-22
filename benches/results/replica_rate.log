@@ -1,0 +1,135 @@
+
+=============== 2026-11-22 03:26:14  treedb-standby 传送吞吐（rev 62b6fab，§6.6 边界 4）
+
+[1] 冷启动：先在主上造数据，再让空目录副本从 0 追平
+  主      op=create conns=64 threads=64 pipeline=32 → 30308 ops/s over 3.33s | lat us: p50=1182 p90=4619 p99=9900 max=11072 | errors=0
+  主      nodes=101536 seq=304096 snapshot=242080 snap_bytes=10569168 wal_logical=4723136
+  口径    下载字节 = 快照 + WAL 逻辑长度（不含逐块协议头）；快照块长 = --fetch-bytes
+  副本    1 MiB/块（默认）（1048576 B/轮）：端到端 773 ms（其中装快照那一轮 216696 µs）
+          端到端 18.87 MiB/s；扣掉装快照 ≈ 26.22 MiB/s
+  副本    4 MiB/块（WAL_FETCH_MAX）（4194304 B/轮）：端到端 470 ms（其中装快照那一轮 179864 µs）
+          端到端 31.03 MiB/s；扣掉装快照 ≈ 50.27 MiB/s
+  结论    端到端 4 MiB/块是 1 MiB/块的 1.64×（773 → 470 ms）；块长只影响传输段，端到端被装快照主导
+
+[2] 追赶：副本停（目录停在 seq 304096），主攒 3s 的 WAL（--auto-checkpoint-mb 0），再放副本追
+  主      op=create conns=64 threads=64 pipeline=32 → 53303 ops/s over 3.05s | lat us: p50=1047 p90=1850 p99=2821 max=2834 | errors=0
+  堆积    seq 304096 → 791200（+487104 条，WAL 逻辑 +36924704 B，≈ 75.8 B/条）
+  副本    追 487104 条 / 1885 ms → 258411 条/s，≈ 18.68 MiB/s（估算字节 36922483，按 75.8 B/条）
+  口径    这一段是传送 + 副本 apply + 副本 fsync，不含装快照
+  最坏轮  追赶阶段：106948 µs（引擎自报的完整一轮循环上限）
+  落快照  checkpoints 0 → 0（相位内变没变；变了说明最坏轮里含快照）
+  摘要    recovered 0 wal recs (133 ms, snap 304096) | accepted 30 refused 0 peak 1 | rounds 38 worst 106948 us | ops 29 writes 0 syncs 0 avg 0 us | checkpoints 1 | replica applied 487104 lag 0 resyncs 0 errors 0（摘要里的 checkpoints 1 是停服补的那一次，不在相位内）
+  基线    稳态起跑：lag 0（seq 791200）
+
+[3] 稳态追平：主持续写 3s（create，64 连接，pipeline 32），副本同步采样
+  主      op=create conns=64 threads=64 pipeline=32 → 52255 ops/s over 3.05s | lat us: p50=1155 p90=1597 p99=2119 max=2145 | errors=0
+  产出    主 seq +477696 条 / 3401 ms → 140458 条/s（副本同期 applied 140627 条/s）
+  副本    applied +478272 条；lag 中位 10994、最大 45376（13 个采样，200 ms/个）
+  收尾    负载停后 135 ms 追平（lag 0）
+  最坏轮  稳态阶段：184393 µs（引擎自报的完整一轮循环上限）
+  落快照  checkpoints 0 → 0（相位内变没变；变了说明最坏轮里含快照）
+  摘要    recovered 0 wal recs (313 ms, snap 791200) | accepted 24 refused 0 peak 1 | rounds 54 worst 184393 us | ops 23 writes 0 syncs 0 avg 0 us | checkpoints 1 | replica applied 478272 lag 0 resyncs 0 errors 0（摘要里的 checkpoints 1 是停服补的那一次，不在相位内）
+  基线    读侧压测起跑：lag 0（seq 1269472）
+
+[4] 追平期间的读侧代价（代理指标：同机对副本打 ping，8 连接 pipeline 1）
+  静置    op=ping conns=8 threads=8 pipeline=1 → 343246 ops/s over 3.00s | lat us: p50=22 p90=28 p99=35 max=2505 | errors=0
+  追平中  op=ping conns=8 threads=8 pipeline=1 → 293106 ops/s over 3.00s | lat us: p50=25 p90=32 p99=45 max=14690 | errors=0（同期 lag 中位 0）
+  结论    p50 +13%（22 → 25 µs）、p99 +28%（35 → 45 µs）；同机 CPU 竞争计入
+  注意    这是「tick 占住循环」的对外可见代价，不是 tick 时长本身；下一行有引擎自报的最坏一轮
+  收尾    压测停后 279 ms 追平（lag 0）
+  最坏轮  读侧压测阶段：177732 µs（引擎自报的完整一轮循环上限）
+  落快照  checkpoints 0 → 0（相位内变没变；变了说明最坏轮里含快照）
+  摘要    recovered 0 wal recs (504 ms, snap 1269472) | accepted 51 refused 0 peak 9 | rounds 219 worst 177732 us | ops 1909103 writes 0 syncs 0 avg 0 us | checkpoints 1 | replica applied 758688 lag 0 resyncs 0 errors 0（摘要里的 checkpoints 1 是停服补的那一次，不在相位内）
+
+说明：所有格子都在同一台机器、同一块盘上跑（主与副本共用 CPU 与 IO），
+     数字回答的是「本机形状下能不能跟上」，不是跨机网络的基准。
+
+=============== 2026-11-22 03:26:41  treedb-standby 传送吞吐（rev 62b6fab，§6.6 边界 4）
+
+[1] 冷启动：先在主上造数据，再让空目录副本从 0 追平
+  主      op=create conns=64 threads=64 pipeline=32 → 36132 ops/s over 3.01s | lat us: p50=920 p90=4142 p99=16234 max=16239 | errors=0
+  主      nodes=109248 seq=327232 snapshot=279328 snap_bytes=12214608 wal_logical=3650272
+  口径    下载字节 = 快照 + WAL 逻辑长度（不含逐块协议头）；快照块长 = --fetch-bytes
+  副本    1 MiB/块（默认）（1048576 B/轮）：端到端 750 ms（其中装快照那一轮 199150 µs）
+          端到端 20.17 MiB/s；扣掉装快照 ≈ 27.47 MiB/s
+  副本    4 MiB/块（WAL_FETCH_MAX）（4194304 B/轮）：端到端 420 ms（其中装快照那一轮 206474 µs）
+          端到端 36.02 MiB/s；扣掉装快照 ≈ 70.86 MiB/s
+  结论    端到端 4 MiB/块是 1 MiB/块的 1.79×（750 → 420 ms）；块长只影响传输段，端到端被装快照主导
+
+[2] 追赶：副本停（目录停在 seq 327232），主攒 3s 的 WAL（--auto-checkpoint-mb 0），再放副本追
+  主      op=create conns=64 threads=64 pipeline=32 → 54758 ops/s over 3.03s | lat us: p50=1053 p90=1574 p99=2066 max=2109 | errors=0
+  堆积    seq 327232 → 825376（+498144 条，WAL 逻辑 +37766592 B，≈ 75.8 B/条）
+  副本    追 498144 条 / 2055 ms → 242406 条/s，≈ 17.52 MiB/s（估算字节 37759315，按 75.8 B/条）
+  口径    这一段是传送 + 副本 apply + 副本 fsync，不含装快照
+  最坏轮  追赶阶段：112944 µs（引擎自报的完整一轮循环上限）
+  落快照  checkpoints 0 → 0（相位内变没变；变了说明最坏轮里含快照）
+  摘要    recovered 0 wal recs (146 ms, snap 327232) | accepted 32 refused 0 peak 1 | rounds 39 worst 112944 us | ops 31 writes 0 syncs 0 avg 0 us | checkpoints 1 | replica applied 498144 lag 0 resyncs 0 errors 0（摘要里的 checkpoints 1 是停服补的那一次，不在相位内）
+  基线    稳态起跑：lag 0（seq 825376）
+
+[3] 稳态追平：主持续写 3s（create，64 连接，pipeline 32），副本同步采样
+  主      op=create conns=64 threads=64 pipeline=32 → 50544 ops/s over 3.04s | lat us: p50=1182 p90=1726 p99=2497 max=2520 | errors=0
+  产出    主 seq +461088 条 / 3308 ms → 139386 条/s（副本同期 applied 135819 条/s）
+  副本    applied +449288 条；lag 中位 5812、最大 28709（13 个采样，200 ms/个）
+  收尾    负载停后 150 ms 追平（lag 0）
+  最坏轮  稳态阶段：197718 µs（引擎自报的完整一轮循环上限）
+  落快照  checkpoints 0 → 0（相位内变没变；变了说明最坏轮里含快照）
+  摘要    recovered 0 wal recs (325 ms, snap 825376) | accepted 24 refused 0 peak 1 | rounds 51 worst 197718 us | ops 23 writes 0 syncs 0 avg 0 us | checkpoints 1 | replica applied 461472 lag 0 resyncs 0 errors 0（摘要里的 checkpoints 1 是停服补的那一次，不在相位内）
+  基线    读侧压测起跑：lag 0（seq 1286848）
+
+[4] 追平期间的读侧代价（代理指标：同机对副本打 ping，8 连接 pipeline 1）
+  静置    op=ping conns=8 threads=8 pipeline=1 → 381600 ops/s over 3.00s | lat us: p50=20 p90=27 p99=37 max=3826 | errors=0
+  追平中  op=ping conns=8 threads=8 pipeline=1 → 336707 ops/s over 3.00s | lat us: p50=20 p90=31 p99=41 max=14041 | errors=0（同期 lag 中位 4152）
+  结论    p50 +0%（20 → 20 µs）、p99 +10%（37 → 41 µs）；同机 CPU 竞争计入
+  注意    这是「tick 占住循环」的对外可见代价，不是 tick 时长本身；下一行有引擎自报的最坏一轮
+  收尾    压测停后 369 ms 追平（lag 0）
+  最坏轮  读侧压测阶段：181572 µs（引擎自报的完整一轮循环上限）
+  落快照  checkpoints 0 → 0（相位内变没变；变了说明最坏轮里含快照）
+  摘要    recovered 0 wal recs (512 ms, snap 1286848) | accepted 51 refused 0 peak 9 | rounds 214 worst 181572 us | ops 2154973 writes 0 syncs 0 avg 0 us | checkpoints 1 | replica applied 764640 lag 0 resyncs 0 errors 0（摘要里的 checkpoints 1 是停服补的那一次，不在相位内）
+
+说明：所有格子都在同一台机器、同一块盘上跑（主与副本共用 CPU 与 IO），
+     数字回答的是「本机形状下能不能跟上」，不是跨机网络的基准。
+
+=============== 2026-11-22 03:27:09  treedb-standby 传送吞吐（rev 62b6fab，§6.6 边界 4）
+
+[1] 冷启动：先在主上造数据，再让空目录副本从 0 追平
+  主      op=create conns=64 threads=64 pipeline=32 → 34777 ops/s over 3.16s | lat us: p50=986 p90=4466 p99=16048 max=16079 | errors=0
+  主      nodes=110496 seq=330976 snapshot=300352 snap_bytes=13139696 wal_logical=2335136
+  口径    下载字节 = 快照 + WAL 逻辑长度（不含逐块协议头）；快照块长 = --fetch-bytes
+  副本    1 MiB/块（默认）（1048576 B/轮）：端到端 696 ms（其中装快照那一轮 201619 µs）
+          端到端 21.20 MiB/s；扣掉装快照 ≈ 29.85 MiB/s
+  副本    4 MiB/块（WAL_FETCH_MAX）（4194304 B/轮）：端到端 397 ms（其中装快照那一轮 187796 µs）
+          端到端 37.17 MiB/s；扣掉装快照 ≈ 70.54 MiB/s
+  结论    端到端 4 MiB/块是 1 MiB/块的 1.75×（696 → 397 ms）；块长只影响传输段，端到端被装快照主导
+
+[2] 追赶：副本停（目录停在 seq 330976），主攒 3s 的 WAL（--auto-checkpoint-mb 0），再放副本追
+  主      op=create conns=64 threads=64 pipeline=32 → 55783 ops/s over 3.03s | lat us: p50=1082 p90=1598 p99=2061 max=2080 | errors=0
+  堆积    seq 330976 → 838528（+507552 条，WAL 逻辑 +38477376 B，≈ 75.8 B/条）
+  副本    追 507552 条 / 2156 ms → 235414 条/s，≈ 17.02 MiB/s（估算字节 38472442，按 75.8 B/条）
+  口径    这一段是传送 + 副本 apply + 副本 fsync，不含装快照
+  最坏轮  追赶阶段：132546 µs（引擎自报的完整一轮循环上限）
+  落快照  checkpoints 0 → 0（相位内变没变；变了说明最坏轮里含快照）
+  摘要    recovered 0 wal recs (146 ms, snap 330976) | accepted 31 refused 0 peak 1 | rounds 41 worst 132546 us | ops 30 writes 0 syncs 0 avg 0 us | checkpoints 1 | replica applied 507552 lag 0 resyncs 0 errors 0（摘要里的 checkpoints 1 是停服补的那一次，不在相位内）
+  基线    稳态起跑：lag 0（seq 838528）
+
+[3] 稳态追平：主持续写 3s（create，64 连接，pipeline 32），副本同步采样
+  主      op=create conns=64 threads=64 pipeline=32 → 48096 ops/s over 3.03s | lat us: p50=1244 p90=1899 p99=3383 max=3395 | errors=0
+  产出    主 seq +436512 条 / 3305 ms → 132076 条/s（副本同期 applied 131107 条/s）
+  副本    applied +433310 条；lag 中位 24151、最大 32124（12 个采样，200 ms/个）
+  收尾    负载停后 136 ms 追平（lag 0）
+  最坏轮  稳态阶段：192462 µs（引擎自报的完整一轮循环上限）
+  落快照  checkpoints 0 → 0（相位内变没变；变了说明最坏轮里含快照）
+  摘要    recovered 0 wal recs (328 ms, snap 838528) | accepted 23 refused 0 peak 1 | rounds 52 worst 192462 us | ops 22 writes 0 syncs 0 avg 0 us | checkpoints 1 | replica applied 437088 lag 0 resyncs 0 errors 0（摘要里的 checkpoints 1 是停服补的那一次，不在相位内）
+  基线    读侧压测起跑：lag 0（seq 1275616）
+
+[4] 追平期间的读侧代价（代理指标：同机对副本打 ping，8 连接 pipeline 1）
+  静置    op=ping conns=8 threads=8 pipeline=1 → 326779 ops/s over 3.00s | lat us: p50=24 p90=28 p99=46 max=3692 | errors=0
+  追平中  op=ping conns=8 threads=8 pipeline=1 → 317764 ops/s over 3.00s | lat us: p50=20 p90=29 p99=54 max=20387 | errors=0（同期 lag 中位 20419）
+  结论    p50 -16%（24 → 20 µs）、p99 +17%（46 → 54 µs）；同机 CPU 竞争计入
+  注意    这是「tick 占住循环」的对外可见代价，不是 tick 时长本身；下一行有引擎自报的最坏一轮
+  收尾    压测停后 378 ms 追平（lag 0）
+  最坏轮  读侧压测阶段：261889 µs（引擎自报的完整一轮循环上限）
+  落快照  checkpoints 0 → 0（相位内变没变；变了说明最坏轮里含快照）
+  摘要    recovered 0 wal recs (505 ms, snap 1275616) | accepted 53 refused 0 peak 9 | rounds 218 worst 261889 us | ops 1933689 writes 0 syncs 0 avg 0 us | checkpoints 1 | replica applied 756960 lag 0 resyncs 0 errors 0（摘要里的 checkpoints 1 是停服补的那一次，不在相位内）
+
+说明：所有格子都在同一台机器、同一块盘上跑（主与副本共用 CPU 与 IO），
+     数字回答的是「本机形状下能不能跟上」，不是跨机网络的基准。

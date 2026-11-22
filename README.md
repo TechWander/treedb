@@ -22,6 +22,7 @@ bash benches/throughput_matrix.sh 3 1 2 3 4 5           # 五轴复现，输出�
 bash benches/sync_ratio.sh 3                           # 写路径机制：一次 fsync 摊了多少写
 bash benches/single_conn.sh 3                          # 单连接对标 PG（$PIPE=32 走批量档、$CONNS/$WORKERS 走并发档）
 bash benches/backup_probe.sh 2                         # 备份/还原三形状实测（冷拷贝 / 热拷贝 / 副本目录）
+bash benches/replica_rate.sh 3                         # 副本传送：冷启动 / 追赶积压 / 追平时的读侧 p99
 bash benches/ab_layout.sh <基线 rev>                     # 受控 A/B：只换服务端二进制比引擎改动
 bash benches/default_check.sh                           # 零旗标默认档同格跑 5 次，验默认值真的生效
 bash benches/ab_durability.sh <基线 rev>                  # 写轴 A/B：只换服务端二进制比持久化档
@@ -125,6 +126,13 @@ dump 走的是日志标签表（`Log`，1..=24；`LOG_BATCH` 23 与 `LOG_ADD_COL
 目录里有什么就先用什么：冷启动先向主要一份快照，之后按 seq 追 WAL；追上之前对读的
 答案是「空库」而不是报错。写拿 `EROFS`，主挂了副本照答读。拉取式、异步、
 无读己之写 —— 边界与没做到的四条见 [DESIGN.md](DESIGN.md) §6.6。
+
+代价也量过了（`bash benches/replica_rate.sh 3`，主副本同机共用一块机械盘，同日连跑
+三次取范围）：10–11 万节点的库冷启动端到端 0.70–0.77 s（默认 1 MiB/块；
+`--fetch-bytes 4194304` 时 0.40–0.47 s），攒下 37 MB 积压 1.9–2.2 s 追平，
+主 4.8–5.2 万 `create`/s 时副本 lag 中位 0.6–2.4 万条、峰值 4.5 万条，停写后
+135–150 ms 归零；追平期间副本 `ping` 的 p50 不动、p99 +11%…+28%。
+没测的是跨机网络，以及它在长期稳态下对主 p99 的影响。
 
 切主是**两步**，中间那一步是这个命令（v0.4.0）：
 
