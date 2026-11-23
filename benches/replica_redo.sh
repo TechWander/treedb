@@ -20,10 +20,16 @@
 #
 # 两个形状（换代负载不同）：
 #   [row]    `rowput`：表的行在快照编码最尾部，换代只动了尾巴 —— 前缀整体可复用；
-#   [create] `create`：`nodes` 条数变了，正文从很前面就分叉 —— crc 对不上，必须
-#            整份重来。这一格证明判据是对内容的，也证明不留用时**没有回归**。
+#   [mid]    `write --ino 中段节点`：正文前半段逐字节不动、后半段分叉 —— 整段 crc
+#            对不上，只有二分才能把前半段留下；
+#   [create] `create`：`nodes` 条数变了，正文从很前面就分叉 —— crc 对不上，二分
+#            也只能留下一个头。这一格证明判据是对内容的，也证明不留用时**没有回归**。
 #
-# 两份二进制：老的是 `c5ff0b7`（前一版，换代即整份重下），新的是当前工作树。
+# 造数据的库用 `--views 1 --view-tag 0` 把 64 个线程的节点全堆进同一棵树：节点在
+# 快照里按 `(view, ino)` 排，只有一棵树时「中段 ino」才真落在正文中段（每个线程
+# 一棵树的话，中段 ino 也在正文的 1/64 处）。
+#
+# 两份二进制：老的是 `43f55b3`（前一笔，探针只判「整段等不等」），新的是当前工作树。
 #
 # 用法：benches/replica_redo.sh [造数据秒数=40] [每臂轮数=3]
 # 结果追加到 benches/results/replica_redo.log；原始日志留在 .spot/redo/<arm>/。
@@ -39,13 +45,17 @@ W=.spot/redo
 P1=${P1:-17841}
 P2=${P2:-17842}
 P3=${P3:-17843}
-OLDREV=${OLDREV:-c5ff0b7}
+OLDREV=${OLDREV:-43f55b3}
 OLDSRC=${OLDSRC:-.spot/redo-oldsrc}
 OLDTGT=${OLDTGT:-.spot/redo-oldtarget}
-# 换代注入点：副本起跑后多久把 WAL 推过阈值。要早于「换代完成时刻 - 一小段」，
-# 让副本在换代时已经下了一截（20 MB/s 下 500 ms ≈ 10 MB）。
-GAP_MS=${GAP_MS:-500}
-PRELOAD=${PRELOAD:-$((1048576 - 8192))}
+# 换代注入点：副本起跑后多久把 WAL 推过阈值。这个数决定「换代时已下多少」，
+# 而 [mid] 要的就是「已下量 > 改动位置」—— 否则前半段一格没变，整段 crc 也对
+# 得上，二分没机会上场。实测换代时刻 ≈ 起跑 + GAP + 1.5 s（编码）；20 MB/s 下
+# 2000 ms 时已下约 70 MB（四成），比改动位置（三成）大一大截。
+GAP_MS=${GAP_MS:-2000}
+# 预装量：只到阈值的一半。它的作用是「让换代那份快照里有东西变」，不是去凑阈值
+# —— 凑阈值留给 push 阶段（那时才知道副本已经下了多少）。
+PRELOAD=${PRELOAD:-524288}
 THRESH=${THRESH:-1048576}
 # 代理的下行限速（字节/秒）。必须明显低于主侧 checkpoint 的编码速率
 # （164 MB 状态约 33 MB/s），否则下载先于换代结束。
@@ -107,12 +117,15 @@ settle() {
 }
 
 # 上一版二进制：`git archive` 到 .spot 里独立编，不碰工作树、不借 target/。
+# 认一个 `.rev` 戳：重复跑时复用，但抄错 OLDREV（或换了基线）就重编 —— 否则旧
+# 目标目录里坐着的可能是另一个 revision 的二进制，A/B 两臂就不成立。
 build_old() {
-    if [ -x "$OLDTGT/release/treedb-standby" ]; then
+    if [ -x "$OLDTGT/release/treedb-standby" ] &&
+        [ "$(cat "$OLDTGT/.rev" 2>/dev/null)" = "$OLDREV" ]; then
         return 0
     fi
     log "  编译旧二进制（$OLDREV → $OLDTGT/release）：开始"
-    rm -rf "$OLDSRC"
+    rm -rf "$OLDSRC" "$OLDTGT"
     mkdir -p "$OLDSRC"
     git archive "$OLDREV" | tar -x -C "$OLDSRC" || return 1
     CARGO_TARGET_DIR="$OLDTGT" cargo build --release \
@@ -120,6 +133,7 @@ build_old() {
         log "  编译旧二进制失败"
         return 1
     }
+    printf '%s\n' "$OLDREV" > "$OLDTGT/.rev"
     log "  编译旧二进制：完成"
 }
 
@@ -135,30 +149,64 @@ seed_state() {
     SRV=$!
     wait_port "$P1" || return 1
     $BIN/treedb-bench --addr 127.0.0.1:"$P1" --op create --conns 64 --threads 64 \
-        --pipeline 32 --secs "$SECS" > "$d/seed.log" 2>&1
+        --views 1 --view-tag 0 --pipeline 32 --secs "$SECS" > "$d/seed.log" 2>&1
     settle
     SEED_NODES=$(s_num "$P1" nodes 3)
     SEED_SEQ=$(s_num "$P1" seq 3)
     SEED_SNAP=$(s_num "$P1" snapshot 3)
     SEED_SSEQ=$(snap_gen "$P1")
+    # 中段节点：实测节点段占快照正文约 7 成、记录长得很均匀，所以 ino 取全量的
+    # 42% 就落在正文三成处（ino=50% 实测 first_diff=35.5%）。取三成而不是正中，
+    # 是为了让「换代时已下量」稳稳压过改动位置（四成 vs 三成）。
+    MID_INO=$((2 + (${SEED_NODES:-0} - 2) * 42 / 100))
     kill -TERM "$SRV" 2>/dev/null
     wait "$SRV" 2>/dev/null
     SRV=""
     log "  种子    nodes=$SEED_NODES seq=$SEED_SEQ snapshot=$SEED_SSEQ snap_bytes=$SEED_SNAP"
 }
 
-# 慢速写：逐行 fsync 的形状 ~200 KB/s，用来把 WAL 顶到「差一点满 1 MB」和随后的
-# 「越过阈值」。换代注入不能更快：越过阈值只要 8 KB，写多了只会让 checkpoint 提前。
-slow_write() { # slow_write OP MAX_SECS
+# 慢速写：逐行 fsync 的形状 ~700 KB/s，用来把 WAL 预装到一半、以及随后的 push
+# 把 WAL 推过 1 MB。换代注入不能更快：越过阈值只要一小段，写多了只会让
+# checkpoint 提前，把「换代时刻」从我们手里抢走。
+slow_write() { # slow_write OP MAX_SECS [EXTRA...]
     $BIN/treedb-bench --addr 127.0.0.1:"$P1" --op "$1" --conns 8 --threads 8 \
-        --pipeline 1 --secs "$2" > "$W/last-slow.log" 2>&1 &
+        --pipeline 1 --secs "$2" ${3:-} > "$W/last-slow.log" 2>&1 &
     LOAD=$!
 }
 
-# 一轮：$1 = 轮次目录，$2 = 二进制目录，$3 = 换代负载的 op。
-# 结果写回 RUN_MS / RUN_GAP / RUN_KEEP / RUN_RESTART / RUN_RESYNCS / RUN_OK。
-one_run() { # one_run DIR BIN OP
-    local d=$1 bin=$2 op=$3
+# 预装一小段 WAL，并保证没有越过阈值。
+#
+# 预装写入就是「换代那份快照里有什么变」的来源；但它不能把 WAL 顶过 1 MB，
+# 否则 checkpoint 在副本开跑之前就发起来了，脚本看到的换代其实是那一次，
+# 「已下多少」就只剩两成多。以前预装到 1 MB − 8 KB，10 ms 的轮询间隔在
+# 700 KB/s 下就能越过 7 KB —— 实测每一轮都越过了。所以留在阈值的一半。
+#
+# 返回 0 = 起点干净；1 = 还是越过了（调用方等 checkpoint 收口后重试）。
+preload() { # preload OP EXTRA
+    local w i=0
+    while [ $i -lt 40 ]; do
+        i=$((i + 1))
+        w=$(s_num "$P1" wal 3)
+        [ -n "$w" ] && [ "$w" -ge "$PRELOAD" ] && break
+        slow_write "$1" 20 "$2"
+        while kill -0 "$LOAD" 2>/dev/null; do
+            w=$(s_num "$P1" wal 3)
+            [ -n "$w" ] && [ "$w" -ge "$PRELOAD" ] && break
+            sleep 0.01
+        done
+        kill "$LOAD" 2>/dev/null
+        wait "$LOAD" 2>/dev/null
+        LOAD=""
+    done
+    w=$(s_num "$P1" wal 3)
+    [ -n "$w" ] && [ "$w" -lt "$THRESH" ] && return 0
+    return 1
+}
+
+# 一轮：$1 = 轮次目录，$2 = 二进制目录，$3 = 换代负载的 op，$4 = 该负载的额外参数。
+# 结果写回 RUN_MS / RUN_GAP / RUN_KEEP / RUN_KEEPB / RUN_RESTART / RUN_RESYNCS / RUN_OK。
+one_run() { # one_run DIR BIN OP [EXTRA]
+    local d=$1 bin=$2 op=$3 extra=${4:-}
     rm -rf "$d"
     mkdir -p "$d"
     cp -a "$W/seed/primary" "$d/primary"
@@ -173,35 +221,15 @@ one_run() { # one_run DIR BIN OP
     THR=$!
     sleep 0.3
 
-    # 预装 WAL 到差一点满 1 MB。中途若已越过阈值（checkpoint 把 WAL 清空），重来。
-    local g0 w g i=0
-    g0=$(snap_gen "$P1")
-    while [ $i -lt 40 ]; do
-        i=$((i + 1))
-        w=$(s_num "$P1" wal 3)
-        if [ -n "$w" ] && [ "$w" -ge "$PRELOAD" ]; then
-            break
+    # 预装一小段 WAL（不过阈值），中途若还是越过了就等 checkpoint 收口重来。
+    local tries=0
+    until preload "$op" "$extra"; do
+        tries=$((tries + 1))
+        if [ $tries -ge 5 ]; then
+            log "  WAL 预装反复越过阈值，放弃这一轮" >&2
+            return 1
         fi
-        slow_write "$op" 20
-        while kill -0 "$LOAD" 2>/dev/null; do
-            w=$(s_num "$P1" wal 3)
-            if [ -n "$w" ] && [ "$w" -ge "$PRELOAD" ]; then
-                break
-            fi
-            if [ "$(snap_gen "$P1")" != "$g0" ]; then
-                break
-            fi
-            sleep 0.01
-        done
-        kill "$LOAD" 2>/dev/null
-        wait "$LOAD" 2>/dev/null
-        LOAD=""
-        if [ "$(snap_gen "$P1")" != "$g0" ]; then
-            # 预装时就越过了阈值：等这次 checkpoint 收口，从零再预装。
-            settle
-            g0=$(snap_gen "$P1")
-            continue
-        fi
+        settle
     done
     WAL0=$(s_num "$P1" wal 3)
     GEN0=$(snap_gen "$P1")
@@ -216,11 +244,13 @@ one_run() { # one_run DIR BIN OP
     local t0
     t0=$(ms_now)
 
-    # 下载一截之后把 WAL 推过 1 MB：换代正好落在下载窗口里。一越过阈值就停写 ——
-    # 再写下去会在第一份 checkpoint 编码期间把 WAL 重新堆满，逼出第二次换代，
-    # 两个形状就不同形了。
-    sleep "0.$(printf '%03d' "$GAP_MS")"
-    slow_write "$op" 20
+    # 下载一截之后把 WAL 推过 1 MB（从一半推到满，约 0.4 s）：换代正好落在
+    # 下载窗口里。一越过阈值就停写 —— 再写下去会在第一份 checkpoint 编码期间
+    # 把 WAL 重新堆满，逼出第二次换代，三个形状就不同形了。
+    # （毫秒要按 1000 进制拆：以前写成 `sleep "0.$GAP_MS"`，
+    # GAP_MS=2000 就变成 0.2 s —— 换代比 push 还早，量到的是预装那一次。）
+    sleep "$(printf '%d.%03d' $((GAP_MS / 1000)) $((GAP_MS % 1000)))"
+    slow_write "$op" 20 "$extra"
 
     local g1 tck="" j=0 pushed=0
     while [ $j -lt 400 ]; do
@@ -269,9 +299,11 @@ one_run() { # one_run DIR BIN OP
     kill -TERM "$REP" 2>/dev/null
     wait "$REP" 2>/dev/null
     REP=""
-    local keep restart resyncs
+    local keep restart resyncs keepb
     keep=$(grep -c "keeping .* already downloaded" "$d/replica.log" 2>/dev/null || true)
     restart=$(grep -c "restarting from 0" "$d/replica.log" 2>/dev/null || true)
+    # 探针判定留了多少字节：「keeping X of Y B already downloaded」。老臂没有这行。
+    keepb=$(sed -n 's/.*keeping \([0-9]*\) of \([0-9]*\) B.*/\1 of \2/p' "$d/replica.log" 2>/dev/null | tail -1)
     resyncs=$(sed -n '$p' "$d/replica.log" | sed -n 's/.*resyncs \([0-9]*\).*/\1/p')
     kill -TERM "$SRV" 2>/dev/null
     wait "$SRV" 2>/dev/null
@@ -283,6 +315,7 @@ one_run() { # one_run DIR BIN OP
     RUN_MS=$ms
     RUN_OK=$ok
     RUN_KEEP=${keep:-0}
+    RUN_KEEPB=${keepb:-none}
     RUN_RESTART=${restart:-0}
     RUN_RESYNCS=${resyncs:-?}
     return 0
@@ -300,18 +333,26 @@ NEW="$BIN"
 OLD="$OLDTGT/release"
 
 log ""
-log "[种子] 两臂共用的起点（$SECS s 造数据）"
+log "[种子] 两臂共用的起点（$SECS s 造数据，单视图）"
 seed_state || exit 1
+log "  中段节点 mid_ino=$MID_INO（[mid] 改它；单视图，ino 42% ≈ 正文三成处）"
 
-for shape in row create; do
+for shape in row mid create; do
     case $shape in
     row)
         op=rowput
-        oplabel="rowput（改动落在快照尾部 → 前缀可留）"
+        extra=""
+        oplabel="rowput（改动落在快照尾部 → 前缀整体可留）"
+        ;;
+    mid)
+        op=write
+        extra="--views 1 --view-tag 0 --ino $MID_INO"
+        oplabel="write ino=$MID_INO（改动落在正文三成处 → 老臂整份重下，二分能留前段）"
         ;;
     create)
         op=create
-        oplabel="create（nodes 条数变了 → 前缀留不下）"
+        extra="--views 1 --view-tag 0"
+        oplabel="create（nodes 条数变了 → 几乎留不下）"
         ;;
     esac
     log ""
@@ -322,13 +363,13 @@ for shape in row create; do
         bin=$NEW
         [ "$arm" = old ] && bin=$OLD
         if [ "$arm" = old ]; then
-            log "  old（$OLDREV，换代即整份重下）"
+            log "  old（$OLDREV，探针只判「整段等不等」，对不上就整份重下）"
         else
-            log "  new（工作树，探针 + 前缀复用）"
+            log "  new（工作树，整段对不上再二分找最长公共前缀）"
         fi
         for r in $(seq 1 "$REPS"); do
-            one_run "$W/$arm-$shape-$r" "$bin" "$op" || exit 1
-            log "    第 $r 轮  端到端 $RUN_MS ms（$RUN_OK）｜换代落在 ${RUN_GAP} ms｜预装 WAL $WAL0 B｜留前缀 $RUN_KEEP、整份重下 $RUN_RESTART｜resyncs $RUN_RESYNCS"
+            one_run "$W/$arm-$shape-$r" "$bin" "$op" "$extra" || exit 1
+            log "    第 $r 轮  端到端 $RUN_MS ms（$RUN_OK）｜换代落在 ${RUN_GAP} ms｜预装 WAL $WAL0 B｜留前缀 $RUN_KEEP 次、留下 $RUN_KEEPB B、整份重下 $RUN_RESTART｜resyncs $RUN_RESYNCS"
             if [ "$arm" = old ]; then
                 OLD_MS[$r]=$RUN_MS
             else
@@ -348,8 +389,11 @@ done
 
 log ""
 log "读数提示："
-log "  - [row] 的「留前缀」行数是撞上的换代次数；老二进制没有这行日志，它的对应"
-log "    行为只能从「端到端 ms」看出来（它每次换代都从 0 重下）。"
-log "  - [create] 改动落在 nodes 条数上，前缀从很前面就分叉：新臂也必须整份重下，"
-log "    时间应当与老臂相当。这一格是「不静默拼错」的反面证据，不是性能数字。"
+log "  - 「留前缀 N 次」是撞上的换代次数，「留下 X of Y B」是探针最后判定的可复用"
+log "    字节数（Y = 换代时已下量）。老臂没有前缀探针，这两列是 none。"
+log "  - [row] 改的是快照最后一段：Y 内的字节逐字节相同，一次探针就能留全部。"
+log "  - [mid] 改的是正文三成处的节点：整段 crc 必然对不上，老臂只能从 0 重下，"
+log "    新臂二分后应留下「改动位置之前的全部」（三成正文），丢掉其余已下部分。"
+log "  - [create] 改动落在 nodes 条数上，正文从很前面就分叉：新臂也几乎留不下，"
+log "    时间应当与老臂相当。这一格是「不静默拼错」的反面证据。"
 log "  - 端到端含 WAL 预装、限速下载、换代与装快照，两臂同形，只比同形状的两臂。"

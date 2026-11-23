@@ -123,11 +123,11 @@ checkpoint 在抹掉 `(from, to]` 之前把这一段原始帧与即将被覆盖�
 按「不改写已推引用」的纪律保留现状：Cargo 解析 git 依赖只看 tag/rev 与 lock 里的
 hash，不看这个字段，所以不影响任何构建；下一次带 API 变更的发版重新对齐。
 
-test 现在分两档报：默认档（纯引擎）`cargo test --release` = **206 passed / 1 ignored**（70 lib +
-35 engine_crud + 14 migrate + 19 replication + 11 net_protocol + 9 pitr + 8 read_scaling
+test 现在分两档报：默认档（纯引擎）`cargo test --release` = **207 passed / 1 ignored**（70 lib +
+35 engine_crud + 14 migrate + 20 replication + 11 net_protocol + 9 pitr + 8 read_scaling
 + 7 crash_recovery + 6 batch + 5 auth + 5 observe + 5 table_alter + 4 dump_restore +
 3 backup_online + 3 independence + 1 large_reply + 1 scale_connections，10k 那条仍
-`#[ignore]`）；`--features postgres-compat` = **237 passed / 7 ignored**，多出的 31 条 = 过渡档自己的 30 条单测 +
+`#[ignore]`）；`--features postgres-compat` = **238 passed / 7 ignored**，多出的 31 条 = 过渡档自己的 30 条单测 +
 `concurrency.rs` 里那条
 不需要 PG 的拨号用例（剩下 6 条要真 PG，默认 `#[ignore]`，不计入 passed）。即 PG 只出现在
 `postgres-compat` 后面的 `src/pool`、`src/store`、
@@ -1407,15 +1407,25 @@ p50 +14% / p90 +15% / 吞吐 −13%，与上一笔的代价同量级。
 （只在测试侧可见，`--stats` 没加字段 —— 理由同上一笔）。两条 eprintln 是给现场用的：
 `keeping X of Y B already downloaded` / `no usable prefix in the Y B ... restarting from 0`。
 
-**集成用例**（`tests/replication.rs` 三条）：
+**集成用例**（`tests/replication.rs`：探针一条 + 换代三形状）：
 
 - `a_snapshot_probe_reports_the_prefix_crc`：offset 0 / 1 / 4096 / 一半 / 整份 / 越界
   六个点上 `prefix_crc == crc32(&raw[..n])`，且 `len > 0` 仍回 `SnapChunk`；
-- `a_snapshot_generation_change_keeps_the_downloaded_prefix`：4000 条 `Batch` 播种、
-  8 KiB 块、下一截后改最后一个节点的 `mode` 再 checkpoint —— 前缀整体可复用，
-  `snap_reused > 0`、`snap_restarts == 0`、`resyncs == 1`，两份快照逐字节相同；
-- `a_snapshot_generation_change_with_a_different_prefix_restarts`：同形状但新建一个文件
-  （`nodes` 条数变了）—— `snap_reused == 0`、`snap_restarts == 1`，仍然收敛、逐字节相同。
+- `a_snapshot_generation_change_keeps_the_downloaded_prefix`（Tail）：4000 条 `Batch`
+  播种 + 一张一行的通用表（它在快照编码的最后一段），下一截后改那一行的值再
+  checkpoint —— 前缀整体可复用，且 `snap_probes == 1`（整段对得上就不二分）；
+- `a_snapshot_generation_change_keeps_the_common_prefix_mid_body`（Mid）：改中段那个
+  节点的 `mode` —— 整段 crc 必然对不上，只有二分能把前半段留下；
+- `a_snapshot_generation_change_with_a_different_prefix_keeps_only_the_head`（Head）：
+  新建一个文件（`nodes` 条数变了）—— 分叉在第 32 字节，`snap_reused` 只剩一个头。
+
+三条换代用例都断言 `resyncs == 1`、拼出来的快照与主的逐字节相同（Tail 另加
+`snap_restarts == 0`，Head 另加 `snap_restarts == 1`）。块长取「整份的四分之一」：
+`next_fetch_bytes` 只在落后超过 4 个块长时才翻倍，于是这条路径固定走 4 个块、块长
+不变 —— 第 3 块结束时正好下了 3/4 且还在下载中，「换代落在下载中段」不再靠机器快慢
+撞出来。断言不写魔法数，而是拿两份快照逐字节比出真实分叉点 `d`：
+`snap_reused <= d`（安全：绝不保留不同的字节）且 `snap_reused * 4 >= d * 3`
+（有效：边界收在 `d` 附近，误差在已下量的 1/256 以内）。
 
 **同机实测**（`benches/replica_redo.sh 40 3`，原始输出 `benches/results/replica_redo.log`）。
 口径：两臂同一份种子（119 万节点、快照 131 MB）；副本从 0 起跑，起跑 500 ms 后把主侧
@@ -1439,10 +1449,64 @@ WAL 推过 1 MB 触发**一次**换代；量「副本进程起 → lag 0」的�
 省下的还大，这一格的正收益需要「下载 > 编码」这个形状，跨机本来就更容易成立，但那是
 推断，不是实测。
 
-一件没做的：探针按 crc 只判「前缀全等」，不做「二分找最长公共前缀」—— 前半段相同、
-后半段分叉的形状（比如在很靠前的目录里加一个条目）仍要整份重下。二分要多发 O(log n)
-次往返，而 `nodes` 区的任何改动都会让前缀在中段断掉，收益面比 `rowput` 这种尾部改动小
-得多；留到有真实形状需要时再说。
+#### 换代重下：二分找最长公共前缀（2026-11-23）
+
+上一条的探针只答「已下这 N 字节整段是否相同」。改正文中段的节点（前半段逐字节相同、
+后半段分叉）时整段 crc 必然对不上，于是那百分之几十已下的前缀也一起扔 —— 上一轮的
+`[create]` 形状就是这类「判据对、但只能答否」的极端（0.98×）。补法是二分：公共前缀
+是单调的（前 k 字节相同 ⇒ 任何更短的也相同），整段 miss 之后再取
+`mid = lo + (hi - lo) / 2`，`lo` 恒为「已知可留」、`hi` 恒为「已知不可留」，直到接壤
+或用完预算 `PREFIX_PROBE_BUDGET = 8`（粒度 = 已下量的 1/256）。
+
+**协议与引擎零改动**：`SnapFetch{offset, len: 0}` 本来就能问任意 offset 的前缀 crc，
+多点几次全在副本侧（`probe_prefix` → `prefix_matches`）。主侧的代价是每次从 0 线性扫
+到 `n`，最坏合计 ≤ 9 × 已下量（上界：二分的各点之和远小于这个数）；slicing-by-8 之后
+1.3 GB/s，95 MB 的已下量上界 0.66 s，而 20 MB/s 下重下这 95 MB 要 4.8 s。分叉越靠后，
+探针花得越多、留下的也越多；分叉越靠前，探针便宜、留下的少 —— 两端都不比「整份重下」
+贵。三条安全边界与上一条相同（内容判据、装快照仍验尾部 crc、混版一律归零），没有
+一处依赖「主的公共前缀有多长」。
+
+`FollowerProgress` 多两个字段：`snap_off`（此刻已下到哪里 —— 原来不带）与
+`snap_probes`（累计探针次数）；两条 eprintln 末尾带上 `(N probes)`，现场能直接看出
+这次换代是「一次就中」还是「二分了 9 次」。
+
+**同机实测**（`benches/replica_redo.sh 40 3`，原始输出
+`benches/results/replica_redo_bisect.log`）。口径与上一条同形，只是种子换成单视图、
+注入点提前到 2000 ms：两臂同一份种子（125 万节点、快照 149 MB / 正文 167 MB）；
+副本经 20 MB/s 限速代理从 0 起跑，起跑 2 s 后把主侧 WAL 从 512 KB 推过 1 MB 触发
+**一次**换代（实测换代落在 4.6–5.2 s，已下 95 MB ≈ 正文 57%）；量「副本进程起 → lag 0」，
+每臂三轮取中位。旧臂是前一笔 `43f55b3`（探针只判整段）。
+
+| 形状（换代负载） | 旧 `43f55b3` | 新（二分） | 比 |
+|---|---|---|---|
+| `rowput`（改动在最后一段） | 10 298 / 10 170 / 10 132 ms，中位 **10 170** | 10 101 / 10 147 / 10 112 ms，中位 **10 112** | 1.01× |
+| `write --ino`（正文 29.8% 处） | 14 836 / 15 231 / 14 975 ms，中位 **14 975** | 12 586 / 12 764 / 12 665 ms，中位 **12 665** | **1.18×** |
+| `create`（正文第 32 字节） | 15 676 / 15 162 / 15 017 ms，中位 **15 162** | 14 988 / 14 899 / 15 148 ms，中位 **14 988** | 1.01× |
+
+三轮 `[mid]` 都留下 49 573 888 of 95 420 416 B（52%），换算成下载时间 2.48 s，与实际
+省的 2.31 s 对得上；留下的字节数比真实分叉点（两份快照逐字节比出来的
+`d = 49 886 009 B`）少 312 KB —— 正好在二分粒度（95 MB / 256 ≈ 373 KB）以内，方向
+永远是「少留一点」，不会多留。`[row]` 与 `[create]` 两格是**快速路径与判据的反面
+证据**：前者一次探针就留全部（1.01×，二分没把这条路径弄慢），后者分叉在第 32 字节、
+二分满 9 次仍判 0（1.01×，不静默拼错）。
+
+**收益的上限是几何的，不是常数的**：能省的字节 = 改动位置之前的已下量。改动在正文
+30%、换代时已下 57%，上界就是 `0.30 × 149 MB ÷ 20 MB/s ≈ 2.2 s`（实测 2.31 s，多出来
+的 0.1 s 是 `d` 落在 29.79% 而非整 30%）。改动落在已下范围之外时一格都省不下：第一
+次校准跑（换代只下了 25%、改动在 35%）两臂都是 1.00× —— 那不是回归，是那一次换代
+本来就没有可丢的字节。
+
+这一轮顺带修掉了 harness 的两个坑，留在这里免得下次再踩：① `PRELOAD` 取
+「1 MB − 8 KB」时，10 ms 的轮询间隔在 700 KB/s 的写速下就能越过阈值 7 KB —— 每个
+轮次都在副本起跑前就触发了 checkpoint，脚本量到的「换代」其实是预装那一次，已下量
+只有两成多；改成预装到阈值的一半，并在预装后断言 `wal < 1 MB`。② 注入点的睡眠写成
+`sleep "0.$GAP_MS"`，`GAP_MS=2000` 就变成 0.2 s —— 换成按 1000 进制拆。上一轮
+`c5ff0b7` 那组表（13.2 → 10.0 s）是在旧 harness 下测的，那是同口径的 A/B，结论不受
+影响；但跨轮直接比绝对值没有意义。
+
+**没做的**：二分只在「整段 miss」之后才启动，`[create]` 那种第 32 字节就分叉的形状
+仍要问满 9 次（上界 0.66 s，远小于重下的 4.8 s），所以没有加「先小步试探」的启发式。
+跨机没跑：理由同上一条（gfs2 上快照段的方差比省下的还大）。
 
 ### 6.7 备份与还原（实测三形状，2026-11-19）
 
@@ -2982,8 +3046,8 @@ pipeline 8 secs 3`，500 行表，auto-checkpoint 关）**：
 ## 9. 测试清单
 
 ```sh
-cargo test --release                            # 默认档（纯引擎），206 条（+1 ignored）
-cargo test --release --features postgres-compat # 加上过渡档，237 条（+7 ignored）
+cargo test --release                            # 默认档（纯引擎），207 条（+1 ignored）
+cargo test --release --features postgres-compat # 加上过渡档，238 条（+7 ignored）
 cargo test --release --lib                      # 只看引擎单测
 cargo test --release --test migrate              # 快照升级：11 条走 API + 3 条真进程跑 CLI（§6.5）
 cargo test --release --test scale_connections -- --ignored   # 万级连接重压（§7.6）；并发数由 TREEDB_CONNS 控制，本机到 25 000 为限（再高是客户端源端口不够）

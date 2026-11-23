@@ -33,6 +33,14 @@ struct Args {
     /// `rowrange` 的区间宽度（键数）。小于页宽（100）时一页装完，大于页宽才会
     /// 走到「区间没走完」那一支。
     range: u64,
+    /// `write` / `lock` 打的 inode。默认 1（根）；给一个中段 ino 就能造出
+    /// 「只改正文中段某个节点」的换代负载（`benches/replica_redo.sh` 的 [mid]）。
+    ino: u64,
+    /// 视图名里的线程号。不给 = 用线程自己的编号（`bench{t}v{v}`，各线程互不
+    /// 干扰）。给了 = 所有线程共用一个视图（`bench{N}v{v}`）—— 多线程把数据都
+    /// 堆进同一棵子树，节点在快照里按 `(view, ino)` 排，于是「改中段 ino」真的
+    /// 落在正文中段；不共用时每个视图只占正文的 1/视图数，中段 ino 也在很前面。
+    view_tag: Option<u32>,
     /// 集群共享密钥：给了就每条连接先跑一次握手（§4.4）。`None` = 不握手，
     /// 与旧版逐字一致 —— 历史基线数字因此仍然可以直接对比。
     auth: Option<std::sync::Arc<treedb::net::auth::Key>>,
@@ -50,6 +58,8 @@ fn parse() -> Args {
         hold: false,
         views: 8,
         range: 64,
+        ino: 1,
+        view_tag: None,
         auth: None,
     };
     let mut i = 1;
@@ -67,6 +77,8 @@ fn parse() -> Args {
             "--pipeline" => args.pipeline = next(&mut i).parse().unwrap_or(1),
             "--views" => args.views = next(&mut i).parse().unwrap_or(8),
             "--range" => args.range = next(&mut i).parse().unwrap_or(64),
+            "--ino" => args.ino = next(&mut i).parse().unwrap_or(1),
+            "--view-tag" => args.view_tag = next(&mut i).parse().ok(),
             "--hold" => args.hold = true,
             "--auth-key-file" => {
                 let p = next(&mut i);
@@ -274,6 +286,8 @@ fn main() {
         let pipeline = args.pipeline;
         let views = args.views;
         let range = args.range;
+        let ino = args.ino;
+        let view_tag = args.view_tag;
         let auth = args.auth.clone();
         let nonce = nonce();
         handles.push(std::thread::spawn(move || {
@@ -290,7 +304,8 @@ fn main() {
             let mut missing: Vec<String> = Vec::new();
             if !row_axis {
                 for v in 0..views {
-                    let name = format!("bench{t}v{v}");
+                    let tag = view_tag.unwrap_or(t as u32);
+                    let name = format!("bench{tag}v{v}");
                     match cs[0].call(&Op::CreateView {
                         name: name.clone().into_bytes(),
                     }) {
@@ -495,7 +510,17 @@ fn main() {
                 } else {
                     vids[(seq as usize) % vids.len()]
                 };
-                let batch = build(&op, view, seq, pipeline, t, nonce, warm_span() as u64, range);
+                let batch = build(
+                    &op,
+                    view,
+                    seq,
+                    pipeline,
+                    t,
+                    nonce,
+                    warm_span() as u64,
+                    range,
+                    ino,
+                );
                 let idx = ci % cs.len();
                 ci += 1;
                 let c = &mut cs[idx];
@@ -571,7 +596,17 @@ fn warm_span() -> usize {
 ///
 /// `nonce` 是本次进程的启动时间：没有它，同一数据目录上重跑 create/key 就
 /// 全在撞 EEXIST，量到的是“已存在”这条早退路径，不是真的建项开销。
-fn build(op: &str, view: u32, seq: u64, n: usize, t: usize, nonce: u64, span: u64, rw: u64) -> Vec<Op> {
+fn build(
+    op: &str,
+    view: u32,
+    seq: u64,
+    n: usize,
+    t: usize,
+    nonce: u64,
+    span: u64,
+    rw: u64,
+    ino: u64,
+) -> Vec<Op> {
     let mut v = Vec::with_capacity(n);
     for k in 0..n as u64 {
         let s = seq + k;
@@ -591,7 +626,7 @@ fn build(op: &str, view: u32, seq: u64, n: usize, t: usize, nonce: u64, span: u6
             },
             "write" => Op::Setattr {
                 view,
-                ino: 1,
+                ino,
                 valid: 1 << 6, // SA_DATA_REF
                 mode: 0,
                 uid: 0,
@@ -607,7 +642,7 @@ fn build(op: &str, view: u32, seq: u64, n: usize, t: usize, nonce: u64, span: u6
             },
             "lock" => Op::LockSet {
                 view,
-                ino: 1,
+                ino,
                 owner: format!("owner{t}").into_bytes(),
                 verb: 0,
                 kind: 1,
@@ -759,6 +794,11 @@ treedb-bench — 对 treedb-server 打负载
   --secs N           持续秒数（默认 5）
   --views N          每线程视图数（默认 8）
   --range N          rowrange 的区间宽度（默认 64）
+  --ino N            write/lock 打的 inode（默认 1 = 根）。给一个中段 ino 就是
+                     「只改正文中段某个节点」的换代负载（replica_redo.sh 的 [mid]）
+  --view-tag N       视图名用 bench<N>v* 而不是 bench<线程号>v*：所有线程共用
+                     一个视图。造数据时用它把整份快照压进一棵子树，中段 ino 才
+                     真落在正文中段
   --hold             只建立 N 条连接并保持，用于量服务端 RSS
   --auth-key-file P  每条连接先用这把密钥跑一次握手（§4.4）。不给 = 不握手。
                      服务端必须开着同一把密钥，否则报错退出（客户端

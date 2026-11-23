@@ -88,9 +88,12 @@ pub struct Follower {
     /// 换代时从手里那半份里**留下来**的字节（累计）与整份重下的次数。
     ///
     /// 只给测试与 `progress` 看，不进 `Stats`：后者是线协议的一帧，加字段就得
-    /// 抬 `PROTOCOL_VERSION`（§4.1），而这两个数的读者只有运维和用例。
+    /// 抬 `PROTOCOL_VERSION`（§4.1），而这三个数的读者只有运维和用例。
     snap_reused: u64,
     snap_restarts: u64,
+    /// 换代探针累计问了几次（含「整段是否相同」那一次）。二分让这个数从 1 变成
+    /// 最多 `1 + PREFIX_PROBE_BUDGET`；只给 `progress` 与用例看。
+    snap_probes: u64,
 }
 
 /// 快照下载的中间状态。
@@ -104,6 +107,17 @@ struct SnapDl {
 }
 
 const BACKOFF_MAX_MS: u64 = 2_000;
+
+/// 一次换代最多额外问主几次前缀 crc（不含「整段是否相同」那一次）。
+///
+/// 每多问一次就把「留/丢」的边界往中间收一格：8 次把粒度收到已下量的 1/256。
+/// 主侧每次都从 0 算到 `n`（[`Engine::snap_prefix_crc`] 是线性扫，slicing-by-8
+/// 之后约 1.3 GB/s），最坏额外代价约 8 × 已下量 —— 130 MB 的快照约 0.8 s，
+/// 仍比整份重下（限速 20 MB/s 下 6.5 s）便宜一个量级。
+///
+/// 分叉越靠后，探针花掉的 crc 越多，但留下的字节也越多，两个方向同阶；
+/// 分叉越靠前，探针越便宜，留下的一格越少。
+pub const PREFIX_PROBE_BUDGET: u32 = 8;
 
 /// 追赶时开始放大块长的滞后量，单位是「配置块长的倍数」。
 ///
@@ -144,6 +158,7 @@ impl Follower {
             cur_bytes,
             snap_reused: 0,
             snap_restarts: 0,
+            snap_probes: 0,
         }
     }
 
@@ -330,8 +345,9 @@ impl Follower {
     /// 翻倍，封顶 `WAL_FETCH_MAX`。
     ///
     /// 下载途中主又 checkpoint 一次（`snap_seq` 变了）是设计里的正常分支：两代
-    /// 的字节不能拼，但**已下过的前缀未必作废** —— 换代时先问主一次前缀 crc
-    /// （[`Follower::probe_prefix`]），能接上就接着下，接不上才从 0 重来。
+    /// 的字节不能拼，但**已下过的前缀未必作废** —— 换代时向主要前缀 crc
+    /// （[`Follower::probe_prefix`]），能接上就接着下；整段对不上时再二分，把
+    /// 「前半段相同、后半段分叉」的那一半也留下。
     fn step_snapshot(&mut self, eng: &mut Engine) -> Result<()> {
         let (off, cap, seen) = {
             let dl = self.snap.as_ref().expect("step_snapshot 只在下载态调用");
@@ -453,53 +469,84 @@ impl Follower {
         Ok(())
     }
 
-    /// 换代之后问主一次：手里这 `off` 字节的前缀在新的一代里是否逐字节相同。
+    /// 换代之后问主：手里这 `off` 字节的前缀在新的一代里到底能留多长。
     ///
-    /// 返回可以留用的前缀长度。发出的是 `SnapFetch { offset: off, len: 0 }` ——
-    /// `len == 0` 在协议里本来就是个空读，这一笔给它加了「顺便把前缀 crc 报上来」
-    /// 的意思（[`Reply::SnapPrefix`]）。旧主不认识这个语义，会回一个空
-    /// `SnapChunk`：任何非 `SnapPrefix` 的答复都当「不能留」，退回整份重下 ——
-    /// 代价是一轮白拉，而不是拼出一份谁都不认识的快照。
+    /// 每次探针是 `SnapFetch { offset: n, len: 0 }`（`len == 0` 在协议里本来就是
+    /// 个空读，这一笔给它加了「顺便把前 n 字节的 crc 报上来」的意思，
+    /// [`Reply::SnapPrefix`]）。旧主不认识这个语义，会回一个空 `SnapChunk`：任何
+    /// 非 `SnapPrefix` 的答复都当「不能留」，退回整份重下 —— 代价是一轮白拉，而
+    /// 不是拼出一份谁都不认识的快照。
     ///
-    /// 两种「对不上」都归零：主已经在算下一代的途中（`snap_seq` 或长度与本块
-    /// 不符），或 crc 不同。返回 0 让调用方从 0 重来。
+    /// 整段对不上不等于一格都留不下。公共前缀是单调的（前 k 字节相同 ⇒ 任何更短
+    /// 的也相同），所以整段 miss 之后再二分：`lo` 恒为「已知可留」、`hi` 恒为
+    /// 「已知不可留」，直到接壤或用完 [`PREFIX_PROBE_BUDGET`]。只有「一次探针只判
+    /// 全等」的年代，改一个中段节点（前半段相同、后半段分叉）也要从 0 重下。
+    ///
+    /// 三种「对不上」都归零：主已经在算下一代的途中（`snap_seq` 或长度与本块
+    /// 不符）、旧主不认识探针、二分到头也没找到。返回 0 让调用方从 0 重来。
     fn probe_prefix(&mut self, off: u64, gen: u64, total: u64) -> Result<u64> {
-        let rep = self.call(&Op::SnapFetch { offset: off, len: 0 })?;
-        let keep = match rep {
-            Reply::SnapPrefix {
-                prefix_crc,
-                total: ptotal,
-                snap_seq: pgen,
-                ..
-            } if pgen == gen && ptotal == total => {
-                let keep = off.min(total);
-                let mine = {
-                    let dl = self.snap.as_ref().expect("下载态");
-                    let n = keep.min(dl.buf.len() as u64) as usize;
-                    crate::engine::wal::crc32(&dl.buf[..n])
-                };
-                if mine == prefix_crc {
-                    keep
-                } else {
-                    0
-                }
+        let cap = off.min(total);
+        // 第一个点就是「已下的整段」：对得上说明一格没变，是最常见的那一支，
+        // 也是唯一不需要二分的一支。
+        let mut lo = 0u64;
+        let mut hi = cap;
+        let mut probes = 1;
+        match self.prefix_matches(cap, gen, total)? {
+            Some(true) => lo = cap,
+            Some(false) => {}
+            None => return Ok(0),
+        }
+        let mut budget = PREFIX_PROBE_BUDGET;
+        while hi - lo > 1 && budget > 0 {
+            let mid = lo + (hi - lo) / 2;
+            budget -= 1;
+            probes += 1;
+            match self.prefix_matches(mid, gen, total)? {
+                Some(true) => lo = mid,
+                Some(false) => hi = mid,
+                // 主在算下一代：这次判据不再属于同一份正文，整段作废。
+                None => return Ok(0),
             }
-            _ => 0,
-        };
+        }
+        let keep = lo;
         if keep == 0 {
             self.snap_restarts += 1;
             eprintln!(
                 "treedb-standby: snapshot generation moved to {gen}, no usable prefix in the \
-                 {off} B already downloaded; restarting from 0"
+                 {cap} B already downloaded; restarting from 0 ({probes} probes)"
             );
         } else {
             self.snap_reused += keep;
             eprintln!(
-                "treedb-standby: snapshot generation moved to {gen}; keeping {keep} of {off} B \
-                 already downloaded"
+                "treedb-standby: snapshot generation moved to {gen}; keeping {keep} of {cap} B \
+                 already downloaded ({probes} probes)"
             );
         }
         Ok(keep)
+    }
+
+    /// 问主一次「前 `n` 字节的 crc 是否与我手里这段相同」。
+    ///
+    /// `Some(..)` 是同一代、同一个 `total` 下的比较结果；`None` 表示判据不可用
+    /// （旧主不认识探针，或主已经在算下一代 —— `snap_seq`/`total` 与本块不符）。
+    fn prefix_matches(&mut self, n: u64, gen: u64, total: u64) -> Result<Option<bool>> {
+        self.snap_probes += 1;
+        let rep = self.call(&Op::SnapFetch { offset: n, len: 0 })?;
+        let (prefix_crc, ptotal, pgen) = match rep {
+            Reply::SnapPrefix {
+                prefix_crc,
+                total,
+                snap_seq,
+                ..
+            } => (prefix_crc, total, snap_seq),
+            _ => return Ok(None),
+        };
+        if pgen != gen || ptotal != total {
+            return Ok(None);
+        }
+        let dl = self.snap.as_ref().expect("下载态");
+        let k = n.min(dl.buf.len() as u64) as usize;
+        Ok(Some(crate::engine::wal::crc32(&dl.buf[..k]) == prefix_crc))
     }
 
     /// 开始一次快照重装。gap 不是错，是「跟不上」，所以这里不抬
@@ -568,8 +615,10 @@ impl Follower {
             connected: self.client.is_some(),
             downloading: self.snap.is_some(),
             fetch_bytes: self.cur_bytes,
+            snap_off: self.snap.as_ref().map(|d| d.off).unwrap_or(0),
             snap_reused: self.snap_reused,
             snap_restarts: self.snap_restarts,
+            snap_probes: self.snap_probes,
         }
     }
 
@@ -600,10 +649,13 @@ pub struct FollowerProgress {
     pub downloading: bool,
     /// 下一轮实际要的负载上限（追赶时会大于配置值，见 [`next_fetch_bytes`]）。
     pub fetch_bytes: u32,
-    /// 快照换代时留下来的字节（累计）与整份重下的次数。两个数只在下载阶段
-    /// 会动；它们不进 `Stats`（那会改线协议），是给用例与排查用的。
+    /// 快照下载的当前偏移（没在下载就是 0）、换代时留下来的字节（累计）、
+    /// 整份重下的次数与总探针次数。它们只在下载阶段会动，不进 `Stats`
+    /// （那会改线协议），是给用例与排查用的。
+    pub snap_off: u64,
     pub snap_reused: u64,
     pub snap_restarts: u64,
+    pub snap_probes: u64,
 }
 
 #[cfg(test)]

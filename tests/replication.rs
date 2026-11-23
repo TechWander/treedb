@@ -27,14 +27,15 @@ use std::time::{Duration, Instant};
 use tempfile::TempDir;
 use treedb::engine::core::SNAP_FILE;
 use treedb::engine::model::{
-    errno, Kind, Node, Op, Reply, MAX_BATCH_OPS, SA_MODE, WAL_FETCH_MAX,
+    errno, ColumnDef, Kind, Node, Op, Reply, TableDef, COND_NONE, MAX_BATCH_OPS, SA_MODE,
+    WAL_FETCH_MAX,
 };
 use treedb::engine::wal::crc32;
 use treedb::engine::{Durability, Engine, FENCE_FILE};
 use treedb::error::Error;
 use treedb::net::auth::Key;
 use treedb::net::client::Client;
-use treedb::net::replicate::{Follower, FollowerProgress, ReplicaCfg};
+use treedb::net::replicate::{Follower, FollowerProgress, ReplicaCfg, PREFIX_PROBE_BUDGET};
 
 // ---------------------------------------------------------------- 驱动脚手架
 
@@ -683,13 +684,25 @@ fn a_snapshot_probe_reports_the_prefix_crc() {
     }
 }
 
-/// 下载途中主换代：已下的前缀能留下就接着下，不能留才从 0 重来。
+/// 换代时改动落在正文的哪一段。
+#[derive(Clone, Copy, PartialEq)]
+enum Change {
+    /// 通用表的一行（快照编码的最后一段）：前缀整体可复用，探针一次就够。
+    Tail,
+    /// 中段某个节点：前半段逐字节相同、后半段分叉 —— 只有二分能留下前半段。
+    Mid,
+    /// 新增一个文件：`nodes` 条数变了，正文从很前面就分叉。
+    Head,
+}
+
+/// 下载途中主换代：已下的前缀能留多长，由两份快照的实际公共前缀说了算。
 ///
-/// 这条把改动钉在「主在下载期间又 checkpoint 了一次」那条路上：它把最后一个
-/// 文件改个 mode 再落快照 —— 节点按 `(view, ino)` 排，最大的 ino 落在正文末尾，
-/// 所以换代只动了尾巴，已下的前缀整体可复用。
-fn generation_change_mid_download(reuse: bool) -> (FollowerProgress, Vec<u8>, Vec<u8>) {
-    const CFG: u32 = 8 * 1024;
+/// 这条把改动钉在「主在下载期间又 checkpoint 了一次」那条路上：节点按
+/// `(view, ino)` 排，`ino` 是入库顺序，所以改最后一个节点只动正文尾部、改中段
+/// 节点只动中段，而新建文件会改 `nodes` 条数、从很前面就分叉。
+///
+/// 返回（进度, 换代前的快照, 副本拼出来的快照, 主换代后的快照）。
+fn generation_change_mid_download(change: Change) -> (FollowerProgress, Vec<u8>, Vec<u8>, Vec<u8>) {
     const N: u32 = 4_000;
     const PER: u32 = MAX_BATCH_OPS as u32;
 
@@ -698,7 +711,11 @@ fn generation_change_mid_download(reuse: bool) -> (FollowerProgress, Vec<u8>, Ve
     let vid = view_id(okc(
         &mut c,
         &Op::CreateView {
-            name: if reuse { "rkeep" } else { "rdrop" }.into(),
+            name: match change {
+                Change::Head => "rdrop",
+                _ => "rkeep",
+            }
+            .into(),
         },
     ));
     for start in (0..N).step_by(PER as usize) {
@@ -714,104 +731,224 @@ fn generation_change_mid_download(reuse: bool) -> (FollowerProgress, Vec<u8>, Ve
             .collect();
         okc(&mut c, &Op::Batch { ops });
     }
+    // 一张通用表 + 一行：它在快照编码的最后一段（tables/rows 在 nodes 与
+    // dentries 之后），所以「改这一行」是真正的尾部改动，与中段改节点分开。
+    okc(
+        &mut c,
+        &Op::TableCreate {
+            def: TableDef {
+                name: b"tailtbl".to_vec(),
+                columns: vec![ColumnDef {
+                    name: b"v".to_vec(),
+                    flags: 0,
+                }],
+            },
+        },
+    );
+    okc(&mut c, &Op::RowPut {
+        table: b"tailtbl".to_vec(),
+        key: b"k".to_vec(),
+        cols: vec![b"x".to_vec()],
+        flags: 0,
+        cond_col: COND_NONE,
+        cond_val: Vec::new(),
+    });
     okc(&mut c, &Op::Checkpoint);
     let snap_len = match okc(&mut c, &Op::Stats) {
         Reply::Stats(s) => s.snap_bytes,
         other => panic!("expected Stats, got {other:?}"),
     };
     assert!(
-        snap_len > 16 * CFG as u64,
+        snap_len > 64 * 1024,
         "这条用例要在一份大快照中途换代：got {snap_len} B"
     );
+    let old = std::fs::read(srv.dir().join(SNAP_FILE)).expect("primary snapshot (generation 0)");
 
+    // 块长取整份的 1/4：`next_fetch_bytes` 只在「落后超过 4 个块」时才翻倍，
+    // 于是这条用例固定走 4 个块、块长不变 —— 第 3 块结束时正好下了 3/4，
+    // 中段的分叉点一定落在已经下过的范围里，而且还有一块没下完（不会刚好装完）。
+    let cfg_bytes = ((snap_len / 4) as u32).clamp(1, 1 << 20);
     let (_tmp, dir) = read_only_dir("rep");
     let mut eng = replica(&dir);
-    let mut f = Follower::new(fcfg(&srv.addr, 1, CFG));
+    let mut f = Follower::new(fcfg(&srv.addr, 1, cfg_bytes));
 
-    // 先下几块：块长已经开始翻倍，说明至少拿满过一块、后面还剩下不少。
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         std::thread::sleep(Duration::from_millis(2));
         f.tick(&mut eng).expect("tick must not be fatal");
         let p = f.progress(&mut eng);
-        if p.downloading && p.fetch_bytes > CFG {
+        if p.snap_off > snap_len * 2 / 3 {
+            assert!(p.downloading, "下载提前装完了，没赶上换代：{p:?}");
             break;
         }
         assert!(Instant::now() < deadline, "下载没有推进：{p:?}");
     }
 
-    if reuse {
-        // 改正文末尾那个节点：前缀不动，只动尾巴。
-        let last = node(okc(
-            &mut c,
-            &Op::Lookup {
-                view: vid,
-                parent: 1,
-                name: format!("f{}", N - 1).into(),
-            },
-        ))
-        .ino;
-        okc(
-            &mut c,
-            &Op::Setattr {
-                view: vid,
-                ino: last,
-                valid: SA_MODE,
-                mode: 0o600,
-                uid: 0,
-                gid: 0,
-                size: 0,
-                atime: 0,
-                mtime: 0,
-                data_ref: Vec::new(),
-                ref_bytes: 0,
-            },
-        );
-    } else {
-        // 再加一个文件：`nodes` 的条数变了，正文从很前面就分叉。
-        okc(
-            &mut c,
-            &Op::Create {
-                view: vid,
-                parent: 1,
-                name: b"zzz".to_vec(),
-                mode: 0o644,
-                uid: 7,
-                gid: 7,
-            },
-        );
+    match change {
+        Change::Tail => {
+            // 改写那一行的值：它在快照最后一段，前面一个字节都不动。
+            okc(&mut c, &Op::RowPut {
+                table: b"tailtbl".to_vec(),
+                key: b"k".to_vec(),
+                cols: vec![b"y".to_vec()],
+                flags: 0,
+                cond_col: COND_NONE,
+                cond_val: Vec::new(),
+            });
+        }
+        Change::Mid => {
+            // 改中段那个节点：它前面那一截在快照里逐字节不动，后面也一样 ——
+            // 整段 crc 必然对不上，但公共前缀停在这条记录上。
+            let mid = node(okc(
+                &mut c,
+                &Op::Lookup {
+                    view: vid,
+                    parent: 1,
+                    name: format!("f{}", N / 2).into(),
+                },
+            ))
+            .ino;
+            set_mode(&mut c, vid, mid);
+        }
+        Change::Head => {
+            // 再加一个文件：`nodes` 的条数变了，正文从很前面就分叉。
+            okc(
+                &mut c,
+                &Op::Create {
+                    view: vid,
+                    parent: 1,
+                    name: b"zzz".to_vec(),
+                    mode: 0o644,
+                    uid: 7,
+                    gid: 7,
+                },
+            );
+        }
     }
     okc(&mut c, &Op::Checkpoint);
 
     let p = converge(&mut f, &mut eng, &srv.log_text());
     let mine = std::fs::read(dir.join(SNAP_FILE)).expect("replica snapshot");
     let theirs = std::fs::read(srv.dir().join(SNAP_FILE)).expect("primary snapshot");
-    (p, mine, theirs)
+    (p, old, mine, theirs)
 }
 
-/// 换代的改动落在正文末尾：已下的前缀逐字节相同，crc 对得上，接着下。
+fn set_mode(c: &mut Client, vid: u32, ino: u64) {
+    okc(
+        c,
+        &Op::Setattr {
+            view: vid,
+            ino,
+            valid: SA_MODE,
+            mode: 0o600,
+            uid: 0,
+            gid: 0,
+            size: 0,
+            atime: 0,
+            mtime: 0,
+            data_ref: Vec::new(),
+            ref_bytes: 0,
+        },
+    );
+}
+
+/// 两份快照第一个不同的字节（没有不同就是较短那份的长度）。
+fn first_diff(a: &[u8], b: &[u8]) -> u64 {
+    let n = a.len().min(b.len());
+    let mut i = 0;
+    while i < n && a[i] == b[i] {
+        i += 1;
+    }
+    i as u64
+}
+
+/// 换代的改动落在正文末尾：已下的前缀逐字节相同，crc 对得上，一次探针就接着下。
 #[test]
 fn a_snapshot_generation_change_keeps_the_downloaded_prefix() {
-    let (p, mine, theirs) = generation_change_mid_download(true);
+    let (p, old, mine, theirs) = generation_change_mid_download(Change::Tail);
+    let d = first_diff(&old, &theirs);
+    assert!(
+        d > old.len() as u64 * 3 / 4,
+        "这条用例要尾部改动：d={d}，len={}",
+        old.len()
+    );
     assert!(
         p.snap_reused > 0,
         "换代之后一格前缀都没留下（restarts {}）",
         p.snap_restarts
     );
+    assert!(
+        p.snap_reused <= d,
+        "留下的 {} B 越过了分叉点 {d}",
+        p.snap_reused
+    );
     assert_eq!(p.snap_restarts, 0, "可复用的前缀不该被判成整份重下");
+    assert_eq!(p.snap_probes, 1, "整段对得上就不该再二分");
     assert_eq!(p.resyncs, 1, "换代不是新的一次重装");
     assert_eq!(mine, theirs, "拼出来的快照必须与主的逐字节相同");
 }
 
-/// 反面：换代改动落在正文开头，前缀对不上就只能从 0 重来 —— 宁可白拉一轮，
+/// 中段分叉：整段 crc 对不上，但前半段逐字节相同 —— 二分把前半段留下。
+///
+/// 断言不猜分叉点：从两份快照直接找第一个不同的字节，`snap_reused` 必须落在它
+/// 之前（安全：绝不保留一个不同的字节）且离它不远（有效：二分确实把边界收到了
+/// 分叉点附近，而不是退回 0）。
+#[test]
+fn a_snapshot_generation_change_keeps_the_common_prefix_mid_body() {
+    let (p, old, mine, theirs) = generation_change_mid_download(Change::Mid);
+    assert_eq!(mine, theirs, "拼出来的快照必须与主的逐字节相同");
+    let d = first_diff(&old, &theirs);
+    assert!(
+        d > old.len() as u64 / 4,
+        "这条用例要中段分叉：d={d}，len={}",
+        old.len()
+    );
+    assert!(
+        p.snap_reused <= d,
+        "留下的 {} B 越过了分叉点 {d}",
+        p.snap_reused
+    );
+    assert!(
+        p.snap_reused * 4 >= d * 3,
+        "二分没把边界收近：留了 {} B，分叉点在 {d}（probes {}）",
+        p.snap_reused,
+        p.snap_probes
+    );
+    assert_eq!(p.snap_restarts, 0, "留下了前缀就不算整份重下");
+    assert!(
+        p.snap_probes > 1 && p.snap_probes <= 1 + PREFIX_PROBE_BUDGET as u64,
+        "探针次数越界：{}",
+        p.snap_probes
+    );
+    assert_eq!(p.resyncs, 1, "换代不是新的一次重装");
+}
+
+/// 反面：换代改动落在正文开头（`nodes` 条数变了），公共前缀只有开头那一小截。
+///
+/// 二分在这里只该留下那个真实的公共头，且绝不允许越过分叉点 —— 宁可重下，
 /// 也不拼一份谁都不认识的快照。
 #[test]
-fn a_snapshot_generation_change_with_a_different_prefix_restarts() {
-    let (p, mine, theirs) = generation_change_mid_download(false);
-    assert_eq!(p.snap_reused, 0, "crc 对不上就不能留");
-    assert_eq!(p.snap_restarts, 1, "前缀作废必须记一次整份重下");
-    assert_eq!(p.resyncs, 1, "重下不算新的一次重装");
+fn a_snapshot_generation_change_with_a_different_prefix_keeps_only_the_head() {
+    let (p, old, mine, theirs) = generation_change_mid_download(Change::Head);
     assert_eq!(mine, theirs, "拼出来的快照必须与主的逐字节相同");
+    let d = first_diff(&old, &theirs);
+    assert!(
+        p.snap_reused <= d,
+        "留下的 {} B 越过了分叉点 {d}",
+        p.snap_reused
+    );
+    assert!(
+        p.snap_reused < old.len() as u64 / 8,
+        "正文从很前面就分叉，不该留下 {} B（整份 {} B）",
+        p.snap_reused,
+        old.len()
+    );
+    assert!(
+        p.snap_probes <= 1 + PREFIX_PROBE_BUDGET as u64,
+        "探针次数越界：{}",
+        p.snap_probes
+    );
+    assert_eq!(p.resyncs, 1, "重下不算新的一次重装");
 }
 
 /// 端到端：`treedb-standby` 进程 + 真客户端。线协议上的 `EROFS` 与
