@@ -123,12 +123,13 @@ checkpoint 在抹掉 `(from, to]` 之前把这一段原始帧与即将被覆盖�
 按「不改写已推引用」的纪律保留现状：Cargo 解析 git 依赖只看 tag/rev 与 lock 里的
 hash，不看这个字段，所以不影响任何构建；下一次带 API 变更的发版重新对齐。
 
-test 现在分两档报：默认档（纯引擎）`cargo test --release` = **212 passed / 2 ignored**（70 lib +
+test 现在分两档报：默认档（纯引擎）`cargo test --release` = **214 passed / 3 ignored**（71 lib +
 38 engine_crud + 14 migrate + 20 replication + 12 net_protocol + 9 pitr + 8 read_scaling
 + 7 crash_recovery + 6 batch + 5 auth + 5 observe + 5 table_alter + 4 dump_restore +
-3 backup_online + 3 independence + 1 large_reply + 1 scale_connections + 1 scale_restore，
-10k 连接与百万节点那两条仍
-`#[ignore]`）；`--features postgres-compat` = **243 passed / 8 ignored**，多出的 31 条 = 过渡档自己的 30 条单测 +
+3 backup_online + 3 independence + 1 large_reply + 1 scale_connections + 1 scale_restore
++ 1 checkpoint_tail，
+万级连接、百万节点、64 MiB 快照收尾那三条仍
+`#[ignore]`）；`--features postgres-compat` = **245 passed / 9 ignored**，多出的 31 条 = 过渡档自己的 30 条单测 +
 `concurrency.rs` 里那条
 不需要 PG 的拨号用例（剩下 6 条要真 PG，默认 `#[ignore]`，不计入 passed）。即 PG 只出现在
 `postgres-compat` 后面的 `src/pool`、`src/store`、
@@ -282,7 +283,7 @@ test 现在分两档报：默认档（纯引擎）`cargo test --release` = **212
 
 | 文件 | 行 | 职责 |
 |------|----|------|
-| `src/engine/wal.rs` | 1325 | WAL 帧格式、CRC32、预分配、group commit、扫描/重放、`reset` 与旁路快照收尾用的 `truncate_before`，外加面向副本的只读交付入口 `deliver`（§6.6、§8 第 7 条）与归档用的定段拷贝 `copy_range` / 整段重读 `read_records`（§6.11） |
+| `src/engine/wal.rs` | 1442 | WAL 帧格式、CRC32、预分配、group commit、扫描/重放、`reset` 与旁路快照收尾用的 `truncate_before`（搬运与扫描都走 1 MiB 缓冲，§8 第 7 条②），外加面向副本的只读交付入口 `deliver`（§6.6）与归档用的定段拷贝 `copy_range` / 整段重读 `read_records`（§6.11） |
 | `src/engine/core.rs` | 1887 | `Engine`：op 入口、durability 分档、同步与旁路 checkpoint（`checkpoint_start/poll/wait`）、`Stats`、只读入口 `exec_read`、副本侧的 `install_snapshot`/`replicate_records`、fencing token（`read_fence`/`raise_fence`/`promote`/`admit_epoch`，§6.6 切主）；外加快照探测与迁移（`probe_snapshot`/`migrate_snapshot`，§6.5），以及离线 dump/load 的目录半边（`dump_dir`/`restore_dump`，与 `write_snapshot` 共用同一处落盘，§6.9），再加归档钩子的挂点（`open_with_archive`/`archive_dir`，§6.11）与过期租约的分批回收 `sweep_expired_locks`（§8 第 17 条） |
 | `src/engine/archive.rs` | 442 | WAL 归档目录（`Archive`：段/快照的自描述命名、`record` 的顺序与 fail-closed 校验）与时间点恢复（`plan_pitr` 选锚点/拼段/查缺口、`pitr_restore` 落成新目录，§6.11） |
 | `src/engine/dump.rs` | 541 | 逻辑 dump 容器：`Dump`/`DumpCounts`、`encode`/`decode`（魔数 + 版本 + 三个 `next_*` + 条数 + 尾部 CRC32）、终态→重建序列的 `state_to_logs`（视图→节点→目录项→…→表→行的三条硬顺序）与文件读写；导出确定性由 `dump → restore → dump` 的字节相等钉住（§6.9） |
@@ -2938,19 +2939,25 @@ pipeline 8 secs 3`，500 行表，auto-checkpoint 关）**：
 
    | 节点数 | 快照 | 插入（单条提交） | checkpoint | 恢复冷 / 热 | 重放 10 万条 | RSS / 峰值 |
    |--------|------|------------------|------------|-------------|--------------|-------------|
-   | 10 万 | 12.5 MB | 0.38 s（263 k op/s） | 71 ms | 94 / 84 ms | 130 ms（2 万条） | 43 / 56 MB |
-   | 100 万 | 124.9 MB | 4.08 s（245 k op/s） | 601 ms | 1 134 / 1 054 ms | 724 ms | 425 / 550 MB |
-   | 300 万 | 374.8 MB | 12.3 s（244 k op/s） | 1 443 ms | 3 818 / 3 364 ms | 858 ms | 1 273 / 1 648 MB |
-   | 1 000 万 | 1 249.3 MB | 41.4 s（241 k op/s） | 4 332 ms | 12 916 / 11 480 ms | 1 173 ms | 4 243 / 5 492 MB |
-
+   | 10 万 | 12.5 MB | 0.37 s（267 k op/s） | 80 ms | 97 / 83 ms | 46 ms（2 万条） | 43 / 57 MB |
+   | 100 万 | 124.9 MB | 3.83 s（261 k op/s） | 1 109 ms | 1 228 / 1 101 ms | 184 ms | 425 / 551 MB |
+   | 300 万 | 374.8 MB | 12.14 s（247 k op/s） | 2 532 ms | 3 764 / 3 335 ms | 319 ms | 1 273 / 1 649 MB |
+   | 1 000 万 | 1 249.3 MB | 41.3 s（242 k op/s） | 8 827 ms | 12 927 / 11 659 ms | 619 ms | 4 243 / 5 493 MB |
+   （本表是 2026-11-23 第二轮。同日早一轮的 checkpoint 一列快约 2×（1 000 万档
+   4 332 ms），重测两遍仍是 8.6–8.8 s，归因未查 —— 同期根盘已用 96%，测试目录
+   落在 /tmp。两轮不可互减，引用请整行取同一轮。）
    三条硬数：① **内存 445–455 B/节点**（RSS，线性到 1 000 万）；② **快照 131 B/节点**，
-   checkpoint 期间峰值 = RSS + 快照大小（编码缓冲，1 000 万档 5 492 MB），编码吞吐
-   ≈ 290 MB/s、0.43–0.60 µs/节点；③ **恢复 ≈ 1.1–1.15 µs/节点**（页缓存热时
-   871 k–1 195 k 节点/s；冷读 1.25 GB 只多 1.4 s，约 11%），尾巴重放 8.5 万–15 万条/秒
-   （随状态变大而下降 —— 每条都要往更大的 dentry 表里插，1 000 万档 85 k/s）。
+   checkpoint 期间峰值 = RSS + 快照大小（编码缓冲，1 000 万档 5 493 MB），编码吞吐
+   ≈ 115–150 MB/s、0.8–1.1 µs/节点；③ **恢复 ≈ 1.0–1.17 µs/节点**（页缓存热时
+   857 k–987 k 节点/s；冷读 1.25 GB 只多 1.1–1.4 s，约 9–11%），尾巴重放
+   13 万–43 万条/秒（随状态变大而下降 —— 每条都要往更大的 dentry 表里插，
+   1 000 万档 13 万/s）。同日把 WAL 的两个读口（`open` 的 scan、`replay` 的
+   scan_each）从逐帧无缓冲读换成 1 MiB 缓冲后，重放 10 万条从 724 / 858 / 1 173 ms
+   降到 184 / 319 / 619 ms（与 §8 第 7 条② 同一笔优化），恢复的冷/热两列基本没动
+   —— 那边的大头是快照解码。
    线性外推到 **1 亿 inode**（外推，未实测）：RSS ≈ 44.5 GB、checkpoint 峰值 ≈ 57.6 GB、
-   快照 ≈ 13.1 GB、重启 ≈ 111–115 s；若一直不 checkpoint，WAL 按 209 B/节点会到
-   20.9 GB。这三个数就是「分层」的触发线：单机内存到 64 GB 就该动手，把 `nodes` 的
+   快照 ≈ 13.1 GB、重启 ≈ 117 s（热）/ 129 s（冷）；若一直不 checkpoint，WAL 按
+   209 B/节点会到 20.9 GB。这三个数就是「分层」的触发线：单机内存到 64 GB 就该动手，把 `nodes` 的
    冷段挪出内存（或换 mmap 快照 + 懒加载）——**分层本轮仍没做**，真上亿级前必须先
    做这一项设计；本轮只把「未量」变成「有数」，顺带把百 MB 级恢复的语义钉进回归板
    （`restore_survives_a_hundred_thousand_nodes`）。
@@ -2979,8 +2986,15 @@ pipeline 8 secs 3`，500 行表，auto-checkpoint 关）**：
    仍有的三条边界：① 一份在编时不派第二份（同一个 `state.snap.tmp`）；② 后台那份
    读盘 + 重放 + 全量编码的总工作量**没有减少**，只是挪出了回合 —— 派工那一刻到
    上一次快照之间的日志越长，后台那段越久；收尾的 `truncate_before` 仍然在提交
-   线程上逐帧读一遍日志（丢掉水位前的），是 O(日志长度)、不是 O(状态) ——
-   64 MB 阈值下这一次整理没有单独测过，但它是「几十毫秒量级」的同一档；③ 退出、显式
+   线程上逐帧读一遍日志（丢掉水位前的），是 O(日志长度)、不是 O(状态)。这一笔
+   2026-11-23 单独量了，原文写的「几十毫秒量级」在**改之前**是错的：老实现一帧
+   两次 `read` 系统调用、保留的记录再把 20 字节头拆成四次 `write_all`，64 MiB /
+   88 万条记录下收尾停 510 ms，尾巴 32 MiB 时 2.7 s（`tests/checkpoint_tail.rs`
+   的端到端计时，`never` 档、状态只有 1 个节点，所以没把编快照的账算进来）。两侧都换
+   1 MiB 缓冲、头一次写完、CRC 复用刚校验过的值之后，同一条路径是 82 / 112 / 267 ms
+   （尾巴 0 / 4 / 32 MiB），`Wal::open` 的 scan 与 `replay` 的 scan_each 同款改进
+   （64 MiB 扫描 664–762 → 59–199 ms，第三轮起 59–144）；剩下的下限是 CRC 本身
+   （64 MiB ≈ 50 ms，slicing-by-8）。③ 退出、显式
    `Checkpoint` 与副本装快照之前都 `checkpoint_wait()` 把它收掉，代价落在该处。
    `auto_checkpoint_bytes` 现在决定的是派工频率，不再决定停轮长短。
 8. **视图名 25 字节上限**：与 grovefs `pg_store::schema_for` 对齐；突破要同步改
@@ -3083,12 +3097,13 @@ pipeline 8 secs 3`，500 行表，auto-checkpoint 关）**：
 ## 9. 测试清单
 
 ```sh
-cargo test --release                            # 默认档（纯引擎），212 条（+2 ignored）
-cargo test --release --features postgres-compat # 加上过渡档，243 条（+8 ignored）
+cargo test --release                            # 默认档（纯引擎），214 条（+3 ignored）
+cargo test --release --features postgres-compat # 加上过渡档，245 条（+9 ignored）
 cargo test --release --lib                      # 只看引擎单测
 cargo test --release --test migrate              # 快照升级：11 条走 API + 3 条真进程跑 CLI（§6.5）
 cargo test --release --test scale_connections -- --ignored   # 万级连接重压（§7.6）；并发数由 TREEDB_CONNS 控制，本机到 25 000 为限（再高是客户端源端口不够）
 TREEDB_RESTORE_NODES=10000000 TREEDB_RESTORE_TAIL=100000 cargo test --release --test scale_restore -- --ignored --nocapture   # 百 MB 到 GB 级快照的恢复成本（§8 第 2 条）
+cargo test --release --test checkpoint_tail -- --ignored --nocapture   # 64 MiB 阈值下快照收尾那一轮的停顿（§8 第 7 条②）
 bash benches/backup_probe.sh 2                  # 备份/还原三形状：冷拷贝、热拷贝、副本目录（§6.7）
 bash benches/throughput_matrix.sh 3             # 五轴吞吐矩阵（默认只跑 1–4）
 bash benches/default_check.sh                   # 零旗标默认档同格重跑 5 次（§7.5）
@@ -3123,7 +3138,7 @@ gcc -O2 -pthread -o /tmp/lb_floor benches/lb_floor.c && /tmp/lb_floor 1 64 3   #
 
 | 目标 | 数量 | 覆盖 |
 |------|------|------|
-| `--lib` | **70**（+30 属 `postgres-compat`） | codec round-trip（全 tag：55 op / 31 reply）、**fetch 应答的两条长度/计数上限在 decode 处兼得**（`fetch_reply_bounds_are_enforced_on_decode`，§6.6）、**`Log` 全变体 round-trip**、**握手两条 op 的定长字段多一字节少一字节都拒**（`handshake_fixed_fields_reject_wrong_length`，§4.4）、**自写 SHA-256/HMAC 的已知向量 10 条**（FIPS 180-4 与 RFC 4231 逐条对表 + `ct_eq` 长度严格，`src/engine/sha256.rs`）、**`Key::load` 收哪三种形状拒哪三种**（`key_load_is_strict`：32 原始字节**一个字节都不剔**、hex 档忽略尾随换行、全空白与全零拒 —— 那条「不剔」是拿真密钥踩出来的，随机密钥末位正好是 ASCII 空白的概率是 1/64，§4.4）、**`Gate` 的四档进度与双向 MAC**（`gate_gates`、`gate_without_key_is_open`、`macs_are_directional_and_nonce_bound`、`key_debug_does_not_leak_bytes`）、CRC 已知向量、**slicing-by-8 与逐字节参考实现的对拍（0..=4096 字节全长度 + 分段喂，§6.6「主侧的账」）**、碎帧/超长帧、WAL 帧与截断重放、**预分配空洞重开**（`prealloc_padding_reopens_cleanly`）、**大批次不跳写**（`huge_batch_writes_every_record`）、**交付只到 durable 水位**（`deliver_stops_at_the_durable_watermark_not_the_logical_end`，§6.6 第一条口径）、**hint 命中与退回全扫**（`deliver_streams_forward_with_the_returned_hint` / `deliver_ignores_a_stale_or_absent_hint_and_still_lands_right`）、**跨滑动窗口不丢记录**、**max_bytes 是软上限**（至少给一条 + 逐轮恰好吃完整批）、**两代快照正文逐字节相同**（`legacy_snapshot_decodes_from_the_same_prefix`，§6.5 的前提）、**旧布局写回不能默默丢表**（`legacy_writer_refuses_to_drop_tables`）、**seq 跳号硬错**、状态快照保留 node key、**两层 dentry 与 kind 冗余过快照不坏**（`dentries_are_two_level_and_kind_survives_snapshot`，§7.10）、**通用表行与索引过快照不坏**（`generic_tables_keep_rows_and_rebuild_indexes`，§5.1）、缓冲压缩、租约过期边界、**快照收尾只切割水位以下的记录**（`truncate_before_drops_the_covered_prefix_and_keeps_the_tail`，§8 第 7 条）、**dump 容器的四条自测**（全域往返逐字段相等、容器头独占三个 `next_*`、编解码字节稳定且 CRC 拓坏必拒、未知容器版本点名拒，§6.9）、`default_workers` 上下界、**自适应块长五条**（`net::replicate::tests`：拿不满/浅滞后→配置值、深滞后逐级翻倍并封顶、配置值即上限、以及「恒在 [floor, WAL_FETCH_MAX]」的不变量） |
+| `--lib` | **71**（+30 属 `postgres-compat`） | codec round-trip（全 tag：55 op / 31 reply）、**fetch 应答的两条长度/计数上限在 decode 处兼得**（`fetch_reply_bounds_are_enforced_on_decode`，§6.6）、**`Log` 全变体 round-trip**、**握手两条 op 的定长字段多一字节少一字节都拒**（`handshake_fixed_fields_reject_wrong_length`，§4.4）、**自写 SHA-256/HMAC 的已知向量 10 条**（FIPS 180-4 与 RFC 4231 逐条对表 + `ct_eq` 长度严格，`src/engine/sha256.rs`）、**`Key::load` 收哪三种形状拒哪三种**（`key_load_is_strict`：32 原始字节**一个字节都不剔**、hex 档忽略尾随换行、全空白与全零拒 —— 那条「不剔」是拿真密钥踩出来的，随机密钥末位正好是 ASCII 空白的概率是 1/64，§4.4）、**`Gate` 的四档进度与双向 MAC**（`gate_gates`、`gate_without_key_is_open`、`macs_are_directional_and_nonce_bound`、`key_debug_does_not_leak_bytes`）、CRC 已知向量、**slicing-by-8 与逐字节参考实现的对拍（0..=4096 字节全长度 + 分段喂，§6.6「主侧的账」）**、碎帧/超长帧、WAL 帧与截断重放、**预分配空洞重开**（`prealloc_padding_reopens_cleanly`）、**大批次不跳写**（`huge_batch_writes_every_record`）、**交付只到 durable 水位**（`deliver_stops_at_the_durable_watermark_not_the_logical_end`，§6.6 第一条口径）、**hint 命中与退回全扫**（`deliver_streams_forward_with_the_returned_hint` / `deliver_ignores_a_stale_or_absent_hint_and_still_lands_right`）、**跨滑动窗口不丢记录**、**max_bytes 是软上限**（至少给一条 + 逐轮恰好吃完整批）、**两代快照正文逐字节相同**（`legacy_snapshot_decodes_from_the_same_prefix`，§6.5 的前提）、**旧布局写回不能默默丢表**（`legacy_writer_refuses_to_drop_tables`）、**seq 跳号硬错**、状态快照保留 node key、**两层 dentry 与 kind 冗余过快照不坏**（`dentries_are_two_level_and_kind_survives_snapshot`，§7.10）、**通用表行与索引过快照不坏**（`generic_tables_keep_rows_and_rebuild_indexes`，§5.1）、缓冲压缩、租约过期边界、**快照收尾只切割水位以下的记录**（`truncate_before_drops_the_covered_prefix_and_keeps_the_tail`，§8 第 7 条）、**dump 容器的四条自测**（全域往返逐字段相等、容器头独占三个 `next_*`、编解码字节稳定且 CRC 拓坏必拒、未知容器版本点名拒，§6.9）、`default_workers` 上下界、**自适应块长五条**（`net::replicate::tests`：拿不满/浅滞后→配置值、深滞后逐级翻倍并封顶、配置值即上限、以及「恒在 [floor, WAL_FETCH_MAX]」的不变量）、**跨缓冲的大记录过一遍裁剪与扫描**（`records_larger_than_the_copy_buffer_survive_compaction_and_scan`，§8 第 7 条②） |
 | `tests/engine_crud.rs` | **38** | §5.2 全部 POSIX 语义（含 GC 线索、NOREPLACE 与硬链接）+ 控制面（密钥/审计/定义/放置）+ checkpoint 后重开 + 坏尾截断；v0.5.0 新增 3 条硬链接：多名字共享 inode 与字节（含 `drop` 后重开仍是 `nlink = 2`）、五种拒绝各报对应 errno 且不动票数、覆盖其中一个名字只减一票；再往前新增 6 条：4 条盖通用表（表形状校验与表名回收、行写边界/约束/CAS/flags、主键与索引列游标翻页、表状态过 checkpoint+重开），1 条盖 `ReadDirPlus` 与 `ReadDir`+`Getattr` 逐字段对齐，1 条盖 `Stats` 新字段；2026-11-20 又加 2 条：`a_data_dir_refuses_a_second_engine`（同一个目录开第二个引擎必须被拒，且 `drop` 后立刻可开）、`unlink_and_rmdir_report_enotdir_for_a_non_dir_parent`（§5.2 的 `ENOTDIR` 口径）；2026-11-21 又加 2 条旁路快照：`background_snapshot_costs_a_dispatch_not_a_pause`（派工 37.5 µs vs 停轮 23.2 ms @ 20 000 节点，且取水位之后的尾巴必须活过 `truncate_before`）、`explicit_checkpoint_drains_the_background_one_first`（同步 checkpoint 先收掉在编那份，不许两份抢同一个 `.tmp`）；2026-11-23 又加 3 条过期租约回收（§8 第 17 条）：`expired_leases_are_reclaimed_and_stay_gone_after_restart`（只删过期那把、永久锁与未到期锁不动、`DelLock` 进了 WAL，重开不复活）、`the_lock_sweep_walks_the_table_in_batches_and_terminates`（2 148 条锁、每轮 ≤ 1 024，四轮内扫完且能收尾）、`the_lock_sweep_never_writes_on_a_replica`（副本返回 `(0,0)`、`seq` 不动、行还在） |
 | `tests/net_protocol.rs` | **12** | TCP 端到端：CRUD、碎帧、pipeline 保序、并发连接不串扰、超长帧只杀违规者、大回包流式读完、`--stats`/`--checkpoint`/`--shutdown`（含两个磁盘长度与协议版本）、优雅停服后同地址立刻重绑、**通用表 + readdirplus 走 TCP**（1000 行 pipeline、错误帧经网络回真实 errno、8 KiB 收缓冲下大应答完整接回）、**过期租约由服务端周期回收**（`--lock-sweep-ms 50` 下 `Stats.locks` 自己从 2 降到 1，客户端一个 op 都不发，永久锁不动） |
 | `tests/dump_restore.rs` | **4** | §6.9 的目录级闭环：真造一份「每张表都有内容」的状态（视图/目录/文件/硬链接/符号链接/锁/引用/密钥/审计/定义/放置/两张表与行）→ 同步 checkpoint → 再写两条尾巴 → `dump_dir` → 落文件读回 → 导进新目录 → `Engine::open` 重开逐字段相等、`snap_seq == dump.seq`、`wal_records == 0`；**再从目标目录导一次比字节**（确定性）；第二条钉拒绝路径（非空目标拒且一个字节不动、空目录可导、服务在跑时 dump 被锁拒且释放后可导）；第三条钉零票引用不进 dump、`Kind` 与冗余 `Dent::kind` 过重建不变；第四条起**真进程**钉两个命令的退出码契约（0 完成 / 1 拒绝且不动字节 / 2 参数不全，含改一个字节后的 CRC 拒收与「锁解除后立即可导」） |
@@ -3138,6 +3153,7 @@ gcc -O2 -pthread -o /tmp/lb_floor benches/lb_floor.c && /tmp/lb_floor 1 64 3   #
 | `tests/concurrency.rs` | 0（+7，整文件 feature 门控） | T1 之后整个文件在 `postgres-compat` 后面：无 PG 时跑「拨号失败不漏 live」（1 条，要 feature），其余 6 条 `#[ignore]` 需真实 PG。**它测的是共享池，不是引擎并发**（§7.8）|
 | `tests/scale_connections.rs` | 1（+1 ignored） | 1 000 连接 fd/RSS 断言每次跑；万级（`TREEDB_CONNS`，含 25 000）手动 |
 | `tests/scale_restore.rs` | 1（+1 ignored） | §8 第 2 条的规模档：10 万节点 + 2 万条尾巴走完「插入 → 同步 checkpoint → 冷/热两次恢复 → 再写尾巴 → 恢复」，钉节点数、`wal_bytes == 0`、随机名字 lookup 命中；百万到千万档（1M/3M/10M）`#[ignore]`，手动跑，打印耗时/内存供 §8 第 2 条引用 |
+| `tests/checkpoint_tail.rs` | 1（+1 ignored） | §8 第 7 条②：后台快照收尾那一轮（`Wal::truncate_before`）的正确性与代价。默认档 4 MiB 触发 + 512 KiB 尾巴，钉「尾巴留下、日志变小、不 checkpoint 直接重开能重放出最后一次 setattr」；64 MiB 档 `#[ignore]`，尾巴 0/4/32 MiB 三档打印耗时并守 1500 ms 回归线（缓冲搬运被退回去就会红） |
 | `tests/independence.rs` | **3** | 独立性三把门：内核目录（`src/engine`、`src/net`）不出现客户端名字；`[dependencies]` 非 optional 项只能是 `libc` + `thiserror`；`postgres-compat` 不得进 `default`（§11 第 7 条） |
 | `tests/migrate.rs` | **14** | §6.5 那四条承诺。11 条直接打 API：v2 样本迁移后 `State` 逐字段相等且 WAL 文件字节不变、重开后每个语义面都能读到（密钥/审计/定义/放置/锁/引用）、尾巴 seq 照搬且发号接着走、幂等重跑不动当前目录、未知版本与「正文配不上版本位」都拒动且零改动、既有备份不被覆盖、迁完的目录能直接用通用表。3 条用 `env!("CARGO_BIN_EXE_treedb-migrate")` 起**真进程**钉退出码（10 / 1 / 0）与输出里的命令、备份路径、回滚步骤 |
 | `tests/observe.rs` | **5** | §7.14 的接入面契约，全部起**真进程**：`--max-conn` 在 `workers = 1` 与 `8` 两种形状下都只放行上限内、第三条起被拒且在册连接不受牵连、日志只打第 1 条、`drop` 后能重新进；prometheus 输出与 `Op::Stats` 逐项对上（稳定项精确相等、计数器只要求 ≥、`fsync_seconds_total ≈ sync_us_total/1e6`）且默认文本档 5 行格式不变；抓不上时只剩一行 `treedb_up 0` 且退出码 1；四种参数错全 exit 2 不产出字节；`--shutdown` 在两种 worker 形状下都得到 ack 且进程干净退出（§7.14 那条真 bug 的回归锁） |
@@ -3467,7 +3483,7 @@ treedb-server --dir /var/lib/treedb --listen 127.0.0.1:7777  # 新二进制现�
 `cargo check --all-targets`、两条窄 feature 门（`remote-only`、
 `remote-only,fuse-bridge`）与整块回归板都在默认档复跑过 ——
 `SKIP_BENCH=1 .build-bin/run_all.sh`：39 个套件、1418 条断言、0 失败，
-`cargo test --release` 212 passed。同一份 `test_treedb.sh` 在默认档二进制上跑
+`cargo test --release` 214 passed。同一份 `test_treedb.sh` 在默认档二进制上跑
 只输出 `SKIP=1`（自跳门是**行为探针**：启一次 `--meta-store treedb://` 看它是否
 拒绝，不能用 `--help` 判，帮助文本在所有 build 里都提 treedb），所以它在板上
 永远记 PASS，不会把一个没有 treedb 的 checkout 弄红。

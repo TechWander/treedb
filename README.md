@@ -16,8 +16,8 @@ cargo build --release                                   # 默认档：依赖只�
 ./target/release/treedb-server --dir /var/lib/treedb --listen 127.0.0.1:7777
 ./target/release/treedb-bench --op lookup --conns 64 --pipeline 32 --secs 3
 
-cargo test --release                                    # 默认档 212 passed / 2 ignored（引擎本体）
-cargo test --release --features postgres-compat        # 243 passed / 8 ignored（含 PG 过渡档）
+cargo test --release                                    # 默认档 214 passed / 3 ignored（引擎本体）
+cargo test --release --features postgres-compat        # 245 passed / 9 ignored（含 PG 过渡档）
 bash benches/throughput_matrix.sh 3 1 2 3 4 5           # 五轴复现，输出进 benches/results/
 bash benches/sync_ratio.sh 3                           # 写路径机制：一次 fsync 摊了多少写
 bash benches/single_conn.sh 3                          # 单连接对标 PG（$PIPE=32 走批量档、$CONNS/$WORKERS 走并发档）

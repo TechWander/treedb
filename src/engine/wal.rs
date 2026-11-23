@@ -35,7 +35,7 @@ use crate::engine::codec::{Rd, W};
 use crate::engine::mem::Log;
 use crate::error::{Error, Result};
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 
@@ -43,6 +43,11 @@ use std::path::{Path, PathBuf};
 pub const HDR: usize = 20;
 /// 单条记录 payload 上限，防损坏头把恢复过程带进天坑。
 pub const MAX_RECORD: u32 = 16 * 1024 * 1024;
+
+/// `truncate_before` 的搬运缓冲：一帧一帧无缓冲读时，64 MiB / 88 万条
+/// 记录要付 176 万次 `read`，提交线程因此停 640 ms（§8 第 7 条② 实测）。
+/// 缓冲之后剩下的下限是 CRC 与逐帧解析本身。
+const COPY_BUF: usize = 1 << 20;
 /// WAL 预分配的起步粒度。
 const PREALLOC_MIN: u64 = 4 << 20;
 /// 预分配单次扩展的上限：倍增到 256 MiB 后按块递增，不一口气把数据目录
@@ -418,11 +423,12 @@ impl Wal {
         if !path.exists() {
             return Ok(());
         }
-        let mut file = OpenOptions::new().read(true).open(path)?;
+        let mut src = BufReader::with_capacity(COPY_BUF, OpenOptions::new().read(true).open(path)?);
         let mut hdr = [0u8; HDR];
+        let mut body: Vec<u8> = Vec::new();
         let mut expect: Option<u64> = None;
         loop {
-            if !read_exact_or_eof(&mut file, &mut hdr)? {
+            if !read_exact_or_eof(&mut src, &mut hdr)? {
                 break;
             }
             let seq = u64::from_le_bytes(hdr[0..8].try_into().unwrap());
@@ -437,8 +443,9 @@ impl Wal {
             if len == 0 {
                 break;
             }
-            let mut body = vec![0u8; len as usize];
-            if !read_exact_or_eof(&mut file, &mut body)? {
+            body.clear();
+            body.resize(len as usize, 0);
+            if !read_exact_or_eof(&mut src, &mut body)? {
                 break;
             }
             if crc32(&body) != crc {
@@ -714,13 +721,24 @@ impl Wal {
     /// 那些字节要么从没写过，要么本身就是未确认的写。
     pub fn truncate_before(&mut self, seq: u64) -> Result<u64> {
         let tmp = self.path.with_extension("wal.tmp");
-        let mut src = OpenOptions::new().read(true).open(&self.path)?;
-        let mut out = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .open(&tmp)?;
-        out.set_len(0)?;
+        // 两侧都带缓冲：以前是一帧一次 `read` 进 header、再一次读 body，
+        // 保留的记录还要拆成四次 `write_all` 写头 + 一次写 body。64 MiB /
+        // 88 万条记录下那是 176 万次 read + 最多 220 万次 write 系统调用，
+        // 实测在提交线程上停 640 ms（尾巴留 32 MiB 时 3.1 s）。帧格式不变，
+        // 只是把同一份搬运从逐系统调用改成分块。
+        let mut src = BufReader::with_capacity(
+            COPY_BUF,
+            OpenOptions::new().read(true).open(&self.path)?,
+        );
+        let mut out = BufWriter::with_capacity(COPY_BUF, {
+            let f = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .open(&tmp)?;
+            f.set_len(0)?;
+            f
+        });
         let mut hdr = [0u8; HDR];
         let mut body: Vec<u8> = Vec::new();
         let mut end = 0u64;
@@ -754,16 +772,23 @@ impl Wal {
                     self.path.display()
                 )));
             }
-            out.write_all(&s.to_le_bytes())?;
-            out.write_all(&crc32(&body).to_le_bytes())?;
-            out.write_all(&(body.len() as u32).to_le_bytes())?;
-            out.write_all(&0u32.to_le_bytes())?;
+            // 头一次写完：crc 刚校验过，重算一遍纯属白烧（尾巴 32 MiB 时
+            // 那是 44 万条记录的第二遍 CRC）。
+            let mut h = [0u8; HDR];
+            h[0..8].copy_from_slice(&s.to_le_bytes());
+            h[8..12].copy_from_slice(&crc.to_le_bytes());
+            h[12..16].copy_from_slice(&(body.len() as u32).to_le_bytes());
+            out.write_all(&h)?;
             out.write_all(&body)?;
             end += (HDR + body.len()) as u64;
             next = s + 1;
             last = s;
             kept += 1;
         }
+        out.flush()?;
+        let out = out
+            .into_inner()
+            .map_err(|e| Error::Io(format!("flush wal compaction tmp: {e}")))?;
         let pre = preallocate(&out, PREALLOC_MIN.max(end));
         // 长度/内容先落定再 rename，与 reset 同一条理由：换名之后新文件就是
         // 唯一的日志，它的扇区与长度必须已经在盘上。
@@ -862,7 +887,7 @@ fn preallocate(f: &File, target: u64) -> std::result::Result<(), i32> {
     }
 }
 
-fn read_exact_or_eof(f: &mut File, buf: &mut [u8]) -> Result<bool> {
+fn read_exact_or_eof<R: Read>(f: &mut R, buf: &mut [u8]) -> Result<bool> {
     let mut got = 0usize;
     while got < buf.len() {
         match f.read(&mut buf[got..]) {
@@ -885,12 +910,16 @@ fn read_exact_or_eof(f: &mut File, buf: &mut [u8]) -> Result<bool> {
 fn scan(file: &mut File) -> Result<(u64, u64)> {
     let mut seq = 0u64;
     let mut off = 0u64;
+    // 与 `truncate_before` 同一笔账：逐帧无缓冲读时 64 MiB / 88 万条记录要付
+    // 176 万次 `read`，实测打开一次日志停 664–762 ms（每次重启都付）。
+    let mut src = BufReader::with_capacity(COPY_BUF, &*file);
     let mut hdr = [0u8; HDR];
+    let mut body: Vec<u8> = Vec::new();
     // 下一条完好记录应有的 seq。第一条把基准定下来（checkpoint 重置后
     // 文件从快照水位+1 开始，所以不能写死 0/1）。
     let mut expect: Option<u64> = None;
     loop {
-        if !read_exact_or_eof(file, &mut hdr)? {
+        if !read_exact_or_eof(&mut src, &mut hdr)? {
             break;
         }
         let s = u64::from_le_bytes(hdr[0..8].try_into().unwrap());
@@ -903,8 +932,9 @@ fn scan(file: &mut File) -> Result<(u64, u64)> {
         if len == 0 {
             break;
         }
-        let mut body = vec![0u8; len as usize];
-        if !read_exact_or_eof(file, &mut body)? {
+        body.clear();
+        body.resize(len as usize, 0);
+        if !read_exact_or_eof(&mut src, &mut body)? {
             break;
         }
         if crc32(&body) != crc {
@@ -1150,6 +1180,27 @@ mod tests {
         assert_eq!(w2.commit(&[log_payload(&put_view(b"v7", 7))]).unwrap(), 7);
         drop(w2);
         assert_eq!(Wal::replay(&p, 0).unwrap(), vec![put_view(b"v7", 7)]);
+    }
+
+    /// 缓冲搬运不能假设「一条记录装得进一个缓冲」：2 MiB 的 payload 会跨三次
+    /// `fill_buf`，裁剪与扫描两条读口都得对同一个文件给出同一结论。
+    #[test]
+    fn records_larger_than_the_copy_buffer_survive_compaction_and_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("t.wal");
+        let big: Vec<u8> = (0..2 * COPY_BUF + 7).map(|i| (i % 251) as u8).collect();
+        let small = log_payload(&put_view(b"tail", 9));
+        let mut w = Wal::open(&p).unwrap().0;
+        w.append_nodur(std::slice::from_ref(&big)).unwrap();
+        let big_seq = w.appended_seq();
+        w.append_nodur(std::slice::from_ref(&small)).unwrap();
+        assert_eq!(w.truncate_before(big_seq).unwrap(), 1, "只该留下尾巴那条");
+        assert_eq!(Wal::replay(&p, 0).unwrap(), vec![put_view(b"tail", 9)]);
+        drop(w);
+        let (w2, last, end) = Wal::open(&p).unwrap();
+        assert_eq!(last, big_seq + 1, "扫描跨缓冲的大记录不能把尾当成坏帧");
+        assert_eq!(end as usize, HDR + small.len());
+        drop(w2);
     }
 
     /// 预分配空洞不能被当成记录：健康日志重开 N 次都得给出同样的结论。
