@@ -123,11 +123,12 @@ checkpoint 在抹掉 `(from, to]` 之前把这一段原始帧与即将被覆盖�
 按「不改写已推引用」的纪律保留现状：Cargo 解析 git 依赖只看 tag/rev 与 lock 里的
 hash，不看这个字段，所以不影响任何构建；下一次带 API 变更的发版重新对齐。
 
-test 现在分两档报：默认档（纯引擎）`cargo test --release` = **211 passed / 1 ignored**（70 lib +
+test 现在分两档报：默认档（纯引擎）`cargo test --release` = **212 passed / 2 ignored**（70 lib +
 38 engine_crud + 14 migrate + 20 replication + 12 net_protocol + 9 pitr + 8 read_scaling
 + 7 crash_recovery + 6 batch + 5 auth + 5 observe + 5 table_alter + 4 dump_restore +
-3 backup_online + 3 independence + 1 large_reply + 1 scale_connections，10k 那条仍
-`#[ignore]`）；`--features postgres-compat` = **242 passed / 7 ignored**，多出的 31 条 = 过渡档自己的 30 条单测 +
+3 backup_online + 3 independence + 1 large_reply + 1 scale_connections + 1 scale_restore，
+10k 连接与百万节点那两条仍
+`#[ignore]`）；`--features postgres-compat` = **243 passed / 8 ignored**，多出的 31 条 = 过渡档自己的 30 条单测 +
 `concurrency.rs` 里那条
 不需要 PG 的拨号用例（剩下 6 条要真 PG，默认 `#[ignore]`，不计入 passed）。即 PG 只出现在
 `postgres-compat` 后面的 `src/pool`、`src/store`、
@@ -2928,11 +2929,31 @@ pipeline 8 secs 3`，500 行表，auto-checkpoint 关）**：
    提交线程，N 再大也只是前端收发包并行，写一旦超过那个核的 compute 能力就该先看
    `worst_round_us`（`Report`）而不是继续加 worker。核数自适应只到“起步值”这一层：
    换机器要重测 §7.5 那张表，别把 8 当常数。
-2. **状态全内存**：恢复时间 = 快照读入 + 尾日志重放。状态规模上限就是内存上限；
-   本轮之后这个规模不再只算 inode —— 通用表的每一行都全量住在 `rows` 里
-   （`row_index` 额外占一份，它不进快照但占内存）。快照多大、重启多少秒
-   **本轮没实测**（现有测试都在 MB 量级以下），真到百 MB / 亿级 inode 或千万级行
-   前要先量，并另设计分层。
+2. **状态全内存**（2026-11-23 已量，分层仍未做）：恢复时间 = 快照读入 + 尾日志重放。
+   状态规模上限就是内存上限；这个规模不只算 inode —— 通用表的每一行都全量住在
+   `rows` 里（`row_index` 额外占一份，它不进快照但占内存）。
+   `tests/scale_restore.rs` 量了 10 万 → 1 000 万节点这条曲线（10 万档进回归板，
+   百万以上手动跑：`TREEDB_RESTORE_DIR=… TREEDB_RESTORE_TAIL=100000 cargo test
+   --release --test scale_restore -- --ignored --nocapture`）：
+
+   | 节点数 | 快照 | 插入（单条提交） | checkpoint | 恢复冷 / 热 | 重放 10 万条 | RSS / 峰值 |
+   |--------|------|------------------|------------|-------------|--------------|-------------|
+   | 10 万 | 12.5 MB | 0.38 s（263 k op/s） | 71 ms | 94 / 84 ms | 130 ms（2 万条） | 43 / 56 MB |
+   | 100 万 | 124.9 MB | 4.08 s（245 k op/s） | 601 ms | 1 134 / 1 054 ms | 724 ms | 425 / 550 MB |
+   | 300 万 | 374.8 MB | 12.3 s（244 k op/s） | 1 443 ms | 3 818 / 3 364 ms | 858 ms | 1 273 / 1 648 MB |
+   | 1 000 万 | 1 249.3 MB | 41.4 s（241 k op/s） | 4 332 ms | 12 916 / 11 480 ms | 1 173 ms | 4 243 / 5 492 MB |
+
+   三条硬数：① **内存 445–455 B/节点**（RSS，线性到 1 000 万）；② **快照 131 B/节点**，
+   checkpoint 期间峰值 = RSS + 快照大小（编码缓冲，1 000 万档 5 492 MB），编码吞吐
+   ≈ 290 MB/s、0.43–0.60 µs/节点；③ **恢复 ≈ 1.1–1.15 µs/节点**（页缓存热时
+   871 k–1 195 k 节点/s；冷读 1.25 GB 只多 1.4 s，约 11%），尾巴重放 8.5 万–15 万条/秒
+   （随状态变大而下降 —— 每条都要往更大的 dentry 表里插，1 000 万档 85 k/s）。
+   线性外推到 **1 亿 inode**（外推，未实测）：RSS ≈ 44.5 GB、checkpoint 峰值 ≈ 57.6 GB、
+   快照 ≈ 13.1 GB、重启 ≈ 111–115 s；若一直不 checkpoint，WAL 按 209 B/节点会到
+   20.9 GB。这三个数就是「分层」的触发线：单机内存到 64 GB 就该动手，把 `nodes` 的
+   冷段挪出内存（或换 mmap 快照 + 懒加载）——**分层本轮仍没做**，真上亿级前必须先
+   做这一项设计；本轮只把「未量」变成「有数」，顺带把百 MB 级恢复的语义钉进回归板
+   （`restore_survives_a_hundred_thousand_nodes`）。
 3. **`never` 档会丢数据**：它只是把 fsync 从提交路径挪走，崩溃丢最近 `sync_ms` 窗口。
    选它必须是有外部冗余的场景。
 4. **无数据面 / 无 fd 语义**（§5.3）：`O_TRUNC`、POSIX 记录锁的 `(pid,fd)` 所有权这类
@@ -3062,11 +3083,12 @@ pipeline 8 secs 3`，500 行表，auto-checkpoint 关）**：
 ## 9. 测试清单
 
 ```sh
-cargo test --release                            # 默认档（纯引擎），211 条（+1 ignored）
-cargo test --release --features postgres-compat # 加上过渡档，242 条（+7 ignored）
+cargo test --release                            # 默认档（纯引擎），212 条（+2 ignored）
+cargo test --release --features postgres-compat # 加上过渡档，243 条（+8 ignored）
 cargo test --release --lib                      # 只看引擎单测
 cargo test --release --test migrate              # 快照升级：11 条走 API + 3 条真进程跑 CLI（§6.5）
 cargo test --release --test scale_connections -- --ignored   # 万级连接重压（§7.6）；并发数由 TREEDB_CONNS 控制，本机到 25 000 为限（再高是客户端源端口不够）
+TREEDB_RESTORE_NODES=10000000 TREEDB_RESTORE_TAIL=100000 cargo test --release --test scale_restore -- --ignored --nocapture   # 百 MB 到 GB 级快照的恢复成本（§8 第 2 条）
 bash benches/backup_probe.sh 2                  # 备份/还原三形状：冷拷贝、热拷贝、副本目录（§6.7）
 bash benches/throughput_matrix.sh 3             # 五轴吞吐矩阵（默认只跑 1–4）
 bash benches/default_check.sh                   # 零旗标默认档同格重跑 5 次（§7.5）
@@ -3115,6 +3137,7 @@ gcc -O2 -pthread -o /tmp/lb_floor benches/lb_floor.c && /tmp/lb_floor 1 64 3   #
 | `tests/replication.rs` | **19** | §6.6 的十三件事（十九条例，端到端那一件两档各一条；主是真进程，副本是测试里的 `Engine` + `Follower`，只有最后三件起真 `treedb-standby`）：主写逐条收敛（ino/属性/readdir 与主对齐）、**主被 `kill -9` 后副本仍答读且不退出**（`replica_errors` 抬、`connected` 落 true→false）、**gap 触发分块重装快照**（4 KiB 块下 ≥ 2 块，且副本落盘的 `state.snap` 与主的逐字节相同）、**副本拒写在引擎层**（五个形状不同的写真 op 全 `EROFS` 且零 logs、零水位推进，而 `ListViews`/`Stats`/`Checkpoint` 放行）、**lag 中途为正、追平归零**（2 KiB/轮喂不饱一批）、**副本重启靠自己的日志接上**（`resyncs == 0`，快照+尾巴那条恢复路径）、端到端两档事件循环同一份断言（`workers=1`/`2`：线上 `EROFS`、`Stats` 新字段过线、追平后读到主的新写）、启动参数三道门（缺 `--primary` / 自己拉自己 / `--fetch-bytes 0` 均退出码 2）、**开了认证的主只有握得上手的副本追得动**（对密钥逐条收敛、错密钥不收敛）；v0.4.0 新增四条 fencing：令牌只升不降/落盘/坏文件不当 0、副本侧四档闸门（含“权力优先于新旧”与它的反面）、**真链路上提权后拒旧主的批**（状态不回滚、仍在答读、`replica_errors` 抬）、`--promote` 离线动作（不开端口、两次 0→1→2、与 `--primary` 同时给退出码 2）；2026-11-22 新增 `the_fetch_block_ramps_while_catching_up_and_returns_to_cfg`（64 条/批播 8 192 个文件，`--fetch-bytes` 32 KiB 下块长峰值放大到 1 MiB、收敛后回落到 32 KiB）；同日把同一条规则铺到快照段：`the_snapshot_chunk_ramps_while_downloading_and_returns_to_cfg`（8 KiB 起、4 000 条批量播出 > 8 个块长的快照，下载途中块长涨过配置值且不超 4 MiB，轮数少于定长下的块数，装完落回 8 KiB）；同日再补三条快照换代：`a_snapshot_probe_reports_the_prefix_crc`（六个 offset 上 `prefix_crc == crc32(&raw[..n])`）、`a_snapshot_generation_change_keeps_the_downloaded_prefix`（改尾部节点的 `mode` 再 checkpoint：`snap_reused > 0`、`snap_restarts == 0`、两份快照逐字节相同）、`a_snapshot_generation_change_with_a_different_prefix_restarts`（新建文件：`snap_restarts == 1`，仍然收敛） |
 | `tests/concurrency.rs` | 0（+7，整文件 feature 门控） | T1 之后整个文件在 `postgres-compat` 后面：无 PG 时跑「拨号失败不漏 live」（1 条，要 feature），其余 6 条 `#[ignore]` 需真实 PG。**它测的是共享池，不是引擎并发**（§7.8）|
 | `tests/scale_connections.rs` | 1（+1 ignored） | 1 000 连接 fd/RSS 断言每次跑；万级（`TREEDB_CONNS`，含 25 000）手动 |
+| `tests/scale_restore.rs` | 1（+1 ignored） | §8 第 2 条的规模档：10 万节点 + 2 万条尾巴走完「插入 → 同步 checkpoint → 冷/热两次恢复 → 再写尾巴 → 恢复」，钉节点数、`wal_bytes == 0`、随机名字 lookup 命中；百万到千万档（1M/3M/10M）`#[ignore]`，手动跑，打印耗时/内存供 §8 第 2 条引用 |
 | `tests/independence.rs` | **3** | 独立性三把门：内核目录（`src/engine`、`src/net`）不出现客户端名字；`[dependencies]` 非 optional 项只能是 `libc` + `thiserror`；`postgres-compat` 不得进 `default`（§11 第 7 条） |
 | `tests/migrate.rs` | **14** | §6.5 那四条承诺。11 条直接打 API：v2 样本迁移后 `State` 逐字段相等且 WAL 文件字节不变、重开后每个语义面都能读到（密钥/审计/定义/放置/锁/引用）、尾巴 seq 照搬且发号接着走、幂等重跑不动当前目录、未知版本与「正文配不上版本位」都拒动且零改动、既有备份不被覆盖、迁完的目录能直接用通用表。3 条用 `env!("CARGO_BIN_EXE_treedb-migrate")` 起**真进程**钉退出码（10 / 1 / 0）与输出里的命令、备份路径、回滚步骤 |
 | `tests/observe.rs` | **5** | §7.14 的接入面契约，全部起**真进程**：`--max-conn` 在 `workers = 1` 与 `8` 两种形状下都只放行上限内、第三条起被拒且在册连接不受牵连、日志只打第 1 条、`drop` 后能重新进；prometheus 输出与 `Op::Stats` 逐项对上（稳定项精确相等、计数器只要求 ≥、`fsync_seconds_total ≈ sync_us_total/1e6`）且默认文本档 5 行格式不变；抓不上时只剩一行 `treedb_up 0` 且退出码 1；四种参数错全 exit 2 不产出字节；`--shutdown` 在两种 worker 形状下都得到 ack 且进程干净退出（§7.14 那条真 bug 的回归锁） |
