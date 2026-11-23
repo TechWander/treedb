@@ -6,21 +6,24 @@
 //! treedb-migrate --dir /var/lib/treedb --apply --force   # 连既有备份一起换掉
 //! ```
 //!
-//! 存在的理由：`SNAP_VERSION` 2 → 3 之后，v0.3.2 及更早跑过的数据目录在 v0.3.3
-//! 二进制前**起不来** —— 版本号闸门拒收旧快照，而拒收比静默解错正确。这个工具
-//! 就是那道闸门的合法出路：读旧布局 → 内存状态 → 按新布局写回。
+//! 存在的理由：`SNAP_VERSION` 每一次抬代（2 → 3 加通用表段、3 → 4 删四张专用表段）
+//! 之后，上一代二进制跑过的数据目录在新二进制前**起不来** —— 版本号闸门拒收旧快照，
+//! 而拒收比静默解错正确。这个工具就是那道闸门的合法出路：读旧布局 → 内存状态 →
+//! 按新布局写回。当前的上一代是 v3；v2 及更早已经没有迁移路径。
 //!
 //! 三条硬规矩，都由 [`treedb::engine::core::migrate_snapshot`] 守着：
 //!
 //! 1. **WAL 不动一个字节**。所以已 ack 的写不会因为迁移而丢，回滚也只是把
 //!    备份文件挪回去再跑旧二进制 —— 但这个回滚窗口只到新二进制**第一次
 //!    checkpoint 为止**：checkpoint 会 `wal.reset()` 把上一代记录物理抹掉，此后
-//!    新二进制已吸收的那些写就只存在 v3 快照里，旧二进制读不到（`benches/rehearse_migrate.sh`
+//!    新二进制已吸收的那些写就只存在新布局快照里，旧二进制读不到（`benches/rehearse_migrate.sh`
 //!    把这两个窗口都量过）。
 //! 2. **动手前先把输入看清**：版本不认识、正文与版本位不吻合、字节自检不等
 //!    —— 任一条件不满足就直接失败，此时原文件还没被改过。
 //! 3. **只认上一代**。两代之前的布局没有迁移路径，报错让人去翻历史版本，
-//!    而不是攒一个「什么旧格式都敢读」的黑洞。
+//!    而不是攒一个「什么旧格式都敢读」的黑洞。v3 → v4 还多一道：v3 尾部那四张
+//!    专用控制面表只要有一行就拒迁 —— 删表会丢数据，出路由旧二进制先把它们
+//!    搬进通用表。
 //!
 //! 前提：**服务端必须先停**。本工具不 flock（服务端也没有持文件锁，锁不住
 //! 任何东西），只在改写前后各读一次源文件比对 —— 有并发写者会在这里露馅，
@@ -55,19 +58,8 @@ fn print_info(info: &SnapshotInfo) {
     println!("wal         = {} B on disk (untouched by migration)", info.wal_disk_bytes);
     if info.decodable {
         println!(
-            "counts      = views {} nodes {} dentries {} locks {} refs {} keys {} audit {} \
-             defs {} placement {} tables {} rows {}",
-            info.views,
-            info.nodes,
-            info.dentries,
-            info.locks,
-            info.refs,
-            info.keys,
-            info.audit,
-            info.defs,
-            info.placement,
-            info.tables,
-            info.rows
+            "counts      = views {} nodes {} dentries {} locks {} refs {} tables {} rows {}",
+            info.views, info.nodes, info.dentries, info.locks, info.refs, info.tables, info.rows
         );
     }
     if let Some(note) = &info.note {

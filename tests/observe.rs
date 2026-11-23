@@ -222,8 +222,6 @@ fn prometheus_exposition_matches_the_wire_stats() {
         ("treedb_dentries", s.dentries),
         ("treedb_locks", s.locks),
         ("treedb_refs", s.refs),
-        ("treedb_keys", s.keys),
-        ("treedb_audit_rows", s.audit),
         ("treedb_tables", s.tables),
         ("treedb_table_rows", s.rows),
         ("treedb_seq", s.seq),

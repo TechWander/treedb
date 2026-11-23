@@ -93,13 +93,17 @@ pub const LOCK_FILE: &str = ".lock";
 /// fencing token 文件名（§6.6 第 3 条）：内容是一个十进制整数 + `\n`。
 ///
 /// 它不在快照里，也不在 WAL 里 —— 故意做成一个独立的、人眼能 `cat` 的小文件：
-/// ① 提升它不需要碰任何数据面字节格式（`SNAP_VERSION` 仍是 3）；
+/// ① 提升它不需要碰任何数据面字节格式（fencing 是独立文件，快照布局没动）；
 /// ② 冷拷贝/副本目录自然带着它走；
 /// ③ 一个目录被人误当“空白副本”重用之前，`cat fence` 就能看见它已经被提升过。
 /// 代价是它不在 WAL 的事务边界里 —— 但 fencing 的用处就是“比数据更早一步知道
 /// 谁有权写”，它先落盘、再由数据追上，这个顺序是刻意的。
 pub const FENCE_FILE: &str = "fence";
 /// 上一代快照的备份文件名（迁移工具写，见 [`migrate_snapshot`]）。
+///
+/// 名字里的 `v2` 是历史：它始于 v1 → v2 那次升级，后来每代都沿用同一个文件名。
+/// 故意不改 —— 运维的回滚脚本、已经就位的旧备份都指着这个名字，而它到底是哪一代
+/// 备份只取决于迁移前那份 `state.snap` 自报的版本位。
 pub const SNAP_BACKUP: &str = "state.snap.v2.bak";
 
 /// 读数据目录的 fencing token。文件不存在 = 0（从未被提升过）。
@@ -133,8 +137,6 @@ pub struct EngineStats {
     pub dentries: u64,
     pub locks: u64,
     pub refs: u64,
-    pub keys: u64,
-    pub audit: u64,
     /// WAL 已分配到的 seq。
     pub seq: u64,
     /// 快照覆盖到的 seq（重放水位）。
@@ -186,8 +188,6 @@ impl EngineStats {
         w.u64(self.dentries);
         w.u64(self.locks);
         w.u64(self.refs);
-        w.u64(self.keys);
-        w.u64(self.audit);
         w.u64(self.seq);
         w.u64(self.snap_seq);
         w.u64(self.wal_bytes);
@@ -217,8 +217,6 @@ impl EngineStats {
             dentries: r.u64()?,
             locks: r.u64()?,
             refs: r.u64()?,
-            keys: r.u64()?,
-            audit: r.u64()?,
             seq: r.u64()?,
             snap_seq: r.u64()?,
             wal_bytes: r.u64()?,
@@ -1532,7 +1530,7 @@ impl Engine {
         self.stats.ops_total += self.external_ops.swap(0, Ordering::Relaxed);
         // 先把计数在 Guard 作古前抽出来：guard 借的是 `&self.state`，而下面
         // 要改 `self.stats`，不拆开就过不了借用检查。
-        let (views, nodes, dentries, locks, refs, keys, audit, tables, rows) = {
+        let (views, nodes, dentries, locks, refs, tables, rows) = {
             let s = read_of(&self.state);
             (
                 s.views.len() as u64,
@@ -1541,8 +1539,6 @@ impl Engine {
                 s.dentry_count() as u64,
                 s.locks.len() as u64,
                 s.refs.len() as u64,
-                s.keys.len() as u64,
-                s.audit.len() as u64,
                 s.tables.len() as u64,
                 // 同理：`rows.len()` 是有行的表数。
                 s.row_count() as u64,
@@ -1553,8 +1549,6 @@ impl Engine {
         self.stats.dentries = dentries;
         self.stats.locks = locks;
         self.stats.refs = refs;
-        self.stats.keys = keys;
-        self.stats.audit = audit;
         self.stats.tables = tables;
         self.stats.rows = rows;
         self.stats.seq = self.wal.durable_seq().max(self.stats.seq);
@@ -1605,8 +1599,9 @@ impl Drop for Engine {
 
 // ---- 快照升级（§6.5）------------------------------------------------------------
 //
-// 这一段的存立理由：`SNAP_VERSION` 从 2 升到 3 把已有数据目录挡在门外，而
-// 引擎不会替旧文件猜布局。它**只在离线工具里被调用**（`treedb-migrate`），
+// 这一段的存立理由：快照布局一旦升代（v2 → v3 加了通用表段，v3 → v4 抽掉了
+// 四张控制面表的计数段），已有数据目录就开不了门，而引擎不会替旧文件猜布局。
+// 它**只在离线工具里被调用**（`treedb-migrate`），
 // 常规启动路径一个字节也不走这里 —— `Engine::open` 永远用 [`State::load`]，
 // 那个入口不开兼容口子。
 
@@ -1638,10 +1633,6 @@ pub struct SnapshotInfo {
     pub dentries: u64,
     pub locks: u64,
     pub refs: u64,
-    pub keys: u64,
-    pub audit: u64,
-    pub defs: u64,
-    pub placement: u64,
     pub tables: u64,
     pub rows: u64,
 }
@@ -1692,7 +1683,7 @@ pub fn probe_snapshot(dir: &Path) -> Result<SnapshotInfo> {
     }
     // 走迁移专用的严格解码：整个文件必须正好被布局吃完（尾巴已由
     // `snapshot_split` 切掉，剩下的正文一个字节也不能多）。
-    // 用它而不是 [`State::load`] 是为了让只读体检在 v2 目录上也能报出计数。
+    // 用它而不是 [`State::load`] 是为了让只读体检在上一代目录上也能报出计数。
     match State::snapshot_split(&raw).and_then(|(body, seq)| {
         State::load_for_migration(&mut Rd::new(body)).map(|s| (s, seq))
     }) {
@@ -1704,10 +1695,6 @@ pub fn probe_snapshot(dir: &Path) -> Result<SnapshotInfo> {
             info.dentries = s.dentry_count() as u64;
             info.locks = s.locks.len() as u64;
             info.refs = s.refs.len() as u64;
-            info.keys = s.keys.len() as u64;
-            info.audit = s.audit.len() as u64;
-            info.defs = s.defs.len() as u64;
-            info.placement = s.placement.len() as u64;
             info.tables = s.tables.len() as u64;
             info.rows = s.row_count() as u64;
         }
@@ -1729,7 +1716,7 @@ pub enum MigrationOutcome {
     Migrated {
         before: SnapshotInfo,
         after: SnapshotInfo,
-        /// 原 v2 快照的逐字节副本。WAL 没被碰过，所以「备份文件 + 现有 WAL」
+        /// 上一代（v3）快照的逐字节副本。WAL 没被碰过，所以「备份文件 + 现有 WAL」
         /// 仍是旧二进制可完整还原的一组件 —— 这就是回滚路径。
         backup: PathBuf,
         /// 搬运前后必须相等的那个 seq 水位。

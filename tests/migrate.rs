@@ -1,9 +1,10 @@
 //! 快照升级工具的验收（DESIGN.md §6.5）。
 //!
-//! 「v2 数据目录」是这样造出来的：用当前引擎把状态写全、`checkpoint`，再把快照
-//! 文件按 v2 布局重写一遍（`State::save_v2` 就是那代布局的权威写出器）。这比去
-//! 历史二进制里捞一个文件更好也不更差：字节由同一个编码器产生，只是少写了尾部
-//! 三段，于是任何「迁移后状态不等」都只能来自迁移逻辑，不会来自样本本身。
+//! 「v3 数据目录」是这样造出来的：用当前引擎把状态写全、`checkpoint`，再把快照
+//! 文件按 v3 布局重写一遍（`State::save_v3` 就是那代布局的权威写出器，四张已删
+//! 控制面表的计数段写 0）。这比去历史二进制里捞一个文件更好也不更差：字节由
+//! 同一个编码器产生，只是多写了 v3 那 24 字节计数段，于是任何「迁移后状态不等」
+//! 都只能来自迁移逻辑，不会来自样本本身。
 //!
 //! 三条不可让的判据贯穿全部用例：**状态逐字段相等**、**WAL 一个字节没动**、
 //! **拒动的时候原文件真的没被动过**。
@@ -16,7 +17,7 @@ use treedb::engine::core::{
     migrate_snapshot, probe_snapshot, MigrationOutcome, SNAP_BACKUP, SNAP_FILE, WAL_FILE,
 };
 use treedb::engine::model::{
-    errno, AuditRec, ColumnDef, DefRec, KeyRec, Node, Op, Reply, TableDef, COND_NONE, COL_INDEX,
+    errno, ColumnDef, Node, Op, Reply, TableDef, COND_NONE, COL_INDEX,
     COL_UNIQUE, SA_DATA_REF,
 };
 use treedb::engine::{Durability, Engine, W, SNAP_LEGACY_VERSION, SNAP_MAGIC, SNAP_TRAIL, SNAP_TRAIL_LEGACY, SNAP_VERSION};
@@ -73,7 +74,7 @@ fn node(r: Reply) -> Node {
     }
 }
 
-/// v2 那代布局装得下的全部九段，每段都写点东西进去。
+/// v3 那代布局装得下的全部段，每段都写点东西进去。
 /// 返回 `(view, 文件 ino)` 给后面的语义面断言用。
 fn seed(e: &mut Engine) -> (u32, u64) {
     let view = match ok(e, &Op::CreateView { name: b"alice".to_vec() }) {
@@ -118,64 +119,17 @@ fn seed(e: &mut Engine) -> (u32, u64) {
         e,
         &Op::LockSet { view, ino: f1, owner: b"o1".to_vec(), verb: 0, kind: 1, lease_expiry: 0 },
     );
-    ok(e, &Op::KeyCreate { key: key("k1") });
-    ok(
-        e,
-        &Op::AuditAppend {
-            row: AuditRec {
-                seq: 0,
-                ts: 5,
-                key_id: b"k1".to_vec(),
-                method: b"POST".to_vec(),
-                tool: b"fs_ls".to_vec(),
-                ok: true,
-                detail: Vec::new(),
-            },
-        },
-    );
-    ok(
-        e,
-        &Op::DefPut {
-            def: DefRec {
-                name: b"ls".to_vec(),
-                kind: b"tool".to_vec(),
-                payload: b"x".to_vec(),
-                updated_at: 0,
-            },
-        },
-    );
-    ok(e, &Op::PlaceSet { view: b"alice".to_vec(), instance: b"node-1".to_vec() });
     (view, f1)
 }
 
-fn key(id: &str) -> KeyRec {
-    KeyRec {
-        id: id.into(),
-        label: format!("label-{id}").into(),
-        secret_hash: b"hash".to_vec(),
-        created_at: 0,
-        last_used_at: 0,
-        revoked_at: 0,
-        view: b"alice".to_vec(),
-        ro: false,
-        owner: b"alice".to_vec(),
-        note: Vec::new(),
-        expires_at: 0,
-        created_by: Vec::new(),
-        secret_hint: Vec::new(),
-    }
-}
-
-/// checkpoint 一次，然后把快照文件重写成 v2 布局。返回那份 v2 字节。
+/// checkpoint 一次，然后把快照文件重写成 v3 布局。返回那份 v3 字节。
 ///
 /// checkpoint 之后 WAL 是空的，所以「旧二进制后来又写了」这类场景要由调用方在这
 /// 之后继续写 —— 那几条只会落在 WAL 里，正是迁移最该保住的东西。
-fn downgrade_to_v2(d: &Dir, e: &mut Engine) -> Vec<u8> {
+fn downgrade_to_v3(d: &Dir, e: &mut Engine) -> Vec<u8> {
     let seq = e.checkpoint().expect("checkpoint");
     let mut w = W::new();
-    e.state_snapshot()
-        .save_v2(&mut w)
-        .expect("seed() 只写 v2 装得下的东西");
+    e.state_snapshot().save_v3(&mut w);
     let mut raw = w.finish();
     raw.extend_from_slice(&seq.to_le_bytes());
     d.write(&d.snap(), &raw);
@@ -190,7 +144,7 @@ fn migration_preserves_every_field_and_leaves_the_wal_alone() {
     let d = Dir::new();
     let mut e = d.open();
     let (view, f1) = seed(&mut e);
-    let raw_v2 = downgrade_to_v2(&d, &mut e);
+    let raw_v3 = downgrade_to_v3(&d, &mut e);
 
     // 假装旧二进制又接了几条写：它们只进 WAL，快照里没有。
     let late = node(ok(
@@ -219,16 +173,16 @@ fn migration_preserves_every_field_and_leaves_the_wal_alone() {
     assert_eq!(d.bytes(&d.wal()), wal_before, "WAL 被迁移动过了");
     assert_eq!(before.wal_disk_bytes, after.wal_disk_bytes);
     // 备份 = 原件逐字节，回滚因此只是一次 copy。
-    assert_eq!(d.bytes(&backup), raw_v2);
-    // 增量必须恰好 12 字节 = 尾部三段各一个 u32 计数（tables / next_table_id /
-    // rows），正文一个字节没重排；再加尾巴从 8 字节长到 16 字节（crc32 尾巴，
-    // 2026-11-20 补）。这条是 §6.5「两代正文逐字节相同」那个前提的数值版：
-    // 哪天正文动了而 v2 写出侧没跟着动，这里会先炸。
+    assert_eq!(d.bytes(&backup), raw_v3);
+    // 增量是负的：正文少 24 字节（四个已删控制面表的 u32 计数 + 一个 u64 序号），
+    // 尾巴从 8 字节长到 16 字节（crc32 尾巴）。这条是 §6.5「v3 → v4 就是抽掉
+    // 一段」那个前提的数值版：哪天 v3 写出侧没跟着改，这里会先炸。
+    let body_v3 = raw_v3.len() - SNAP_TRAIL_LEGACY;
     assert_eq!(
         after.bytes as usize,
-        raw_v2.len() + 12 + (SNAP_TRAIL - SNAP_TRAIL_LEGACY),
-        "v3 只该比 v2 多三段计数与新尾巴：{} -> {}",
-        raw_v2.len(),
+        body_v3 - 24 + SNAP_TRAIL,
+        "v4 只该比 v3 少 24 字节正文、换 16 字节尾巴：{} -> {}",
+        raw_v3.len(),
         after.bytes
     );
     // 迁移写出来的是**带 crc 的新尾巴**，而不是旧 8 字节尾巴的替身。
@@ -246,21 +200,8 @@ fn migration_preserves_every_field_and_leaves_the_wal_alone() {
         "只进过 WAL 的那条写没被迁移保住"
     );
     assert_eq!(node(ok(&mut e2, &Op::Getattr { view, ino: f1 })).data_ref, b"1:4096:dev7".to_vec());
-    assert!(matches!(ok(&mut e2, &Op::KeyGet { id: b"k1".to_vec() }), Reply::Key(_)));
     match ok(&mut e2, &Op::LockQuery { view, ino: f1 }) {
         Reply::Locks(v) => assert_eq!(v.len(), 1, "迁移前那条锁得还在"),
-        other => panic!("{other:?}"),
-    }
-    match ok(&mut e2, &Op::PlaceGet { view: b"alice".to_vec() }) {
-        Reply::Place(v) => assert_eq!(v, b"node-1".to_vec()),
-        other => panic!("{other:?}"),
-    }
-    match ok(&mut e2, &Op::AuditList { limit: 0 }) {
-        Reply::Audits(v) => assert_eq!(v.len(), 1),
-        other => panic!("{other:?}"),
-    }
-    match ok(&mut e2, &Op::DefGet { name: b"ls".to_vec() }) {
-        Reply::Def(Some(_)) => {}
         other => panic!("{other:?}"),
     }
     match ok(&mut e2, &Op::RefLookup { data_ref: b"1:4096:dev7".to_vec() }) {
@@ -280,7 +221,7 @@ fn seq_watermark_survives_the_migration_and_numbering_continues() {
     let (view, _) = seed(&mut e);
     let seq = e.checkpoint().expect("checkpoint");
     let mut w = W::new();
-    e.state_snapshot().save_v2(&mut w).unwrap();
+    e.state_snapshot().save_v3(&mut w);
     let mut raw = w.finish();
     raw.extend_from_slice(&seq.to_le_bytes());
     d.write(&d.snap(), &raw);
@@ -318,7 +259,7 @@ fn migration_is_idempotent_and_leaves_a_current_dir_untouched() {
     let d = Dir::new();
     let mut e = d.open();
     seed(&mut e);
-    downgrade_to_v2(&d, &mut e);
+    downgrade_to_v3(&d, &mut e);
     let expect = e.state_snapshot();
     drop(e);
 
@@ -345,16 +286,16 @@ fn unknown_version_is_refused_without_touching_anything() {
     let d = Dir::new();
     let mut e = d.open();
     seed(&mut e);
-    let raw_v2 = downgrade_to_v2(&d, &mut e);
+    let raw_v3 = downgrade_to_v3(&d, &mut e);
     drop(e);
 
-    // 版本位换成 7：正文还是那份正文，所以「按 7 解释」会静默解错，必须拒。
-    let mut bogus = raw_v2.clone();
-    bogus[..4].copy_from_slice(&7u32.to_le_bytes());
+    // 版本位换成 5：正文还是那份正文，所以「按 5 解释」会静默解错，必须拒。
+    let mut bogus = raw_v3.clone();
+    bogus[..4].copy_from_slice(&5u32.to_le_bytes());
     d.write(&d.snap(), &bogus);
 
     let info = probe_snapshot(&d.path()).unwrap();
-    assert_eq!(info.version, 7);
+    assert_eq!(info.version, 5);
     assert!(!info.decodable);
     assert!(info
         .note
@@ -370,16 +311,16 @@ fn unknown_version_is_refused_without_touching_anything() {
 }
 
 /// 正文与版本位不吻合（尾巴多一个字节）= 这不是它自称的那个文件。
-/// 这条测的是 `State::load_for_migration` 那道「正文之后只剩 8 字节」的闸。
+/// 这条测的是 `State::load_for_migration` 那道「正文之后恰好 16 字节尾巴」的闸。
 #[test]
 fn body_that_does_not_match_its_version_is_refused() {
     let d = Dir::new();
     let mut e = d.open();
     seed(&mut e);
-    let mut raw_v2 = downgrade_to_v2(&d, &mut e);
+    let mut raw_v3 = downgrade_to_v3(&d, &mut e);
     drop(e);
-    raw_v2.push(0); // 尾巴变 9 字节
-    d.write(&d.snap(), &raw_v2);
+    raw_v3.push(0); // 尾巴变 17 字节
+    d.write(&d.snap(), &raw_v3);
 
     let info = probe_snapshot(&d.path()).unwrap();
     assert_eq!(info.version, SNAP_LEGACY_VERSION);
@@ -388,7 +329,7 @@ fn body_that_does_not_match_its_version_is_refused() {
 
     let err = migrate_snapshot(&d.path(), false).unwrap_err().to_string();
     assert!(err.contains("refusing to touch"), "{err}");
-    assert_eq!(d.bytes(&d.snap()), raw_v2);
+    assert_eq!(d.bytes(&d.snap()), raw_v3);
     assert!(!d.backup().exists());
 }
 
@@ -398,7 +339,7 @@ fn existing_backup_is_not_clobbered_without_force() {
     let d = Dir::new();
     let mut e = d.open();
     seed(&mut e);
-    let raw_v2 = downgrade_to_v2(&d, &mut e);
+    let raw_v3 = downgrade_to_v3(&d, &mut e);
     let expect = e.state_snapshot();
     drop(e);
 
@@ -408,11 +349,11 @@ fn existing_backup_is_not_clobbered_without_force() {
     let err = migrate_snapshot(&d.path(), false).unwrap_err().to_string();
     assert!(err.contains("--force"), "{err}");
     assert_eq!(d.bytes(&d.backup()), junk, "不加 --force 就动了别人的文件");
-    assert_eq!(d.bytes(&d.snap()), raw_v2, "被备份闸挡住时快照不该被动");
+    assert_eq!(d.bytes(&d.snap()), raw_v3, "被备份闸挡住时快照不该被动");
 
     let out = migrate_snapshot(&d.path(), true).unwrap();
     assert!(matches!(out, MigrationOutcome::Migrated { .. }), "{out:?}");
-    assert_eq!(d.bytes(&d.backup()), raw_v2, "--force 就该把它换成原件");
+    assert_eq!(d.bytes(&d.backup()), raw_v3, "--force 就该把它换成原件");
     let e2 = d.open();
     assert_eq!(e2.state_snapshot(), expect);
 }
@@ -424,7 +365,7 @@ fn migrated_dir_can_use_the_generic_tables() {
     let d = Dir::new();
     let mut e = d.open();
     seed(&mut e);
-    downgrade_to_v2(&d, &mut e);
+    downgrade_to_v3(&d, &mut e);
     drop(e);
     migrate_snapshot(&d.path(), false).unwrap();
 
@@ -490,7 +431,7 @@ fn fresh_dir_has_nothing_to_migrate() {
         MigrationOutcome::NoSnapshot(_)
     ));
 
-    // 新目录直接能被当前二进制打开，且写进去的快照本来就是 v3。
+    // 新目录直接能被当前二进制打开，且写进去的快照本来就是 v4。
     let mut e = d.open();
     seed(&mut e);
     e.checkpoint().unwrap();
@@ -529,7 +470,7 @@ fn cli_reports_exit_10_before_applying_and_migrates_after() {
     let d = Dir::new();
     let mut e = d.open();
     seed(&mut e);
-    downgrade_to_v2(&d, &mut e);
+    downgrade_to_v3(&d, &mut e);
     let expect = e.state_snapshot();
     drop(e);
     let snap = d.bytes(&d.snap());
@@ -544,7 +485,7 @@ fn cli_reports_exit_10_before_applying_and_migrates_after() {
 
     let (code, text) = cli(&d.path(), &["--apply"]);
     assert_eq!(code, 0, "{text}");
-    assert!(text.contains("migrated    = 2 -> 3"), "{text}");
+    assert!(text.contains("migrated    = 3 -> 4"), "{text}");
     assert!(text.contains("wal         = untouched"), "{text}");
     assert!(text.contains("rollback    ="), "{text}");
     assert!(text.contains(SNAP_BACKUP), "备份路径要写在输出里：{text}");
@@ -569,9 +510,9 @@ fn cli_refuses_unknown_version_with_exit_1() {
     let d = Dir::new();
     let mut e = d.open();
     seed(&mut e);
-    let mut raw = downgrade_to_v2(&d, &mut e);
+    let mut raw = downgrade_to_v3(&d, &mut e);
     drop(e);
-    raw[..4].copy_from_slice(&7u32.to_le_bytes());
+    raw[..4].copy_from_slice(&5u32.to_le_bytes());
     d.write(&d.snap(), &raw);
 
     let (code, text) = cli(&d.path(), &["--apply"]);

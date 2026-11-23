@@ -1,6 +1,6 @@
 [package]
 name = "treedb"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
 description = "元数据引擎：单进程事件循环 + 自定义二进制协议 + WAL/checkpoint（POSIX 元数据语义，客户端无关）"
 license = "Apache-2.0"
@@ -51,7 +51,7 @@ path = "src/bin/pitr.rs"
 
 # 在线导出：dump 读本地目录、要目录独占；backup 读在线主，两条腿都是主已经
 # 实现的只读 op（SnapFetch + WalFetch），所以主不停机也能拿到一致切面。
-# 产出与 dump 同格式（TDBDUMP1），`treedb-load` 直接吃得下。
+# 产出与 dump 同格式（TDBDUMP2），`treedb-load` 直接吃得下。
 [[bin]]
 name = "treedb-backup"
 path = "src/bin/backup.rs"

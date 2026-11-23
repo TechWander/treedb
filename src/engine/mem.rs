@@ -14,13 +14,15 @@
 //! - `locks: (view, ino, owner) → LockRec`  ← `locks` 表
 //!
 //! `refs` 是跨视图共享的内容账本（对应那个独立的 refs schema）；
-//! `keys`/`audit`/`defs`/`placement` 是历史遗留的控制面专用表；
 //! `tables`/`rows`/`row_index` 是通用表：列名与语义由客户端定，引擎不解释值。
+//!
+//! 这里曾经还有 `keys`/`audit`/`defs`/`placement` 四张历史遗留的控制面专用表，
+//! 2026-11-23 按 DESIGN §11 第 10 条（M4）连同它们的 `Log` 变体、快照段与
+//! `Op` 一起删除。删表把快照格式抬到 4（§6.5 的迁移链同步）。
 
 use crate::engine::codec::{Rd, W};
 use crate::engine::model::{
-    AuditRec, DataRef, DefRec, Ino, KeyRec, LockRec, Node, RefRec, RowRec, TableDef, ViewId,
-    ViewMeta, MAX_TABLE_ITEMS,
+    DataRef, Ino, LockRec, Node, RefRec, RowRec, TableDef, ViewId, ViewMeta, MAX_TABLE_ITEMS,
 };
 use crate::error::{Error, Result};
 use std::collections::BTreeMap;
@@ -36,16 +38,21 @@ use std::ops::Bound;
 /// v2 → v3：尾部多出通用表三段（`tables` / `next_table_id` / `rows`）。同样是
 /// “不升版本就会把零字节当长度读”那一类，旧快照必须被拒而不是被解错。
 ///
+/// v3 → v4：删掉 `refs` 之后那四段（`keys` / `audit` + `next_audit_seq` /
+/// `defs` / `placement`）—— 四张专用控制面表连同它们的 `Op`/`Log` 一起删了
+/// （§11 第 10 条 M4）。这一次是「段被抽掉」而不是「尾部追加」：v3 的字节流
+/// 在 v4 眼里会把 `keys` 计数当成 `tables` 计数读，所以必须 +1。
+///
 /// 两代升级的**可迁移性不一样**，这决定了工具能做多少事：v1 → v2 改的是既有
-/// 字段的宽度，没有「读旧写新」的稳妥路子；v2 → v3 只在尾部加了三段，前面逐
-/// 字段一致，所以旧文件可以被当前代码完整解出再按新布局写出 ——
+/// 字段的宽度，没有「读旧写新」的稳妥路子；v2 → v3 只在尾部加了三段；
+/// v3 → v4 抽掉了四段且**不丢数据**（这四段在接入侧改用通用表之后一直为空）。
 /// [`State::load_for_migration`] 与 `treedb-migrate`（§6.5）就建立在这个
-/// 事实上，`legacy_snapshot_decodes_from_the_same_prefix` 钉住它。
-pub const SNAP_VERSION: u32 = 3;
+/// 事实上：遇到非空的四段会拒，并指名先去旧版本把数据搬进通用表。
+pub const SNAP_VERSION: u32 = 4;
 
 /// 上一个会被迁移工具接受的快照版本。**只此一个**：认识两代之前的布局等于把
 /// 「格式变更要 +1 并给出门」这条规矩变成「格式变更可以攒着」。
-pub const SNAP_LEGACY_VERSION: u32 = 2;
+pub const SNAP_LEGACY_VERSION: u32 = 3;
 
 /// 快照文件尾巴的两种形状，靠 magic 自描述（不占版本位，因而不用迁移）：
 ///
@@ -123,32 +130,6 @@ pub enum Log {
     DelRef {
         data_ref: DataRef,
     },
-    PutKey {
-        key: KeyRec,
-    },
-    DelKey {
-        id: Vec<u8>,
-    },
-    PutAudit {
-        row: AuditRec,
-    },
-    /// 审计保留窗口裁剪：丢掉 seq <= 此值的行。
-    TrimAudit {
-        keep_from: u64,
-    },
-    PutDef {
-        def: DefRec,
-    },
-    DelDef {
-        name: Vec<u8>,
-    },
-    PutPlace {
-        view: Vec<u8>,
-        instance: Vec<u8>,
-    },
-    DelPlace {
-        view: Vec<u8>,
-    },
     /// 建一张通用表。`id` 由翻译层从 `next_table_id` 分配（与 view id 同构），
     /// 进日志是为了重放时行与表能对上同一个 id。
     PutTable {
@@ -204,14 +185,9 @@ const LOG_PUT_LOCK: u8 = 7;
 const LOG_DEL_LOCK: u8 = 8;
 const LOG_PUT_REF: u8 = 9;
 const LOG_DEL_REF: u8 = 10;
-const LOG_PUT_KEY: u8 = 11;
-const LOG_DEL_KEY: u8 = 12;
-const LOG_PUT_AUDIT: u8 = 13;
-const LOG_TRIM_AUDIT: u8 = 14;
-const LOG_PUT_DEF: u8 = 15;
-const LOG_DEL_DEF: u8 = 16;
-const LOG_PUT_PLACE: u8 = 17;
-const LOG_DEL_PLACE: u8 = 18;
+// 11–18 曾属于四张专用控制面表（`PutKey`/`DelKey`/`PutAudit`/`TrimAudit`/
+// `PutDef`/`DelDef`/`PutPlace`/`DelPlace`），2026-11-23 随表一并删除。
+// tag 不回收：旧 WAL 里出现这几个 tag 会在 `Log::decode` 落到 `unknown log tag`。
 const LOG_PUT_TABLE: u8 = 19;
 const LOG_DEL_TABLE: u8 = 20;
 const LOG_PUT_ROW: u8 = 21;
@@ -293,39 +269,6 @@ impl Log {
             Log::DelRef { data_ref } => {
                 w.u8(LOG_DEL_REF);
                 w.bytes(data_ref);
-            }
-            Log::PutKey { key } => {
-                w.u8(LOG_PUT_KEY);
-                key.encode(w);
-            }
-            Log::DelKey { id } => {
-                w.u8(LOG_DEL_KEY);
-                w.bytes(id);
-            }
-            Log::PutAudit { row } => {
-                w.u8(LOG_PUT_AUDIT);
-                row.encode(w);
-            }
-            Log::TrimAudit { keep_from } => {
-                w.u8(LOG_TRIM_AUDIT);
-                w.u64(*keep_from);
-            }
-            Log::PutDef { def } => {
-                w.u8(LOG_PUT_DEF);
-                def.encode(w);
-            }
-            Log::DelDef { name } => {
-                w.u8(LOG_DEL_DEF);
-                w.bytes(name);
-            }
-            Log::PutPlace { view, instance } => {
-                w.u8(LOG_PUT_PLACE);
-                w.bytes(view);
-                w.bytes(instance);
-            }
-            Log::DelPlace { view } => {
-                w.u8(LOG_DEL_PLACE);
-                w.bytes(view);
             }
             Log::PutTable { id, def } => {
                 w.u8(LOG_PUT_TABLE);
@@ -418,25 +361,6 @@ impl Log {
                 rec: RefRec::decode(r)?,
             },
             LOG_DEL_REF => Log::DelRef { data_ref: r.bytes()? },
-            LOG_PUT_KEY => Log::PutKey {
-                key: KeyRec::decode(r)?,
-            },
-            LOG_DEL_KEY => Log::DelKey { id: r.bytes()? },
-            LOG_PUT_AUDIT => Log::PutAudit {
-                row: AuditRec::decode(r)?,
-            },
-            LOG_TRIM_AUDIT => Log::TrimAudit {
-                keep_from: r.u64()?,
-            },
-            LOG_PUT_DEF => Log::PutDef {
-                def: DefRec::decode(r)?,
-            },
-            LOG_DEL_DEF => Log::DelDef { name: r.bytes()? },
-            LOG_PUT_PLACE => Log::PutPlace {
-                view: r.bytes()?,
-                instance: r.bytes()?,
-            },
-            LOG_DEL_PLACE => Log::DelPlace { view: r.bytes()? },
             LOG_PUT_TABLE => Log::PutTable {
                 id: r.u32()?,
                 def: TableDef::decode(r)?,
@@ -527,10 +451,6 @@ pub struct State {
     pub dentries: BTreeMap<(ViewId, Ino), BTreeMap<Vec<u8>, Dent>>,
     pub locks: BTreeMap<(ViewId, Ino, Vec<u8>), LockRec>,
     pub refs: BTreeMap<DataRef, RefRec>,
-    pub keys: BTreeMap<Vec<u8>, KeyRec>,
-    pub audit: BTreeMap<u64, AuditRec>,
-    pub defs: BTreeMap<Vec<u8>, DefRec>,
-    pub placement: BTreeMap<Vec<u8>, Vec<u8>>,
     /// 通用表（§11 T2）：名字 → id/def。与 `views`/`view_by_id` 同构，
     /// 因为同样的理由：行与索引只带 id，反查名字不能扫全表。
     pub tables: BTreeMap<Vec<u8>, TableMeta>,
@@ -547,8 +467,6 @@ pub struct State {
     /// 它**不进 WAL 也不进快照** —— 完全由 `rows` + def 推出，与 [`Dent::kind`]
     /// 同一个取舍（冗余可推字段不动磁盘格式）。
     pub row_index: BTreeMap<(u32, u32, Vec<u8>, Vec<u8>), ()>,
-    /// 下一个可分配的 audit seq。
-    pub next_audit_seq: u64,
 }
 
 impl State {
@@ -628,41 +546,6 @@ impl State {
             }
             Log::DelRef { data_ref } => {
                 self.refs.remove(data_ref);
-            }
-            Log::PutKey { key } => {
-                self.keys.insert(key.id.clone(), key.clone());
-                // 身份表按 id 单调，seq 由 audit 行自带。
-            }
-            Log::DelKey { id } => {
-                self.keys.remove(id);
-            }
-            Log::PutAudit { row } => {
-                if row.seq >= self.next_audit_seq {
-                    self.next_audit_seq = row.seq + 1;
-                }
-                self.audit.insert(row.seq, row.clone());
-            }
-            Log::TrimAudit { keep_from } => {
-                let dead: Vec<u64> = self
-                    .audit
-                    .range(..*keep_from)
-                    .map(|(k, _)| *k)
-                    .collect();
-                for k in dead {
-                    self.audit.remove(&k);
-                }
-            }
-            Log::PutDef { def } => {
-                self.defs.insert(def.name.clone(), def.clone());
-            }
-            Log::DelDef { name } => {
-                self.defs.remove(name);
-            }
-            Log::PutPlace { view, instance } => {
-                self.placement.insert(view.clone(), instance.clone());
-            }
-            Log::DelPlace { view } => {
-                self.placement.remove(view);
             }
             Log::PutTable { id, def } => {
                 self.table_by_id.insert(*id, def.name.clone());
@@ -1079,22 +962,15 @@ impl State {
         Ok((&raw[..at], seq))
     }
 
-    /// 按上一代布局写快照：版本位写 [`SNAP_LEGACY_VERSION`]，尾部三段不写。
+    /// 按上一代（v3）布局写快照：版本位写 [`SNAP_LEGACY_VERSION`]，`refs`
+    /// 之后多写四个空的遗留段（`keys`/`audit`+`next_audit_seq`/`defs`/`placement`）。
     ///
-    /// 它存在的唯一理由是**让测试能造出真 v2 文件**（`tests/migrate.rs` 与下面的
-    /// 往返用例）。产品路径永远走 [`State::save`]：旧文件是历史版本写出来的，
-    /// 本仓不该假装替它写。所以这里有一道硬闸 —— 有表或有行直接拒，
-    /// v2 布局装不下它们，静默丢掉等于抹掉用户的元数据。
-    pub fn save_v2(&self, w: &mut W) -> Result<()> {
-        if !self.tables.is_empty() || !self.rows.is_empty() {
-            return Err(Error::Config(format!(
-                "cannot write a version {SNAP_LEGACY_VERSION} snapshot while {} table(s) and {} row(s) exist: that layout has no place for them",
-                self.tables.len(),
-                self.row_count()
-            )));
-        }
+    /// 它存在的唯一理由是**让测试能造出真 v3 文件**（`tests/migrate.rs` 与下面
+    /// 的往返用例）。产品路径永远走 [`State::save`]：旧文件是历史版本写出来的，
+    /// 本仓不该假装替它写。四段只能写 0：v4 的 `State` 里已经没有那四张表，
+    /// 写非零计数就说出不存在的数据。
+    pub fn save_v3(&self, w: &mut W) {
         self.save_versioned(w, SNAP_LEGACY_VERSION);
-        Ok(())
     }
 
     fn save_versioned(&self, w: &mut W, ver: u32) {
@@ -1131,26 +1007,19 @@ impl State {
             w.bytes(d);
             rec.encode(w);
         }
-        w.u32(self.keys.len() as u32);
-        for key in self.keys.values() {
-            key.encode(w);
+        // ---- v3 的遗留段：v4 里没有了（四张专用控制面表）----
+        //
+        // 迁移工具读老文件时靠这四段的空计数字段定位到后面的通用表段；反过来
+        // 造老文件时也要把它们补上。v4 的 `State` 里没有那四张表，所以只能写 0。
+        if ver == SNAP_LEGACY_VERSION {
+            w.u32(0); // keys
+            w.u32(0); // audit
+            w.u64(0); // next_audit_seq
+            w.u32(0); // defs
+            w.u32(0); // placement
         }
-        w.u32(self.audit.len() as u32);
-        for row in self.audit.values() {
-            row.encode(w);
-        }
-        w.u64(self.next_audit_seq);
-        w.u32(self.defs.len() as u32);
-        for def in self.defs.values() {
-            def.encode(w);
-        }
-        w.u32(self.placement.len() as u32);
-        for (view, inst) in &self.placement {
-            w.bytes(view);
-            w.bytes(inst);
-        }
-        // ---- v3：通用表 ----
-        if ver == SNAP_VERSION {
+        // ---- v3 起：通用表 ----
+        {
             w.u32(self.tables.len() as u32);
             for t in self.tables.values() {
                 w.u32(t.id);
@@ -1204,21 +1073,22 @@ impl State {
 
     fn load_gate(r: &mut Rd, allow_legacy: bool) -> Result<State> {
         let ver = r.u32()?;
-        let tail = if ver == SNAP_VERSION {
-            true
-        } else if allow_legacy && ver == SNAP_LEGACY_VERSION {
-            false
-        } else if ver == SNAP_LEGACY_VERSION {
-            return Err(Error::Config(format!(
-                "snapshot version {ver} is one generation behind (this build writes \
-                 {SNAP_VERSION}): stop the server and run treedb-migrate --dir <data dir>, \
-                 which rewrites the snapshot in place and leaves the WAL alone"
-            )));
-        } else {
-            return Err(Error::Config(format!(
-                "snapshot version {ver} unsupported (this build writes {SNAP_VERSION})"
-            )));
-        };
+        let legacy = ver == SNAP_LEGACY_VERSION;
+        if ver != SNAP_VERSION {
+            if allow_legacy && legacy {
+                // 迁移工具读老文件：下面跳过四个遗留段。
+            } else if legacy {
+                return Err(Error::Config(format!(
+                    "snapshot version {ver} is one generation behind (this build writes \
+                     {SNAP_VERSION}): stop the server and run treedb-migrate --dir <data dir>, \
+                     which rewrites the snapshot in place and leaves the WAL alone"
+                )));
+            } else {
+                return Err(Error::Config(format!(
+                    "snapshot version {ver} unsupported (this build writes {SNAP_VERSION})"
+                )));
+            }
+        }
         let mut s = State::new();
         let n = r.u32()?;
         for _ in 0..n {
@@ -1262,29 +1132,28 @@ impl State {
             let rec = RefRec::decode(r)?;
             s.refs.insert(d, rec);
         }
-        let n = r.u32()?;
-        for _ in 0..n {
-            let key = KeyRec::decode(r)?;
-            s.keys.insert(key.id.clone(), key);
+        if legacy {
+            // v3 在 `refs` 之后还有四段专用控制面表（keys / audit +
+            // next_audit_seq / defs / placement）。v4 里它们已经不存在，只有
+            // 空段才能转：非空就是一个「删了就丢数据」的升级，不能静默做——
+            // 接入侧改成通用表之后这四段应该一直是空的（§10 阶段 C 3 末）。
+            let keys = r.u32()?;
+            let audit = r.u32()?;
+            r.u64()?; // next_audit_seq
+            let defs = r.u32()?;
+            let places = r.u32()?;
+            if keys + audit + defs + places != 0 {
+                return Err(Error::Config(format!(
+                    "snapshot version {SNAP_LEGACY_VERSION} carries {keys} key(s), {audit} \
+                     audit row(s), {defs} def(s) and {places} placement(s) in the four \
+                     control-plane tables that version {SNAP_VERSION} no longer has: move \
+                     them into general tables with the old build first (its `control-migrate \
+                     --to engine` does exactly that), or they would be dropped"
+                )));
+            }
         }
-        let n = r.u32()?;
-        for _ in 0..n {
-            let row = AuditRec::decode(r)?;
-            s.audit.insert(row.seq, row);
-        }
-        s.next_audit_seq = r.u64()?;
-        let n = r.u32()?;
-        for _ in 0..n {
-            let def = DefRec::decode(r)?;
-            s.defs.insert(def.name.clone(), def);
-        }
-        let n = r.u32()?;
-        for _ in 0..n {
-            let view = r.bytes()?;
-            let inst = r.bytes()?;
-            s.placement.insert(view, inst);
-        }
-        if tail {
+        // ---- v3 起：通用表 ----
+        {
             let n = r.u32()? as usize;
             if n > MAX_TABLE_ITEMS {
                 return Err(Error::Config(format!(
@@ -1410,50 +1279,6 @@ mod tests {
                 },
             },
             Log::DelRef { data_ref: b"r5".to_vec() },
-            Log::PutKey {
-                key: KeyRec {
-                    id: b"id".to_vec(),
-                    label: b"l".to_vec(),
-                    secret_hash: b"h".to_vec(),
-                    created_at: 1,
-                    last_used_at: 0,
-                    revoked_at: 0,
-                    view: Vec::new(),
-                    ro: false,
-                    owner: Vec::new(),
-                    note: Vec::new(),
-                    expires_at: 0,
-                    created_by: Vec::new(),
-                    secret_hint: Vec::new(),
-                },
-            },
-            Log::DelKey { id: b"id".to_vec() },
-            Log::PutAudit {
-                row: AuditRec {
-                    seq: 3,
-                    ts: 1,
-                    key_id: Vec::new(),
-                    method: Vec::new(),
-                    tool: Vec::new(),
-                    ok: true,
-                    detail: Vec::new(),
-                },
-            },
-            Log::TrimAudit { keep_from: 3 },
-            Log::PutDef {
-                def: DefRec {
-                    name: b"n".to_vec(),
-                    kind: b"k".to_vec(),
-                    payload: b"p".to_vec(),
-                    updated_at: 1,
-                },
-            },
-            Log::DelDef { name: b"n".to_vec() },
-            Log::PutPlace {
-                view: b"v".to_vec(),
-                instance: b"i".to_vec(),
-            },
-            Log::DelPlace { view: b"v".to_vec() },
             Log::PutTable {
                 id: 4,
                 def: TableDef {
@@ -1578,28 +1403,6 @@ mod tests {
         assert!(s.nodes.contains_key(&(2, 1)));
         assert!(s.dentries.is_empty());
         assert!(s.locks.is_empty());
-    }
-
-    #[test]
-    fn trim_audit_drops_old_window() {
-        let mut s = State::new();
-        for i in 1..=5u64 {
-            s.apply(&Log::PutAudit {
-                row: AuditRec {
-                    seq: i,
-                    ts: i as i64,
-                    key_id: Vec::new(),
-                    method: Vec::new(),
-                    tool: Vec::new(),
-                    ok: true,
-                    detail: Vec::new(),
-                },
-            });
-        }
-        assert_eq!(s.next_audit_seq, 6);
-        s.apply(&Log::TrimAudit { keep_from: 4 });
-        let keys: Vec<u64> = s.audit.keys().copied().collect();
-        assert_eq!(keys, vec![4, 5]);
     }
 
     /// readdir 游标分页：按 name 字节序，`after` 本身不重复出现。
@@ -1806,7 +1609,8 @@ mod tests {
         assert_eq!(s.indexed_cols(0), Vec::<u32>::new());
     }
 
-    /// 一份只用了 v2 就能装下的状态，按两代布局各写一遍。
+    /// 一份能同时装进 v3 与 v4 布局的状态：v4 里已经没有那四张控制面表，
+    /// 所以示例里也不该有它们 —— 有的话这例子本身就造不出 v3 之后的状态。
     fn legacy_sample() -> State {
         let mut s = State::new();
         s.apply(&Log::PutView {
@@ -1826,93 +1630,46 @@ mod tests {
             data_ref: b"1:4096:dev0".to_vec(),
             rec: RefRec { count: 1, bytes: 4096 },
         });
-        s.apply(&Log::PutKey {
-            key: KeyRec {
-                id: b"id".to_vec(),
-                label: b"l".to_vec(),
-                secret_hash: b"h".to_vec(),
-                created_at: 1,
-                last_used_at: 0,
-                revoked_at: 0,
-                view: b"alice".to_vec(),
-                ro: false,
-                owner: Vec::new(),
-                note: Vec::new(),
-                expires_at: 0,
-                created_by: Vec::new(),
-                secret_hint: Vec::new(),
-            },
-        });
-        s.apply(&Log::PutAudit {
-            row: AuditRec {
-                seq: 7,
-                ts: 1,
-                key_id: b"id".to_vec(),
-                method: Vec::new(),
-                tool: Vec::new(),
-                ok: true,
-                detail: Vec::new(),
-            },
-        });
-        s.apply(&Log::PutDef {
-            def: DefRec { name: b"n".to_vec(), kind: b"k".to_vec(), payload: b"p".to_vec(), updated_at: 1 },
-        });
-        s.apply(&Log::PutPlace { view: b"alice".to_vec(), instance: b"i1".to_vec() });
         s
     }
 
-    /// 「v2 与 v3 只差尾部三段」是迁移工具敢做读旧写新的全部依据。这条测试就
-    /// 是那个依据的可执行版本：前缀字节逐字节相同，旧布局能被迁移入口完整解回，
-    /// 而常规入口仍然拒收它。
+    /// v3 与 v4 的差别是「段被抽掉」：v3 在 `refs` 之后多出四张控制面表的计数
+    /// 与 `next_audit_seq`（共 24 字节），后面才是通用表段。迁移工具靠这 24 字节
+    /// 定位，所以 v3 必须能被迁移入口完整解回；常规入口则必须拒收并指出出路。
     #[test]
-    fn legacy_snapshot_decodes_from_the_same_prefix() {
+    fn legacy_snapshot_is_readable_only_by_the_migration_entry() {
         let s = legacy_sample();
         let mut w = W::new();
-        s.save_v2(&mut w).unwrap();
-        let mut raw = w.finish();
+        s.save_v3(&mut w);
+        let raw = w.finish();
         assert_eq!(State::snapshot_version(&raw).unwrap(), SNAP_LEGACY_VERSION);
-        raw.extend_from_slice(&4242u64.to_le_bytes());
 
-        // 尾巴先切掉再解：crc/seq 不属于正文布局。
-        let (body, seq) = State::snapshot_split(&raw).unwrap();
-        assert_eq!(seq, 4242);
-        let back = State::load_for_migration(&mut Rd::new(body)).unwrap();
-        assert_eq!(back, s, "v2 的正文必须被同一套解码吃下来");
-        assert!(
-            back.tables.is_empty() && back.rows.is_empty() && back.row_index.is_empty(),
-            "旧布局里没有表，解出来就该是两张空表而不是报错"
-        );
+        let back = State::load_for_migration(&mut Rd::new(&raw)).unwrap();
+        assert_eq!(back, s, "v3 的正文必须被同一套解码吃下来");
 
-        // 两代布局的前缀必须逐字节相同：不是「大致相同」，是同一个编码器
-        // 少跑了一个 `if`。这句话一旦不成立，迁移工具的「读旧写新」就得改写。
-        let mut w3 = W::new();
-        s.save(&mut w3);
-        let v3 = w3.finish();
-        let body_end = raw.len() - 8;
-        assert_eq!(
-            &v3[4..body_end],
-            &raw[4..body_end],
-            "两代布局只差版本位与尾部那几段，正文必须逐字节相同"
-        );
-        assert!(v3.len() > body_end, "v3 不写表那三段就等于没升版本");
+        // 两代布局只差那 24 字节：4 个 u32 计数 + 1 个 u64 序号。这条断言是
+        // 「v3 只多一段、不多别的」的可执行版本。
+        let mut w4 = W::new();
+        s.save(&mut w4);
+        let v4 = w4.finish();
+        assert_eq!(raw.len(), v4.len() + 4 + 4 + 8 + 4 + 4);
+
         // 当前布局走迁移入口也得能解（`--apply` 重跑第二次的幂等路径）。
-        // 这里传的是正文（v3 是 `save` 的输出，尾巴由调用方拼）。
-        assert_eq!(State::load_for_migration(&mut Rd::new(&v3)).unwrap(), s);
+        assert_eq!(State::load_for_migration(&mut Rd::new(&v4)).unwrap(), s);
 
         // 常规启动路径不开口子，但拒的时候要指出出路，不能只说「不支持」。
         let err = State::load(&mut Rd::new(&raw)).unwrap_err().to_string();
         assert!(err.contains("treedb-migrate"), "旧目录的出路要写在错里：{err}");
 
-        // 迁移入口按正文解：正文后面多一个字节就不是它自称的那个版本。
+        // 正文后面多一个字节就不是它自称的那个版本。
         let mut extra = raw.clone();
         extra.push(0);
-        let (body, _) = State::snapshot_split(&extra).unwrap();
-        assert!(State::load_for_migration(&mut Rd::new(body)).is_err());
+        assert!(State::load_for_migration(&mut Rd::new(&extra)).is_err());
         // 连 8 字节 seq 尾巴都放不下的文件，不是快照。
-        assert!(State::snapshot_split(&raw[..4]).is_err());
-        // 版本位越老越不认：两代之前没有迁移路径。
-        let ancient = 1u32.to_le_bytes().to_vec();
-        assert_eq!(State::snapshot_version(&ancient).unwrap(), 1);
+        assert!(State::snapshot_split(&[0u8; 4]).is_err());
+        // 版本位越老越不认：两代之前（v2）没有迁移路径。
+        let ancient = 2u32.to_le_bytes().to_vec();
+        assert_eq!(State::snapshot_version(&ancient).unwrap(), 2);
         assert!(State::load_for_migration(&mut Rd::new(&ancient)).is_err());
     }
 
@@ -1959,21 +1716,26 @@ mod tests {
         assert_eq!(State::load(&mut Rd::new(b2)).unwrap(), s);
     }
 
-    /// 旧布局装不下表与行，所以下行写必须硬拒。这个闸存在的原因是：一旦
-    /// 有人拿它去做「导出成旧格式」，静默丢掉行就是掉用户的元数据。
+    /// v3 文件里那四张表若还有数据，升级就会把它们静默丢掉 —— 迁移入口必须
+    /// 拒，并在错里指出先用旧二进制把数据搬进通用表。空段才允许直接转。
     #[test]
-    fn legacy_writer_refuses_to_drop_tables() {
-        let mut s = State::new();
-        s.apply(&Log::PutTable {
-            id: 3,
-            def: TableDef {
-                name: b"kv".to_vec(),
-                columns: vec![ColumnDef { name: b"a".to_vec(), flags: COL_UNIQUE }],
-            },
-        });
+    fn legacy_snapshot_with_control_plane_rows_is_refused() {
+        // 空状态的 v3 正文尾部是两段固定形状：24 字节计数段（4×u32 + u64）
+        // 紧跟 12 字节的空表段（表数 0、next_table_id、行数 0）。
         let mut w = W::new();
-        let err = s.save_v2(&mut w).unwrap_err().to_string();
-        assert!(err.contains("no place for them"), "要说清楚为什么不能写：{err}");
-        assert!(w.finish().is_empty(), "拒了就不该已经写出半截版本位");
+        State::new().save_v3(&mut w);
+        let raw = w.finish();
+        let at = raw.len() - 12 - 24;
+        let mut with_rows = raw.clone();
+        with_rows[at..at + 4].copy_from_slice(&1u32.to_le_bytes()); // keys = 1
+        let err = State::load_for_migration(&mut Rd::new(&with_rows))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("control-migrate"), "要说清楚怎么把数据搬走：{err}");
+        assert!(err.contains("key"), "要点名是哪张表：{err}");
+
+        // 空段是允许转的：同一份文件不改就能被解成 v4 的空状态。
+        let back = State::load_for_migration(&mut Rd::new(&raw)).unwrap();
+        assert_eq!(back, State::new());
     }
 }

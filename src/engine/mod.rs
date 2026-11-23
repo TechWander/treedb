@@ -72,7 +72,14 @@ pub const MAX_FRAME: u32 = 8 * 1024 * 1024;
 /// `SnapFetch { len: 0 }` 的探针答复 `Reply::SnapPrefix`（0x0182）：旧副本从不发
 /// `len == 0`（`--fetch-bytes 0` 启动时就拒），旧主对它回一个空 `SnapChunk`，
 /// 新副本认出这个答复就退回整份重下。
-pub const PROTOCOL_VERSION: u16 = 6;
+///
+/// v7（2026-11-23，§11 第 10 条 M4）删掉了四组专用控制面 op 的 14 个 Op tag
+/// （0x0040–0x0062）与 9 个 Reply tag（0x0140–0x0161），`Stats` 的帧里也少了
+/// 中间两个 u64（`keys` / `audit`）。删除既有帧不是「只追加」，按 §4.1 的判据
+/// 必须抬版本：v6 客户端发 `KeyList` 之类会撞上 `unknown op tag`，读 v6 的
+/// `Stats` 也会把后面的字段整体错位 —— 两边都在握手时就 fail-closed，好过
+/// 静默解错。
+pub const PROTOCOL_VERSION: u16 = 7;
 /// 帧头长度：payload 字节数（u32 小端，不含头）。
 pub const FRAME_HDR: usize = 4;
 

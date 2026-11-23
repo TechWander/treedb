@@ -68,8 +68,6 @@ fn print_stats(addr: &str, key: Option<&Key>, prometheus: bool) -> Result<(), St
             println!("dentries   = {}", s.dentries);
             println!("locks      = {}", s.locks);
             println!("refs       = {}", s.refs);
-            println!("keys       = {}", s.keys);
-            println!("audit      = {}", s.audit);
             println!("tables     = {} (rows {})", s.tables, s.rows);
             println!("seq        = {} (snapshot {})", s.seq, s.snap_seq);
             // 两个长度各说一件事：逻辑长度决定 checkpoint 何时触发，磁盘长度

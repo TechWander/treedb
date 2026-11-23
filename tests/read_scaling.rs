@@ -19,7 +19,7 @@ mod common;
 
 use common::Server;
 use treedb::engine::model::{
-    errno, AuditRec, ColumnDef, DefRec, KeyRec, Op, Reply, TableDef, COL_INDEX, COL_UNIQUE,
+    errno, ColumnDef, Op, Reply, TableDef, COL_INDEX, COL_UNIQUE,
     COND_NONE, NONCE_LEN, ROW_PK, SNAP_CHUNK_MAX, WAL_FETCH_MAX, WAL_HINT_NONE,
 };
 use treedb::engine::sha256::DIGEST_LEN;
@@ -95,7 +95,7 @@ fn rowput(table: &str, key: &str, val: &str, cond_col: u32, cond_val: &str) -> O
     }
 }
 
-/// 55 个 op 变体的语料，每条都带能让它走到真实分支的参数（视图/文件名/表名
+/// 41 个 op 变体的语料，每条都带能让它走到真实分支的参数（视图/文件名/表名
 /// 取自下面 `seed` 播好的状态，所以视图 id 由调用方递进来）。加新 op 必须同时
 /// 补这里 —— 最后两个计数断言就是报警器。
 fn corpus(v: u32) -> Vec<Op> {
@@ -132,31 +132,6 @@ fn corpus(v: u32) -> Vec<Op> {
         Op::RefDown { data_ref: blk(7), bytes: 4096 },
         Op::LockQuery { view: v, ino: 2 },
         Op::LockSet { view: v, ino: 2, owner: name("mnt1"), verb: 0, kind: 1, lease_expiry: i64::MAX },
-        // ---- 密钥 ----
-        Op::KeyCreate {
-            key: KeyRec {
-                id: name("k-new"), label: name("l"), secret_hash: name("h"),
-                created_at: 1, last_used_at: 0, revoked_at: 0, view: name("seed-view"),
-                ro: false, owner: name("o"), note: name(""), expires_at: i64::MAX,
-                created_by: name("test"), secret_hint: name(""),
-            },
-        },
-        Op::KeyGet { id: name("k-seed") },
-        Op::KeyList,
-        Op::KeyUpdate { id: name("k-seed"), verb: 2, ts: 2, new_hash: vec![], new_hint: vec![], ro: false },
-        Op::KeyCheck { id: name("k-seed"), verb: 0, hash: name("seed-hash"), now_ms: 1 },
-        // ---- 审计 / 定义 / 放置 ----
-        Op::AuditAppend {
-            row: AuditRec { seq: 0, ts: 1, key_id: name("k-seed"), method: name("ls"), tool: name("cli"), ok: true, detail: name("") },
-        },
-        Op::AuditList { limit: 10 },
-        Op::DefPut { def: DefRec { name: name("d-new"), kind: name("json"), payload: name("{}"), updated_at: 1 } },
-        Op::DefGet { name: name("d-seed") },
-        Op::DefList { kind: name("") },
-        Op::DefDel { name: name("d-seed") },
-        Op::PlaceSet { view: name("seed-view"), instance: name("pg2") },
-        Op::PlaceGet { view: name("seed-view") },
-        Op::PlaceList,
         // ---- 通用表 ----
         Op::TableCreate { def: tbl("new-table") },
         Op::TableDrop { name: name("seed-table") },
@@ -213,24 +188,6 @@ fn seed(e: &mut Engine) -> u32 {
     e.submit(&Op::Symlink { view: v, parent: 1, name: b"l".to_vec(), target: b"a".to_vec(), uid: 1, gid: 1 }).unwrap();
     e.submit(&Op::LockSet { view: v, ino: 2, owner: b"mnt".to_vec(), verb: 0, kind: 1, lease_expiry: i64::MAX }).unwrap();
     e.submit(&Op::RefUp { data_ref: blk(7), bytes: 4096 }).unwrap();
-    e.submit(&Op::KeyCreate {
-        key: KeyRec {
-            id: b"k-seed".to_vec(), label: b"l".to_vec(), secret_hash: b"seed-hash".to_vec(),
-            created_at: 1, last_used_at: 0, revoked_at: 0, view: b"seed-view".to_vec(),
-            ro: false, owner: b"o".to_vec(), note: b"".to_vec(), expires_at: i64::MAX,
-            created_by: b"test".to_vec(), secret_hint: b"".to_vec(),
-        },
-    })
-    .unwrap();
-    e.submit(&Op::AuditAppend {
-        row: AuditRec { seq: 0, ts: 1, key_id: b"k-seed".to_vec(), method: b"ls".to_vec(), tool: b"cli".to_vec(), ok: true, detail: b"".to_vec() },
-    })
-    .unwrap();
-    e.submit(&Op::DefPut {
-        def: DefRec { name: b"d-seed".to_vec(), kind: b"json".to_vec(), payload: b"{}".to_vec(), updated_at: 1 },
-    })
-    .unwrap();
-    e.submit(&Op::PlaceSet { view: b"seed-view".to_vec(), instance: b"pg1".to_vec() }).unwrap();
     // 通用表：不建表不灌行，五条只读表 op 两边都只会拼 ENOENT，分类断言
     // 就只在测「查不存在的表不产日志」这一件废话。
     e.submit(&Op::TableCreate { def: tbl("seed-table") }).unwrap();
@@ -265,9 +222,9 @@ fn readonly_classification_matches_translate() {
         }
     }
     let cs_len = cs.len();
-    assert_eq!(cs_len, 55, "op 语料必须覆盖全部变体");
-    assert_eq!(ro, 23, "只读 op 数变了：分派表、这里和 DESIGN.md §4.2 分组表要一起改");
-    assert_eq!(wr, 32, "非只读 op 数变了：同上");
+    assert_eq!(cs_len, 41, "op 语料必须覆盖全部变体");
+    assert_eq!(ro, 15, "只读 op 数变了：分派表、这里和 DESIGN.md §4.2 分组表要一起改");
+    assert_eq!(wr, 26, "非只读 op 数变了：同上");
 }
 
 /// 三档划分必须穷举且两两不交：只读 / 真写 / 控制面。
@@ -292,8 +249,8 @@ fn ops_partition_into_three_classes() {
     }
     assert_eq!(
         (ro, wr, ctl),
-        (23, 25, 7),
-        "三档的分布：只读 23 / 真写 25 / 控制面 7（Stats、Checkpoint、Shutdown、WalFetch、\
+        (15, 19, 7),
+        "三档的分布：只读 15 / 真写 19 / 控制面 7（Stats、Checkpoint、Shutdown、WalFetch、\
          SnapFetch、AuthBegin、AuthFinish）"
     );
     // 语料覆盖全部变体，因此三档之和就是 op 总数。

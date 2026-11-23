@@ -50,3 +50,20 @@ ok   快照水位照搬（尾巴 8 字节逐字节相等） = 123432
 ok   WAL 完好时回滚无损（旧二进制读到迁移后的全部写） = 41512
 ok   checkpoint 之后回滚确实丢写：64888 → 41512（回滚窗口 = 第一次 checkpoint 之前）
 ---- 结论：四条承诺全部对上真机数据 ----
+---- 彩排 v0.5.1 → 当前树（2026-11-23T08:23:21+00:00）----
+---- 彩排 v0.5.1 → 当前树（2026-11-23T08:23:59+00:00）----
+旧二进制：views=64 nodes=16208 dentries=16144 snap_seq=74760 snap=2101350 B（版本位 3）
+ok   不带 --apply 的退出码 = 10
+ok   体检不写任何文件 = 05cf469aecb19321
+ok   --apply 退出码 = 0
+ok   WAL 逐字节没动 = bb9f8df61474d25e
+ok   备份 = 原件 = 05cf469aecb19321
+ok   快照尺寸差 = -24 B（抽掉四段计数） = 2101326
+apply 输出：wal         = 4194304 B on disk (untouched by migration) migrated    = 3 -> 4 (2101350 B -> 2101326 B, seq 74760 preserved, 93 ms) backup      = /data/grovefs/treedb/.matrix/mig/data/state.snap.v2.bak wal         = untouched: 4194304 B -> 4194304 B 
+ok   迁移后 views = 64
+ok   迁移后 nodes = 16208
+ok   迁移后 dentries = 16144
+ok   快照水位照搬（尾巴 8 字节逐字节相等） = 74760
+ok   WAL 完好时回滚无损（旧二进制读到迁移后的全部写） = 39696
+ok   checkpoint 之后回滚确实丢写：62864 → 39696（回滚窗口 = 第一次 checkpoint 之前）
+---- 结论：四条承诺全部对上真机数据 ----

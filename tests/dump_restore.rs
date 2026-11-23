@@ -12,7 +12,7 @@
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 use treedb::engine::model::{
-    AuditRec, ColumnDef, DefRec, KeyRec, Kind, Node, Op, Reply, TableDef, COL_INDEX, COL_UNIQUE,
+    ColumnDef, Kind, Node, Op, Reply, TableDef, COL_INDEX, COL_UNIQUE,
     COND_NONE, SA_DATA_REF,
 };
 use treedb::engine::{dump_dir, now_ms, restore_dump, Durability, Engine, State};
@@ -118,24 +118,6 @@ fn commit_ref(view: u32, ino: u64, data_ref: u64, bytes: u64) -> Op {
     }
 }
 
-fn key(id: &str) -> KeyRec {
-    KeyRec {
-        id: id.into(),
-        label: format!("label-{id}").into(),
-        secret_hash: b"hash-1".to_vec(),
-        created_at: 7,
-        last_used_at: 9,
-        revoked_at: 0,
-        view: b"team".to_vec(),
-        ro: false,
-        owner: b"alice".to_vec(),
-        note: b"n".to_vec(),
-        expires_at: 0,
-        created_by: b"root".to_vec(),
-        secret_hint: b"h".to_vec(),
-    }
-}
-
 /// 每张表都放一条：漏掉哪张，`assert_eq!(back, before)` 会给出字段名。
 fn build_rich(e: &mut Engine) -> (u32, u64) {
     let v = mk_view(e, "v");
@@ -161,28 +143,6 @@ fn build_rich(e: &mut Engine) -> (u32, u64) {
             lease_expiry: now_ms() + 60_000,
         },
     );
-    ok(e, &Op::KeyCreate { key: key("k1") });
-    ok(
-        e,
-        &Op::AuditAppend {
-            row: AuditRec {
-                seq: 0,
-                ts: 5,
-                key_id: b"k1".to_vec(),
-                method: b"POST".to_vec(),
-                tool: b"fs_ls".to_vec(),
-                ok: true,
-                detail: b"d".to_vec(),
-            },
-        },
-    );
-    ok(
-        e,
-        &Op::DefPut {
-            def: DefRec { name: b"ls".to_vec(), kind: b"tool".to_vec(), payload: b"x".to_vec(), updated_at: 3 },
-        },
-    );
-    ok(e, &Op::PlaceSet { view: b"v".to_vec(), instance: b"node-1".to_vec() });
     ok(
         e,
         &Op::TableCreate {

@@ -1,4 +1,4 @@
-//! 引擎功能验收：POSIX 目录树语义 + refs 账本 + 锁 + 控制面 + 崩溃恢复等价性。
+//! 引擎功能验收：POSIX 目录树语义 + refs 账本 + 锁 + 通用表 + 崩溃恢复等价性。
 //!
 //! 全部走 [`Engine::submit`]（内嵌路径，`Durability::Always`），刻意**不经
 //! 网络**：这样「语义对不对」与「传输对不对」分开失败，报错时可读。
@@ -9,7 +9,7 @@
 use std::path::PathBuf;
 use tempfile::TempDir;
 use treedb::engine::model::{
-    errno, AuditRec, ColumnDef, DefRec, KeyRec, Kind, Node, NodeAttr, Op, Reply, TableDef,
+    errno, ColumnDef, Kind, Node, NodeAttr, Op, Reply, TableDef,
     DEL_IF_EXISTS, COL_INDEX, COL_UNIQUE, COND_NONE, PUT_IF_ABSENT, PUT_IF_EXISTS, ROW_KEY_MAX,
     ROW_PK, RENAME_NOREPLACE, SA_DATA_REF, SA_GID, SA_MODE, SA_SIZE, SA_UID, TABLE_NAME_MAX,
 };
@@ -168,24 +168,6 @@ fn dir_names(e: &mut Engine, view: u32, parent: u64, offset: u64, limit: u32) ->
             end,
         ),
         other => panic!("expected Reply::Dirents, got {other:?}"),
-    }
-}
-
-fn key(id: &str, hash: &str) -> KeyRec {
-    KeyRec {
-        id: id.into(),
-        label: format!("label-{id}").into(),
-        secret_hash: hash.into(),
-        created_at: 0,
-        last_used_at: 0,
-        revoked_at: 0,
-        view: b"team".to_vec(),
-        ro: false,
-        owner: b"alice".to_vec(),
-        note: Vec::new(),
-        expires_at: 0,
-        created_by: Vec::new(),
-        secret_hint: Vec::new(),
     }
 }
 
@@ -1113,189 +1095,6 @@ fn the_lock_sweep_never_writes_on_a_replica() {
     }
 }
 
-// ---------------------------------------------------------------- 控制面
-
-fn fresh_key() -> KeyRec {
-    key("k1", "hash-1")
-}
-
-#[test]
-fn key_lifecycle_auth_revoke_rotate_expire() {
-    let d = Dir::new("keys");
-    let mut e = d.open();
-
-    match ok(&mut e, &Op::KeyCreate { key: fresh_key() }) {
-        Reply::Key(k) => assert_eq!(k.id, b"k1"),
-        other => panic!("{other:?}"),
-    }
-    assert_eq!(err_code(&mut e, &Op::KeyCreate { key: fresh_key() }), errno::EEXIST);
-    match ok(&mut e, &Op::KeyGet { id: b"k1".to_vec() }) {
-        Reply::Key(k) => {
-            assert_eq!(
-                (k.label.as_slice(), k.ro, k.view.as_slice(), k.owner.as_slice()),
-                (b"label-k1".as_slice(), false, b"team".as_slice(), b"alice".as_slice())
-            );
-            assert_eq!(k.revoked_at, 0);
-        }
-        other => panic!("{other:?}"),
-    }
-    assert_eq!(err_code(&mut e, &Op::KeyGet { id: b"nope".to_vec() }), errno::ENOENT);
-
-    // auth：口令对 → 回 label/ro/view/owner（FUSE 侧要按 view 决定挂哪个树）。
-    match ok(&mut e, &Op::KeyCheck { id: b"k1".to_vec(), verb: 0, hash: b"hash-1".to_vec(), now_ms: now_ms() }) {
-        Reply::Authed { label, ro, view, owner } => {
-            assert_eq!(
-                (label.as_slice(), ro, view.as_slice(), owner.as_slice()),
-                (b"label-k1".as_slice(), false, b"team".as_slice(), b"alice".as_slice())
-            );
-        }
-        other => panic!("{other:?}"),
-    }
-    // live 探测与 auth 分开：verb=1 只回 bool。
-    assert_eq!(
-        ok(&mut e, &Op::KeyCheck { id: b"k1".to_vec(), verb: 1, hash: b"hash-1".to_vec(), now_ms: now_ms() }),
-        Reply::Live(true)
-    );
-
-    // 口令不符与 id 不存在必须同码同长，否则 id 可以被枚举出来。
-    let wrong = match rep(&mut e, &Op::KeyCheck { id: b"k1".to_vec(), verb: 0, hash: b"bad".to_vec(), now_ms: now_ms() }) {
-        Reply::Err { code, msg } => (code, msg),
-        other => panic!("{other:?}"),
-    };
-    let missing = match rep(&mut e, &Op::KeyCheck { id: b"kghost".to_vec(), verb: 0, hash: b"bad".to_vec(), now_ms: now_ms() }) {
-        Reply::Err { code, msg } => (code, msg),
-        other => panic!("{other:?}"),
-    };
-    assert_eq!(wrong, missing);
-    assert_eq!(wrong.0, errno::EADV);
-
-    // revoke 后 auth 直接拒；revoke 时间戳落库可见。
-    ok(&mut e, &Op::KeyUpdate { id: b"k1".to_vec(), verb: 0, ts: 111, new_hash: Vec::new(), new_hint: Vec::new(), ro: false });
-    assert_eq!(err_code(&mut e, &Op::KeyCheck { id: b"k1".to_vec(), verb: 0, hash: b"hash-1".to_vec(), now_ms: now_ms() }), errno::EADV);
-    match ok(&mut e, &Op::KeyGet { id: b"k1".to_vec() }) {
-        Reply::Key(k) => assert_eq!(k.revoked_at, 111),
-        other => panic!("{other:?}"),
-    }
-
-    // rotate：换新口令后旧 hash 失效；hint 同步更新。
-    ok(&mut e, &Op::KeyUpdate { id: b"k1".to_vec(), verb: 1, ts: 0, new_hash: b"hash-2".to_vec(), new_hint: b"ab12".to_vec(), ro: false });
-    assert_eq!(err_code(&mut e, &Op::KeyCheck { id: b"k1".to_vec(), verb: 0, hash: b"hash-1".to_vec(), now_ms: now_ms() }), errno::EADV);
-    // 已撤销的 key 即使口令对也过不去（revoked 优先于 hash 比较）。
-    assert_eq!(err_code(&mut e, &Op::KeyCheck { id: b"k1".to_vec(), verb: 0, hash: b"hash-2".to_vec(), now_ms: now_ms() }), errno::EADV);
-
-    // 过期：expires_at 到了就拒，0 表示永不过期。
-    ok(&mut e, &Op::KeyCreate {
-        key: KeyRec { expires_at: 5000, ..fresh_key().with_id("k2") },
-    });
-    assert!(matches!(
-        ok(&mut e, &Op::KeyCheck { id: b"k2".to_vec(), verb: 0, hash: b"hash-1".to_vec(), now_ms: 4999 }),
-        Reply::Authed { .. }
-    ));
-    assert_eq!(err_code(&mut e, &Op::KeyCheck { id: b"k2".to_vec(), verb: 0, hash: b"hash-1".to_vec(), now_ms: 5000 }), errno::EADV);
-
-    // touch 记 last_used；set_ro 翻只读位。
-    ok(&mut e, &Op::KeyUpdate { id: b"k2".to_vec(), verb: 2, ts: 777, new_hash: Vec::new(), new_hint: Vec::new(), ro: false });
-    ok(&mut e, &Op::KeyUpdate { id: b"k2".to_vec(), verb: 3, ts: 0, new_hash: Vec::new(), new_hint: Vec::new(), ro: true });
-    match ok(&mut e, &Op::KeyGet { id: b"k2".to_vec() }) {
-        Reply::Key(k) => assert_eq!((k.last_used_at, k.ro), (777, true)),
-        other => panic!("{other:?}"),
-    }
-    assert_eq!(err_code(&mut e, &Op::KeyUpdate { id: b"k2".to_vec(), verb: 9, ts: 0, new_hash: Vec::new(), new_hint: Vec::new(), ro: false }), errno::EINVAL);
-    assert_eq!(err_code(&mut e, &Op::KeyUpdate { id: b"ghost".to_vec(), verb: 0, ts: 1, new_hash: Vec::new(), new_hint: Vec::new(), ro: false }), errno::ENOENT);
-
-    match ok(&mut e, &Op::KeyList) {
-        Reply::Keys(v) => assert_eq!(v.len(), 2),
-        other => panic!("{other:?}"),
-    }
-}
-
-/// `key()` 的小糖：让用例能 `..fresh_key()` 复用其余字段。
-trait WithId {
-    fn with_id(self, id: &str) -> KeyRec;
-}
-impl WithId for KeyRec {
-    fn with_id(mut self, id: &str) -> KeyRec {
-        self.id = id.into();
-        self
-    }
-}
-
-#[test]
-fn audit_defs_placement_roundtrip() {
-    let d = Dir::new("control");
-    let mut e = d.open();
-
-    // seq=0 由引擎分配且单调；显式 seq 原样保留（导入历史数据用）。
-    ok(&mut e, &Op::AuditAppend {
-        row: AuditRec { seq: 0, ts: 1, key_id: b"k1".to_vec(), method: b"POST".to_vec(), tool: b"fs_ls".to_vec(), ok: true, detail: Vec::new() },
-    });
-    ok(&mut e, &Op::AuditAppend {
-        row: AuditRec { seq: 0, ts: 2, key_id: b"k2".to_vec(), method: b"GET".to_vec(), tool: b"key_list".to_vec(), ok: false, detail: b"denied".to_vec() },
-    });
-    ok(&mut e, &Op::AuditAppend {
-        row: AuditRec { seq: 900, ts: 3, key_id: b"k3".to_vec(), method: b"POST".to_vec(), tool: b"fs_rm".to_vec(), ok: true, detail: Vec::new() },
-    });
-    match ok(&mut e, &Op::AuditList { limit: 0 }) {
-        Reply::Audits(v) => {
-            assert_eq!(v.len(), 3);
-            assert_eq!(v[0].seq, 900, "limit=0 取全量，最新在前");
-            let mut auto: Vec<u64> = v.iter().map(|r| r.seq).filter(|s| *s < 900).collect();
-            auto.sort_unstable();
-            assert_eq!(auto, vec![1, 2], "自动 seq 必须递增不复用");
-            assert_eq!(v[1].detail, b"denied");
-        }
-        other => panic!("{other:?}"),
-    }
-    match ok(&mut e, &Op::AuditList { limit: 2 }) {
-        Reply::Audits(v) => assert_eq!(v.iter().map(|r| r.seq).collect::<Vec<_>>(), vec![900, 2]),
-        other => panic!("{other:?}"),
-    }
-
-    // 视图定义：按 kind 过滤，空 kind = 全量。
-    for (n, k) in [("ls", b"tool".as_slice()), ("rm", b"tool"), ("intro", b"prompt")] {
-        ok(&mut e, &Op::DefPut {
-            def: DefRec { name: n.into(), kind: k.to_vec(), payload: format!("body-{n}").into(), updated_at: 0 },
-        });
-    }
-    match ok(&mut e, &Op::DefList { kind: b"tool".to_vec() }) {
-        Reply::Defs(v) => assert_eq!(v.len(), 2),
-        other => panic!("{other:?}"),
-    }
-    match ok(&mut e, &Op::DefList { kind: Vec::new() }) {
-        Reply::Defs(v) => assert_eq!(v.len(), 3),
-        other => panic!("{other:?}"),
-    }
-    match ok(&mut e, &Op::DefGet { name: b"ls".to_vec() }) {
-        Reply::Def(Some(x)) => {
-            assert_eq!((x.payload.as_slice(), x.kind.as_slice()), (b"body-ls".as_slice(), b"tool".as_slice()));
-            assert!(x.updated_at > 0, "updated_at=0 必须由引擎填当前时间");
-        }
-        other => panic!("{other:?}"),
-    }
-    // 不存在的 def 回 Def(None) 而不是 Err：读路径要能区分「没有」与「查错」。
-    assert_eq!(ok(&mut e, &Op::DefGet { name: b"ghost".to_vec() }), Reply::Def(None));
-    ok(&mut e, &Op::DefDel { name: b"ls".to_vec() });
-    assert_eq!(ok(&mut e, &Op::DefGet { name: b"ls".to_vec() }), Reply::Def(None));
-    assert_eq!(err_code(&mut e, &Op::DefDel { name: b"ls".to_vec() }), errno::ENOENT);
-
-    // 放置表：视图名 → 实例，与视图生命周期无关（视图还没建就能先记归属）。
-    assert_eq!(err_code(&mut e, &Op::PlaceGet { view: b"ghost".to_vec() }), errno::ENOENT);
-    ok(&mut e, &Op::PlaceSet { view: b"ghost".to_vec(), instance: b"node-3".to_vec() });
-    assert_eq!(ok(&mut e, &Op::PlaceGet { view: b"ghost".to_vec() }), Reply::Place(b"node-3".to_vec()));
-    ok(&mut e, &Op::PlaceSet { view: b"other".to_vec(), instance: b"node-1".to_vec() });
-    match ok(&mut e, &Op::PlaceList) {
-        Reply::Places(v) => assert_eq!(v, vec![(b"ghost".to_vec(), b"node-3".to_vec()), (b"other".to_vec(), b"node-1".to_vec())]),
-        other => panic!("{other:?}"),
-    }
-    ok(&mut e, &Op::PlaceSet { view: b"ghost".to_vec(), instance: b"node-9".to_vec() });
-    assert_eq!(ok(&mut e, &Op::PlaceGet { view: b"ghost".to_vec() }), Reply::Place(b"node-9".to_vec()));
-    assert_eq!(
-        match ok(&mut e, &Op::PlaceList) { Reply::Places(v) => v.len(), other => panic!("{other:?}") },
-        2,
-        "改放置不能插出第二行"
-    );
-}
-
 // ---------------------------------------------------------------- 崩溃恢复等价性
 
 /// 造一份覆盖所有表的状态，返回 (视图 id, 文件 a 的 ino)。
@@ -1312,14 +1111,6 @@ fn build_state(e: &mut Engine) -> (u32, u64) {
         &Op::Symlink { view: v, parent: 1, name: b"l".to_vec(), target: b"a".to_vec(), uid: 1, gid: 1 },
     );
     ok(e, &Op::LockSet { view: v, ino: a.ino, owner: b"o1".to_vec(), verb: 0, kind: 1, lease_expiry: now_ms() + 10_000 });
-    ok(e, &Op::KeyCreate { key: fresh_key() });
-    ok(e, &Op::AuditAppend {
-        row: AuditRec { seq: 0, ts: 5, key_id: b"k1".to_vec(), method: b"POST".to_vec(), tool: b"fs_ls".to_vec(), ok: true, detail: Vec::new() },
-    });
-    ok(e, &Op::DefPut {
-        def: DefRec { name: b"ls".to_vec(), kind: b"tool".to_vec(), payload: b"x".to_vec(), updated_at: 0 },
-    });
-    ok(e, &Op::PlaceSet { view: b"v".to_vec(), instance: b"node-1".to_vec() });
     // 通用表：让表/行/级联删除也进重放与快照这两条恢复路径。
     ok(
         e,
@@ -1402,10 +1193,6 @@ fn assert_rich_state(s: &State, v: u32) {
     assert_eq!(s.refs.len(), 1);
     assert_eq!(s.refs[&blk(100)], treedb::engine::model::RefRec { count: 2, bytes: 5120 });
     assert_eq!(s.locks.len(), 1);
-    assert_eq!(s.keys.len(), 1);
-    assert_eq!(s.audit.len(), 1);
-    assert_eq!(s.defs.len(), 1);
-    assert_eq!(s.placement.len(), 1);
     assert!(s.view_by_id.contains_key(&v));
     // 通用表：级联后只剩一张活表，正向表同批摘掉；id 不回收。
     assert_eq!(s.tables.len(), 1, "只剩 t1：{:?}", s.tables.keys().collect::<Vec<_>>());

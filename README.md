@@ -16,8 +16,8 @@ cargo build --release                                   # 默认档：依赖只�
 ./target/release/treedb-server --dir /var/lib/treedb --listen 127.0.0.1:7777
 ./target/release/treedb-bench --op lookup --conns 64 --pipeline 32 --secs 3
 
-cargo test --release                                    # 默认档 214 passed / 3 ignored（引擎本体）
-cargo test --release --features postgres-compat        # 245 passed / 9 ignored（含 PG 过渡档）
+cargo test --release                                    # 默认档 211 passed / 3 ignored（引擎本体）
+cargo test --release --features postgres-compat        # 242 passed / 9 ignored（含 PG 过渡档）
 bash benches/throughput_matrix.sh 3 1 2 3 4 5           # 五轴复现，输出进 benches/results/
 bash benches/sync_ratio.sh 3                           # 写路径机制：一次 fsync 摊了多少写
 bash benches/single_conn.sh 3                          # 单连接对标 PG（$PIPE=32 走批量档、$CONNS/$WORKERS 走并发档）
@@ -27,13 +27,13 @@ bash benches/replica_rate_xhost.sh 3                   # 同上跨机版（需 s
 bash benches/ab_layout.sh <基线 rev>                     # 受控 A/B：只换服务端二进制比引擎改动
 bash benches/default_check.sh                           # 零旗标默认档同格跑 5 次，验默认值真的生效
 bash benches/ab_durability.sh <基线 rev>                  # 写轴 A/B：只换服务端二进制比持久化档
-bash benches/rehearse_migrate.sh v0.3.2                 # 快照升级真机彩排：旧 tag 的二进制 → 迁移 → 回滚
+bash benches/rehearse_migrate.sh v0.5.1                 # 快照升级真机彩排：旧 tag 的二进制 → 迁移 → 回滚
 bash benches/handshake_cost.sh 20000                   # 接入握手的代价：两臂同轮 A/B（建连 + RSS/conn + 稳态）
 bash benches/bench_rows.sh                             # 通用表九条路径（rowput/rowget/rowlist/rowidx/rowrange/…）× 三形状
 ./target/release/treedb-micro --items 32000             # 纯计算档（不经网络/不写 WAL）+ 分配计数
 ```
 
-数据目录是从旧快照布局（`SNAP_VERSION` 2）上来的，新二进制会拒收 —— 那不是 bug，
+数据目录是从旧快照布局（`SNAP_VERSION` 3）上来的，新二进制会拒收 —— 那不是 bug，
 而是不静默按错布局解字节的故意选择。出路随包安装：
 
 ```sh
@@ -41,10 +41,12 @@ bash benches/bench_rows.sh                             # 通用表九条路径�
 ./target/release/treedb-migrate --dir /var/lib/treedb --apply  # 只重写 state.snap，WAL 不动
 ```
 
-回滚是把自动落下的 `state.snap.v2.bak` 拷回去再跑旧二进制 —— 但无损只维持到新二进制
-做过第一次 checkpoint 之前（同步 checkpoint 会 `wal.reset()`，把上一代日志物理抹掉）。
-四条承诺、回滚窗口与为什么不在启动路径上开「自动兼容读」的口子，见
-[DESIGN.md](DESIGN.md) §6.5；`bash benches/rehearse_migrate.sh v0.3.2` 拿真旧二进制
+回滚是把自动落下的 `state.snap.v2.bak`（名字是历史，自 v2 → v3 起就没改）拷回去再跑
+旧二进制 —— 但无损只维持到新二进制做过第一次 checkpoint 之前（同步 checkpoint 会
+`wal.reset()`，把上一代日志物理抹掉）。
+四条承诺加 v3 → v4 的「四张已删专用表非空就拒」、回滚窗口与为什么不在启动路径上开
+「自动兼容读」的口子，见
+[DESIGN.md](DESIGN.md) §6.5；`bash benches/rehearse_migrate.sh v0.5.1` 拿真旧二进制
 把整条链（造旧目录 → 迁移 → 开门 → 回滚）复算一遍。
 
 要把一份数据搬到别的机器/别的目录，用逻辑 dump（停服后两侧都独占目录）：
@@ -297,7 +299,7 @@ DESIGN.md §7（含 §7.8 那次全五轴复跑）。
 
 - **认证只管身份，授权与传输加密仍然没有**（§4.4、§8 第 13 条）。v5 起可以
   `--auth-key-file` 打开一次共享密钥的双向握手，但它默认关、而且过了握手的连接与
-  不开时一样拥有全部 55 个 op 的权限，包括 `Shutdown` 与 `Checkpoint`；握手之后仍是
+  不开时一样拥有全部 41 个 op 的权限，包括 `Shutdown` 与 `Checkpoint`；握手之后仍是
   裸 TCP + 长度前缀 + CRC32，而 CRC32 只判损坏。所以「谁能连上 + 谁持有这把密钥」
   = 「谁能改整个状态」，多租户、配额、审计归属必须在引擎之外做（grovefs 的
   apikey + 网关白名单就是这一层），或者把端口锁在回环/私有网段。副本对主那一侧
@@ -335,7 +337,7 @@ DESIGN.md §7（含 §7.8 那次全五轴复跑）。
 
 | 路径 | 内容 |
 |------|------|
-| `src/engine/` | 线协议类型（`model.rs`，55 个 op / 31 个 Reply）、帧编码（`codec.rs`）、状态机（`mem.rs`）、应用与定序（`apply.rs`）、WAL/快照（`wal.rs`）、核心（`core.rs`）、WAL 归档与 PITR（`archive.rs`，§6.11）、离线 dump 容器（`dump.rs`，§6.9）、自写的 SHA-256/HMAC（`sha256.rs`，§4.4） |
+| `src/engine/` | 线协议类型（`model.rs`，41 个 op / 22 个 Reply）、帧编码（`codec.rs`）、状态机（`mem.rs`）、应用与定序（`apply.rs`）、WAL/快照（`wal.rs`）、核心（`core.rs`）、WAL 归档与 PITR（`archive.rs`，§6.11）、离线 dump 容器（`dump.rs`，§6.9）、自写的 SHA-256/HMAC（`sha256.rs`，§4.4） |
 | `src/net/` | 单线程事件循环（`server.rs`）、多前端 worker + 唯一提交线程（`multi.rs`）、跨线程信箱（`mail.rs`）、接入认证闸门（`auth.rs`，§4.4）、副本跟踪器（`replicate.rs`）、阻塞客户端（`client.rs`） |
 | `src/{pool,store,persist,schema,probe}.rs` | `postgres-compat` 过渡档 |
 | `src/bin/` | `treedb-server` / `treedb-bench` / `treedb-pgbench`（对照工具）/ `treedb-micro`（纯计算 + 分配计数）/ `treedb-migrate`（快照升级）/ `treedb-standby`（只读副本 + `--promote`）/ `treedb-dump` + `treedb-load`（离线逻辑导出与重建）/ `treedb-backup`（在线一致快照）/ `treedb-pitr`（按 seq 恢复到新目录）/ `treedb-demo` |

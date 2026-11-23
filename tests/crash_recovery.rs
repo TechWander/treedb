@@ -17,7 +17,7 @@ use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use treedb::engine::model::{
-    errno, AuditRec, ColumnDef, DefRec, KeyRec, Kind, Node, Op, Reply, TableDef, COL_INDEX,
+    errno, ColumnDef, Kind, Node, Op, Reply, TableDef, COL_INDEX,
     COL_UNIQUE, COND_NONE, ROW_PK, SA_DATA_REF, SA_SIZE,
 };
 use treedb::net::client::Client;
@@ -67,24 +67,6 @@ fn trow(table: &str, key: &str, a: &str, b: &str) -> Op {
         flags: 0,
         cond_col: COND_NONE,
         cond_val: Vec::new(),
-    }
-}
-
-fn key(id: &str, hash: &str) -> KeyRec {
-    KeyRec {
-        id: id.into(),
-        label: format!("label-{id}").into(),
-        secret_hash: hash.into(),
-        created_at: 1,
-        last_used_at: 0,
-        revoked_at: 0,
-        view: b"team".to_vec(),
-        ro: false,
-        owner: b"alice".to_vec(),
-        note: Vec::new(),
-        expires_at: 0,
-        created_by: Vec::new(),
-        secret_hint: b"ab".to_vec(),
     }
 }
 
@@ -436,21 +418,6 @@ fn control_plane_survives_sigkill() {
         },
     );
 
-    ok(&mut c, &Op::KeyCreate { key: key("k-durable", "hash-1") });
-    ok(
-        &mut c,
-        &Op::KeyUpdate { id: b"k-durable".to_vec(), verb: 3, ts: 0, new_hash: Vec::new(), new_hint: Vec::new(), ro: true },
-    );
-    ok(
-        &mut c,
-        &Op::KeyUpdate { id: b"k-durable".to_vec(), verb: 2, ts: 777, new_hash: Vec::new(), new_hint: Vec::new(), ro: false },
-    );
-    ok(&mut c, &Op::AuditAppend { row: AuditRec { seq: 0, ts: 123, key_id: b"k-durable".to_vec(), method: b"xfer.get".to_vec(), tool: b"api".to_vec(), ok: true, detail: b"durable detail".to_vec() } });
-    ok(
-        &mut c,
-        &Op::DefPut { def: DefRec { name: b"view.ctl".to_vec(), kind: b"view".to_vec(), payload: br#"{"sql":"select 1"}"#.to_vec(), updated_at: 7 } },
-    );
-    ok(&mut c, &Op::PlaceSet { view: b"ctl".to_vec(), instance: b"node-3".to_vec() });
     ok(
         &mut c,
         &Op::LockSet { view: v, ino: renamed.ino, owner: b"owner-1".to_vec(), verb: 0, kind: 2, lease_expiry: 0 },
@@ -521,39 +488,6 @@ fn control_plane_survives_sigkill() {
     // ---- 块引用账本：崩后 count/bytes 仍对得上
     match ok(&mut c, &Op::RefLookup { data_ref: blk }) {
         Reply::Ref { count, bytes } => assert_eq!((count, bytes), (1, 4096)),
-        other => panic!("{other:?}"),
-    }
-
-    // ---- 密钥：ro / last_used 都要带回来，且旧口令仍能过 auth
-    match ok(&mut c, &Op::KeyGet { id: b"k-durable".to_vec() }) {
-        Reply::Key(k) => assert_eq!((k.ro, k.last_used_at, k.revoked_at), (true, 777, 0)),
-        other => panic!("{other:?}"),
-    }
-    assert!(matches!(
-        ok(&mut c, &Op::KeyCheck { id: b"k-durable".to_vec(), verb: 0, hash: b"hash-1".to_vec(), now_ms: 1000 }),
-        Reply::Authed { .. }
-    ));
-
-    // ---- 审计：seq 由服务端分配，崩后不能重号也不能丢行
-    match ok(&mut c, &Op::AuditList { limit: 10 }) {
-        Reply::Audits(rows) => {
-            assert_eq!(rows.len(), 1, "{rows:?}");
-            assert!(rows[0].seq > 0, "audit seq 应当已分配");
-            assert_eq!(rows[0].detail, b"durable detail".to_vec());
-        }
-        other => panic!("{other:?}"),
-    }
-
-    // ---- 视图定义与放置
-    match ok(&mut c, &Op::DefGet { name: b"view.ctl".to_vec() }) {
-        Reply::Def(Some(def)) => assert_eq!(
-            (def.kind.as_slice(), def.payload.as_slice(), def.updated_at),
-            (b"view".as_slice(), br#"{"sql":"select 1"}"#.as_slice(), 7)
-        ),
-        other => panic!("{other:?}"),
-    }
-    match ok(&mut c, &Op::PlaceGet { view: b"ctl".to_vec() }) {
-        Reply::Place(i) => assert_eq!(i, b"node-3".to_vec()),
         other => panic!("{other:?}"),
     }
 

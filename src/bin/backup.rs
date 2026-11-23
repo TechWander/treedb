@@ -23,7 +23,7 @@
 //!   热副本逐条追。
 //! - **主在备份期间 checkpoint 掉了还没拉的那段，本轮作废重来**（`gap`）。
 //!   这不是错，是「没跟上」，重试整份即可；`--retries` 管次数。
-//! - **文件形状与 dump 完全相同**：`TDBDUMP1` 容器，`treedb-load` 直接吃得下。
+//! - **文件形状与 dump 完全相同**：`TDBDUMP2` 容器，`treedb-load` 直接吃得下。
 //!   唯一区别是它不来自目录，所以连 `.lock` 都不碰 —— 主可以一直在跑。
 //!
 //! 不搬 `fence`（与 dump 同一条规矩）：备份是内容快照，不是「谁有权写」的凭证，
@@ -193,10 +193,8 @@ fn main() {
                     ));
                 }
                 say(format!(
-                    "  views {} nodes {} dentries {} locks {} refs {} keys {} audit {} defs {} \
-                     placement {} tables {} rows {}",
-                    c.views, c.nodes, c.dentries, c.locks, c.refs, c.keys, c.audit, c.defs,
-                    c.placement, c.tables, c.rows
+                    "  views {} nodes {} dentries {} locks {} refs {} tables {} rows {}",
+                    c.views, c.nodes, c.dentries, c.locks, c.refs, c.tables, c.rows
                 ));
                 say(format!("  took {:.1} ms", started.elapsed().as_secs_f64() * 1000.0));
                 return;

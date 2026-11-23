@@ -5,10 +5,14 @@
 //!   内存里按 `(view,parent)` 分两层存，见 [`crate::engine::mem::State`]）；
 //! - `locks` 表 → [`LockRec`]（`(view,ino,owner) → kind,lease`）；
 //! - 内容引用账本 → [`RefRec`]（`data_ref → count,size`，跨视图共享）；
-//! - 控制面「命名密钥 + 调用审计」两张表 → [`KeyRec`] / [`AuditRec`]。
+//! - 通用表 → [`TableDef`] / [`RowRec`]：列名与语义由客户端定义，引擎不解释。
 //!
 //! 命名与列语义与关系库那一版逐字段对得上，客户端接入时上层映射是翻译，
 //! 不是重新建模 —— 这是这套形状存在的原因，不是对某个具体客户端的契约。
+//!
+//! 这里曾经还有**按某个客户端照抄的四张专用表**（命名密钥 / 调用审计 / 视图
+//! 定义 / 放置），2026-11-23 按 DESIGN §11 第 10 条（M4）整体删掉了：接入侧
+//! 已经用通用表拼出等价语义并跑过端到端，内核不再保留业务表。
 
 use crate::engine::codec::{Rd, W};
 use crate::engine::sha256::DIGEST_LEN;
@@ -156,128 +160,6 @@ impl RefRec {
         Ok(RefRec {
             count: r.u64()?,
             bytes: r.u64()?,
-        })
-    }
-}
-
-/// 控制面 API 密钥行。列形状照「关系库版 api_keys 表」来，字段都是字节串；
-/// 撤销/过期/只读这些规则由客户端解释（§11 第 7 条 T2 会把它换成通用表）。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct KeyRec {
-    pub id: Vec<u8>,
-    pub label: Vec<u8>,
-    pub secret_hash: Vec<u8>,
-    pub created_at: i64,
-    pub last_used_at: i64,
-    pub revoked_at: i64,
-    pub view: Vec<u8>,
-    pub ro: bool,
-    pub owner: Vec<u8>,
-    pub note: Vec<u8>,
-    pub expires_at: i64,
-    pub created_by: Vec<u8>,
-    pub secret_hint: Vec<u8>,
-}
-
-impl KeyRec {
-    pub fn encode(&self, w: &mut W) {
-        w.bytes(&self.id);
-        w.bytes(&self.label);
-        w.bytes(&self.secret_hash);
-        w.i64(self.created_at);
-        w.i64(self.last_used_at);
-        w.i64(self.revoked_at);
-        w.bytes(&self.view);
-        w.bool(self.ro);
-        w.bytes(&self.owner);
-        w.bytes(&self.note);
-        w.i64(self.expires_at);
-        w.bytes(&self.created_by);
-        w.bytes(&self.secret_hint);
-    }
-    pub fn decode(r: &mut Rd) -> Result<Self> {
-        Ok(KeyRec {
-            id: r.bytes()?,
-            label: r.bytes()?,
-            secret_hash: r.bytes()?,
-            created_at: r.i64()?,
-            last_used_at: r.i64()?,
-            revoked_at: r.i64()?,
-            view: r.bytes()?,
-            ro: r.bool()?,
-            owner: r.bytes()?,
-            note: r.bytes()?,
-            expires_at: r.i64()?,
-            created_by: r.bytes()?,
-            secret_hint: r.bytes()?,
-        })
-    }
-    /// 0 = 不过期（对应关系库里这一列存空串的做法）。
-    pub fn expired(&self, now_ms: i64) -> bool {
-        self.expires_at != 0 && self.expires_at <= now_ms
-    }
-    pub fn revoked(&self) -> bool {
-        self.revoked_at != 0
-    }
-}
-
-/// 审计行：一次外部调用的记账，形状同关系库版的 mcp_calls 表。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AuditRec {
-    pub seq: u64,
-    pub ts: i64,
-    pub key_id: Vec<u8>,
-    pub method: Vec<u8>,
-    pub tool: Vec<u8>,
-    pub ok: bool,
-    pub detail: Vec<u8>,
-}
-
-impl AuditRec {
-    pub fn encode(&self, w: &mut W) {
-        w.u64(self.seq);
-        w.i64(self.ts);
-        w.bytes(&self.key_id);
-        w.bytes(&self.method);
-        w.bytes(&self.tool);
-        w.bool(self.ok);
-        w.bytes(&self.detail);
-    }
-    pub fn decode(r: &mut Rd) -> Result<Self> {
-        Ok(AuditRec {
-            seq: r.u64()?,
-            ts: r.i64()?,
-            key_id: r.bytes()?,
-            method: r.bytes()?,
-            tool: r.bytes()?,
-            ok: r.bool()?,
-            detail: r.bytes()?,
-        })
-    }
-}
-
-/// 视图定义行（MCP resource/prompt/tool 定义），对齐 `view_defs`。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DefRec {
-    pub name: Vec<u8>,
-    pub kind: Vec<u8>,
-    pub payload: Vec<u8>,
-    pub updated_at: i64,
-}
-
-impl DefRec {
-    pub fn encode(&self, w: &mut W) {
-        w.bytes(&self.name);
-        w.bytes(&self.kind);
-        w.bytes(&self.payload);
-        w.i64(self.updated_at);
-    }
-    pub fn decode(r: &mut Rd) -> Result<Self> {
-        Ok(DefRec {
-            name: r.bytes()?,
-            kind: r.bytes()?,
-            payload: r.bytes()?,
-            updated_at: r.i64()?,
         })
     }
 }
@@ -726,56 +608,10 @@ pub enum Op {
         lease_expiry: i64,
     },
 
-    // ---- 控制面 ----
-    KeyCreate {
-        key: KeyRec,
-    },
-    KeyGet {
-        id: Vec<u8>,
-    },
-    KeyList,
-    /// verb: 0 = revoke, 1 = rotate（换 hash+hint）, 2 = touch, 3 = set_ro。
-    KeyUpdate {
-        id: Vec<u8>,
-        verb: u8,
-        ts: i64,
-        new_hash: Vec<u8>,
-        new_hint: Vec<u8>,
-        ro: bool,
-    },
-    /// verb: 0 = auth, 1 = live check。
-    KeyCheck {
-        id: Vec<u8>,
-        verb: u8,
-        hash: Vec<u8>,
-        now_ms: i64,
-    },
-    AuditAppend {
-        row: AuditRec,
-    },
-    AuditList {
-        limit: u32,
-    },
-    DefPut {
-        def: DefRec,
-    },
-    DefGet {
-        name: Vec<u8>,
-    },
-    DefList {
-        kind: Vec<u8>,
-    },
-    DefDel {
-        name: Vec<u8>,
-    },
-    PlaceSet {
-        view: Vec<u8>,
-        instance: Vec<u8>,
-    },
-    PlaceGet {
-        view: Vec<u8>,
-    },
-    PlaceList,
+    // 0x0040–0x0062 这一段曾是四组专用控制面 op（`Key*`/`Audit*`/`Def*`/
+    // `Place*`），2026-11-23 按 §11 第 10 条（M4）整体删除。tag 不回收：
+    // 旧客户端发过来会落到 `decode` 的 `unknown op tag`，所以线协议主版本
+    // 抬到了 7（§4.1 的判据：删除既有帧不是「纯追加」）。
 
     // ---- 通用表：列名与语义由客户端定义，引擎不解释值 ----
     /// 建表。重名 → `EEXIST`；无列/超列数上限/列名空或重复 → `EINVAL`。
@@ -976,20 +812,7 @@ impl Op {
             Op::RefDown { .. } => 0x0032,
             Op::LockQuery { .. } => 0x0033,
             Op::LockSet { .. } => 0x0034,
-            Op::KeyCreate { .. } => 0x0040,
-            Op::KeyGet { .. } => 0x0041,
-            Op::KeyList => 0x0042,
-            Op::KeyUpdate { .. } => 0x0043,
-            Op::KeyCheck { .. } => 0x0044,
-            Op::AuditAppend { .. } => 0x0045,
-            Op::AuditList { .. } => 0x0046,
-            Op::DefPut { .. } => 0x0050,
-            Op::DefGet { .. } => 0x0051,
-            Op::DefList { .. } => 0x0052,
-            Op::DefDel { .. } => 0x0053,
-            Op::PlaceSet { .. } => 0x0060,
-            Op::PlaceGet { .. } => 0x0061,
-            Op::PlaceList => 0x0062,
+            // 0x0040–0x0062 留空：四组专用控制面 op 已删除（不回收 tag）。
             Op::TableCreate { .. } => 0x0070,
             Op::TableDrop { .. } => 0x0071,
             Op::TableGet { .. } => 0x0072,
@@ -1062,14 +885,6 @@ impl Op {
             | Op::ReadDirPlus { .. }
             | Op::RefLookup { .. }
             | Op::LockQuery { .. }
-            | Op::KeyGet { .. }
-            | Op::KeyList
-            | Op::KeyCheck { .. }
-            | Op::AuditList { .. }
-            | Op::DefGet { .. }
-            | Op::DefList { .. }
-            | Op::PlaceGet { .. }
-            | Op::PlaceList
             | Op::TableGet { .. }
             | Op::TableList
             | Op::RowGet { .. }
@@ -1092,12 +907,6 @@ impl Op {
             | Op::RefUp { .. }
             | Op::RefDown { .. }
             | Op::LockSet { .. }
-            | Op::KeyCreate { .. }
-            | Op::KeyUpdate { .. }
-            | Op::AuditAppend { .. }
-            | Op::DefPut { .. }
-            | Op::DefDel { .. }
-            | Op::PlaceSet { .. }
             | Op::TableCreate { .. }
             | Op::TableDrop { .. }
             | Op::TableAddColumn { .. }
@@ -1118,10 +927,7 @@ impl Op {
             | Op::Checkpoint
             | Op::Shutdown
             | Op::ListViews
-            | Op::KeyList
-            | Op::PlaceList
             | Op::TableList => {}
-            Op::AuditList { limit } => w.u32(*limit),
             Op::CreateView { name } => w.bytes(name),
             Op::DropView { name } => w.bytes(name),
             Op::Lookup {
@@ -1272,38 +1078,6 @@ impl Op {
                 w.u8(*kind);
                 w.i64(*lease_expiry);
             }
-            Op::KeyCreate { key } => key.encode(w),
-            Op::KeyGet { id } => w.bytes(id),
-            Op::KeyUpdate {
-                id,
-                verb,
-                ts,
-                new_hash,
-                new_hint,
-                ro,
-            } => {
-                w.bytes(id);
-                w.u8(*verb);
-                w.i64(*ts);
-                w.bytes(new_hash);
-                w.bytes(new_hint);
-                w.bool(*ro);
-            }
-            Op::KeyCheck { id, verb, hash, now_ms } => {
-                w.bytes(id);
-                w.u8(*verb);
-                w.bytes(hash);
-                w.i64(*now_ms);
-            }
-            Op::AuditAppend { row } => row.encode(w),
-            Op::DefPut { def } => def.encode(w),
-            Op::DefGet { name } | Op::DefDel { name } => w.bytes(name),
-            Op::DefList { kind } => w.bytes(kind),
-            Op::PlaceSet { view, instance } => {
-                w.bytes(view);
-                w.bytes(instance);
-            }
-            Op::PlaceGet { view } => w.bytes(view),
             Op::TableCreate { def } => def.encode(w),
             Op::TableDrop { name } | Op::TableGet { name } => w.bytes(name),
             Op::TableAddColumn { table, column } => {
@@ -1528,41 +1302,6 @@ impl Op {
                 kind: r.u8()?,
                 lease_expiry: r.i64()?,
             },
-            0x0040 => Op::KeyCreate {
-                key: KeyRec::decode(r)?,
-            },
-            0x0041 => Op::KeyGet { id: r.bytes()? },
-            0x0042 => Op::KeyList,
-            0x0043 => Op::KeyUpdate {
-                id: r.bytes()?,
-                verb: r.u8()?,
-                ts: r.i64()?,
-                new_hash: r.bytes()?,
-                new_hint: r.bytes()?,
-                ro: r.bool()?,
-            },
-            0x0044 => Op::KeyCheck {
-                id: r.bytes()?,
-                verb: r.u8()?,
-                hash: r.bytes()?,
-                now_ms: r.i64()?,
-            },
-            0x0045 => Op::AuditAppend {
-                row: AuditRec::decode(r)?,
-            },
-            0x0046 => Op::AuditList { limit: r.u32()? },
-            0x0050 => Op::DefPut {
-                def: DefRec::decode(r)?,
-            },
-            0x0051 => Op::DefGet { name: r.bytes()? },
-            0x0052 => Op::DefList { kind: r.bytes()? },
-            0x0053 => Op::DefDel { name: r.bytes()? },
-            0x0060 => Op::PlaceSet {
-                view: r.bytes()?,
-                instance: r.bytes()?,
-            },
-            0x0061 => Op::PlaceGet { view: r.bytes()? },
-            0x0062 => Op::PlaceList,
             0x0070 => Op::TableCreate {
                 def: TableDef::decode(r)?,
             },
@@ -1818,25 +1557,11 @@ pub enum Reply {
         bytes: u64,
     },
     Locks(Vec<(Vec<u8>, u8, i64)>),
-    Key(Box<KeyRec>),
-    Keys(Vec<KeyRec>),
-    Authed {
-        label: Vec<u8>,
-        ro: bool,
-        view: Vec<u8>,
-        owner: Vec<u8>,
-    },
-    Live(bool),
-    Audits(Vec<AuditRec>),
-    Def(Option<DefRec>),
-    Defs(Vec<DefRec>),
-    Place(Vec<u8>),
-    Places(Vec<(Vec<u8>, Vec<u8>)>),
-    /// 一张通用表的形状：`None` = 没有这张表（不是错误，与 `DefGet` 同形）。
+    /// 一张通用表的形状：`None` = 没有这张表（不是错误，与 `TableGet` 同形）。
     Table(Option<TableDef>),
     Tables(Vec<TableDef>),
-    /// 一行：`None` = 没有这行。`RowPut` 成功时回存进去的那一行（与
-    /// `KeyCreate` 一样把成品给回去，免得调用方再读一次）。
+    /// 一行：`None` = 没有这行。`RowPut` 成功时回存进去的那一行（把成品
+    /// 直接给回去，免得调用方再读一次）。
     Row(Option<RowRec>),
     /// `RowList` 的一页。`end = false` 意味着还有：下一页把本页最后一行的
     /// 键当 `from` 游标。
@@ -2016,69 +1741,6 @@ impl Reply {
                     w.bytes(owner);
                     w.u8(*kind);
                     w.i64(*exp);
-                }
-            }
-            Reply::Key(k) => {
-                w.u16(0x0140);
-                k.encode(w);
-            }
-            Reply::Keys(v) => {
-                w.u16(0x0141);
-                w.u32(v.len() as u32);
-                for k in v {
-                    k.encode(w);
-                }
-            }
-            Reply::Authed {
-                label,
-                ro,
-                view,
-                owner,
-            } => {
-                w.u16(0x0142);
-                w.bytes(label);
-                w.bool(*ro);
-                w.bytes(view);
-                w.bytes(owner);
-            }
-            Reply::Live(b) => {
-                w.u16(0x0143);
-                w.bool(*b);
-            }
-            Reply::Audits(v) => {
-                w.u16(0x0144);
-                w.u32(v.len() as u32);
-                for a in v {
-                    a.encode(w);
-                }
-            }
-            Reply::Def(d) => {
-                w.u16(0x0150);
-                match d {
-                    Some(x) => {
-                        w.u8(1);
-                        x.encode(w);
-                    }
-                    None => w.u8(0),
-                }
-            }
-            Reply::Defs(v) => {
-                w.u16(0x0151);
-                w.u32(v.len() as u32);
-                for d in v {
-                    d.encode(w);
-                }
-            }
-            Reply::Place(p) => {
-                w.u16(0x0160);
-                w.bytes(p);
-            }
-            Reply::Places(v) => {
-                w.u16(0x0161);
-                w.u32(v.len() as u32);
-                for (view, inst) in v {
-                    w.bytes(view);
-                    w.bytes(inst);
                 }
             }
             Reply::Table(t) => {
@@ -2276,54 +1938,6 @@ impl Reply {
                     v.push((r.bytes()?, r.u8()?, r.i64()?));
                 }
                 Reply::Locks(v)
-            }
-            0x0140 => Reply::Key(Box::new(KeyRec::decode(r)?)),
-            0x0141 => {
-                let n = r.u32()? as usize;
-                let mut v = Vec::with_capacity(n.min(100_000));
-                for _ in 0..n {
-                    v.push(KeyRec::decode(r)?);
-                }
-                Reply::Keys(v)
-            }
-            0x0142 => Reply::Authed {
-                label: r.bytes()?,
-                ro: r.bool()?,
-                view: r.bytes()?,
-                owner: r.bytes()?,
-            },
-            0x0143 => Reply::Live(r.bool()?),
-            0x0144 => {
-                let n = r.u32()? as usize;
-                let mut v = Vec::with_capacity(n.min(200_000));
-                for _ in 0..n {
-                    v.push(AuditRec::decode(r)?);
-                }
-                Reply::Audits(v)
-            }
-            0x0150 => {
-                if r.u8()? == 1 {
-                    Reply::Def(Some(DefRec::decode(r)?))
-                } else {
-                    Reply::Def(None)
-                }
-            }
-            0x0151 => {
-                let n = r.u32()? as usize;
-                let mut v = Vec::with_capacity(n.min(100_000));
-                for _ in 0..n {
-                    v.push(DefRec::decode(r)?);
-                }
-                Reply::Defs(v)
-            }
-            0x0160 => Reply::Place(r.bytes()?),
-            0x0161 => {
-                let n = r.u32()? as usize;
-                let mut v = Vec::with_capacity(n.min(100_000));
-                for _ in 0..n {
-                    v.push((r.bytes()?, r.bytes()?));
-                }
-                Reply::Places(v)
             }
             0x0170 => {
                 if r.u8()? == 0 {
@@ -2582,56 +2196,6 @@ mod tests {
                 kind: 1,
                 lease_expiry: -9,
             },
-            Op::KeyCreate {
-                key: sample_key(),
-            },
-            Op::KeyGet { id: b"abcd".to_vec() },
-            Op::KeyList,
-            Op::KeyUpdate {
-                id: b"abcd".to_vec(),
-                verb: 1,
-                ts: 5,
-                new_hash: b"h".to_vec(),
-                new_hint: b"hh".to_vec(),
-                ro: true,
-            },
-            Op::KeyCheck {
-                id: b"abcd".to_vec(),
-                verb: 0,
-                hash: b"h".to_vec(),
-                now_ms: 1,
-            },
-            Op::AuditAppend {
-                row: AuditRec {
-                    seq: 1,
-                    ts: 2,
-                    key_id: b"k".to_vec(),
-                    method: b"m".to_vec(),
-                    tool: b"t".to_vec(),
-                    ok: true,
-                    detail: b"d".to_vec(),
-                },
-            },
-            Op::AuditList { limit: 5 },
-            Op::DefPut {
-                def: DefRec {
-                    name: b"n".to_vec(),
-                    kind: b"prompt".to_vec(),
-                    payload: b"{}".to_vec(),
-                    updated_at: 3,
-                },
-            },
-            Op::DefGet { name: b"n".to_vec() },
-            Op::DefList {
-                kind: b"prompt".to_vec(),
-            },
-            Op::DefDel { name: b"n".to_vec() },
-            Op::PlaceSet {
-                view: b"v".to_vec(),
-                instance: b"i".to_vec(),
-            },
-            Op::PlaceGet { view: b"v".to_vec() },
-            Op::PlaceList,
             // ---- 通用表 ----
             Op::TableCreate {
                 def: TableDef {
@@ -2751,6 +2315,25 @@ mod tests {
         }
     }
 
+    /// 四组专用控制面 op 的 tag 已被整段删除（§11 第 10 条 M4）。旧客户端发过来
+    /// 必须落进 `unknown op tag`，而不是碰巧解成另一条 op —— tag 不回收，这条测试
+    /// 就是那段区间不再被任何人占用的可执行声明。
+    #[test]
+    fn removed_control_plane_tags_are_unknown() {
+        for tag in [0x0040u16, 0x0041, 0x004d, 0x0062] {
+            let mut w = W::new();
+            w.u16(tag);
+            let err = Op::decode(&mut Rd::new(&w.finish())).unwrap_err().to_string();
+            assert!(err.contains("unknown op tag"), "0x{tag:04x}: {err}");
+        }
+        for tag in [0x0140u16, 0x0150, 0x0161] {
+            let mut w = W::new();
+            w.u16(tag);
+            let err = Reply::decode(&mut Rd::new(&w.finish())).unwrap_err().to_string();
+            assert!(err.contains("unknown reply tag"), "0x{tag:04x}: {err}");
+        }
+    }
+
     /// 握手的两个定长字段在解码侧就是硬门槛：短一个字节是 `Err`，不是「少读一点」。
     /// 短的挑战值 = 随机空间缩水，短的 MAC = 摘要被截，两种都是静默降低安全性，
     /// 所以宁可断连。（长的在 `bytes_bounded` 那一步就被拦掉。）
@@ -2818,39 +2401,6 @@ mod tests {
                 bytes: 500,
             },
             Reply::Locks(vec![(b"o1".to_vec(), 1, 99)]),
-            Reply::Key(Box::new(sample_key())),
-            Reply::Keys(vec![sample_key()]),
-            Reply::Authed {
-                label: b"lbl".to_vec(),
-                ro: true,
-                view: b"v".to_vec(),
-                owner: b"o".to_vec(),
-            },
-            Reply::Live(true),
-            Reply::Audits(vec![AuditRec {
-                seq: 1,
-                ts: 2,
-                key_id: b"k".to_vec(),
-                method: b"m".to_vec(),
-                tool: b"t".to_vec(),
-                ok: false,
-                detail: b"d".to_vec(),
-            }]),
-            Reply::Def(Some(DefRec {
-                name: b"n".to_vec(),
-                kind: b"k".to_vec(),
-                payload: b"p".to_vec(),
-                updated_at: 1,
-            })),
-            Reply::Def(None),
-            Reply::Defs(vec![DefRec {
-                name: b"n".to_vec(),
-                kind: b"k".to_vec(),
-                payload: b"p".to_vec(),
-                updated_at: 1,
-            }]),
-            Reply::Place(b"inst".to_vec()),
-            Reply::Places(vec![(b"v".to_vec(), b"i".to_vec())]),
             Reply::Table(Some(TableDef {
                 name: b"kv".to_vec(),
                 columns: vec![
@@ -3016,38 +2566,5 @@ mod tests {
             },
             "越上限的请求要能解出来，才能被回一个 EINVAL 而不是被断连"
         );
-    }
-
-    fn sample_key() -> KeyRec {
-        KeyRec {
-            id: b"0123456789abcdef".to_vec(),
-            label: b"analyst".to_vec(),
-            secret_hash: b"deadbeef".to_vec(),
-            created_at: 1_700_000_000_000,
-            last_used_at: 0,
-            revoked_at: 0,
-            view: b"alice".to_vec(),
-            ro: false,
-            owner: b"team-a".to_vec(),
-            note: Vec::new(),
-            expires_at: 0,
-            created_by: b"admin".to_vec(),
-            secret_hint: b"abcd~ef01".to_vec(),
-        }
-    }
-
-    #[test]
-    fn kind_and_expired_boundaries() {
-        assert_eq!(Kind::from_code(1).unwrap(), Kind::Dir);
-        assert!(Kind::from_code(3).is_err());
-        let mut k = sample_key();
-        assert!(!k.revoked());
-        assert!(!k.expired(1));
-        k.revoked_at = 5;
-        assert!(k.revoked());
-        k.revoked_at = 0;
-        k.expires_at = 100;
-        assert!(k.expired(100));
-        assert!(!k.expired(99));
     }
 }

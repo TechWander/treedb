@@ -11,7 +11,7 @@ use crate::engine::mem::{DENT_KIND_UNKNOWN, Log, State, TableMeta};
 use std::collections::BTreeMap;
 use std::ops::Bound;
 use crate::engine::model::{
-    errno, AuditRec, ColumnDef, DataRef, DefRec, Ino, LockRec, Names, Node, NodeAttr, RefRec,
+    errno, ColumnDef, DataRef, Ino, LockRec, Names, Node, NodeAttr, RefRec,
     Reply, RowRec, TableDef, ViewId, ViewMeta, Kind, Op, MAX_BATCH_OPS, MAX_COLUMNS, PUT_IF_ABSENT,
     PUT_IF_EXISTS,
     DEL_IF_EXISTS, COND_NONE, RENAME_NOREPLACE, ROW_KEY_MAX, ROW_PK, SA_ATIME, SA_DATA_REF,
@@ -1168,70 +1168,9 @@ pub fn translate(s: &State, now: i64, op: &Op) -> (Vec<Log>, Reply) {
             )
         }
 
-        // ---- 控制面：只读 ----
-        Op::KeyGet { id } => match s.keys.get(id) {
-            Some(k) => (vec![], Reply::Key(Box::new(k.clone()))),
-            None => (vec![], Reply::err(errno::ENOENT, "no such key")),
-        },
-        Op::KeyList => (vec![], Reply::Keys(s.keys.values().cloned().collect())),
-        Op::KeyCheck { id, verb, hash, now_ms } => {
-            let k = match s.keys.get(id) {
-                Some(k) => k,
-                // 不存在与口令不符回同一个错，避免 id 枚举 oracle。
-                None => return (vec![], Reply::err(errno::EADV, "bad key")),
-            };
-            if k.revoked() || k.expired(*now_ms) || k.secret_hash != *hash {
-                return (vec![], Reply::err(errno::EADV, "bad key"));
-            }
-            let rep = if *verb == 1 {
-                Reply::Live(true)
-            } else {
-                Reply::Authed {
-                    label: k.label.clone(),
-                    ro: k.ro,
-                    view: k.view.clone(),
-                    owner: k.owner.clone(),
-                }
-            };
-            (vec![], rep)
-        }
-        Op::AuditList { limit } => {
-            let n = if *limit == 0 { 100 } else { *limit as usize };
-            let v = s
-                .audit
-                .values()
-                .rev()
-                .take(n)
-                .cloned()
-                .collect::<Vec<AuditRec>>();
-            (vec![], Reply::Audits(v))
-        }
-        Op::DefGet { name } => (
-            vec![],
-            Reply::Def(s.defs.get(name).cloned()),
-        ),
-        Op::DefList { kind } => {
-            let v = s
-                .defs
-                .values()
-                .filter(|d| kind.is_empty() || &d.kind == kind)
-                .cloned()
-                .collect::<Vec<DefRec>>();
-            (vec![], Reply::Defs(v))
-        }
-        Op::PlaceGet { view } => match s.placement.get(view) {
-            Some(i) => (vec![], Reply::Place(i.clone())),
-            None => (vec![], Reply::err(errno::ENOENT, "not placed")),
-        },
-        Op::PlaceList => (
-            vec![],
-            Reply::Places(
-                s.placement
-                    .iter()
-                    .map(|(v, i)| (v.clone(), i.clone()))
-                    .collect(),
-            ),
-        ),
+        // 控制面那四组专用 op（`Key*`/`Audit*`/`Def*`/`Place*`）2026-11-23 已按
+        // §11 第 10 条（M4）删除，它们的 tag 在 `decode` 就落到 `unknown op tag`，
+        // 到不了这里。
 
         // ---- 通用表：只读 ----
         Op::TableGet { name } => (
@@ -1317,70 +1256,6 @@ pub fn translate(s: &State, now: i64, op: &Op) -> (Vec<Log>, Reply) {
             };
             (vec![], Reply::Count(n as u64))
         }
-
-        // ---- 控制面：写 ----
-        Op::KeyCreate { key } => {
-            if s.keys.contains_key(&key.id) {
-                return (vec![], Reply::err(errno::EEXIST, "key id exists"));
-            }
-            (
-                vec![Log::PutKey { key: key.clone() }],
-                Reply::Key(Box::new(key.clone())),
-            )
-        }
-        Op::KeyUpdate {
-            id,
-            verb,
-            ts,
-            new_hash,
-            new_hint,
-            ro,
-        } => {
-            let mut k = match s.keys.get(id) {
-                Some(k) => k.clone(),
-                None => return (vec![], Reply::err(errno::ENOENT, "no such key")),
-            };
-            match *verb {
-                0 => k.revoked_at = *ts,
-                1 => {
-                    k.secret_hash = new_hash.clone();
-                    k.secret_hint = new_hint.clone();
-                }
-                2 => k.last_used_at = *ts,
-                3 => k.ro = *ro,
-                x => return (vec![], Reply::err(errno::EINVAL, format!("bad key verb {x}"))),
-            }
-            (vec![Log::PutKey { key: k.clone() }], Reply::Key(Box::new(k)))
-        }
-        Op::AuditAppend { row } => {
-            let mut r = row.clone();
-            if r.seq == 0 {
-                // 0 是「请分配」的约定值，所以自增号不能从 0 发：否则写进
-                // WAL 的行与请求里的「未分配」同值，重放时会再分一次号。
-                r.seq = s.next_audit_seq.max(1);
-            }
-            (vec![Log::PutAudit { row: r }], Reply::Ok)
-        }
-        Op::DefPut { def } => {
-            let mut d = def.clone();
-            if d.updated_at == 0 {
-                d.updated_at = now;
-            }
-            (vec![Log::PutDef { def: d }], Reply::Ok)
-        }
-        Op::DefDel { name } => {
-            if !s.defs.contains_key(name) {
-                return (vec![], Reply::err(errno::ENOENT, "no such def"));
-            }
-            (vec![Log::DelDef { name: name.clone() }], Reply::Ok)
-        }
-        Op::PlaceSet { view, instance } => (
-            vec![Log::PutPlace {
-                view: view.clone(),
-                instance: instance.clone(),
-            }],
-            Reply::Ok,
-        ),
 
         // ---- 通用表：写 ----
         Op::TableCreate { def } => {

@@ -35,8 +35,6 @@ pub fn prometheus(s: &EngineStats) -> String {
     gauge(&mut o, "treedb_dentries", "directory entries alive in the current state", s.dentries);
     gauge(&mut o, "treedb_locks", "POSIX-style locks currently held", s.locks);
     gauge(&mut o, "treedb_refs", "content references (data_ref ledger) alive", s.refs);
-    gauge(&mut o, "treedb_keys", "client access keys stored in the engine", s.keys);
-    gauge(&mut o, "treedb_audit_rows", "rows in the audit table", s.audit);
     gauge(&mut o, "treedb_tables", "generic tables defined", s.tables);
     gauge(&mut o, "treedb_table_rows", "rows across all generic tables", s.rows);
     gauge(
@@ -187,8 +185,6 @@ mod tests {
             dentries: 33,
             locks: 44,
             refs: 55,
-            keys: 66,
-            audit: 77,
             seq: 88,
             snap_seq: 99,
             wal_bytes: 1234,
@@ -201,7 +197,7 @@ mod tests {
             rows: 15,
             wal_disk_bytes: 16_777_216,
             snap_bytes: 4096,
-            proto_version: 6,
+            proto_version: 7,
             replica: true,
             replica_primary_seq: 101,
             replica_lag: 13,
@@ -285,8 +281,6 @@ mod tests {
         assert_eq!(get("treedb_dentries"), "33");
         assert_eq!(get("treedb_locks"), "44");
         assert_eq!(get("treedb_refs"), "55");
-        assert_eq!(get("treedb_keys"), "66");
-        assert_eq!(get("treedb_audit_rows"), "77");
         assert_eq!(get("treedb_seq"), "88");
         assert_eq!(get("treedb_snapshot_seq"), "99");
         assert_eq!(get("treedb_wal_logical_bytes"), "1234");
@@ -300,7 +294,7 @@ mod tests {
         assert_eq!(get("treedb_table_rows"), "15");
         assert_eq!(get("treedb_wal_disk_bytes"), "16777216");
         assert_eq!(get("treedb_snapshot_bytes"), "4096");
-        assert_eq!(get("treedb_protocol_version"), "6");
+        assert_eq!(get("treedb_protocol_version"), "7");
         assert_eq!(get("treedb_replica"), "1");
         assert_eq!(get("treedb_replica_primary_seq"), "101");
         assert_eq!(get("treedb_replica_lag"), "13");
@@ -308,7 +302,7 @@ mod tests {
         assert_eq!(get("treedb_replica_resyncs_total"), "3");
         assert_eq!(get("treedb_replica_errors_total"), "4");
         // 样本数 == 字段数 + treedb_up：加字段忘了加指标（或反之）会在这里断。
-        assert_eq!(scan(&text).len(), (2 + 1) * 27, "指标条数变了却没改这条断言");
+        assert_eq!(scan(&text).len(), (2 + 1) * 25, "指标条数变了却没改这条断言");
     }
 
     /// 计数器名必须以 `_total` 结尾、gauge 不能以它结尾 —— Prometheus 对

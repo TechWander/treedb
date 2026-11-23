@@ -17,8 +17,8 @@
 //! - load **不搬 `fence` 令牌**：那是部署态（谁是当前主），不是逻辑数据。源目录
 //!   若是提升过的副本，导入后的目录按新主（fence 0）起步，需要 fencing 的拓扑
 //!   由调用方按 §6.6 重新发号，而不是让一次 dump 悄悄把旧权威带过来。
-//! - 三个 `next_*` 计数器不由任何 [`Log`] 表达，单独放在容器头上：漏掉它们会让
-//!   空审计表的 `next_audit_seq` 退回 1，审计 seq 从此复用。
+//! - 两个 `next_*` 计数器不由任何 [`Log`] 表达，单独放在容器头上：漏掉它们会让
+//!   下一张表复用已用过的 id。
 //!
 //! 导出是确定性的：同一份状态导出两次字节相同（BTreeMap 序 + 固定段落序），
 //! 这条性质被 `dump → restore → dump` 的往返测试当成判据。
@@ -32,10 +32,14 @@ use crate::engine::wal::crc32;
 use crate::error::{Error, Result};
 
 /// 容器魔数（8 字节）。第二个字符起是给人看的，末位是格式代。
-pub const DUMP_MAGIC: &[u8] = b"TDBDUMP1";
+pub const DUMP_MAGIC: &[u8] = b"TDBDUMP2";
 
 /// 容器版本。日志标签或容器字段变了就 +1，读侧对未知版本 fail-closed。
-pub const DUMP_VERSION: u32 = 1;
+///
+/// v1 → v2（2026-11-23，§11 第 10 条 M4）：容器头少一个 `next_audit_seq`
+/// 计数器，四张专用控制面表不再导出。旧 dump 拆不了这四张表，只能用旧
+/// 二进制 `treedb-load` 进去再走 `control-migrate` —— 读侧不猜，直接拒。
+pub const DUMP_VERSION: u32 = 2;
 
 /// 一份完整的逻辑导出。
 ///
@@ -49,8 +53,6 @@ pub struct Dump {
     pub next_view_id: ViewId,
     /// 下一个通用表 id。
     pub next_table_id: u32,
-    /// 下一条审计行的 seq。
-    pub next_audit_seq: u64,
     pub logs: Vec<Log>,
 }
 
@@ -63,10 +65,6 @@ pub struct DumpCounts {
     pub dentries: usize,
     pub locks: usize,
     pub refs: usize,
-    pub keys: usize,
-    pub audit: usize,
-    pub defs: usize,
-    pub placement: usize,
     pub tables: usize,
     pub rows: usize,
 }
@@ -78,14 +76,13 @@ impl Dump {
             seq,
             next_view_id: state.next_view_id,
             next_table_id: state.next_table_id,
-            next_audit_seq: state.next_audit_seq,
             logs: state_to_logs(state),
         }
     }
 
     /// 把导出重建成状态。
     ///
-    /// 三个 `next_*` 取「重放结果」与「容器头」的较大者：正常 dump 两者相等，
+    /// 两个 `next_*` 取「重放结果」与「容器头」的较大者：正常 dump 两者相等，
     /// 取 max 只为一件事 —— 手改过的 dump 不能让 id 回绕、把已存在的对象覆盖掉。
     pub fn state(&self) -> State {
         let mut s = State::new();
@@ -94,11 +91,10 @@ impl Dump {
         }
         s.next_view_id = s.next_view_id.max(self.next_view_id);
         s.next_table_id = s.next_table_id.max(self.next_table_id);
-        s.next_audit_seq = s.next_audit_seq.max(self.next_audit_seq);
         s
     }
 
-    /// 编码成自描述容器：魔数、版本、三个计数器、条数、逐条记录、尾部 CRC32。
+    /// 编码成自描述容器：魔数、版本、两个计数器、条数、逐条记录、尾部 CRC32。
     ///
     /// CRC 覆盖到条数为止的全部字节（含魔数），尾部 4 字节是它自己 —— 与快照
     /// 尾巴、WAL 帧同一个口径：坏了就拒，不猜。
@@ -109,7 +105,6 @@ impl Dump {
         w.u64(self.seq);
         w.u32(self.next_view_id);
         w.u32(self.next_table_id);
-        w.u64(self.next_audit_seq);
         w.u64(self.logs.len() as u64);
         for l in &self.logs {
             let mut body = W::new();
@@ -151,7 +146,6 @@ impl Dump {
         let seq = r.u64()?;
         let next_view_id = r.u32()?;
         let next_table_id = r.u32()?;
-        let next_audit_seq = r.u64()?;
         let count = r.u64()?;
         // 每条记录至少 1 字节（tag）：条数超过剩余字节数一定是坏头，先拒掉，
         // 免得 `Vec::with_capacity` 按一个天文数字去要内存。
@@ -179,13 +173,11 @@ impl Dump {
             seq,
             next_view_id,
             next_table_id,
-            next_audit_seq,
             logs,
         })
     }
 
-    /// 给人看的规模：views / nodes / dentries / locks / refs / keys / audit /
-    /// defs / placement / tables / rows。
+    /// 给人看的规模：views / nodes / dentries / locks / refs / tables / rows。
     pub fn counts(&self) -> DumpCounts {
         let s = self.state();
         DumpCounts {
@@ -194,10 +186,6 @@ impl Dump {
             dentries: s.dentry_count(),
             locks: s.locks.len(),
             refs: s.refs.len(),
-            keys: s.keys.len(),
-            audit: s.audit.len(),
-            defs: s.defs.len(),
-            placement: s.placement.len(),
             tables: s.tables.len(),
             rows: s.row_count(),
         }
@@ -210,8 +198,8 @@ impl Dump {
     pub fn summary(&self) -> String {
         let c = self.counts();
         format!(
-            "seq {} logs {} | views {} nodes {} dentries {} locks {} refs {} keys {} \
-             audit {} defs {} placement {} tables {} rows {}",
+            "seq {} logs {} | views {} nodes {} dentries {} locks {} refs {} \
+             tables {} rows {}",
             self.seq,
             self.logs.len(),
             c.views,
@@ -219,10 +207,6 @@ impl Dump {
             c.dentries,
             c.locks,
             c.refs,
-            c.keys,
-            c.audit,
-            c.defs,
-            c.placement,
             c.tables,
             c.rows
         )
@@ -308,21 +292,6 @@ pub fn state_to_logs(s: &State) -> Vec<Log> {
             });
         }
     }
-    for key in s.keys.values() {
-        out.push(Log::PutKey { key: key.clone() });
-    }
-    for row in s.audit.values() {
-        out.push(Log::PutAudit { row: row.clone() });
-    }
-    for def in s.defs.values() {
-        out.push(Log::PutDef { def: def.clone() });
-    }
-    for (view, instance) in &s.placement {
-        out.push(Log::PutPlace {
-            view: view.clone(),
-            instance: instance.clone(),
-        });
-    }
     // `tables` 按名字排序，id 是另一维：id 小的先建，重放结果与源一致
     // （`next_table_id` 还会被容器头再校一次）。
     let mut tables: Vec<_> = s.tables.values().collect();
@@ -348,8 +317,7 @@ pub fn state_to_logs(s: &State) -> Vec<Log> {
 mod tests {
     use super::*;
     use crate::engine::model::{
-        AuditRec, ColumnDef, DefRec, KeyRec, LockRec, Node, RefRec, RowRec, TableDef, ViewMeta,
-        COL_UNIQUE,
+        ColumnDef, LockRec, Node, RefRec, RowRec, TableDef, ViewMeta, COL_UNIQUE,
     };
     use crate::engine::model::Kind;
 
@@ -413,46 +381,6 @@ mod tests {
             data_ref: b"r1".to_vec(),
             rec: RefRec { count: 1, bytes: 7 },
         });
-        s.apply(&Log::PutKey {
-            key: KeyRec {
-                id: b"k1".to_vec(),
-                label: b"l".to_vec(),
-                secret_hash: vec![9u8; 32],
-                created_at: 7,
-                last_used_at: 0,
-                revoked_at: 0,
-                view: b"v1".to_vec(),
-                ro: false,
-                owner: b"o".to_vec(),
-                note: b"n".to_vec(),
-                expires_at: 0,
-                created_by: b"a".to_vec(),
-                secret_hint: b"h".to_vec(),
-            },
-        });
-        s.apply(&Log::PutAudit {
-            row: AuditRec {
-                seq: 3,
-                ts: 8,
-                key_id: b"k1".to_vec(),
-                method: b"Lookup".to_vec(),
-                tool: b"cli".to_vec(),
-                ok: true,
-                detail: b"".to_vec(),
-            },
-        });
-        s.apply(&Log::PutDef {
-            def: DefRec {
-                name: b"d1".to_vec(),
-                kind: b"layout".to_vec(),
-                payload: b"{}".to_vec(),
-                updated_at: 9,
-            },
-        });
-        s.apply(&Log::PutPlace {
-            view: b"v1".to_vec(),
-            instance: b"inst".to_vec(),
-        });
         s.apply(&Log::PutTable {
             id: 1,
             def: TableDef {
@@ -488,23 +416,19 @@ mod tests {
         assert_eq!(d.seq, 42);
         assert_eq!(back.next_view_id, s.next_view_id);
         assert_eq!(back.next_table_id, s.next_table_id);
-        assert_eq!(back.next_audit_seq, s.next_audit_seq);
     }
 
-    /// 空审计表但 `next_audit_seq` 已经走远：这条只有容器头能保住。
-    /// 以前把它交给「重放推 max」的话，导入后下一条审计会拿回 seq 1。
+    /// 两个 `next_*` 计数器没有对应的 [`Log`]：只能靠容器头保住。
     #[test]
     fn container_keeps_next_counters_that_no_log_can_express() {
         let mut s = State::new();
         s.next_view_id = 9;
         s.next_table_id = 4;
-        s.next_audit_seq = 1_234;
         let d = Dump::of_state(&s, 7);
         assert!(d.logs.is_empty());
         let back = d.state();
         assert_eq!(back.next_view_id, 9);
         assert_eq!(back.next_table_id, 4);
-        assert_eq!(back.next_audit_seq, 1_234);
     }
 
     #[test]
@@ -521,14 +445,13 @@ mod tests {
         let e = Dump::decode(&bad).expect_err("CRC 坏了必须拒");
         assert!(e.to_string().contains("crc"), "{e}");
 
-        let e = Dump::decode(b"TDBDUMP1").expect_err("短到没有尾巴也要拒");
+        let e = Dump::decode(b"TDBDUMP2").expect_err("短到没有尾巴也要拒");
         assert!(e.to_string().contains("crc"), "{e}");
     }
 
     #[test]
     fn unknown_container_version_is_refused_by_name() {
-        let mut d = Dump::of_state(&rich_state(), 1);
-        d.next_audit_seq = 1;
+        let d = Dump::of_state(&rich_state(), 1);
         let mut raw = d.encode();
         // 魔数(4B 长度前缀 + 8B) 之后的 4 字节是版本位。
         raw[12..16].copy_from_slice(&(DUMP_VERSION + 1).to_le_bytes());

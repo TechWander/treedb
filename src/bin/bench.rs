@@ -15,7 +15,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use treedb::engine::model::{
-    errno, ColumnDef, KeyRec, Op, Reply, TableDef, COL_INDEX, COND_NONE, PUT_IF_ABSENT, ROW_PK,
+    errno, ColumnDef, Op, Reply, TableDef, COL_INDEX, COND_NONE, PUT_IF_ABSENT, ROW_PK,
 };
 use treedb::net::client::Client;
 
@@ -747,23 +747,6 @@ fn build(
                     }
                 }
             }
-            "key" => Op::KeyCreate {
-                key: KeyRec {
-                    id: format!("k{t}{nonce}{s}").into_bytes(),
-                    label: b"bench".to_vec(),
-                    secret_hash: format!("h{s}").into_bytes(),
-                    created_at: 0,
-                    last_used_at: 0,
-                    revoked_at: 0,
-                    view: Vec::new(),
-                    ro: false,
-                    owner: Vec::new(),
-                    note: Vec::new(),
-                    expires_at: 0,
-                    created_by: Vec::new(),
-                    secret_hint: Vec::new(),
-                },
-            },
             _ => Op::Create {
                 view,
                 parent: 1,
@@ -781,7 +764,7 @@ const HELP: &str = "\
 treedb-bench — 对 treedb-server 打负载
 
   --addr HOST:PORT   服务端地址（默认 127.0.0.1:7777）
-  --op NAME          create|lookup|readdir|write|lock|key|ping|stat
+  --op NAME          create|lookup|readdir|write|lock|ping|stat
                      |rowinsert|rowput|rowget|rowlist|rowidx|rowcount|rowchurn
                      |rowrange|rowidxrange
                      通用表档用固定形状的表 benchkv(tag 索引, payload)，首次运行
