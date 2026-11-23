@@ -51,17 +51,27 @@ const PREALLOC_MAX: u64 = 256 << 20;
 
 const CRC_POLY: u32 = 0xEDB8_8320;
 
-fn crc_table() -> &'static [u32; 256] {
+/// CRC32 的 slicing-by-8 表：`T[0]` 就是那张经典 256 项表，`T[n]` 是它再
+/// 「退一字节」的结果。八张表合计 8 KiB，L1 放得下；一次吃 8 字节，吞吐 比逐
+/// 字节查表高一个数量级 —— 这不是微优化：副本追赶时主侧 `WalFetch` 处理 4 MiB
+/// 块的耗时一度有九成以上花在这里（§6.6「追赶块长」末尾）。
+fn crc_tables() -> &'static [[u32; 256]; 8] {
     use std::sync::OnceLock;
-    static T: OnceLock<[u32; 256]> = OnceLock::new();
+    static T: OnceLock<[[u32; 256]; 8]> = OnceLock::new();
     T.get_or_init(|| {
-        let mut t = [0u32; 256];
+        let mut t = [[0u32; 256]; 8];
         for i in 0..256u32 {
             let mut c = i;
             for _ in 0..8 {
                 c = if c & 1 != 0 { CRC_POLY ^ (c >> 1) } else { c >> 1 };
             }
-            t[i as usize] = c;
+            t[0][i as usize] = c;
+        }
+        for n in 1..8 {
+            for i in 0..256 {
+                let p = t[n - 1][i];
+                t[n][i] = (p >> 8) ^ t[0][(p & 0xFF) as usize];
+            }
         }
         t
     })
@@ -79,9 +89,23 @@ pub fn crc32(buf: &[u8]) -> u32 {
 /// 而正文可能有几百 MB —— 为了拼一个连续 buffer 再算一遍，就是白白多一份
 /// 全量拷贝的内存峰值。分两段算与一次算完逐位相同。
 pub fn crc32_update(mut c: u32, buf: &[u8]) -> u32 {
-    let t = crc_table();
-    for &b in buf {
-        c = t[((c ^ b as u32) & 0xFF) as usize] ^ (c >> 8);
+    let t = crc_tables();
+    let (chunks, rest) = buf.as_chunks::<8>();
+    for ch in chunks {
+        // 前 4 字节先与余数异或，后 4 字节直接查表：slicing-by-8 的标准形状。
+        let a = u32::from_le_bytes([ch[0], ch[1], ch[2], ch[3]]) ^ c;
+        let b = u32::from_le_bytes([ch[4], ch[5], ch[6], ch[7]]);
+        c = t[7][(a & 0xFF) as usize]
+            ^ t[6][((a >> 8) & 0xFF) as usize]
+            ^ t[5][((a >> 16) & 0xFF) as usize]
+            ^ t[4][(a >> 24) as usize]
+            ^ t[3][(b & 0xFF) as usize]
+            ^ t[2][((b >> 8) & 0xFF) as usize]
+            ^ t[1][((b >> 16) & 0xFF) as usize]
+            ^ t[0][(b >> 24) as usize];
+    }
+    for &b in rest {
+        c = t[0][((c ^ b as u32) & 0xFF) as usize] ^ (c >> 8);
     }
     c
 }
@@ -923,6 +947,48 @@ mod tests {
         // 标准测试向量："123456789" -> 0xCBF43926
         assert_eq!(crc32(b"123456789"), 0xCBF4_3926);
         assert_eq!(crc32(b""), 0);
+    }
+
+    /// slicing-by-8 的守门测试：与「逐字节单表」参考实现逐位对拍。
+    ///
+    /// 表是 `T[n] = T[n-1] 退一字节` 递推出来的，递推写错时已知向量仍可能
+    /// 碰巧对上（长度 9 只走一次 8 字节块 + 1 字节尾巴），而一条长度 3 的
+    /// 记录、一条 8 的整数倍、一条跨两个块的都要走不同分支。这个对拍把
+    /// 「所有长度与尾巴组合」都过一遍，语料顺带覆盖非零初值（增量形式）。
+    #[test]
+    fn slicing_by_8_matches_the_bytewise_reference() {
+        fn ref_update(mut c: u32, buf: &[u8]) -> u32 {
+            let t = crc_tables();
+            for &b in buf {
+                c = t[0][((c ^ b as u32) & 0xFF) as usize] ^ (c >> 8);
+            }
+            c
+        }
+        let mut x = 0x2545_F491_4F6C_DD1Du64;
+        let mut buf = Vec::with_capacity(4096);
+        for _ in 0..4096 {
+            // xorshift64：不引依赖，语料每次跑都一样
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            buf.push((x >> 24) as u8);
+        }
+        for n in 0..=buf.len() {
+            assert_eq!(
+                crc32_update(0xFFFF_FFFF, &buf[..n]),
+                ref_update(0xFFFF_FFFF, &buf[..n]),
+                "整体喂 {n} 字节"
+            );
+            let split = n / 3;
+            let rest = n - split;
+            let a = ref_update(0xFFFF_FFFF, &buf[..split]);
+            assert_eq!(
+                crc32_update(a, &buf[split..n]),
+                ref_update(0xFFFF_FFFF, &buf[..n]),
+                "{n} 字节分两段（{split} + {rest}）"
+            );
+        }
+        assert_eq!(crc32(&buf), !ref_update(0xFFFF_FFFF, &buf));
     }
 
     #[test]

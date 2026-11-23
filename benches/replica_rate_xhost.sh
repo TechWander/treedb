@@ -28,7 +28,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT" || exit 1
 RUNS=${1:-3}
 SECS=${2:-8}
-BIN=./target/release
+BIN=${BIN:-./target/release}
 OUT=${OUT:-benches/results/replica_rate_xhost.log}
 W=${W:-.spot/xrate}
 P1=${P1:-17901}
