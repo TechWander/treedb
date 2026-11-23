@@ -27,6 +27,7 @@ use crate::engine::wal::{log_payload, Wal};
 use crate::error::{Error, Result};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
+use std::ops::Bound;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -390,7 +391,18 @@ pub struct Engine {
     /// 正在后台编的一份快照（§8 第 7 条）。有它时自动档不再派新的；
     /// 退出、显式 checkpoint 与副本装快照都会先把它收掉。
     inflight: Option<Inflight>,
+    /// 过期租约清扫扫到了哪一格（§8 第 17 条）。`None` = 从头开始。
+    ///
+    /// 只在内存里：它是「这一轮从哪儿接着看」的进度，不是状态的一部分，
+    /// 重启后从头发一遍只是多扫一圈。
+    lock_sweep_cur: Option<(u32, u64, Vec<u8>)>,
 }
+
+/// 一次过期租约清扫最多看多少条（§8 第 17 条）。
+///
+/// 清扫跑在提交线程上，所以单轮的代价必须与表大小无关：1024 条 × 一次
+/// `BTreeMap` 迭代是微秒级，而一整圈的成本是 `ceil(n/1024)` 轮摊出来的。
+pub const LOCK_SWEEP_BATCH: usize = 1024;
 
 /// 一份正在后台生成的快照。
 struct Inflight {
@@ -634,6 +646,7 @@ impl Engine {
             _lock: lock,
             archive,
             inflight: None,
+            lock_sweep_cur: None,
         };
         // Stats 反映本进程服务量，故不把恢复期的重放计入 ops/writes；
         // 但 seq 水位必须对齐磁盘，否则重启后第一次 Stats 会回退。
@@ -1444,6 +1457,72 @@ impl Engine {
     /// 因 gap 重装了一次快照。
     pub fn note_replica_resync(&mut self) {
         self.stats.replica_resyncs += 1;
+    }
+
+    /// 清一批过期租约（§8 第 17 条）。
+    ///
+    /// 读路径一直把过期租约当不存在（`LockQuery` 过滤 `lease_expiry`），
+    /// 而那个过滤**不能**顺手删行：读 op 不许产生日志（§4.2 的只读划分是
+    /// 副本拒写与「worker 就地把算」的判据），删行会把一条读变成写。于是
+    /// 记录只能等同一个 `(view, ino, owner)` 被覆盖或 `Close` 才消失 ——
+    /// 长尾场景下 `locks` 只增不减，既是内存也是快照体积。
+    ///
+    /// 回收放在这里，由提交线程的周期任务调用：用的是**已有的**
+    /// [`Log::DelLock`]（没有新 op、没有新日志变体、不动 `PROTOCOL_VERSION`），
+    /// 所以副本照旧收敛，`Stats.locks` 也从一个周期内的「行数」收敛到有效租约数。
+    ///
+    /// 分批而不是全表扫：游标记住上一批扫到哪，每次最多看 `limit` 条，
+    /// 扫到尾就把游标清空、下一轮从头开始。单轮开销与「表多大」无关，
+    /// 一整圈的成本是 `O(表大小)` 摊在 `ceil(n/limit)` 轮上。
+    ///
+    /// 返回 `(看过, 删掉)`。`lease_expiry == 0` 是「不过期」，永不回收。
+    /// 没删到东西时不会碰 WAL，也不会多付一次 fsync。
+    pub fn sweep_expired_locks(&mut self, now: i64, limit: usize) -> Result<(usize, usize)> {
+        // 副本的 WAL 是主的镜像：本地发一句 `DelLock` 就会让自己的 seq 与主
+        // 对不上，下一批 `WalFetch` 当场报 gap。主那边会发同样的回收日志，
+        // 副本只负责重放。
+        if self.replica || limit == 0 {
+            return Ok((0, 0));
+        }
+        let mut logs: Vec<Log> = Vec::new();
+        let scanned;
+        {
+            let mut s = write_of(&self.state);
+            let keys: Vec<(u32, u64, Vec<u8>)> = match self.lock_sweep_cur.take() {
+                Some(k) => s
+                    .locks
+                    .range((Bound::Excluded(k), Bound::Unbounded))
+                    .take(limit)
+                    .map(|(k, _)| k.clone())
+                    .collect(),
+                None => s.locks.iter().take(limit).map(|(k, _)| k.clone()).collect(),
+            };
+            scanned = keys.len();
+            // 没扫满说明这一圈到尾巴了，下一轮从头开始；扫满了就从最后一格
+            // 接着往后看。两种情况下这一批都已经看/删完了。
+            if scanned == limit {
+                self.lock_sweep_cur = keys.last().cloned();
+            }
+            for k in &keys {
+                // `get` 而不是直接拿迭代时的值：两行之间没有别人能改，
+                // 但这样写能显式把「已不存在」当成不需要删。
+                let expired = matches!(s.locks.get(k), Some(r) if r.lease_expiry != 0 && r.lease_expiry <= now);
+                if expired {
+                    let l = Log::DelLock {
+                        view: k.0,
+                        ino: k.1,
+                        owner: k.2.clone(),
+                    };
+                    s.apply(&l);
+                    logs.push(l);
+                }
+            }
+        }
+        let removed = logs.len();
+        if !logs.is_empty() {
+            self.commit_batch(&[logs.as_slice()])?;
+        }
+        Ok((scanned, removed))
     }
 
     /// 给 `Op::Stats` 用的即时快照。

@@ -11,10 +11,11 @@ mod common;
 use common::Server;
 use std::io::{Read, Write};
 use std::net::TcpStream;
+use std::time::{Duration, Instant};
 use treedb::engine::model::{
     errno, ColumnDef, Op, Reply, TableDef, COL_INDEX, COL_UNIQUE, COND_NONE, Kind, Node, ROW_PK,
 };
-use treedb::engine::{encode_frame, RxBuf, FRAME_HDR, MAX_FRAME};
+use treedb::engine::{encode_frame, now_ms, RxBuf, FRAME_HDR, MAX_FRAME};
 use treedb::net::client::Client;
 
 fn call(c: &mut Client, op: &Op) -> Reply {
@@ -525,6 +526,51 @@ fn ops_stats_checkpoint_shutdown_over_tcp() {
     // 停服走的是优雅路径：退出码 0。
     let st = srv.graceful_shutdown();
     assert!(st.status.success());
+}
+
+/// §8 第 17 条：过期租约由服务端自己回收，客户端一个 op 都不用发。
+///
+/// 读路径一直把过期租约当不存在，但记录本身只在被覆盖或 Close 时消失；
+/// 周期清扫（`--lock-sweep-ms`）走 `Log::DelLock`，所以 `Stats.locks` 会
+/// 自己降下来，且这笔回收是普通 WAL 记录 —— 副本靠它收敛，不用另开协议。
+#[test]
+fn expired_leases_are_swept_by_the_server_itself() {
+    let srv = Server::start_extra("always", 1, &["--lock-sweep-ms", "50"]);
+    let mut c = srv.client();
+    let v = mk_view(&mut c, "sweep");
+    let f = create(&mut c, v, "f");
+
+    fn stats(c: &mut Client) -> u64 {
+        match ok(c, &Op::Stats) {
+            Reply::Stats(s) => s.locks,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    // 一把不过期的锁 + 一把 200ms 后到期的租约。
+    ok(&mut c, &Op::LockSet { view: v, ino: f.ino, owner: b"forever".to_vec(), verb: 0, kind: 1, lease_expiry: 0 });
+    ok(&mut c, &Op::LockSet { view: v, ino: f.ino, owner: b"lease".to_vec(), verb: 0, kind: 2, lease_expiry: now_ms() + 200 });
+    assert_eq!(stats(&mut c), 2, "两把锁都该在表里");
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let n = stats(&mut c);
+        if n == 1 {
+            break;
+        }
+        assert!(Instant::now() < deadline, "过期租约一直没被回收（locks = {n}）");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    // 永久那把不能顺手删掉；能查到的也只剩它。
+    match ok(&mut c, &Op::LockQuery { view: v, ino: f.ino }) {
+        Reply::Locks(l) => {
+            assert_eq!(l.len(), 1);
+            assert_eq!(l[0].0, b"forever".to_vec());
+        }
+        other => panic!("{other:?}"),
+    }
+    let _ = srv.graceful_shutdown();
 }
 
 /// 端口复用：同一个地址上「起—停—再起」要能立刻重绑（TIME_WAIT 不挡道）。

@@ -13,7 +13,7 @@ use treedb::engine::model::{
     DEL_IF_EXISTS, COL_INDEX, COL_UNIQUE, COND_NONE, PUT_IF_ABSENT, PUT_IF_EXISTS, ROW_KEY_MAX,
     ROW_PK, RENAME_NOREPLACE, SA_DATA_REF, SA_GID, SA_MODE, SA_SIZE, SA_UID, TABLE_NAME_MAX,
 };
-use treedb::engine::{now_ms, Durability, Engine, Log, State};
+use treedb::engine::{now_ms, Durability, Engine, Log, State, LOCK_SWEEP_BATCH};
 
 // ---------------------------------------------------------------- 驱动脚手架
 
@@ -1004,6 +1004,113 @@ fn locks_are_owner_scoped_and_lease_filtered() {
     assert_eq!(stats_locks(&mut e), 2);
     ok(&mut e, &Op::DropView { name: b"v".to_vec() });
     assert_eq!(stats_locks(&mut e), 0, "drop view 必须连带清锁");
+}
+
+/// 过期租约从「查询时被过滤」走到「真的被删掉」（§8 第 17 条）。
+///
+/// 读路径不能删（读 op 不许产生日志），所以回收只能由提交线程的周期
+/// 任务发 `Log::DelLock`。这里验的是引擎那一半：只删过期的，不碰
+/// `lease_expiry == 0`（不过期）与还没到期的行，而且删掉的写真的进了
+/// WAL —— 重开后不会又看见它。
+#[test]
+fn expired_leases_are_reclaimed_and_stay_gone_after_restart() {
+    let d = Dir::new("locksweep");
+    let mut e = d.open();
+    let v = mk_view(&mut e, "v");
+    let f = mk_file(&mut e, v, 1, "f");
+
+    ok(&mut e, &Op::LockSet { view: v, ino: f.ino, owner: b"forever".to_vec(), verb: 0, kind: 1, lease_expiry: 0 });
+    ok(&mut e, &Op::LockSet { view: v, ino: f.ino, owner: b"live".to_vec(), verb: 0, kind: 1, lease_expiry: now_ms() + 60_000 });
+    ok(&mut e, &Op::LockSet { view: v, ino: f.ino, owner: b"gone".to_vec(), verb: 0, kind: 1, lease_expiry: now_ms() - 1 });
+
+    let stats_locks = |e: &mut Engine| match ok(e, &Op::Stats) {
+        Reply::Stats(s) => s.locks,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(
+        stats_locks(&mut e),
+        3,
+        "过期租约在查询时被过滤，但行还在表里 —— 这正是要回收的那三行"
+    );
+
+    assert_eq!(e.sweep_expired_locks(now_ms(), 1024).unwrap(), (3, 1));
+    assert_eq!(stats_locks(&mut e), 2, "永久锁与未到期锁一行都不能少");
+    // 再扫一次：没有可删的，也不应该动 WAL。
+    assert_eq!(e.sweep_expired_locks(now_ms(), 1024).unwrap(), (2, 0));
+
+    drop(e);
+    let mut e = d.open();
+    assert_eq!(
+        stats_locks(&mut e),
+        2,
+        "DelLock 必须进了 WAL：重放之后过期的那行不应复活"
+    );
+}
+
+/// 清扫按批走完整个表：每轮最多 `limit` 条，扫到尾巴就从头再来。
+///
+/// 这条钉的是「单轮代价与表大小无关」那个前提 —— 若哪天改成全表扫，
+/// 这里的 `scanned <= limit` 会直接红，而不是等到线上出现一次慢轮。
+#[test]
+fn the_lock_sweep_walks_the_table_in_batches_and_terminates() {
+    let d = Dir::new("locksweepbatches");
+    let mut e = Engine::open(&d.path(), Durability::Never).expect("engine open");
+    let v = mk_view(&mut e, "v");
+    let f = mk_file(&mut e, v, 1, "f");
+
+    let n = LOCK_SWEEP_BATCH * 2 + 100;
+    let expired = now_ms() - 1;
+    for i in 0..n {
+        ok(
+            &mut e,
+            &Op::LockSet {
+                view: v,
+                ino: f.ino,
+                owner: format!("o{i}").into_bytes(),
+                verb: 0,
+                kind: 1,
+                lease_expiry: expired,
+            },
+        );
+    }
+
+    let (mut rounds, mut total) = (0usize, 0usize);
+    loop {
+        let (scanned, removed) = e.sweep_expired_locks(now_ms(), LOCK_SWEEP_BATCH).unwrap();
+        rounds += 1;
+        assert!(scanned <= LOCK_SWEEP_BATCH, "一轮不能看超过 limit 条");
+        total += removed;
+        if scanned == 0 {
+            break;
+        }
+        assert!(rounds <= 8, "{n} 条锁应该在 4 轮内扫完");
+    }
+    assert_eq!(total, n, "每一条过期租约都必须被删掉一次");
+    match ok(&mut e, &Op::Stats) {
+        Reply::Stats(s) => assert_eq!(s.locks, 0),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// 副本上这个周期任务必须是空操作：副本的 WAL 是主的镜像，本地发一句
+/// `DelLock` 就会让自己与主的 seq 对不上，下一批 `WalFetch` 当场报 gap。
+#[test]
+fn the_lock_sweep_never_writes_on_a_replica() {
+    let d = Dir::new("locksweepreplica");
+    {
+        let mut e = d.open();
+        let v = mk_view(&mut e, "v");
+        let f = mk_file(&mut e, v, 1, "f");
+        ok(&mut e, &Op::LockSet { view: v, ino: f.ino, owner: b"gone".to_vec(), verb: 0, kind: 1, lease_expiry: now_ms() - 1 });
+    }
+    let mut r = Engine::open_replica(&d.path(), Durability::Always).expect("replica open");
+    let before = r.snapshot_stats().seq;
+    assert_eq!(r.sweep_expired_locks(now_ms(), LOCK_SWEEP_BATCH).unwrap(), (0, 0));
+    assert_eq!(r.snapshot_stats().seq, before, "副本一条日志都不该产生");
+    match ok(&mut r, &Op::Stats) {
+        Reply::Stats(s) => assert_eq!(s.locks, 1, "过期行还在，等主来发 DelLock"),
+        other => panic!("{other:?}"),
+    }
 }
 
 // ---------------------------------------------------------------- 控制面

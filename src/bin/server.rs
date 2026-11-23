@@ -111,6 +111,7 @@ fn main() {
     let mut auto_ckpt_mb: u64 = 64;
     let mut backlog: i32 = 4096;
     let mut max_conn: usize = 0;
+    let mut lock_sweep_ms: i32 = 1000;
     let mut workers: usize = 0;
     let mut flush_pipeline = false;
     let mut stats_only = false;
@@ -137,6 +138,9 @@ fn main() {
             }
             "--backlog" => backlog = num("--backlog", &next(&mut i), backlog),
             "--max-conn" => max_conn = num("--max-conn", &next(&mut i), max_conn),
+            "--lock-sweep-ms" => {
+                lock_sweep_ms = num("--lock-sweep-ms", &next(&mut i), lock_sweep_ms)
+            }
             "--workers" => workers = num("--workers", &next(&mut i), workers),
             "--flush-pipeline" => flush_pipeline = true,
             "--pid-file" => pid_file = Some(PathBuf::from(next(&mut i))),
@@ -258,6 +262,7 @@ fn main() {
         replication: None,
         auth,
         archive: archive.clone(),
+        lock_sweep_ms,
     };
     eprintln!(
         // 帧里没有版本位（§4.1），升级顺序又是硬约束，所以 banner 一开就把它摆出来：
@@ -326,6 +331,12 @@ treedb-server — 元数据引擎服务端（POSIX 元数据语义，客户端�
                              一次 fsync。写多读少的负载可以显式收到 1：并行
                              只偷得到读，且每个 worker 要多占 3 个 fd。
   --sync-ms N                事件循环空闲唤醒间隔，默认 20
+  --lock-sweep-ms N          过期租约回收的间隔，默认 1000（0 = 关）。读路径一直
+                             把过期租约当不存在，但记录本身只在被覆盖或 Close 时
+                             消失；这条周期任务把它真正删掉（Log::DelLock，参与
+                             WAL 与副本收敛），否则 locks 只增不减、既占内存也
+                             进快照。每次最多看 1024 条，一圈的成本摊在多轮上；
+                             副本上这个旋钮无效。
   --flush-pipeline           写轴流水线（§11 第 8 条）：提交线程只 append，
                              fdatasync 交给专用线程，落盘回执到了再 ack。
                              默认关：实测在 fsync 1.3–1.6 ms 的盘上是净负收益

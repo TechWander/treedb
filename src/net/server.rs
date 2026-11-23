@@ -149,6 +149,15 @@ pub struct ServerConfig {
     /// 因为历史不能静默丢。开关必须一直开着：中间关过一段，那几次 checkpoint
     /// 就会在归档里留一个洞，`treedb-pitr` 越过它时会直接报缺口。
     pub archive: Option<PathBuf>,
+    /// 过期租约的清扫间隔（毫秒），`0` = 关。默认 1000。
+    ///
+    /// `LockQuery` 一直把过期租约当不存在，但记录本身要等被覆盖或被
+    /// `Close` 才消失 —— 不改这一点的话，`locks` 只增不减（§8 第 17 条）。
+    /// 回收是一条**写**（`Log::DelLock`），所以只能在提交线程上做，且必须
+    /// 去 WAL、参与副本收敛；这里只决定它多久跑一次。每次最多看
+    /// [`crate::engine::LOCK_SWEEP_BATCH`] 条，一圈的成本摊在多轮上，与
+    /// 表大小无关。副本上这个旋钮无效：它的 WAL 是主的镜像。
+    pub lock_sweep_ms: i32,
 }
 
 impl ServerConfig {
@@ -175,6 +184,9 @@ impl ServerConfig {
             max_conn: 0,
             // 默认不归档：额外一次字节搬运与一份磁盘占用，不该默认替用户决定。
             archive: None,
+            // 默认 1 s 扫一圈的前缀：对 1 024 条的批次是微秒级，而一圈的
+            // 代价与表大小成正比 —— 1 s 在「租约以秒计」的场景下足够早。
+            lock_sweep_ms: 1000,
         }
     }
 }
@@ -573,6 +585,9 @@ pub(crate) fn serve_single(cfg: &ServerConfig, stop: &AtomicBool, live: &AtomicU
     // 那 `Never` 就和 `Group` 一模一样了（实测两档都是 ~820 ops/s），
     // “无持久化上限”这根轴就量不到事件循环本身。
     let mut last_sync = Instant::now();
+    // 过期租约清扫的节拍（§8 第 17 条）。与 sync 分开计时：后者是落盘语义，
+    // 前者是内存/快照体积的清理，两者的默认间隔不同（20 ms vs 1 s）。
+    let mut last_sweep = Instant::now();
 
     while !stop.load(Ordering::Relaxed) {
         let t0 = Instant::now();
@@ -818,6 +833,16 @@ pub(crate) fn serve_single(cfg: &ServerConfig, stop: &AtomicBool, live: &AtomicU
         // 拉回来的记录才不会当场又逼出一次 checkpoint。
         if let Some(f) = follower.as_mut() {
             f.tick(&mut engine)?;
+        }
+        // 过期租约回收（§8 第 17 条）：读路径只过滤、不回收（读 op 不许产生
+        // 日志），回收放在提交线程的周期任务里，用已有的 `Log::DelLock`。
+        // 放在副本 tick 之后：这一轮拉回来的 `PutLock` 不会在同一轮就被
+        // 自己判过期再删一遍。
+        if cfg.lock_sweep_ms > 0
+            && last_sweep.elapsed() >= Duration::from_millis(cfg.lock_sweep_ms as u64)
+        {
+            engine.sweep_expired_locks(crate::engine::now_ms(), crate::engine::LOCK_SWEEP_BATCH)?;
+            last_sweep = Instant::now();
         }
         let us = t0.elapsed().as_micros() as u64;
         if us > rep.worst_round_us {

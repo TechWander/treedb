@@ -1152,6 +1152,9 @@ fn committer(
     // Never 档的周期 sync 计时基准；Group/Always 的 fsync 已经在 flusher
     // 里按语义付过了。
     let mut last_sync = Instant::now();
+    // 过期租约清扫的节拍（§8 第 17 条）。清扫只能在这里：它是一条写
+    // （`Log::DelLock`），而写永远只在这条线程上定序。
+    let mut last_sweep = Instant::now();
 
     while !stop.load(Ordering::Relaxed) && !flag.load(Ordering::Relaxed) {
         let t0 = Instant::now();
@@ -1234,6 +1237,18 @@ fn committer(
         }
         if let Some(f) = follower.as_mut() {
             f.tick(engine)?;
+        }
+        // 过期租约回收（§8 第 17 条）：读路径只过滤、不回收（读 op 不许产生
+        // 日志），回收放在这条唯一的写线程上，用已有的 `Log::DelLock`。
+        //
+        // 它在 flusher 档里会自己 `commit_batch`（一次同步 fsync），与在飞的
+        // 那次 fsync 不冲突：同一个文件上两条 fsync 只是多付一次，不会把
+        // 已 ack 的写置于磁盘外。而这种时候只在扫到了东西时才发生。
+        if cfg.lock_sweep_ms > 0
+            && last_sweep.elapsed() >= Duration::from_millis(cfg.lock_sweep_ms as u64)
+        {
+            engine.sweep_expired_locks(crate::engine::now_ms(), crate::engine::LOCK_SWEEP_BATCH)?;
+            last_sweep = Instant::now();
         }
         let us = t0.elapsed().as_micros() as u64;
         if us > rep.worst_round_us {

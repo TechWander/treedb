@@ -29,7 +29,7 @@ pub use archive::{pitr_restore, plan_pitr, Archive, PitrPlan};
 pub use codec::{Rd, W};
 pub use core::{
     dump_dir, migrate_snapshot, now_ms, probe_snapshot, read_fence, restore_dump, Durability,
-    Engine, EngineStats, MigrationOutcome, SnapshotInfo, FENCE_FILE,
+    Engine, EngineStats, MigrationOutcome, SnapshotInfo, FENCE_FILE, LOCK_SWEEP_BATCH,
 };
 pub use dump::{Dump, DumpCounts, DUMP_MAGIC, DUMP_VERSION};
 pub use mem::{Log, State, SNAP_LEGACY_VERSION, SNAP_MAGIC, SNAP_TRAIL, SNAP_TRAIL_LEGACY, SNAP_VERSION};
