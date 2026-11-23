@@ -14,6 +14,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
+use treedb::engine::core::EngineStats;
 use treedb::engine::model::{
     errno, ColumnDef, Op, Reply, TableDef, COL_INDEX, COND_NONE, PUT_IF_ABSENT, ROW_PK,
 };
@@ -44,6 +45,14 @@ struct Args {
     /// 集群共享密钥：给了就每条连接先跑一次握手（§4.4）。`None` = 不握手，
     /// 与旧版逐字一致 —— 历史基线数字因此仍然可以直接对比。
     auth: Option<std::sync::Arc<treedb::net::auth::Key>>,
+    /// 固定工作量档（`--bulk`）：不是「跑满 N 秒看 ops/s」，而是「删掉正好 N 行
+    /// 看花了多少记录/字节/毫秒」。破坏性负载不能用时长口径量 —— 表删空之后
+    /// 剩下的时间全在数空区间，报出来的 ops/s 反而最好看。
+    bulk: String,
+    /// 这一档的表规模。
+    rows: u64,
+    /// `range` 模式每批删多少行（0 = 1000）。
+    batch: u64,
 }
 
 fn parse() -> Args {
@@ -61,6 +70,9 @@ fn parse() -> Args {
         ino: 1,
         view_tag: None,
         auth: None,
+        bulk: String::new(),
+        rows: 200_000,
+        batch: 1000,
     };
     let mut i = 1;
     while i < a.len() {
@@ -79,6 +91,9 @@ fn parse() -> Args {
             "--range" => args.range = next(&mut i).parse().unwrap_or(64),
             "--ino" => args.ino = next(&mut i).parse().unwrap_or(1),
             "--view-tag" => args.view_tag = next(&mut i).parse().ok(),
+            "--bulk" => args.bulk = next(&mut i),
+            "--rows" => args.rows = next(&mut i).parse().unwrap_or(200_000),
+            "--batch" => args.batch = next(&mut i).parse().unwrap_or(1000),
             "--hold" => args.hold = true,
             "--auth-key-file" => {
                 let p = next(&mut i);
@@ -123,10 +138,31 @@ fn nonce() -> u64 {
 
 // ---------------------------------------------------------------- 通用表档
 
-/// 基准用的表名。固定一个而不带 nonce：行键里已经带了 nonce，而反复跑同一条
+/// 基准用的默认表名。固定一个而不带 nonce：行键里已经带了 nonce，而反复跑同一条
 /// 基准要能命中上一轮已经预热好的那张表 —— 每次重建一遍等于把建表成本混进
 /// 第一格。
 const ROW_TABLE: &[u8] = b"benchkv";
+
+/// 本轮实际用的表名：默认 `benchkv`（与历史格子逐字一致），`TREEDB_BENCH_TABLE`
+/// 可覆盖。
+///
+/// 为什么要能改：`benches/shard_write.sh` 的对照组要把多个 bench 进程压到
+/// **同一个服务端**上，而键的唯一性只到 `(nonce, 线程, seq)` —— `nonce` 是启动
+/// 纳秒 mod 100000，两个进程撞上就是成片的 `EEXIST`，那一格报的是错误而不是
+/// 吞吐。各进程打自己的表名既把键空间隔开，也正好是「按表路由」这个分片方案
+/// 的形状：单实例内多张表与多实例各一张表，服务端都只有一路提交线程。
+fn row_table() -> &'static [u8] {
+    static TBL: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+    TBL.get_or_init(|| {
+        std::env::var("TREEDB_BENCH_TABLE")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(|s| s.into_bytes())
+            .unwrap_or_else(|| ROW_TABLE.to_vec())
+    })
+    .as_slice()
+}
+
 /// 索引列下标。列序固定为 `(tag, payload)`，所以 tag 恒为 0。
 const ROW_TAG: u32 = 0;
 
@@ -136,7 +172,7 @@ const ROW_TAG: u32 = 0;
 /// 路径」的常数开销（定位 / 索引维护 / 帧编解码），不是某种真实业务的行宽。
 fn row_table_def() -> TableDef {
     TableDef {
-        name: ROW_TABLE.to_vec(),
+        name: row_table().to_vec(),
         columns: vec![
             ColumnDef { name: b"tag".to_vec(), flags: COL_INDEX },
             ColumnDef { name: b"payload".to_vec(), flags: 0 },
@@ -154,13 +190,13 @@ fn setup_row_table(addr: &str, auth: Option<&treedb::net::auth::Key>) {
     match c.call(&Op::TableCreate { def: row_table_def() }) {
         Ok(Reply::Table(Some(_))) => {}
         Ok(Reply::Err { code, .. }) if code == errno::EEXIST => {
-            match c.call(&Op::TableGet { name: ROW_TABLE.to_vec() }) {
+            match c.call(&Op::TableGet { name: row_table().to_vec() }) {
                 Ok(Reply::Table(Some(d))) if d == row_table_def() => {}
                 Ok(Reply::Table(Some(d))) => {
                     eprintln!(
                         "table {} already exists with a different shape ({} columns); \
                          drop it or use another --dir",
-                        String::from_utf8_lossy(ROW_TABLE),
+                        String::from_utf8_lossy(row_table()),
                         d.columns.len()
                     );
                     std::process::exit(2);
@@ -195,7 +231,7 @@ fn row_key(i: u64) -> Vec<u8> {
 /// 都有多个命中（否则 `rowidx` 量到的全是「索引里只有一条」那条快路径）。
 fn row_op(seq: u64, span: u64) -> Op {
     Op::RowPut {
-        table: ROW_TABLE.to_vec(),
+        table: row_table().to_vec(),
         key: row_key(seq % span),
         cols: vec![
             format!("t{}", seq % 16).into_bytes(),
@@ -204,6 +240,339 @@ fn row_op(seq: u64, span: u64) -> Op {
         flags: 0,
         cond_col: COND_NONE,
         cond_val: Vec::new(),
+    }
+}
+
+// ---------------------------------------------------------------- 批量形状档
+
+/// 批量档用的表名。与 `benchkv` 分开：那一档要常驻一张表给读轴用，而这一档
+/// 每一轮都要把表删空，共用一张就会互相污染。
+const BULK_TABLE: &[u8] = b"bulkkv";
+
+/// 批量档的键：8 位补零，字节序 == 数字序。`range` 模式的分窗靠这一点才能保证
+/// 「一个窗口正好装 `batch` 行」，否则量到的窗宽是个随机数。
+fn bulk_key(i: u64) -> Vec<u8> {
+    format!("b{i:08}").into_bytes()
+}
+
+/// 一行的内容只由 `i` 决定，与第几轮运行无关：`putsame` 要的就是「逐字节重推
+/// 同一份值」，混一个 nonce 进去就把这条路径变成了一次真改动。
+fn bulk_cols(i: u64) -> Vec<Vec<u8>> {
+    vec![format!("t{}", i % 16).into_bytes(), format!("p{i}").into_bytes()]
+}
+
+fn bulk_put(i: u64, changed: bool) -> Op {
+    let mut cols = bulk_cols(i);
+    if changed {
+        cols[1] = format!("p{i}x").into_bytes();
+    }
+    Op::RowPut {
+        table: BULK_TABLE.to_vec(),
+        key: bulk_key(i),
+        cols,
+        flags: 0,
+        cond_col: COND_NONE,
+        cond_val: Vec::new(),
+    }
+}
+
+fn stats_of(c: &mut Client) -> EngineStats {
+    match c.call(&Op::Stats).expect("stats") {
+        Reply::Stats(s) => *s,
+        other => panic!("Stats → {other:?}"),
+    }
+}
+
+fn rows_of(c: &mut Client) -> u64 {
+    match c
+        .call(&Op::RowCount {
+            table: BULK_TABLE.to_vec(),
+            column: ROW_PK,
+            value: Vec::new(),
+        })
+        .expect("rowcount")
+    {
+        Reply::Count(n) => n,
+        other => panic!("RowCount → {other:?}"),
+    }
+}
+
+/// 固定工作量档：灌 `--rows` 行 → 按 `--bulk` 指定的形状处理完 → 报时间、
+/// 记录数、WAL 字节、fsync 次数与剩下的行数。
+///
+/// 六个模式：`rowdelete`（逐行删）、`range`（按区间删，批大小 `--batch`）、
+/// `clear`（一条清空）、`rename`（建一张影子表再顶替）、`putsame`（逐字节相同的
+/// 覆盖写）、`putchanged`（同量但每行真的变）。最后两个是对拉组：同值消除的
+/// 收益 = 两者的 `records` / `syncs` / 时间之差。
+///
+/// `records` 是服务端 `seq` 的差值，也就是「这些 op 总共写了多少条 WAL 记录」——
+/// 它才是这一档的主指标：时间跟盘走，记录数是格式自己的性质。
+fn run_bulk(args: &Args) {
+    let n = args.rows;
+    let bat = if args.batch == 0 { 1000 } else { args.batch };
+    let mut ctrl =
+        Client::connect_auth(&args.addr, 3000, args.auth.as_deref()).expect("bulk control conn");
+
+    // 每轮都从空表开始：否则第二轮量的就是「在已经空了的表上删」，那一档的
+    // 数字非但不可比，还正好是最快最好看的那一支。
+    let _ = ctrl.call(&Op::TableDrop { name: BULK_TABLE.to_vec() });
+    let def = TableDef {
+        name: BULK_TABLE.to_vec(),
+        columns: vec![
+            ColumnDef { name: b"tag".to_vec(), flags: COL_INDEX },
+            ColumnDef { name: b"payload".to_vec(), flags: 0 },
+        ],
+    };
+    match ctrl.call(&Op::TableCreate { def: def.clone() }) {
+        Ok(Reply::Table(Some(_))) => {}
+        Ok(other) => panic!("table create → {other:?}"),
+        Err(e) => panic!("table create: {e}"),
+    }
+
+    // 灌数据在测量窗口外（分块 pipeline）。这一步自己也是数字：它是
+    // 「逐行写」那一条的对照价。
+    let tl = Instant::now();
+    let s_load0 = stats_of(&mut ctrl);
+    let mut got = 0u64;
+    while got < n {
+        let end = (got + 500).min(n);
+        let batch: Vec<Op> = (got..end).map(|i| bulk_put(i, false)).collect();
+        for r in ctrl.pipeline(&batch).expect("load pipeline") {
+            if let Reply::Err { code, ref msg } = r {
+                panic!("load 失败 code={code} msg={}", String::from_utf8_lossy(msg));
+            }
+        }
+        got = end;
+    }
+    let load_ms = tl.elapsed().as_millis() as u64;
+    let s_load1 = stats_of(&mut ctrl);
+    if rows_of(&mut ctrl) != n {
+        eprintln!("bulk: 灌了 {n} 行，表里只剩 {}", rows_of(&mut ctrl));
+        std::process::exit(1);
+    }
+
+    // 构造这一档要跑的 op。
+    let mut ops: Vec<Op> = Vec::new();
+    match args.bulk.as_str() {
+        "rowdelete" => {
+            ops = (0..n)
+                .map(|i| Op::RowDelete {
+                    table: BULK_TABLE.to_vec(),
+                    key: bulk_key(i),
+                    flags: 0,
+                    cond_col: COND_NONE,
+                    cond_val: Vec::new(),
+                })
+                .collect();
+        }
+        "range" => {
+            let mut start = 0u64;
+            while start < n {
+                let hi = (start + bat).min(n);
+                ops.push(Op::RowRangeDelete {
+                    table: BULK_TABLE.to_vec(),
+                    column: ROW_PK,
+                    lo: bulk_key(start),
+                    hi: bulk_key(hi),
+                    max: bat.min(u32::MAX as u64) as u32,
+                });
+                start = hi;
+            }
+        }
+        "clear" => ops.push(Op::TableClear { table: BULK_TABLE.to_vec() }),
+        // 影子表切换：先灌一张同形状的表（名字带 nonce），再一条 op 顶替。
+        // 顶替那一刀只产一条记录；灌影子表的代价在 ops 里单列。
+        "rename" => {
+            let shadow = format!("bulkkv-{:x}", nonce()).into_bytes();
+            let sdef = TableDef { name: shadow.clone(), ..def.clone() };
+            match ctrl.call(&Op::TableCreate { def: sdef }) {
+                Ok(Reply::Table(Some(_))) => {}
+                other => panic!("shadow create → {other:?}"),
+            }
+            // 影子行的 payload 换一个标记前缀：两边内容相同时，剩下的行数、表名、
+            // 记录数都对不出「看见的到底是不是新行」这件事，只在被顶替表还挂着
+            // 的时候才露馅。收尾那一步要拿它做终态检查。
+            let mut got = 0u64;
+            while got < n {
+                let end = (got + 500).min(n);
+                let batch: Vec<Op> = (got..end)
+                    .map(|i| Op::RowPut {
+                        table: shadow.clone(),
+                        key: bulk_key(i),
+                        cols: vec![
+                            format!("t{}", i % 16).into_bytes(),
+                            format!("q{i}").into_bytes(),
+                        ],
+                        flags: 0,
+                        cond_col: COND_NONE,
+                        cond_val: Vec::new(),
+                    })
+                    .collect();
+                for r in ctrl.pipeline(&batch).expect("shadow load") {
+                    if let Reply::Err { code, ref msg } = r {
+                        panic!("shadow load 失败 {code} {}", String::from_utf8_lossy(msg));
+                    }
+                }
+                got = end;
+            }
+            // 影子表的灌入不计进这一档的时间：它属于调用方自己选的那条路
+            // （要顶替就得先备好一张新表）。这里量的是「切换」这个动作。
+            ops.push(Op::TableRename { from: shadow, to: BULK_TABLE.to_vec(), flags: 0 });
+        }
+        "putsame" => ops = (0..n).map(|i| bulk_put(i, false)).collect(),
+        "putchanged" => ops = (0..n).map(|i| bulk_put(i, true)).collect(),
+        other => {
+            eprintln!("unknown --bulk {other:?}\n{HELP}");
+            std::process::exit(2);
+        }
+    }
+
+    // 测量窗口。
+    let conns = args.conns.max(1);
+    let pipe = args.pipeline.max(1);
+    let total = ops.len();
+    let per = (total + conns - 1) / conns;
+    let ops = std::sync::Arc::new(ops);
+    // `rename` 只有一条 op：多开连接等于让七条线程去抢一个空区间。
+    let conns = conns.min(total.max(1));
+    let s0 = stats_of(&mut ctrl);
+    let t0 = Instant::now();
+    let mut handles = Vec::new();
+    for k in 0..conns {
+        let a = args.addr.clone();
+        let auth = args.auth.clone();
+        let ops = ops.clone();
+        let lo = k * per;
+        let hi = (lo + per).min(total);
+        handles.push(std::thread::spawn(move || {
+            let mut c = Client::connect_auth(&a, 3000, auth.as_deref()).expect("bulk conn");
+            let (mut done, mut reported, mut errs) = (0u64, 0u64, 0u64);
+            let mut i = lo;
+            while i < hi {
+                let end = (i + pipe).min(hi);
+                let batch: Vec<Op> = ops[i..end].to_vec();
+                match c.pipeline(&batch) {
+                    Ok(rs) => {
+                        for r in rs {
+                            match r {
+                                Reply::Count(v) => {
+                                    done += 1;
+                                    reported += v;
+                                }
+                                Reply::Ok | Reply::Row(_) | Reply::Table(_) => done += 1,
+                                Reply::Err { code, ref msg } => {
+                                    errs += 1;
+                                    eprintln!(
+                                        "bulk reply err {code} {}",
+                                        String::from_utf8_lossy(msg)
+                                    );
+                                }
+                                other => {
+                                    errs += 1;
+                                    eprintln!("bulk reply shape {other:?}");
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        errs += (end - i) as u64;
+                        eprintln!("bulk pipeline: {e}");
+                    }
+                }
+                i = end;
+            }
+            (done, reported, errs)
+        }));
+    }
+    let mut done = 0u64;
+    let mut reported = 0u64;
+    let mut errs = 0u64;
+    for h in handles {
+        let (d, r, e) = h.join().expect("bulk thread");
+        done += d;
+        reported += r;
+        errs += e;
+    }
+    let time_ms = t0.elapsed().as_millis() as u64;
+    let s1 = stats_of(&mut ctrl);
+    let left = rows_of(&mut ctrl);
+
+    // 影子表那一档：被顶替的那张旧表必须消失，否则「旧行还在状态里」会被
+    // `rows_left` 抓出来 —— 这正是这一档的回归闸门。
+    let orphan = ctrl
+        .call(&Op::TableList)
+        .ok()
+        .map(|r| match r {
+            Reply::Tables(v) => v.iter().filter(|t| t.name.starts_with(b"bulkkv-")).count(),
+            _ => usize::MAX,
+        })
+        .unwrap_or(usize::MAX);
+
+    println!(
+        "bulk mode={} rows={} batch={} conns={} pipeline={} load_ms={} time_ms={} ops={}/{} \
+         reported={} records={} writes={} syncs={} wal_bytes={} rows_left={} shadow_left={} errors={} \
+         rows_per_s={}",
+        args.bulk,
+        n,
+        bat,
+        conns,
+        pipe,
+        load_ms,
+        time_ms.max(1),
+        done,
+        total,
+        reported,
+        s1.seq - s0.seq,
+        s1.writes_total - s0.writes_total,
+        s1.syncs_total - s0.syncs_total,
+        s1.wal_bytes.saturating_sub(s0.wal_bytes),
+        left,
+        orphan,
+        errs,
+        n * 1000 / time_ms.max(1)
+    );
+    // 灌数据那一段的成本也报一次：逐行写与逐行删得用同一把尺子比。
+    println!(
+        "  load: records={} writes={} syncs={} ms={} rows_per_s={}",
+        s_load1.seq - s_load0.seq,
+        s_load1.writes_total - s_load0.writes_total,
+        s_load1.syncs_total - s_load0.syncs_total,
+        load_ms.max(1),
+        n * 1000 / load_ms.max(1)
+    );
+    if errs != 0 || done != total as u64 {
+        eprintln!("bulk: op 没跑完或出错（{done}/{total}，errors={errs}）");
+        std::process::exit(1);
+    }
+    match args.bulk.as_str() {
+        "rowdelete" | "range" | "clear" if left != 0 => {
+            eprintln!("bulk: 删完还剩 {left} 行，这一档没到终态");
+            std::process::exit(1);
+        }
+        // `rename` 的终态与删法相反：表里必须还是 N 行，而且每行都是影子表的
+        // 内容 —— 顶替既要换掉旧行，又不能让表看起来空了。
+        "rename" => {
+            if left != n {
+                eprintln!("bulk: rename 后 bulkkv 有 {left} 行，应为 {n}");
+                std::process::exit(1);
+            }
+            let probe = Op::RowGet {
+                table: BULK_TABLE.to_vec(),
+                key: bulk_key(0),
+            };
+            match ctrl.call(&probe) {
+                Ok(Reply::Row(Some(r))) if r.cols.get(1).map(|v| v.as_slice()) == Some(b"q0") => {}
+                other => {
+                    eprintln!("bulk: rename 后首行不是影子表的内容（{other:?}）");
+                    std::process::exit(1);
+                }
+            }
+        }
+        _ => {}
+    }
+    if args.bulk == "rename" && orphan != 0 {
+        eprintln!("bulk: 被顶替的影子表还在状态里（{orphan} 张）");
+        std::process::exit(1);
     }
 }
 
@@ -264,6 +633,12 @@ fn main() {
             args.secs.max(30)
         );
         std::thread::sleep(Duration::from_secs(args.secs.max(30)));
+        return;
+    }
+
+    // 固定工作量档：与压测档互斥，跑完就走（不进下面那个时长循环）。
+    if !args.bulk.is_empty() {
+        run_bulk(&args);
         return;
     }
 
@@ -417,14 +792,14 @@ fn main() {
                     "rowget" => (
                         "RowGet(r000000)",
                         Op::RowGet {
-                            table: ROW_TABLE.to_vec(),
+                            table: row_table().to_vec(),
                             key: row_key(0),
                         },
                     ),
                     "rowlist" => (
                         "RowList(pk, limit=1)",
                         Op::RowList {
-                            table: ROW_TABLE.to_vec(),
+                            table: row_table().to_vec(),
                             column: ROW_PK,
                             value: Vec::new(),
                             from: Vec::new(),
@@ -434,7 +809,7 @@ fn main() {
                     "rowidx" => (
                         "RowList(tag=t0, limit=1)",
                         Op::RowList {
-                            table: ROW_TABLE.to_vec(),
+                            table: row_table().to_vec(),
                             column: ROW_TAG,
                             value: b"t0".to_vec(),
                             from: Vec::new(),
@@ -444,7 +819,7 @@ fn main() {
                     "rowidxrange" => (
                         "RowRange(tag [t0, t1), limit=1)",
                         Op::RowRange {
-                            table: ROW_TABLE.to_vec(),
+                            table: row_table().to_vec(),
                             column: ROW_TAG,
                             lo: b"t0".to_vec(),
                             hi: b"t1".to_vec(),
@@ -456,7 +831,7 @@ fn main() {
                     "rowrange" => (
                         "RowRange(pk [r000000, r000001), limit=1)",
                         Op::RowRange {
-                            table: ROW_TABLE.to_vec(),
+                            table: row_table().to_vec(),
                             column: ROW_PK,
                             lo: row_key(0),
                             hi: row_key(1),
@@ -468,7 +843,7 @@ fn main() {
                     _ => (
                         "RowCount(pk)",
                         Op::RowCount {
-                            table: ROW_TABLE.to_vec(),
+                            table: row_table().to_vec(),
                             column: ROW_PK,
                             value: Vec::new(),
                         },
@@ -652,7 +1027,7 @@ fn build(
             // `rowinsert` 的键带 nonce：重跑时不撞上一轮的键（撞上就不是插入而是
             // 覆盖，量的将是另一条路径）。
             "rowinsert" => Op::RowPut {
-                table: ROW_TABLE.to_vec(),
+                table: row_table().to_vec(),
                 key: format!("n{nonce}-{t}-{s}").into_bytes(),
                 cols: vec![format!("t{}", s % 16).into_bytes(), b"p".to_vec()],
                 flags: PUT_IF_ABSENT,
@@ -661,14 +1036,14 @@ fn build(
             },
             "rowput" => row_op(s, span),
             "rowget" => Op::RowGet {
-                table: ROW_TABLE.to_vec(),
+                table: row_table().to_vec(),
                 key: row_key(s % span),
             },
             // 主键序第一页：`from` 空 = 从头。固定首页而不翻到底，是因为翻页的
             // 成本与「翻到第几页」无关（键游标直接从树上定位），而首页恰好是
             // `rowlist` 最常用的形状（挂载后第一次列目录）。
             "rowlist" => Op::RowList {
-                table: ROW_TABLE.to_vec(),
+                table: row_table().to_vec(),
                 column: ROW_PK,
                 value: Vec::new(),
                 from: Vec::new(),
@@ -677,14 +1052,14 @@ fn build(
             // 二级索引等值页：16 个 tag 轮转，每个 tag 在 500 行里约 31 行 ——
             // 既不是「只命中一条」的快路径，也不会大到把回包帧长测成瓶颈。
             "rowidx" => Op::RowList {
-                table: ROW_TABLE.to_vec(),
+                table: row_table().to_vec(),
                 column: ROW_TAG,
                 value: format!("t{}", s % 16).into_bytes(),
                 from: Vec::new(),
                 limit: 100,
             },
             "rowcount" => Op::RowCount {
-                table: ROW_TABLE.to_vec(),
+                table: row_table().to_vec(),
                 column: ROW_PK,
                 value: Vec::new(),
             },
@@ -698,7 +1073,7 @@ fn build(
                 let win = rw.min(span.saturating_sub(1)).max(1);
                 let start = s % (span - win + 1);
                 Op::RowRange {
-                    table: ROW_TABLE.to_vec(),
+                    table: row_table().to_vec(),
                     column: ROW_PK,
                     lo: row_key(start),
                     hi: row_key(start + win),
@@ -712,7 +1087,7 @@ fn build(
             // 逐行 take_while」这两条路径本身。不拿 `--range` 去切 tag：16 个
             // 值切不出「宽 64」这种窗口，硬切只会让两档语料不可比。
             "rowidxrange" => Op::RowRange {
-                table: ROW_TABLE.to_vec(),
+                table: row_table().to_vec(),
                 column: ROW_TAG,
                 lo: b"t0".to_vec(),
                 hi: b"t1".to_vec(),
@@ -730,7 +1105,7 @@ fn build(
                 let key = format!("c{nonce}-{t}-{}", s / 2).into_bytes();
                 if s % 2 == 0 {
                     Op::RowPut {
-                        table: ROW_TABLE.to_vec(),
+                        table: row_table().to_vec(),
                         key,
                         cols: vec![b"tchurn".to_vec(), b"p".to_vec()],
                         flags: 0,
@@ -739,7 +1114,7 @@ fn build(
                     }
                 } else {
                     Op::RowDelete {
-                        table: ROW_TABLE.to_vec(),
+                        table: row_table().to_vec(),
                         key,
                         flags: 0,
                         cond_col: COND_NONE,
@@ -783,8 +1158,20 @@ treedb-bench — 对 treedb-server 打负载
                      一个视图。造数据时用它把整份快照压进一棵子树，中段 ino 才
                      真落在正文中段
   --hold             只建立 N 条连接并保持，用于量服务端 RSS
+  --bulk MODE        固定工作量档（§5.1 的批量形状）：灌 --rows 行再一次性处理完，
+                     rowdelete|range|clear|rename|putsame|putchanged。报的是
+                     time_ms / records(WAL 记录差) / writes / syncs / wal_bytes /
+                     rows_left，而不是 ops/s —— 破坏性负载用时长口径量，表空之后
+                     剩下的时间全在数空区间，报出来的数字反而最好看
+  --rows N           批量档的表规模（默认 200000）
+  --batch N          range 模式每批删多少行（默认 1000）
   --auth-key-file P  每条连接先用这把密钥跑一次握手（§4.4）。不给 = 不握手。
                      服务端必须开着同一把密钥，否则报错退出（客户端
                      fail-closed，不会静默降级成不认证）。与 --hold 合用
                      就是「建连风暴里握手占多少」的口径
+
+环境变量（只影响基准形状，不动线协议）：
+  TREEDB_BENCH_WARM  预热条数 = 被测目录 / 表的规模（默认 500，最小 100）
+  TREEDB_BENCH_TABLE 通用表档的表名（默认 benchkv）。同一服务端上并跑多个 bench
+                     进程时必须各给一个，否则两边的 nonce 撞上就是一排 EEXIST
 ";

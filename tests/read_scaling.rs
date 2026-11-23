@@ -20,7 +20,7 @@ mod common;
 use common::Server;
 use treedb::engine::model::{
     errno, ColumnDef, Op, Reply, TableDef, COL_INDEX, COL_UNIQUE,
-    COND_NONE, NONCE_LEN, ROW_PK, SNAP_CHUNK_MAX, WAL_FETCH_MAX, WAL_HINT_NONE,
+    COND_NONE, NONCE_LEN, RENAME_NOREPLACE, ROW_PK, SNAP_CHUNK_MAX, WAL_FETCH_MAX, WAL_HINT_NONE,
 };
 use treedb::engine::sha256::DIGEST_LEN;
 use treedb::engine::{Durability, Engine};
@@ -95,7 +95,7 @@ fn rowput(table: &str, key: &str, val: &str, cond_col: u32, cond_val: &str) -> O
     }
 }
 
-/// 41 个 op 变体的语料，每条都带能让它走到真实分支的参数（视图/文件名/表名
+/// 44 个 op 变体的语料，每条都带能让它走到真实分支的参数（视图/文件名/表名
 /// 取自下面 `seed` 播好的状态，所以视图 id 由调用方递进来）。加新 op 必须同时
 /// 补这里 —— 最后两个计数断言就是报警器。
 fn corpus(v: u32) -> Vec<Op> {
@@ -148,6 +148,12 @@ fn corpus(v: u32) -> Vec<Op> {
         Op::RowRange { table: name("seed-table"), column: ROW_PK, lo: name("r1"), hi: name("r3"), after_val: Vec::new(), after_key: Vec::new(), limit: 10 },
         Op::RowDelete { table: name("seed-table"), key: name("r2"), flags: 0, cond_col: COND_NONE, cond_val: Vec::new() },
         Op::RowCount { table: name("seed-table"), column: 1, value: name("x") },
+        // ---- 批量形状（0x007c–0x007e）----
+        // 三条都是真写：`max` 给有限值、`to` 给一个不存在的名字，于是它们在种子
+        // 状态下都走得到「有结果」那一支，而不是只在测参数校验。
+        Op::TableClear { table: name("seed-table") },
+        Op::RowRangeDelete { table: name("seed-table"), column: ROW_PK, lo: name("r1"), hi: name("r3"), max: 10 },
+        Op::TableRename { from: name("seed-table"), to: name("seed-table-2"), flags: RENAME_NOREPLACE },
         // ---- readdir 带属性 ----
         Op::ReadDirPlus { view: v, parent: 1, offset: 0, limit: 100 },
         // ---- 跨 op 的原子批 ----
@@ -222,9 +228,9 @@ fn readonly_classification_matches_translate() {
         }
     }
     let cs_len = cs.len();
-    assert_eq!(cs_len, 41, "op 语料必须覆盖全部变体");
+    assert_eq!(cs_len, 44, "op 语料必须覆盖全部变体");
     assert_eq!(ro, 15, "只读 op 数变了：分派表、这里和 DESIGN.md §4.2 分组表要一起改");
-    assert_eq!(wr, 26, "非只读 op 数变了：同上");
+    assert_eq!(wr, 29, "非只读 op 数变了：同上");
 }
 
 /// 三档划分必须穷举且两两不交：只读 / 真写 / 控制面。
@@ -249,8 +255,8 @@ fn ops_partition_into_three_classes() {
     }
     assert_eq!(
         (ro, wr, ctl),
-        (15, 19, 7),
-        "三档的分布：只读 15 / 真写 19 / 控制面 7（Stats、Checkpoint、Shutdown、WalFetch、\
+        (15, 22, 7),
+        "三档的分布：只读 15 / 真写 22 / 控制面 7（Stats、Checkpoint、Shutdown、WalFetch、\
          SnapFetch、AuthBegin、AuthFinish）"
     );
     // 语料覆盖全部变体，因此三档之和就是 op 总数。

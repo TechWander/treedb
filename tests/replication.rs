@@ -396,7 +396,8 @@ fn the_replica_refuses_writes_at_the_engine() {
     assert!(eng.is_replica());
     let seq0 = eng.apply_seq();
 
-    // 真写：挑五个形状不同的，确认判据是“类别”而不是某个 op。
+    // 真写：挑六个形状不同的，确认判据是“类别”而不是某个 op。
+    // 最后一条是批量 op（0x007c）：它三档里落在「真写」，所以也必须被拒。
     let write_ops: Vec<Op> = vec![
         Op::CreateView { name: b"v".to_vec() },
         Op::Create {
@@ -429,6 +430,7 @@ fn the_replica_refuses_writes_at_the_engine() {
             lease_expiry: 0,
         },
         Op::DropView { name: b"v".to_vec() },
+        Op::TableClear { table: b"t".to_vec() },
     ];
     for op in &write_ops {
         let (logs, r) = eng.exec(op);
@@ -446,7 +448,7 @@ fn the_replica_refuses_writes_at_the_engine() {
         // 已经改了 —— 那比报错更坏。
         assert!(logs.is_empty(), "{op:?} → 被拒却产出了日志");
     }
-    assert_eq!(eng.apply_seq(), seq0, "五个被拒的写不该推过水位");
+    assert_eq!(eng.apply_seq(), seq0, "六个被拒的写不该推过水位");
 
     // 只读与控制面放行：一个连自己状态都问不出来的副本没法监控。
     match eng.exec(&Op::ListViews).1 {

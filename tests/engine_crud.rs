@@ -2120,7 +2120,33 @@ fn background_snapshot_costs_a_dispatch_not_a_pause() {
     let sync_seq = e.checkpoint().expect("sync checkpoint");
     let paused = t.elapsed();
 
-    // 再来一条写，好让旁路快照有活干。
+    // 再来一条写，好让旁路快照有活干。派工读数里混着**起线程的调度延迟**：机器
+    // 被别人压满时一次 `thread::spawn` 能量到几十毫秒（实测 load 12 的一次跑出
+    // paused=12.6 ms / dispatch=31.1 ms，断言假报警 —— 这条断言拦的是「派工变成
+    // 停轮」，不是「这台机此刻很忙」）。所以取三次里的最小值（与 §7.15 那句
+    // 「单次采样不配当基线」同一条规矩），而每派一份就收掉；两次派工之间必须
+    // 先写一条 —— 水位没动时 `checkpoint_start` 直接回 `false`，那不给读数。
+    let mut dispatch = std::time::Duration::MAX;
+    for i in 0..3 {
+        ok(
+            &mut e,
+            &Op::Create {
+                view: v,
+                parent: 1,
+                name: format!("warm{i}").into_bytes(),
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+            },
+        );
+        e.sync_now().expect("sync warm");
+        let t = Instant::now();
+        assert!(e.checkpoint_start().expect("start"), "第 {i} 次应当真的派出去");
+        let d = t.elapsed();
+        e.checkpoint_wait().expect("drain");
+        dispatch = dispatch.min(d);
+    }
+    // 收尾那一句要拿它当「派工之后还在的节点」查回来。
     ok(
         &mut e,
         &Op::Create { view: v, parent: 1, name: b"after".to_vec(), mode: 0o644, uid: 0, gid: 0 },
@@ -2129,17 +2155,15 @@ fn background_snapshot_costs_a_dispatch_not_a_pause() {
     // 一条写可能落好几条日志（inode + 目录项 + …），所以这里不断言步长，
     // 只确认「水位确实往前走了」—— 派工取的就是它。
     let cut = e.snapshot_stats().seq;
-    assert!(cut > sync_seq, "写一条新 op 之后水位必须往前走：{sync_seq} → {cut}");
+    assert!(cut > sync_seq, "写几条新 op 之后水位必须往前走：{sync_seq} → {cut}");
 
-    let t = Instant::now();
-    assert!(e.checkpoint_start().expect("start"), "应当真的派出去");
-    let dispatch = t.elapsed();
     eprintln!("checkpoint pause vs dispatch @ {N} nodes: paused={paused:?} dispatch={dispatch:?}");
     assert!(
         dispatch * 5 < paused,
         "派工 {dispatch:?} 应当远小于停轮 {paused:?}（状态 {N} 条）"
     );
     // 在路上时第二次派工直接放弃：不让两份抢同一个 `state.snap.tmp`。
+    assert!(e.checkpoint_start().expect("in flight"), "水位已往前走，这一份应当真派出去");
     assert!(!e.checkpoint_start().expect("second start"), "不许两份同时在编");
 
     // 取水位之后才 ack 的两条：不属于这份快照，但必须活过日志整理。

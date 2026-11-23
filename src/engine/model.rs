@@ -706,6 +706,60 @@ pub enum Op {
         value: Vec<u8>,
     },
 
+    // ---- 通用表：批量形状（§5.1「频繁替换/删除」那一档的专用口）----
+    /// 清空一张表：名字、id 与形状（`def`）全留着，只把行与二级索引丢掉。
+    ///
+    /// 存在的理由是「整表替换」这个形状：逐行 `RowDelete` 要 N 条 op、N 条 WAL
+    /// 记录，而这里**一条 op 一条记录**。与 [`Op::TableDrop`] 的区别是不换 id ——
+    /// 换 id 意味着所有拿着 id 的人都要重新 `TableGet`，而清空不需要。
+    ///
+    /// 成本要说清：**一条记录 ≠ 常数时间**。apply 要逐行摘二级索引，O(行数)，
+    /// 全在唯一提交线程上；十万行的清空会让那一轮停住相应的时长。想控制回合
+    /// 时长就用 [`Op::RowRangeDelete`] 分批。
+    ///
+    /// 表不存在 → `ENOENT`。应答 [`Reply::Count`] = 被清掉的行数（本来就空 → 0）。
+    TableClear {
+        table: Vec<u8>,
+    },
+    /// 按区间删行：把 `column` 落在 `[lo, hi)` 内的行至多删掉 `max` 条。
+    ///
+    /// `column == `[`ROW_PK`] 时区间落在**主键**上，否则必须是有索引的列（判据与
+    /// [`Op::RowRange`] 逐字一致：没建索引的列直接 `EINVAL`，不退化成全表扫）。
+    /// `lo` / `hi` 空 = 该侧无界；`lo > hi` 是空区间而不是错误，删 0 行、**零日志**。
+    ///
+    /// `max = 0` = 不限，硬上限 [`MAX_TABLE_ITEMS`]（与列表/快照那道闸门同源）：
+    /// 给它一个有限值是控制「一条 op 占住提交线程多久」的唯一手段。
+    ///
+    /// **一条 `Log::DelRange` = 一条 WAL 记录**，日志里记的是**区间而不是键清单**
+    /// —— 写是全局单序的（§4.2），重放时从同一状态重新推出同一段，结果必然相同；
+    /// 把键清单写进日志则会让一次删除的 WAL 体积正比于命中数，省下的往返又还回去。
+    ///
+    /// 应答 [`Reply::Count`] = 实际删掉的行数。成本 O(命中数)：翻译层为拿到这个数
+    /// 扫一遍区间，apply 再扫一遍摘索引。
+    RowRangeDelete {
+        table: Vec<u8>,
+        column: u32,
+        lo: Vec<u8>,
+        hi: Vec<u8>,
+        max: u32,
+    },
+    /// 换表名（影子表切换）：把 `from` 那张表改叫 `to`。
+    ///
+    /// 默认**替换**：`to` 已存在时那张表连同它的全部行一起被丢 —— 这与文件
+    /// `rename` 同形，也正是「新表顶替旧表」要的语义：先照着旧形状灌一张新表，
+    /// 再一条 op 把它换到位。给 [`RENAME_NOREPLACE`] 则撞名回 `EEXIST`，什么都不动。
+    ///
+    /// **id 不变**：换的只是名字，索引跟着 `id` 走所以不用重建。`from` 不存在 →
+    /// `ENOENT`；`from == to` 是空操作（零日志、回 `Reply::Ok`）。
+    /// 一条 `Log::RenameTable` = 一条 WAL 记录，被替换掉的那张表由 apply 从状态里
+    /// 现取（重放顺序一致，它的 id 不必进日志）。
+    TableRename {
+        from: Vec<u8>,
+        to: Vec<u8>,
+        /// 只用 [`RENAME_NOREPLACE`] 一位。
+        flags: u32,
+    },
+
     // ---- 跨 op 的原子批 ----
     /// 一批子 op：**要么全生效，要么一条都不生效**。
     ///
@@ -826,6 +880,13 @@ impl Op {
             Op::RowRange { .. } => 0x0079,
             // 通用表那一段的最后一个空位 0x007a 给原子批（全局动作，不分段）。
             Op::Batch { .. } => 0x007a,
+            // 三条批量 op 接在同一段的尾部（0x007c–0x007e，0x007b 已是追加列）。
+            // 纯追加：旧客户端不发它们，旧服务端在 `decode` 的兜底那里回 `EINVAL`，
+            // 两侧都没有静默分支；既有帧一个字节没动、`EngineStats` 也没加长，
+            // 所以 `PROTOCOL_VERSION` 留在 7（§4.1 判据，第六例）。
+            Op::TableClear { .. } => 0x007c,
+            Op::RowRangeDelete { .. } => 0x007d,
+            Op::TableRename { .. } => 0x007e,
             Op::ReadDirPlus { .. } => 0x002b,
             // 目录树那一段 0x0020–0x002b 已排满，`Link` 取紧接着的下一个空位。
             Op::Link { .. } => 0x002c,
@@ -912,6 +973,9 @@ impl Op {
             | Op::TableAddColumn { .. }
             | Op::RowPut { .. }
             | Op::RowDelete { .. }
+            | Op::TableClear { .. }
+            | Op::RowRangeDelete { .. }
+            | Op::TableRename { .. }
             | Op::WalFetch { .. }
             | Op::SnapFetch { .. }
             | Op::AuthBegin { .. }
@@ -1154,6 +1218,25 @@ impl Op {
                 w.u32(*column);
                 w.bytes(value);
             }
+            Op::TableClear { table } => w.bytes(table),
+            Op::RowRangeDelete {
+                table,
+                column,
+                lo,
+                hi,
+                max,
+            } => {
+                w.bytes(table);
+                w.u32(*column);
+                w.bytes(lo);
+                w.bytes(hi);
+                w.u32(*max);
+            }
+            Op::TableRename { from, to, flags } => {
+                w.bytes(from);
+                w.bytes(to);
+                w.u32(*flags);
+            }
             Op::Batch { ops } => {
                 w.u32(ops.len() as u32);
                 for o in ops {
@@ -1365,6 +1448,21 @@ impl Op {
                 after_val: r.bytes()?,
                 after_key: r.bytes()?,
                 limit: r.u32()?,
+            },
+            0x007c => Op::TableClear {
+                table: r.bytes()?,
+            },
+            0x007d => Op::RowRangeDelete {
+                table: r.bytes()?,
+                column: r.u32()?,
+                lo: r.bytes()?,
+                hi: r.bytes()?,
+                max: r.u32()?,
+            },
+            0x007e => Op::TableRename {
+                from: r.bytes()?,
+                to: r.bytes()?,
+                flags: r.u32()?,
             },
             // 条数上界在**解码**这里报错（Codec 错 = 断连），而不是等 `translate`
             // 回 EINVAL：`Vec::with_capacity(n)` 拿吃一个敌意计数就是内存放大，
@@ -2253,6 +2351,21 @@ mod tests {
                 table: b"kv".to_vec(),
                 column: ROW_PK,
                 value: Vec::new(),
+            },
+            Op::TableClear {
+                table: b"kv".to_vec(),
+            },
+            Op::RowRangeDelete {
+                table: b"kv".to_vec(),
+                column: 0,
+                lo: b"v0".to_vec(),
+                hi: b"v9".to_vec(),
+                max: 1000,
+            },
+            Op::TableRename {
+                from: b"kv".to_vec(),
+                to: b"kv2".to_vec(),
+                flags: RENAME_NOREPLACE,
             },
             // ---- 原子批 ----
             // 子 op 故意混一条只读进去：编码/解码只关心形状，不为「只读还是写」分叉。

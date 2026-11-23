@@ -1,0 +1,74 @@
+== 批量形状基准 2026-11-23 16:28:16  rows=200000 batch=1000 conns=8 pipeline=64 ==
+-- A) durability=never：扫描 + 索引维护这一层
+   服务端 durability=never workers=8
+   rowdelete       1647 ms  records=200000   writes=200000   syncs=0       wal=7600000   rows_left=0 ops=200000
+   range/b1000      197 ms  records=200      writes=200      syncs=0       wal=11800     rows_left=0 ops=200
+   clear            168 ms  records=1        writes=1        syncs=0       wal=25        rows_left=0 ops=1
+   rename           191 ms  records=1        writes=1        syncs=0       wal=50        rows_left=200000 ops=1
+   putsame          328 ms  records=0        writes=0        syncs=0       wal=0         rows_left=200000 ops=200000
+   putchanged      1885 ms  records=200000   writes=200000   syncs=0       wal=11963890  rows_left=200000 ops=200000
+   range/b10000      170 ms  records=20       writes=20       syncs=0       wal=1180      rows_left=0 ops=20
+-- B) durability=group：加回每轮 fsync
+   服务端 durability=group workers=8
+   rowdelete       3102 ms  records=200000   writes=200000   syncs=465     wal=7600000   rows_left=0 ops=200000
+   range/b1000      206 ms  records=200      writes=200      syncs=2       wal=11800     rows_left=0 ops=200
+   clear            185 ms  records=1        writes=1        syncs=1       wal=25        rows_left=0 ops=1
+   rename           181 ms  records=1        writes=1        syncs=1       wal=51        rows_left=200000 ops=1
+   putsame          232 ms  records=0        writes=0        syncs=0       wal=0         rows_left=200000 ops=200000
+   putchanged      4142 ms  records=200000   writes=200000   syncs=448     wal=11963890  rows_left=200000 ops=200000
+   range/b10000      172 ms  records=20       writes=20       syncs=2       wal=1180      rows_left=0 ops=20
+
+== 汇总（time_ms / records / syncs / wal 字节）==
+mode             never ms   group ms  never rec  group rec  never syn   group syn   group wal
+rowdelete            1647       3102     200000     200000          0         465     7600000
+range/b1000           197        206        200        200          0           2       11800
+range/b10000          170        172         20         20          0           2        1180
+clear                 168        185          1          1          0           1          25
+rename                191        181          1          1          0           1          51
+putsame               328        232          0          0          0           0           0
+putchanged           1885       4142     200000     200000          0         448    11963890
+
+group 档记录数：rowdelete=200000  range/b1000=200  clear=1  → 区间删省 1000×，清空省 200000×
+group 档时间：  rowdelete=3102ms  range/b1000=206ms  clear=185ms  → 快 15.1× / 16.8×
+group 档 fsync：rowdelete=465  range/b1000=2  clear=1 次
+group 档 WAL：   rowdelete=7600000  range/b1000=11800  clear=25 字节
+同值消除：putsame records=0 syncs=0（应为 0），putchanged records=200000 syncs=448；时间 232ms vs 4142ms
+
+== 全部通过：每档 errors=0、终态与格式契约一致 ==
+== 批量形状基准 2026-11-23 16:29:24  rows=1000000 batch=2000 conns=8 pipeline=64 ==
+-- A) durability=never：扫描 + 索引维护这一层
+   服务端 durability=never workers=8
+   rowdelete       6199 ms  records=1000000  writes=1000000  syncs=0       wal=38000000  rows_left=0 ops=1000000
+   range/b2000     1016 ms  records=500      writes=500      syncs=0       wal=29500     rows_left=0 ops=500
+   clear           1364 ms  records=1        writes=1        syncs=0       wal=25        rows_left=0 ops=1
+   rename          1231 ms  records=1        writes=1        syncs=0       wal=50        rows_left=1000000 ops=1
+   putsame         1467 ms  records=0        writes=0        syncs=0       wal=0         rows_left=1000000 ops=1000000
+   putchanged      9890 ms  records=1000000  writes=1000000  syncs=0       wal=60263890  rows_left=1000000 ops=1000000
+   range/b10000      964 ms  records=100      writes=100      syncs=0       wal=5900      rows_left=0 ops=100
+-- B) durability=group：加回每轮 fsync
+   服务端 durability=group workers=8
+   rowdelete      16064 ms  records=1000000  writes=1000000  syncs=2075    wal=38000000  rows_left=0 ops=1000000
+   range/b2000     1017 ms  records=500      writes=500      syncs=2       wal=29500     rows_left=0 ops=500
+   clear            924 ms  records=1        writes=1        syncs=1       wal=25        rows_left=0 ops=1
+   rename           964 ms  records=1        writes=1        syncs=1       wal=51        rows_left=1000000 ops=1
+   putsame          970 ms  records=0        writes=0        syncs=0       wal=0         rows_left=1000000 ops=1000000
+   putchanged     21126 ms  records=1000000  writes=1000000  syncs=2046    wal=60263890  rows_left=1000000 ops=1000000
+   range/b10000     1036 ms  records=100      writes=100      syncs=2       wal=5900      rows_left=0 ops=100
+
+== 汇总（time_ms / records / syncs / wal 字节）==
+mode             never ms   group ms  never rec  group rec  never syn   group syn   group wal
+rowdelete            6199      16064    1000000    1000000          0        2075    38000000
+range/b2000          1016       1017        500        500          0           2       29500
+range/b10000          964       1036        100        100          0           2        5900
+clear                1364        924          1          1          0           1          25
+rename               1231        964          1          1          0           1          51
+putsame              1467        970          0          0          0           0           0
+putchanged           9890      21126    1000000    1000000          0        2046    60263890
+
+group 档记录数：rowdelete=1000000  range/b2000=500  clear=1  → 区间删省 2000×，清空省 1000000×
+group 档时间：  rowdelete=16064ms  range/b2000=1017ms  clear=924ms  → 快 15.8× / 17.4×
+group 档 fsync：rowdelete=2075  range/b2000=2  clear=1 次
+group 档 WAL：   rowdelete=38000000  range/b2000=29500  clear=25 字节
+同值消除：putsame records=0 syncs=0（应为 0），putchanged records=1000000 syncs=2046；时间 970ms vs 21126ms
+
+== 全部通过：每档 errors=0、终态与格式契约一致 ==

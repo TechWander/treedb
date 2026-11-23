@@ -22,7 +22,7 @@
 
 use crate::engine::codec::{Rd, W};
 use crate::engine::model::{
-    DataRef, Ino, LockRec, Node, RefRec, RowRec, TableDef, ViewId, ViewMeta, MAX_TABLE_ITEMS,
+    DataRef, Ino, LockRec, Node, RefRec, RowRec, TableDef, ViewId, ViewMeta, MAX_TABLE_ITEMS, ROW_PK,
 };
 use crate::error::{Error, Result};
 use std::collections::BTreeMap;
@@ -163,6 +163,46 @@ pub enum Log {
         id: u32,
         def: TableDef,
     },
+    /// 清空一张表的所有行，名字、id 与形状都不动（[`crate::engine::model::Op::TableClear`]）。
+    ///
+    /// 一条日志替掉 N 条 `DelRow`，这就是它存在的全部理由：整表替换的瓶颈是
+    /// **op 数**（每条都要占一条 WAL 记录），不是删得慢。只记一个表 id 因而重放
+    /// 天然幂等 —— 两次 `rows.remove` 与一次没有区别，不需要前值。
+    ///
+    /// 不进快照也不进 dump：终态里没有「曾经有过又被清掉的行」可写。
+    ClearTable {
+        table: u32,
+    },
+    /// 删掉区间 `[lo, hi)` 内至多 `max` 行（[`crate::engine::model::Op::RowRangeDelete`]）。
+    ///
+    /// 记的是**区间而不是键清单**。能做这个替换的根据是写的全局单序（§4.2）：
+    /// 一轮之内逐条 translate+apply，重放时这条日志左边的状态与当初翻译时看到
+    /// 的完全是同一份，用同一个 `range_keys` 再算一次必然得到同一批键。反过来
+    /// 把键清单写进日志，一次区间删的 WAL 字节数就正比于命中数 —— 省下的往返
+    /// 又原样还回去了。
+    ///
+    /// `column` = [`ROW_PK`] 时区间落在主键上，否则落在该索引列的值上；`max = 0`
+    /// = 不限。与 `ClearTable` 同理，不进快照与 dump。
+    DelRange {
+        table: u32,
+        column: u32,
+        lo: Vec<u8>,
+        hi: Vec<u8>,
+        max: u32,
+    },
+    /// 换表名（[`crate::engine::model::Op::TableRename`]）。
+    ///
+    /// 只记 `from`/`to`，**id 不动**：`rows` 与 `row_index` 都以 id 为键，所以改名
+    /// 的开销与表大小无关。被替换掉的那张表（`to` 上原本挂着的）的 id 不进日志
+    /// —— 与 `DelRange` 同一个理由，重放时从状态里现取，取到的就是当初那一个。
+    ///
+    /// 幂等判据是「`from` 这个名字现在确实指向 `id`」：重放第二次时它已经不指了
+    /// （要么名字没了，要么换成了别的 id），于是第二次什么都不做。
+    RenameTable {
+        id: u32,
+        from: Vec<u8>,
+        to: Vec<u8>,
+    },
     /// 一个原子批：内部逐条等价于把 `logs` 展开后依次 `apply`，但它自己
     /// **只占一条 WAL 记录**（一个 CRC）。[`crate::engine::model::Op::Batch`]
     /// 的「崩溃原子」就靠这一层 —— §6.2 的坏尾丢弃以记录为单位，一条记录
@@ -194,6 +234,10 @@ const LOG_PUT_ROW: u8 = 21;
 const LOG_DEL_ROW: u8 = 22;
 const LOG_BATCH: u8 = 23;
 const LOG_ADD_COLUMN: u8 = 24;
+// 批量形状那三条：与 `Op` 侧的 0x007c–0x007e 同批追加（§4.1 判据，第六例）。
+const LOG_CLEAR_TABLE: u8 = 25;
+const LOG_DEL_RANGE: u8 = 26;
+const LOG_RENAME_TABLE: u8 = 27;
 
 /// 一条 [`Log::Batch`] 能装多少条子日志。
 ///
@@ -295,6 +339,30 @@ impl Log {
                 w.u32(*id);
                 def.encode(w);
             }
+            Log::ClearTable { table } => {
+                w.u8(LOG_CLEAR_TABLE);
+                w.u32(*table);
+            }
+            Log::DelRange {
+                table,
+                column,
+                lo,
+                hi,
+                max,
+            } => {
+                w.u8(LOG_DEL_RANGE);
+                w.u32(*table);
+                w.u32(*column);
+                w.bytes(lo);
+                w.bytes(hi);
+                w.u32(*max);
+            }
+            Log::RenameTable { id, from, to } => {
+                w.u8(LOG_RENAME_TABLE);
+                w.u32(*id);
+                w.bytes(from);
+                w.bytes(to);
+            }
             Log::Batch { logs } => {
                 w.u8(LOG_BATCH);
                 w.u32(logs.len() as u32);
@@ -380,6 +448,19 @@ impl Log {
             LOG_ADD_COLUMN => Log::AddColumn {
                 id: r.u32()?,
                 def: TableDef::decode(r)?,
+            },
+            LOG_CLEAR_TABLE => Log::ClearTable { table: r.u32()? },
+            LOG_DEL_RANGE => Log::DelRange {
+                table: r.u32()?,
+                column: r.u32()?,
+                lo: r.bytes()?,
+                hi: r.bytes()?,
+                max: r.u32()?,
+            },
+            LOG_RENAME_TABLE => Log::RenameTable {
+                id: r.u32()?,
+                from: r.bytes()?,
+                to: r.bytes()?,
             },
             LOG_BATCH => {
                 let n = r.u32()? as usize;
@@ -641,6 +722,78 @@ impl State {
                     }
                 }
             }
+            Log::ClearTable { table } => {
+                // 先把索引列清单取出来再拆表：表名映射还在的时候才拿得到 def。
+                let cols = self.indexed_cols(*table);
+                if let Some(m) = self.rows.remove(table) {
+                    for row in m.values() {
+                        self.unindex_row(*table, row, &cols);
+                    }
+                }
+            }
+            Log::DelRange {
+                table,
+                column,
+                lo,
+                hi,
+                max,
+            } => {
+                // 重新算一遍区间（与翻译层同一个 `range_keys`、同一份状态），然后
+                // 逐个摘索引。先摘到本地再统一 unindex：`rows` 的可变借位与
+                // `unindex_row(&mut self)` 不能同时存在，而克隆的只是行、不是整表。
+                let keys = self.range_keys(*table, *column, lo, hi, *max as usize);
+                if keys.is_empty() {
+                    return;
+                }
+                let cols = self.indexed_cols(*table);
+                let mut dead: Vec<RowRec> = Vec::with_capacity(keys.len());
+                if let Some(m) = self.rows.get_mut(table) {
+                    for k in &keys {
+                        if let Some(row) = m.remove(k.as_slice()) {
+                            dead.push(row);
+                        }
+                    }
+                }
+                for row in &dead {
+                    self.unindex_row(*table, row, &cols);
+                }
+                // 空内层表不留，与 `DelRow` 同规矩（否则 `rows.len()` 会谎报表数）。
+                if self.rows.get(table).map(|m| m.is_empty()).unwrap_or(false) {
+                    self.rows.remove(table);
+                }
+            }
+            Log::RenameTable { id, from, to } => {
+                // 幂等闸门：只有「from 仍指向这张表」才动作。重放第二次时 from
+                // 已经不在表名表里，于是「改过两次」与「只改过一次」无法区分。
+                let Some(meta) = self.tables.get(from.as_slice()) else {
+                    return;
+                };
+                if meta.id != *id {
+                    return;
+                }
+                // 默认替换：to 上原本挂着的那张表连同它的行一起走，与 `DelTable`
+                // 同一个级联 —— 不拆干净的话它的行与索引项会永久留在状态里、
+                // 再没有任何名字能指向它（统计与快照都会跟着多报）。
+                let gone = match self.tables.get(to.as_slice()) {
+                    Some(m) if m.id != *id => Some(m.id),
+                    _ => None,
+                };
+                let mut def = meta.def.clone();
+                def.name = to.clone();
+                if let Some(oid) = gone {
+                    let cols = self.indexed_cols(oid);
+                    self.tables.remove(to.as_slice());
+                    self.table_by_id.remove(&oid);
+                    if let Some(rows) = self.rows.remove(&oid) {
+                        for row in rows.values() {
+                            self.unindex_row(oid, row, &cols);
+                        }
+                    }
+                }
+                self.tables.remove(from.as_slice());
+                self.tables.insert(to.clone(), TableMeta { id: *id, def });
+                self.table_by_id.insert(*id, to.clone());
+            }
         }
     }
 
@@ -844,6 +997,92 @@ impl State {
         let rows: Vec<RowRec> = it.by_ref().take(limit).collect();
         let end = it.next().is_none();
         (rows, end)
+    }
+
+    /// 区间 `[lo, hi)` 内至多 `max` 行的**主键**（`max = 0` 不限）。
+    ///
+    /// 只给批量删用。它跟 [`row_range`](Self::row_range) /
+    /// [`index_range`](Self::index_range) 共享同一套边界规矩（空 = 该侧无界；
+    /// `lo > hi` 是空区间而不是错误，而 `BTreeMap::range` 在 `start > end` 时
+    /// **panic**，所以必须在这儿挡掉；上界只能靠 `take_while`，理由见
+    /// `index_range`），差别是它不克隆整行：十万行的区间删若按 `RowRec` 取回就是
+    /// 十万次、每行若干个 `Vec` 的分配，而删除只需要知道键。
+    ///
+    /// 表不存在、`column` 不是 `ROW_PK` 且无索引 → 空。翻译层已经拦过一遍，
+    /// 这里只是不让一条坏日志把重放变成 panic。
+    pub fn range_keys(&self, tid: u32, column: u32, lo: &[u8], hi: &[u8], max: usize) -> Vec<Vec<u8>> {
+        if !lo.is_empty() && !hi.is_empty() && lo > hi {
+            return Vec::new();
+        }
+        let cap = if max == 0 { MAX_TABLE_ITEMS } else { max };
+        if column == ROW_PK {
+            let Some(m) = self.rows.get(&tid) else {
+                return Vec::new();
+            };
+            let lower = if lo.is_empty() {
+                Bound::Unbounded
+            } else {
+                Bound::Included(lo)
+            };
+            let upper = if hi.is_empty() {
+                Bound::Unbounded
+            } else {
+                Bound::Excluded(hi)
+            };
+            m.range::<[u8], _>((lower, upper))
+                .take(cap)
+                .map(|(k, _)| k.clone())
+                .collect()
+        } else {
+            let hi_v = hi.to_vec();
+            let lo_v = lo.to_vec();
+            let lower = Bound::Included((tid, column, lo_v, Vec::new()));
+            self.row_index
+                .range((lower, Bound::Unbounded))
+                .take_while(move |(k, _)| {
+                    k.0 == tid && k.1 == column && (hi_v.is_empty() || k.2 < hi_v)
+                })
+                .take(cap)
+                .map(|(k, _)| k.3.clone())
+                .collect()
+        }
+    }
+
+    /// 只数不取：区间 `[lo, hi)` 内落在多少行（`max = 0` 不限）。
+    ///
+    /// 与 [`range_keys`](Self::range_keys) 同一套边界规矩，存在的唯一理由是它不
+    /// 克隆键：翻译层只要给得出 `Reply::Count` 那个确切的数，不需要知道是哪几行
+    /// —— 而一次十万行的区间删，把键拷出来再丢掉就是白付十万次分配。
+    pub fn range_count(&self, tid: u32, column: u32, lo: &[u8], hi: &[u8], max: usize) -> usize {
+        if !lo.is_empty() && !hi.is_empty() && lo > hi {
+            return 0;
+        }
+        let cap = if max == 0 { MAX_TABLE_ITEMS } else { max };
+        if column == ROW_PK {
+            let Some(m) = self.rows.get(&tid) else {
+                return 0;
+            };
+            let lower = if lo.is_empty() {
+                Bound::Unbounded
+            } else {
+                Bound::Included(lo)
+            };
+            let upper = if hi.is_empty() {
+                Bound::Unbounded
+            } else {
+                Bound::Excluded(hi)
+            };
+            m.range::<[u8], _>((lower, upper)).take(cap).count()
+        } else {
+            let hi_v = hi.to_vec();
+            self.row_index
+                .range((Bound::Included((tid, column, lo.to_vec(), Vec::new())), Bound::Unbounded))
+                .take_while(move |(k, _)| {
+                    k.0 == tid && k.1 == column && (hi_v.is_empty() || k.2 < hi_v)
+                })
+                .take(cap)
+                .count()
+        }
     }
 
     /// `(view, parent, *)` 区间内、`after` 之后的至多 `limit` 条 dentry。
@@ -1306,6 +1545,21 @@ mod tests {
                 row: RowRec { key: b"k1".to_vec(), cols: vec![b"v1".to_vec(), Vec::new()] },
             },
             Log::DelRow { table: 4, key: b"k1".to_vec() },
+            // 批量形状那三条（tag 25–27）。`DelRange` 给一组非空区间，才能验到
+            // 两个 bytes 字段不是只过了「空」那一支。
+            Log::ClearTable { table: 4 },
+            Log::DelRange {
+                table: 4,
+                column: 1,
+                lo: b"v1".to_vec(),
+                hi: b"v9".to_vec(),
+                max: 1000,
+            },
+            Log::RenameTable {
+                id: 4,
+                from: b"kv".to_vec(),
+                to: b"kv2".to_vec(),
+            },
             // 容器：子日志要跨变体，才能证明「嵌套只拦容器、不拦普通日志」。
             Log::Batch {
                 logs: vec![
@@ -1315,6 +1569,9 @@ mod tests {
             },
             Log::Batch { logs: Vec::new() },
         ];
+        // 语料是手维护的，所以给它一道闸门：新增 `Log` 变体而不补进这里，这条
+        // 断言就红（与 `tests/read_scaling.rs` 给 op 语料设的那两个数同一个作用）。
+        assert_eq!(logs.len(), 20, "Log 语料必须覆盖全部变体");
         for log in &logs {
             let mut w = W::new();
             log.encode(&mut w);

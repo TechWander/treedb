@@ -96,7 +96,8 @@ decode 处得到 `unknown op tag 0x002c`，而不是把一条写静默当成别�
 
 `v0.5.1` 之后（未发版）收了问题清单里的两条能力缺口。第一条是**离线 dump / load**
 （§6.9）：新工具 `treedb-dump` / `treedb-load` 把整份状态导成自描述的逻辑记录流（`Log`
-标签表 1..=22）再重建目录，容器带 CRC32 与三个 `next_*`；load 只写 `state.snap`、
+标签表当时到 22）再重建目录，容器带 CRC32 与三个 `next_*`（两者都是当时的形状 —— M4
+之后是 1..=10 与 19..=27、两个 `next_*`，§6.9）；load 只写 `state.snap`、
 不写 WAL。第二条是**在线备份**（§6.10）：`treedb-backup` 用副本那两条只读 op
 （`SnapFetch` + `WalFetch`）从在线主拉一份一致切面，落成与 dump 逐字节同格式的文件
 —— 主不停机、主端零改动，`PROTOCOL_VERSION` 也不动。
@@ -127,18 +128,36 @@ checkpoint 在抹掉 `(from, to]` 之前把这一段原始帧与即将被覆盖�
 非空就拒（§6.5）；真机彩排（`v0.5.1` → 当前树）12 条 ok / 0 FAIL，尺寸恰好 -24 B、
 WAL 与回滚窗口都原样。定版 `v0.6.0`，前面那些「未发版」的格子随这一版一起出。
 
+`v0.6.0` 之后是**批量形状与写扩展**一轮：三个新 op —— `TableClear`（一条记录清空整张表，
+名字、id 与形状都不动）、`RowRangeDelete`（按字节区间删一批）、`TableRename`（影子表
+顶替，只改名不换 id）—— 加上 `RowPut` 的**同值消除**（写回逐字节相同的值不产生日志）。
+**这一轮是纯追加**：只加三个 op tag `0x007c`–`0x007e` 与三个 `Log` tag 25/26/27，不加
+reply tag（回 `Count` / `Ok`）、`EngineStats` 一个字段也不长，所以 `PROTOCOL_VERSION` 仍 7、
+`SNAP_VERSION` 仍 4、dump 容器仍 `TDBDUMP2` / 版本 2，`v0.6.0` 及更早的数据目录零迁移；
+旧服务端收到新 op 在 decode 处得到 `unknown op tag`，旧副本收到 25/26/27 在
+`Log::decode_depth` 报 `unknown log tag` —— 两侧都没有静默分支（§4.1 追加判据的第六例，
+§5.1）。实测（100 万行表、`dur=group`，§7.16）：同样删完一百万行，逐行 `RowDelete`
+16 064 ms / 1 000 000 条记录 / 2 075 次 fsync / 38 MB，`RowRangeDelete` 1 017 ms / 500 条 /
+2 次 / 29.5 KB，`TableClear` **924 ms / 1 条 / 1 次 / 25 字节**；同值重写一百万次
+**970 ms / 0 条记录 / 0 次 fsync**（真改值同形状是 21 126 ms）。同一轮还第一次量了
+**多实例分片的写扩展**（§7.17）：单实例有一个与客户端压力无关的天花板（`dur=never`
+下把并发压力从 1 路加到 8 路只拿到 **0.94×**，而服务端 CPU 从 4.30 涨到 8.39 核），
+按表切到 8 个进程实例则是 never **6.50×**、group **4.77×** —— 但路由、事务边界、每实例
+的备份与副本都在接入方（§8 第 19 条）。定版 `v0.7.0`。
+
 **发布标记与 crate 版本**：历史上两者逐版对齐（`v0.4.0` 的 `Cargo.toml` 就是 `0.4.0`）；
 `v0.5.1` 是唯一例外 —— 那一笔只改行为、漏了 `version` 字段的同步，而 tag 已先推。
 按「不改写已推引用」的纪律保留现状：Cargo 解析 git 依赖只看 tag/rev 与 lock 里的
 hash，不看这个字段，所以不影响任何构建；`v0.6.0` 是下一次带 API 变更的发版，
-`Cargo.toml` 的 `version` 随它回到 `0.6.0`，两者重新对齐。
+`Cargo.toml` 的 `version` 随它回到 `0.6.0`，两者重新对齐，此后逐版跟齐（`v0.7.0` = `0.7.0`）。
 
-test 现在分两档报：默认档（纯引擎）`cargo test --release` = **211 passed / 3 ignored**（70 lib +
+test 现在分两档报：默认档（纯引擎）`cargo test --release` = **223 passed / 3 ignored**（70 lib +
 36 engine_crud + 14 migrate + 20 replication + 12 net_protocol + 9 pitr + 8 read_scaling
-+ 7 crash_recovery + 6 batch + 5 auth + 5 observe + 5 table_alter + 4 dump_restore +
++ 7 crash_recovery + 6 batch + 12 table_bulk + 5 auth + 5 observe + 5 table_alter
++ 4 dump_restore +
 3 backup_online + 3 independence + 1 large_reply + 1 checkpoint_tail + 1 scale_connections
 + 1 scale_restore；另 3 条带 `#[ignore]` —— 万级连接、百万节点、64 MiB 快照收尾 ——
-只手动跑，不计入 passed）；`--features postgres-compat` = **242 passed / 9 ignored**，多出的 31 条 = 过渡档自己的 30 条单测 +
+只手动跑，不计入 passed）；`--features postgres-compat` = **254 passed / 9 ignored**，多出的 31 条 = 过渡档自己的 30 条单测 +
 `concurrency.rs` 里那条
 不需要 PG 的拨号用例（剩下 6 条要真 PG，默认 `#[ignore]`，不计入 passed）。即 PG 只出现在
 `postgres-compat` 后面的 `src/pool`、`src/store`、
@@ -268,7 +287,7 @@ test 现在分两档报：默认档（纯引擎）`cargo test --release` = **211
                                   │            src/net/mail.rs     纯读批次就地算完直接回；
                                   │           （eventfd 信箱）     含写批次整批 ──► 唯一提交线程
                                   │                                 （只有它持 Engine/WAL/stats）
-                                  │  Op/Reply（src/engine/model.rs，41 op / 22 reply）
+                                  │  Op/Reply（src/engine/model.rs，44 op / 23 reply）
                                   ▼
                                   src/engine/core.rs   Engine：apply → WAL → 持久化 → 回包
                                   │  src/engine/apply.rs  语义实现（rename/锁/账本/分页/表约束）
@@ -295,10 +314,10 @@ test 现在分两档报：默认档（纯引擎）`cargo test --release` = **211
 | `src/engine/wal.rs` | 1442 | WAL 帧格式、CRC32、预分配、group commit、扫描/重放、`reset` 与旁路快照收尾用的 `truncate_before`（搬运与扫描都走 1 MiB 缓冲，§8 第 7 条②），外加面向副本的只读交付入口 `deliver`（§6.6）与归档用的定段拷贝 `copy_range` / 整段重读 `read_records`（§6.11） |
 | `src/engine/core.rs` | 1874 | `Engine`：op 入口、durability 分档、同步与旁路 checkpoint（`checkpoint_start/poll/wait`）、`Stats`、只读入口 `exec_read`、副本侧的 `install_snapshot`/`replicate_records`、fencing token（`read_fence`/`raise_fence`/`promote`/`admit_epoch`，§6.6 切主）；外加快照探测与迁移（`probe_snapshot`/`migrate_snapshot`，§6.5），以及离线 dump/load 的目录半边（`dump_dir`/`restore_dump`，与 `write_snapshot` 共用同一处落盘，§6.9），再加归档钩子的挂点（`open_with_archive`/`archive_dir`，§6.11）与过期租约的分批回收 `sweep_expired_locks`（§8 第 17 条） |
 | `src/engine/archive.rs` | 442 | WAL 归档目录（`Archive`：段/快照的自描述命名、`record` 的顺序与 fail-closed 校验）与时间点恢复（`plan_pitr` 选锚点/拼段/查缺口、`pitr_restore` 落成新目录，§6.11） |
-| `src/engine/dump.rs` | 464 | 逻辑 dump 容器：`Dump`/`DumpCounts`、`encode`/`decode`（魔数 + 版本 + 两个 `next_*` + 条数 + 尾部 CRC32）、终态→重建序列的 `state_to_logs`（视图→节点→目录项→…→表→行的三条硬顺序）与文件读写；导出确定性由 `dump → restore → dump` 的字节相等钉住（§6.9） |
-| `src/engine/mem.rs` | 1741 | `State`（views/nodes/dentries/locks/refs/tables/rows/row_index）+ `Log`；快照的版本闸门与两代读入口（`load` / `load_for_migration`），以及 v3 → v4 的代际差异（抽掉四张专用控制面表的计数段） |
-| `src/engine/apply.rs` | 1488 | 41 个 op 里那 39 个的具体语义：环检测、硬链接引用计数、租约过滤、分页游标、表形状校验与约束、原子批的顺序预演、追加列的补行补索引、副本拒写（两条握手 op 不进引擎，§4.4；这里只留一道 `EINVAL` 兜底） |
-| `src/engine/model.rs` | 2570 | `Op`/`Reply` 定义与 codec 实现（含 `WalBatch`/`SnapChunk` 尾部的 `epoch`、目录树的 `Link`、通用表的 `RowRange`、`TableAddColumn`、原子批 `Batch`/`Reply::Batch` 及其解码层深度/条数闸门） |
+| `src/engine/dump.rs` | 466 | 逻辑 dump 容器：`Dump`/`DumpCounts`、`encode`/`decode`（魔数 + 版本 + 两个 `next_*` + 条数 + 尾部 CRC32）、终态→重建序列的 `state_to_logs`（视图→节点→目录项→…→表→行的三条硬顺序）与文件读写；导出确定性由 `dump → restore → dump` 的字节相等钉住（§6.9） |
+| `src/engine/mem.rs` | 1998 | `State`（views/nodes/dentries/locks/refs/tables/rows/row_index）+ `Log`；快照的版本闸门与两代读入口（`load` / `load_for_migration`），以及 v3 → v4 的代际差异（抽掉四张专用控制面表的计数段） |
+| `src/engine/apply.rs` | 1594 | 44 个 op 里那 42 个的具体语义：环检测、硬链接引用计数、租约过滤、分页游标、表形状校验与约束、原子批的顺序预演、追加列的补行补索引、批量删的区间展开与整表清空、影子表顶替、同值消除、副本拒写（两条握手 op 不进引擎，§4.4；这里只留一道 `EINVAL` 兜底） |
+| `src/engine/model.rs` | 2683 | `Op`/`Reply` 定义与 codec 实现（含 `WalBatch`/`SnapChunk` 尾部的 `epoch`、目录树的 `Link`、通用表的 `RowRange`、`TableAddColumn`、原子批 `Batch`/`Reply::Batch` 及其解码层深度/条数闸门、批量形状的 `TableClear`/`RowRangeDelete`/`TableRename`） |
 | `src/engine/sha256.rs` | 365 | 自写的 SHA-256 / HMAC-SHA256 / 常数时间比对 —— 依赖门逼出来的（§11 第 7 条），正确性钉在 FIPS 180-4 与 RFC 4231 的已知向量上（§4.4） |
 | `src/net/server.rs` | 988 | `workers=1` 的 epoll 循环、连接生命周期、写回背压、周期任务（含追平 tick、旁路快照的 poll/派工、过期租约清扫）；兼作两条路径共用的 `Conn`/`Slot` 构件 |
 | `src/net/multi.rs` | 1381 | `workers>1`：N 条前端 worker + 唯一提交线程（路由闸门、按连接号回程、停机收尾），自动档快照同样只 poll/派工，周期任务里还有过期租约清扫 |
@@ -306,7 +325,7 @@ test 现在分两档报：默认档（纯引擎）`cargo test --release` = **211
 | `src/net/replicate.rs` | 729 | 副本侧跟踪器 `Follower`：拉快照 → 追 WAL → gap 重装，连不上主退避重连；拒收被提掉权的旧主（`Error::Fence`）不退出、只抬计数（§6.6） |
 | `src/net/mail.rs` | 114 | 两者之间那条能被 `epoll` 唤醒的信箱（`Mutex<VecDeque>` + eventfd） |
 | `src/net/client.rs` | 145 | 同步客户端 + pipeline；带密钥时建连后先走一次握手，拿不到 `authed: true` 就 fail-closed（§4.4） |
-| `src/bin/{server,bench,pgbench,sqlitebench,micro,migrate,standby,demo,dump,load,backup,pitr}.rs` | 4175 | 可执行入口；`pgbench` 是 PG 对照器，`migrate` 是快照升级 工具（§6.5），`standby` 是只读副本兼 `--promote`（§6.6），`dump`/`load` 是离线逻辑导出与重建（§6.9），`backup` 是在线一致快照导出（§6.10），`pitr` 是按 seq 恢复到新目录（§6.11）；三个面向网络的入口共用 `--auth-key-file` |
+| `src/bin/{server,bench,pgbench,sqlitebench,micro,migrate,standby,demo,dump,load,backup,pitr}.rs` | 4197 | 可执行入口；`pgbench` 是 PG 对照器，`migrate` 是快照升级 工具（§6.5），`standby` 是只读副本兼 `--promote`（§6.6），`dump`/`load` 是离线逻辑导出与重建（§6.9），`backup` 是在线一致快照导出（§6.10），`pitr` 是按 seq 恢复到新目录（§6.11）；三个面向网络的入口共用 `--auth-key-file` |
 | `benches/throughput_matrix.sh` | 188 | 五轴吞吐矩阵（§7 的数据来源） |
 | `benches/rehearse_migrate.sh` | 159 | 快照升级的真机彩排：旧 tag → 当前树，逐格核四条承诺与回滚窗口（§6.5 的外部效度） |
 | `benches/single_conn.sh` | 99 | 单连接与并发档对标（§7.11）：treedb 默认档 vs 私有 PG 集群，`$PIPE` 选一问一答还是批量、`$CONNS`/`$WORKERS` 选形状，逐格附带引擎自计的 fsync 计数 |
@@ -316,8 +335,8 @@ test 现在分两档报：默认档（纯引擎）`cargo test --release` = **211
 | `benches/three_way_table.py` | 118 | 由两份原始采集重算 §7.13 引用的 `final.tsv`；`--check` 对账、`--selftest` 自带三处注入错（上一版表是手搓 one-liner，把 p50/p99 拼成了一列） |
 | `benches/doc_table_check.py` | 95 | 把 §7.13 的 markdown 表与 `final.tsv` 逐格对账（24×14），`--selftest` 验证它真的会红 |
 | `benches/promote_smoke.sh` | 66 | 切主的活体验证（§6.6「切主」）：主 → 副本 → 被锁时拒提升 → 提升 → 用新主起服 → 旧主回魂被令牌更高的副本拒收；四个端口 7101–7104，不碰默认 7777 |
-| `benches/replica_rate.sh` | 357 | 副本传送的三格实测（§6.6 边界 4）：冷启动端到端与传输段（两种 `--fetch-bytes`）、追赶积压、追平时的读侧 p99；每个阶段用独立 standby 进程，好把「最坏一轮」归属到相位 |
-| `benches/replica_rate_xhost.sh` | 456 | 同上的**跨机**版（§6.6 边界 5）：副本放在第二台机上，量冷启动/追赶的真实链路速率与「副本在追时主 p50/p90/p99 + 吞吐」的 A/B；A/B 从同一份种子目录派生、写入量逐字节相同，并先量链路与 fsync 上限做参照 |
+| `benches/replica_rate.sh` | 359 | 副本传送的三格实测（§6.6 边界 4）：冷启动端到端与传输段（两种 `--fetch-bytes`）、追赶积压、追平时的读侧 p99；每个阶段用独立 standby 进程，好把「最坏一轮」归属到相位 |
+| `benches/replica_rate_xhost.sh` | 459 | 同上的**跨机**版（§6.6 边界 5）：副本放在第二台机上，量冷启动/追赶的真实链路速率与「副本在追时主 p50/p90/p99 + 吞吐」的 A/B；A/B 从同一份种子目录派生、写入量逐字节相同，并先量链路与 fsync 上限做参照 |
 
 行是 `wc -l`，含各文件自己的 `mod tests`（旧版这张表是历史快照，已与代码脱开的
 那几个文件本轮按实测回填）。
@@ -392,8 +411,21 @@ payload = tag: u16 | 字段…            （Op / Reply 各自的 tag 空间，R
   `KeyList` 会在 `decode` 撞上 `unknown op tag`，v6 的 `--stats` 读 v7 的应答则会把
   后面的字段整体错位。抬版本让两边都在握手时就 fail-closed。tag 不回收 —— 那段区间
   留给「已删除」而不是「下次复用」（`removed_control_plane_tags_are_unknown`）。
+  `7 → 7`（`v0.7.0`，§5.1 的批量形状）**不升版本**：一次加三个 op tag
+  （`TableClear` 0x007c / `RowRangeDelete` 0x007d / `TableRename` 0x007e），而且
+  **一个 reply tag 都没加**（前两条回 `Reply::Count(n)`，第三条回 `Reply::Ok`，与
+  `TableDrop` 同形）、**`EngineStats` 一个字段没加**。判据与第二、四例同型：旧客户端
+  不发这三条，旧服务端收到新 tag 在 `decode` 兜底那里回 `EINVAL`，两边都没有静默分支。
+  `Log` 侧多的三个 tag（25/26/27，§5.1）只在「服务端自己写的 WAL」与「主↔副本传送」
+  里出现，而副本与主必须同代本来就是这条硬规则（上面 `3 → 4` 那一段）；旧主对新副本
+  发来的 25/26/27 在 `Log::decode_depth` 的兜底那里报 `unknown log tag`，是可见的错。
+  `SNAP_VERSION` 仍 4（快照存的就是 `tables` + `rows`，`row_index` 载入时重建 —— 改名与
+  清空被现有格式覆盖）、`DUMP_MAGIC`/`DUMP_VERSION` 仍 2（dump 存终态）。
+  同一轮还有一处**不改格式、只改计数**的优化（`RowPut` 同值消除，§5.1）：它让
+  `ops_total − writes_total` 这个既有差值成了「被消除的写」的读数，而 `EngineStats` 的
+  长度没动 —— 所以按上面那句判据，它同样不构成抬版本的理由。
 
-### 4.2 op 分组（41 个）
+### 4.2 op 分组（44 个）
 
 | 组 | op |
 |----|----|
@@ -405,16 +437,16 @@ payload = tag: u16 | 字段…            （Op / Reply 各自的 tag 空间，R
 | 增删 | `Create` `Mkdir` `Symlink` `Link` `Readlink` `Unlink` `Rmdir` `Rename` |
 | 数据账本 | `RefLookup` `RefUp` `RefDown` |
 | 锁 | `LockQuery` `LockSet` |
-| 通用表 | `TableCreate` `TableDrop` `TableGet` `TableList` `TableAddColumn` `RowPut` `RowGet` `RowList` `RowRange` `RowDelete` `RowCount` |
+| 通用表 | `TableCreate` `TableDrop` `TableGet` `TableList` `TableAddColumn` `TableClear` `TableRename` `RowPut` `RowGet` `RowList` `RowRange` `RowDelete` `RowRangeDelete` `RowCount` |
 | 原子批 | `Batch` |
 
-41 个 op 分**三档**，两个布尔判据（`is_readonly` / `is_control`）恰好切出三块，
+44 个 op 分**三档**，两个布尔判据（`is_readonly` / `is_control`）恰好切出三块，
 两两不交、并起来是全集：
 
 - **只读 15 个 = worker 可就地执行集**：`Ping` `ListViews` `Lookup` `Getattr`
   `Readlink` `ReadDir` `ReadDirPlus` `RefLookup` `LockQuery` `TableGet` `TableList` `RowGet`
   `RowList` `RowRange` `RowCount`；
-- **真写 19 个**：`!is_readonly() && !is_control()`，全部要过 WAL；
+- **真写 22 个**：`!is_readonly() && !is_control()`，全部要过 WAL；
 - **控制面 7 个**：`Stats` `Checkpoint` `Shutdown` `WalFetch` `SnapFetch` `AuthBegin`
   `AuthFinish`。
 
@@ -426,7 +458,7 @@ payload = tag: u16 | 字段…            （Op / Reply 各自的 tag 空间，R
 位置在事件循环，比提交线程还靠前一层（§4.4）；把它归进只读档会更贴近「不碰状态」
 这句字面意思，但那会让 worker 以为可以在自己手里就地算它，而它必须**串行于同连接
 的状态机进度**（`Gate` 是每连接一份的可变状态）。三档的现值由
-`tests/read_scaling.rs::ops_partition_into_three_classes` 钉住（15/19/7）。
+`tests/read_scaling.rs::ops_partition_into_three_classes` 钉住（15/22/7）。
 
 `Batch` 在只读那一档里是个**递归判据**：`ops.iter().all(|o| o.is_readonly())`。
 所以同一个 tag 既可能是只读（纯读批，走 worker、副本放行）也可能是真写（含一条写就
@@ -435,8 +467,8 @@ payload = tag: u16 | 字段…            （Op / Reply 各自的 tag 空间，R
 
 - 只读那一档的划分不只是优化提示，**它是语义地基**：`Op::is_readonly()` 判错一条，
   就是把一次应当被确认的写丢在 worker 手里。`readonly_classification_matches_translate`
-  拿 41 个 op 的语料逐条跑 `translate`，断言「判为只读 ⇒ logs 必空」，同时钉住
-  41/15/26 这三个数 —— 加 op、改分派表，这里和测试必须一起动。语料里每条只读 op 都要
+  拿 44 个 op 的语料逐条跑 `translate`，断言「判为只读 ⇒ logs 必空」，同时钉住
+  44/15/29 这三个数 —— 加 op、改分派表，这里和测试必须一起动。语料里每条只读 op 都要
   真查到东西（`seed` 因此也建表灌行），否则「不产 logs」这句只在测「查不存在的表
   不产 logs」那种废话。
 - `Stats` 刻意**不在**只读集里：它不写 WAL，但它读的是 `Engine` 手里的计数器，而那些
@@ -587,7 +619,7 @@ with a handshake"`，它根本没被碰过，重发即可），切点之后要�
 
 1. **不防窃听**。握手之后的每一个字节仍是明文，CRC32 只判损坏。抓包的人拿不到
    密钥，但拿得到全部数据，也随时能 RST 掉这条连接。
-2. **不做授权**。过了握手的连接与今天一样拥有全部 41 个 op，包括 `Shutdown`。
+2. **不做授权**。过了握手的连接与今天一样拥有全部 44 个 op，包括 `Shutdown`。
    它是「一把钥匙开整扇门」，不是租户模型 —— 多租户、配额、审计归属仍在引擎
    之外（§8 第 13 条）。
 3. **不防字典攻击**。密钥必须是 32 字节随机值；从口令派生的话，抓一次握手就能
@@ -719,6 +751,59 @@ GC 拿它当唯一依据。
 拒绝面：表不存在 `ENOENT`；列名空 / 超 `TABLE_NAME_MAX` / 与已有列重名、已达 64 列、
 `COL_UNIQUE` —— 都是 `EINVAL`。
 
+**批量形状（`TableClear` 0x007c / `RowRangeDelete` 0x007d / `TableRename` 0x007e）**。
+三条都是为同一个负载形状写的：某些表被随时整表替换或成段删除，而逐行
+`RowDelete` 顶十万次就是十万条 WAL 记录、十万次占提交线程。实测见 §7.16（一张
+百万行的表上，逐行删与一条 `TableClear` 是 1 000 000 : 1 条记录）。五条语义：
+
+- **一条日志记的是区间，不是键清单**。`Log::DelRange { table, column, lo, hi, max }`
+  与请求同形，`Log::ClearTable { table }` 只记一个 id。重放时对着当时的状态用同一个
+  `range_keys` 再算一遍 —— 写是全局单序的（§2.3 A′），翻译这条日志时左侧的状态与重放
+  它时的那份是同一份，于是算出的必是同一批键。记键清单会让 WAL 体积正比于命中数，
+  而那正是要消掉的东西：`a_range_delete_does_not_grow_with_the_number_of_hits` 在**编码层**
+  钉这件事 —— 一条 `Log::DelRange` 的 payload 必须 < 40 B（与区间里命中几行无关），而
+  一千条 `Log::DelRow` 的总字节必须是它的 500 倍以上。拿字节而不是拿时间来断，是因为
+  时间受盘与缓存影响，而「记录宽度与命中数无关」是格式自己的性质。
+- **原子性 = 一条记录**。§6.2 的坏尾丢弃以记录为单位，所以崩溃切片上「整段在」或
+  「整段不在」，不需要 undo 日志（`table_clear_is_one_record_and_a_torn_tail_keeps_the_rows`）。
+- **`max` 是删多少的上界**，`0` = 用 `MAX_TABLE_ITEMS`，与 `RowRange` 的 `limit` 同口径。
+  `max` 进了日志，所以「删了几行」这件事重放后仍然相同。空区间不产日志（回
+  `Reply::Count(0)`，`writes_total` 不动）；`lo > hi` 是空区间而不是错误，与 `RowRange`
+  那条一致（守卫在 `mem.rs` 里，因为 `BTreeMap::range` 在 `start > end` 上是 panic）。
+  列的规则也沿用 `RowRange`：`ROW_PK` 扫主键，否则必须是已建索引的列（`bad_column`
+  同一条拒绝链，不静默扫全表）。
+- **`TableClear` 保留形状与 id**：只拆行与二级索引，def 不动、`table_by_id` 不动，清完
+  的表仍在 `TableList` 里。「清空一张表」与「删了再建」不是一件事 —— 后者换 id（上面
+  那条「id 单调不回收」的定型），旧行不可能被误认成新表的数据。回 `Reply::Count(n)`，
+  n = 被清掉的行数；空表回 0 且零日志。
+- **`TableRename` 只改名字，不改 id**：`Log::RenameTable { id, from, to }` 记的是 id，
+  幂等判据是「`from` 现在是否仍指向这个 id」—— 重放第二遍时 `from` 已经不在表名空间里，
+  直接返回。顶到一个已存在的名字（不带 `RENAME_NOREPLACE`）就是 POSIX `rename` 的覆盖
+  语义：被顶替那张表的行与索引**级联拆掉**、`table_by_id` 同步摘除，不许留孤儿表
+  （`table_rename_keeps_the_id_and_cascades_the_replaced_table` 逐张数 `tables`/`rows`/
+  `row_index` 的条目数）。空名 `EINVAL`、超 `TABLE_NAME_MAX` `ENAMETOOLONG`、`NOREPLACE`
+  撞名 `EEXIST`、`from == to` 回 `Ok` 且零日志。
+
+**快照与 dump 都不需要新段**：`SNAP_VERSION` 仍 4、`DUMP_VERSION` 仍 2。快照存的就是
+`tables`（id + def）与 `rows`，`row_index` 载入时按 def 重建 —— 于是改名与清空天然被
+现有格式覆盖，不需要「快照里记住曾用名」那种新形状。
+
+**同值消除（`RowPut`）**。`translate` 发现新行与旧行逐字节相同就不产日志，直接回
+`Reply::Row(旧行)`。位置刻意在两条闸门之间：
+
+- **在 `PUT_IF_ABSENT` / `PUT_IF_EXISTS` / CAS 之后**：那三条是客户端要的语义闸门，不能被
+  优化吞掉 —— 否则一次同值重写会把本该 `EEXIST` 的 `PUT_IF_ABSENT` 静默成成功。
+- **在唯一性检查之前**：同值不可能新造出唯一冲突（这些值已经带着旧行的主键活在索引
+  里），也不必重排索引，所以先消掉反而少跑一遍循环。
+- **不为此加统计字段**：`exec` 只在 `!logs.is_empty()` 时抬 `writes_total`，所以
+  `ops_total − writes_total` 这个**既有**差值就是「被消除的写」的读数；`seq` 不走、不
+  append、不 fsync（`commit_batch` 对空 payload 直接返回）。`putsame` 那一格实测
+  records=0 / writes=0 / syncs=0 而 `putchanged` 是 N/N/N（§7.16）。
+
+代价只有一条，但是对外可见的：**一次「值没变」的 `RowPut` 不再产生 WAL 记录**。依
+「每次写都有一条日志」做变更捕获（CDC）的消费方要改成看应答里的行、而不是数 `seq`
+（写进 §8 第 18 条）。只读副本不吃亏：它缺的只是这条无变化的记录，两边终态相同。
+
 ### 5.2 已经锁进测试的语义
 
 | 语义 | 测试 |
@@ -805,14 +890,21 @@ seq: u64 | crc: u32 | len: u32 | reserved: u32   (HDR = 20) | payload(len)
   容器，一条记录一个 CRC，见 §5.1）；单 op 的多 `Log` 维持现状 —— 把它也收成一条
   记录会改动全部写路径的 seq 粒度（副本的 `want_seq`、checkpoint 水位、`Stats.seq`
   全部跟着变），属于另一笔独立的账，不是一个 ops 级改动能带上的。
-- `Log` 现在 24 个变体（`LOG_*` 字节码 1..=24）：22 个状态变更 + 2 个「不是状态变更」的
-  特殊体 —— 容器 `Batch`（`LOG_BATCH` 23）与加列 `AddColumn`（`LOG_ADD_COLUMN` 24）。
+- `Log` 现在 19 个变体，`LOG_*` 字节码爬到 27（1..=10 与 19..=27，11–18 是 M4 删掉后
+  留空不回收的那八个，§11 第 10 条）：17 个状态变更 + 2 个「不是状态变更」的特殊体
+  —— 容器 `Batch`（`LOG_BATCH` 23）与加列 `AddColumn`（`LOG_ADD_COLUMN` 24）。
+  本轮新增的三条批量形状接在尾部：`ClearTable` 25 / `DelRange` 26 / `RenameTable` 27
+  （§5.1）。这里以前写着「24 个变体（1..=24）：22 个状态变更」—— 那是 M4 删掉八个
+  `Log` 时没跟着改的旧账（22 = 剩下的 14 + 被删的 8），本轮按 `enum Log` 实数核对后改正。
   `Batch` 的 `apply` 就是展开后逐条 `apply`；`AddColumn` 记的是**追加后的整张 def**（而不是
   「新增那一列」），所以重放时按「新旧列数差」补行、差 0 就直接早返 —— 幂等。
-  这两个都**不进 dump**（dump 存终态：`Batch` 的效果是它包住的子日志、`AddColumn` 的
-  效果已经到了表定义里）；`AddColumn` 也不进快照 —— 快照存 def + 行本身，载入时
-  `index_row` 按新 def 自然重建新增列的索引。其余 22 条只记**权威事实**（表定义、
-  行全值），其余一律不记：`row_index` 由 `rows` + def 重推，`table_by_id` 由 `tables`
+  这五条都**不进 dump**（dump 存终态：`Batch` 的效果是它包住的子日志，`AddColumn` /
+  `ClearTable` / `DelRange` / `RenameTable` 的效果已经落在表形状与剩下的行里，§6.9）；
+  `AddColumn` 也不进快照 —— 快照存 def + 行本身，载入时
+  `index_row` 按新 def 自然重建新增列的索引。其余 17 条只记**权威事实**（表定义、
+  行全值）与**可重算的意图**（`DelRange` 记区间、`RenameTable` 记 `from`/`to` 而不记被顶替
+  表的 id —— 能靠「写全局单序 + 同一份左侧状态」重算出来的东西不占字节，§5.1），
+  其余一律不记：`row_index` 由 `rows` + def 重推，`table_by_id` 由 `tables`
   同批维护 —— 与 §5.1「冗余可推字段不进磁盘格式」同一条规矩。`DelTable` 的一条日志
   在恢复时负责级联掉整张表的行与索引。未知 tag 硬错拒启（`unknown log tag`），不能
   静默跳过 —— 跳过就是丢一次已 ack 的写。
@@ -940,8 +1032,9 @@ seq: u64 | crc: u32 | len: u32 | reserved: u32   (HDR = 20) | payload(len)
 
 **回滚有个真实长度的窗口**：把 `state.snap.v2.bak` 拷回去跑旧二进制，只要新二进制
 **还没做过第一次 checkpoint** 就是无损的 —— 迁移之后新二进制吸收的那些写还在 WAL 里，
-而 WAL 是两边都能读的（`Log` 标签 1..=10 与 19..=24 在 v3/v4 之间没动；11–18 是删掉
-的四组控制面变体，v4 不再认）。一旦 checkpoint 过，
+而 WAL 是两边都能读的（`Log` 标签 1..=10 与 19..=22 在 v3/v4 之间没动；11–18 是删掉
+的四组控制面变体，v4 不再认；23..=27 那五个容器与批量形状是 v4 之后才追加的，
+v3 的 WAL 里根本不出现那些 tag，所以旧目录重放也不会碰到它们）。一旦 checkpoint 过，
 `wal.reset()` 把上一代记录物理抹掉，那些写就只剩新布局快照一份，旧二进制读不了：
 此时回滚 = 丢掉「第一次 checkpoint 之后的全部写」。注意优雅停服那一次收尾
 checkpoint 也算数，所以「先升、跑一段、发现不行再拷回去」这个顺序本身就是错的。
@@ -1638,10 +1731,11 @@ treedb-load --in /backup/treedb.dump --dir /srv/treedb-new              # 重建
 ```
 
 **为什么不是拷 `state.snap`**。快照是内部格式，读它的人必须跟着 `SNAP_VERSION` 走、
-跨代还要 `treedb-migrate`；dump 走的是**日志标签表**（`Log`，tag 1..=24，历史上只追加；
-11–18 是四组专用控制面表的八个变体，§11 第 10 条 M4 删掉后留空不回收；两个不直接
-落盘的变体不进 dump —— 容器 `LOG_BATCH` 23（导出的是它展开后的那些）与
-`LOG_ADD_COLUMN` 24（导出的是加列后的整张表定义）—— 所以 dump 里实际只会出现
+跨代还要 `treedb-migrate`；dump 走的是**日志标签表**（`Log`，tag 1..=27，历史上只追加；
+11–18 是四组专用控制面表的八个变体，§11 第 10 条 M4 删掉后留空不回收；五个不直接
+落终态的变体不进 dump —— 容器 `LOG_BATCH` 23（导出的是它展开后的那些）、
+`LOG_ADD_COLUMN` 24（加列后的整张表定义）、`LOG_CLEAR_TABLE` 25 / `LOG_DEL_RANGE` 26 /
+`LOG_RENAME_TABLE` 27（清空后的空表、删完后的剩余行、改名后的新名）—— 所以 dump 里实际只会出现
 1..=10 与 19..=22），
 所以它跨版本、跨机器、跨目录能读懂，也能被人用 `xxd` 一条条看。容器长这样：
 
@@ -2946,6 +3040,140 @@ pipeline 8 secs 3`，500 行表，auto-checkpoint 关）**：
 敏感 —— 尤其区间档，窗宽固定时表越大，一页装完的比例越低，`rowrange_w64` 与
 `rowrange_w400` 的差别会反过来。
 
+### 7.16 批量形状的价：三种删法与同值消除（2026-11-23，`benches/bench_bulk.sh`）
+
+§5.1 那三条 op 卖的是**记录数**，不是「删得快」，所以量具必须换口径。§7.15 那一套是
+时长口径（跑满 `SECS` 秒数 ops/s），拿它量破坏性负载会直接翻车：表在第 0.3 秒就被
+删空，剩下 2.7 秒全在数空区间，报出来的 ops/s 反而是全场最好看的那一个。`treedb-bench
+--bulk` 因此是**固定工作量口径**：删掉正好 N 行，报 `time_ms` / `records`（= `Stats.seq`
+差）/ `writes` / `syncs` / `wal_bytes` / `rows_left`。灌数据、建影子表都在测量窗口外。
+
+**每一档都带格式自己的断言**（不是时间断言，所以不会 flaky）：`clear` 只推 1 个 seq、
+`range` 正好 `ceil(N/batch)` 个、`putsame` records=0 且 writes=0、`putchanged` records=N、
+三种删法之后 `rows_left=0`、`rename` 之后 `rows_left=N` 且首行来自影子表（payload 前缀
+换成 `q`，光看行数对不出「看见的是不是新行」）、`shadow_left=0`（不许留孤儿影子表）、
+每格 `errors=0`。数字再好看，断言不过脚本就非零退出。
+
+实测两档规模，同一台机、同一块 160 TiB 机械 XFS（`/data`），`conns 8 pipeline 64`，
+`--auto-checkpoint-mb 0`；逐格原始输出 `benches/results/bench_bulk.log`。
+
+**A) 200 000 行，`batch=1000`**
+
+| 档 | never ms | group ms | records | group syncs | group WAL 字节 |
+|----|---------:|---------:|--------:|------------:|--------------:|
+| `rowdelete` 逐行 | 1 647 | 3 102 | 200 000 | 465 | 7 600 000 |
+| `range/b1000` | 197 | 206 | 200 | 2 | 11 800 |
+| `range/b10000` | 170 | 172 | 20 | 2 | 1 180 |
+| `clear` | 168 | 185 | 1 | 1 | **25** |
+| `rename` 影子表顶替 | 191 | 181 | 1 | 1 | 51 |
+| `putsame` 同值重写 N 次 | 328 | 232 | **0** | **0** | 0 |
+| `putchanged` 真改值 N 次 | 1 885 | 4 142 | 200 000 | 448 | 11 963 890 |
+
+**B) 1 000 000 行，`batch=2000`**
+
+| 档 | never ms | group ms | records | group syncs | group WAL 字节 |
+|----|---------:|---------:|--------:|------------:|--------------:|
+| `rowdelete` | 6 199 | 16 064 | 1 000 000 | 2 075 | 38 000 000 |
+| `range/b2000` | 1 016 | 1 017 | 500 | 2 | 29 500 |
+| `range/b10000` | 964 | 1 036 | 100 | 2 | 5 900 |
+| `clear` | 1 364 | 924 | 1 | 1 | **25** |
+| `rename` | 1 231 | 964 | 1 | 1 | 51 |
+| `putsame` | 1 467 | 970 | 0 | 0 | 0 |
+| `putchanged` | 9 890 | 21 126 | 1 000 000 | 2 046 | 60 263 890 |
+
+**怎么读这两张表：**
+
+1. **记录数比值就是设计目标本身。** 200k 档：逐行 200 000 条 → 区间 200 条（省 1 000×，
+   正好等于 `batch`）→ 清空 1 条（省 200 000×，正好等于 N）；1M 档省 2 000× /
+   1 000 000×。WAL 字节同向：38 MB → 29.5 KB → 25 字节（帧头 20 + 一个 `u32` 表 id）。
+   `rename` 也是 1 条记录，只是正文里多带两个表名（25 → 51 字节）。
+2. **落盘税全在逐行那一档。** group 相对 never 的时长差：`rowdelete` +88%（200k）/
+   +159%（1M），而 `range` +5% / +0%。fsync 那一列更直接：465 / 2 075 次 → 2 次 →
+   1 次；WAL 在机械盘上时这个量级就是钱（§7.9 把 `group` 的合并比量成「≈ 60 次合成
+   1 次」）。`clear` 的两档时间基本同价（168/185、1 364/924），1M 那次 group 反而更快
+   —— 一次 fsync 的差别被 run 间噪声盖住了，别拿它当「落盘变快」的结论。
+3. **时间不随记录数同比例下降。** 1M 档清空只比逐行快 17.4×（924 ms vs 16 064 ms），
+   不是 1 000 000×。理由写在 §5.1：**一条记录 ≠ 常数时间** —— `ClearTable` 的 apply 仍要
+   逐行摘二级索引，O(行数)，且全在唯一提交线程上。这三条 op 省的是 WAL 记录、fsync
+   与往返，索引维护那笔账一分不少；真要控回合时长就用 `RowRangeDelete` 分批，`max`
+   是唯一那个旋钮。
+4. **`rename` 与 `clear` 同价**（181 / 964 ms，各 1 条记录），因为改名不动 id，而 `rows`
+   与 `row_index` 都以 id 为键 —— 切换只是换掉 `tables` 里一个键，成本与表大小无关。
+   但这一档**只量切换那一刀**：影子表得先灌一份同样 N 行的新表（N 次 `RowPut`，代价见
+   `putchanged` 那一行），它在测量窗口外。整表替换的真实总成本是「灌新表 + 一次
+   rename」，比 `clear` + 重灌更贵，只在「新内容已经在别处备好了」时才划算。
+5. **同值消除省下的是整条写路径。** 200k 次逐字节相同的 `RowPut`：records=0、writes=0、
+   syncs=0、WAL=0，232 ms；同样条数真改值：records=200 000、448 次 fsync、11.9 MB、
+   4 142 ms（17.9×；1M 档 21.8×）。这就是 §5.1 那句「`ops_total − writes_total` 成了
+   『被消除的写』的读数」的实测形状：不 append、不 fsync、`seq` 不走 —— 所以副本与
+   PITR 也看不见这些「写」，代价记在 §8 第 18 条。
+6. **批大小的拐点不在时间上。** 200k 档 b1000 → b10000 是 206 → 172 ms（−16%），1M 档
+   1 017 → 1 036 ms（持平）：命中数一多，成本就被「逐行 unindex」吃满，记录数那侧只剩
+   2 vs 2 次 fsync。所以选 `batch` 的判据是「一条 op 允许占住提交线程多久」与 WAL 体积，
+   不是 wall time。
+7. **量具自己也翻过一次车**：`bench_bulk.sh` 的汇总段以前写死过 `range/b1000` 这个键，
+   换 `BATCH=2000` 就跑出 awk 除零、整段结论丢失，而脚本照样报「全部通过」。现在键名由
+   `-v bat` 动态构造、「这一格在不在」用 `have[k]` 判（`records=0` 是 `putsame` 的正确结果，
+   不能拿字段值为 0 当缺格）、awk 非零退出计入 `fail`。这是「脚本自己报绿」不等于
+   「量具没坏」的一个实例（§9.1 第 3 条同一条规矩）。
+
+**不要外推**：两档都在同一台机、同一块机械 XFS、`--auto-checkpoint-mb 0` 下跑。开自动
+checkpoint 时 `clear` 会连累快照（十万行落进快照正文，收尾那一次写盘更大），这一档
+刻意把它关掉是为了隔离变量 —— 那不是「生产也该这么配」。
+
+### 7.17 多实例分片的写扩展（2026-11-23，`benches/shard_write.sh`）
+
+问题从 §8 第 1 条 ③ 那句「写扩展不跟 workers 长」来：既然永远只有一个提交线程在定序，
+那么**多个进程实例**能不能扩、能扩多少？引擎里没有分片层，所以这只能按部署形状实测：
+
+- `split S`：S 个 `treedb-server`，各占一个 `--dir` 一个端口，每个实例一个 bench 客户端
+  （`PER` 条连接）。实例之间零共享：不同 WAL、不同提交线程。
+- `solo S`：**1** 个服务端吃下同样 S 个客户端，每客户端打自己那张表（表名靠
+  `TREEDB_BENCH_TABLE` 分开，本轮为这一档加的旗标）。两边的客户端进程数、连接数、
+  pipeline 逐格相同 —— 唯一被研究的变量就是服务端实例数。
+
+对照组为什么是「S 个客户端进程压 1 个服务端」而不是「1 个客户端开 S×PER 条连接」：
+后者会把工具自己变成瓶颈（一个进程里几十条线程抢 CPU），那时 solo 的数字里混着
+「量具跑不动」，分不出哪部分是服务端定序的墙。三条自检不做就是假绿：每格 `errors=0`
+（`rowinsert` 用 `PUT_IF_ABSENT`，键撞上回 `EEXIST` 而回包本身是成功往返）、**服务端**
+`--stats` 的行数与逐路 `q × 实测时长` 之和对得上（±2% 卡关）、每格从空目录起。
+
+实测（本机 128 核，`SECS=5 PER=8 PIPE=32`，逐格原始输出
+`benches/results/shard_write.log`）：
+
+| 实例数 | group solo | 扩展 | group split | 扩展 | split 每实例 | never solo | 扩展 | never split | 扩展 | split 每实例 |
+|-------:|-----------:|-----:|------------:|-----:|-------------:|-----------:|-----:|------------:|-----:|-------------:|
+| 1 | 37 252 | 1.00 | 38 086 | 1.02 | 38 086 | 114 505 | 1.00 | 115 074 | 1.00 | 115 074 |
+| 2 | 46 897 | 1.26 | 66 499 | 1.79 | 33 249 | 108 439 | 0.95 | 207 293 | 1.81 | 103 646 |
+| 4 | 69 488 | 1.87 | 122 855 | 3.30 | 30 713 | 113 313 | 0.99 | 409 550 | 3.58 | 102 387 |
+| 8 | 86 898 | 2.33 | 177 575 | 4.77 | 22 196 | 107 356 | 0.94 | 744 004 | **6.50** | 93 000 |
+
+服务端 CPU 占用（`/proc/<pid>/stat` 的 utime+stime 差）：never 档 solo/1 用 4.30 核、
+solo/8 用 **8.39** 核，而吞吐没变；split/8 共 43.46 核、**每实例 5.43** 核。
+
+**怎么读：**
+
+1. **单实例写吞吐存在一条与客户端压力无关的天花板。** never 档从 1 个客户端加到 8 个：
+   114 505 → 107 356 ops/s（0.94×，四格全在噪声里），而服务端烧的核从 4.30 涨到 8.39
+   —— 多一倍 CPU 换不到任何吞吐。这就是排队而不是算力：worker 能并行收发包，但
+   定序与 apply 只有一路（§2.3 A′）。
+2. **进程级分片确实能扩。** never 档 8 实例 744 004 ops/s = **6.50×**（每实例仍是 93 000，
+   单实例基线的 81%）；group 档 **4.77×**（每实例 22 196 = 60%）。这台机 128 核，8 实例
+   远没碰 CPU 顶，所以剩下的 19–40% 不是「核不够」而是真实开销：客户端侧连接、页缓存
+   与中断、每实例自己的 worker。
+3. **group 档 solo 也能涨到 2.33× —— 但那是合并率涨，不是扩展性涨。** 客户端多 →
+   一个 fsync 窗口里排上的 op 多；每实例吞吐从 37 252 塌到 10 862（−71%），而 split 只
+   从 38 086 到 22 196（−42%）。拿 solo 的总量曲线去论证「单实例也能扩」是把合并
+   收益误读成并行收益 —— 这正是本档要分开两列的原因。
+4. **分片不是免费的。** 这些数字的背面是 S 份内存状态 + S 份 WAL + S 个进程各自
+   checkpoint / 备份 / 副本 / fencing，而且**路由要接入方自己做**：引擎不认得「表 X 在哪个
+   实例上」，跨实例没有事务、没有级联、表不共享（§8 第 19 条）。
+5. **外推边界就是那列核数。** split 每实例 ~5.4 核：同机实例数只能堆到「核数 / 5.4」，
+   不够时扩展比会先于实例数封顶。换机器要重跑，别拿 6.50× 当常数。
+
+**不要外推**：负载是 `rowinsert` 纯写、单表、键带 nonce，所以这一档量的是写轴上限；
+混合读写、多表热点分布不均的形状要靠 §7.15 那一套另测。
+
 ---
 
 ## 8. 已知限制（诚实边界）
@@ -3057,7 +3285,7 @@ pipeline 8 secs 3`，500 行表，auto-checkpoint 关）**：
 13. **接入面：认证是可选的，而且只管身份；没有授权、没有传输加密**。这条以前写的是
     「根本没有认证」，v5 之后要改成「补了一小块、剩下的仍然没有」（§4.4）。剩下的
     具体是四条：① **默认仍关** —— `--auth-key-file` 不给就是裸 TCP + 长度前缀 +
-    CRC32，`Client::connect` 连上就拿到全部 41 个 op 的权限，包括 `Shutdown` 与
+    CRC32，`Client::connect` 连上就拿到全部 44 个 op 的权限，包括 `Shutdown` 与
     `Checkpoint`；② **开了也是「一把钥匙开整扇门」** —— 过了握手的连接与其他连接
     权限完全相同，无租户、无配额、无按 op 分组；③ **不加密** —— 握手之后仍是
     明文，CRC32 只判损坏，抓包的人读得到全部数据也随时能 RST；④ **不证明「是当前
@@ -3124,14 +3352,38 @@ pipeline 8 secs 3`，500 行表，auto-checkpoint 关）**：
     剩余边界三条：① 游标只在内存，进程重启后从表头再扫一圈（只读，代价即上一句的 0.2 ms/轮）；
     ② `Stats.locks` 仍报**行数**，但语义从「只增不减」变成「一个 `--lock-sweep-ms` 周期内
     收敛到有效租约数」——要看实时有效数只能等这一拍；③ 只有主扫，副本等日志。
+18. **同值消除让「`seq` 有没有动」不再等价于「有没有写」**（§5.1，`v0.7.0` 新添的对外
+    可见代价）。`RowPut` 写进去的值与现存行逐字节相同时不产生日志：不 append、
+    不 fsync、`seq` 不走，而应答仍然是 `Reply::Ok` —— 客户端从应答里看不出区别。
+    三个后果：① 靠「`Stats.seq` 前进」判断「这张表被动过」的下游会漏掉这类写；
+    ② 副本与 PITR 本来就没有那条记录（这正是目的：不把无变化的写传播出去），所以
+    以「日志里出现过」为凭的审计不能建在 `RowPut` 上；③ 要「每次调用都留痕」
+    的形状，得让那一行真的变（带时间戳或版本号列），或者用 `Op::Batch` 包一条必然
+    产生日志的 op。判据是**字节相同**（整行所有列），不是「调用方以为没变」；条件写
+    （`PUT_IF_ABSENT`/`PUT_IF_EXISTS`/按列 CAS）在闸门**之前**判，所以「同值 + 条件不满」
+    仍然是 `EEXIST`/`ENOENT`，不会因消除而变成功。可观测面没加新字段：`ops_total −
+    writes_total` 就是被消除的写数（§4.1 那个判据因此也不用抬），实测见 §7.16 的
+    `putsame` 档（records=0、writes=0、syncs=0）。省下的是真的：200k 次心跳式重写从
+    448 次 fsync / 11.9 MB WAL 降到 0 次 / 0 字节（§7.16）。
+19. **写扩展要自己分片：引擎里没有分片层**（§7.17 实测）。单实例写吞吐有一条与
+    客户端压力无关的天花板：never 档 8 路并发压力只拿到 0.94×（114 505 → 107 356 ops/s），
+    而服务端 CPU 从 4.30 涨到 8.39 核 —— 多烧的 CPU 全在排队；group 档总量能到 2.33×，
+    但那是每个 fsync 窗口里排上了更多 op，**每实例**从 37 252 塌到 10 862（−71%）。按表
+    hash 到多个进程实例确实能扩：never 8 实例 744 004 ops/s（6.50×，每实例保留 81%）、
+    group 4.77×（每实例 60%）。代价全部在接入方：路由表要自己维护（引擎不认得「表 X
+    在哪个实例上」，路由错就是静默的 `ENOENT`）、S 份目录 / WAL / checkpoint / 备份 /
+    副本 / `fence` 令牌、一表一实例是部署不变量（`TableRename` 不会把表搬到另一个实例），
+    而**跨实例没有事务、没有级联**：`Op::Batch` 只在一个实例内原子，引用账本（`refs`）
+    与视图也各自一份 —— 本来就不能拆。引擎侧没有 rebalance、没有目录发现，那些只能建在
+    接入层（§10 阶段 C）。
 
 ---
 
 ## 9. 测试清单
 
 ```sh
-cargo test --release                            # 默认档（纯引擎），214 条（+3 ignored）
-cargo test --release --features postgres-compat # 加上过渡档，245 条（+9 ignored）
+cargo test --release                            # 默认档（纯引擎），226 条（223 passed + 3 ignored）
+cargo test --release --features postgres-compat # 加上过渡档，263 条（254 passed + 9 ignored）
 cargo test --release --lib                      # 只看引擎单测
 cargo test --release --test migrate              # 快照升级：11 条走 API + 3 条真进程跑 CLI（§6.5）
 cargo test --release --test scale_connections -- --ignored   # 万级连接重压（§7.6）；并发数由 TREEDB_CONNS 控制，本机到 25 000 为限（再高是客户端源端口不够）
@@ -3144,6 +3396,8 @@ bash benches/ab_layout.sh <基线 rev>            # 受控 A/B：只换服务端
 bash benches/handshake_cost.sh 20000            # 接入认证的代价：建连风暴 + 稳态两臂（§4.4）
 bash benches/observe.sh                         # 接入面两个旋钮：上限/拒绝/限速/指标/停服总账（§7.14）
 bash benches/bench_rows.sh                      # 通用表七条路径 × 落盘/单线程三形状（§7.15）
+bash benches/bench_bulk.sh                      # 批量形状固定工作量档：逐行/区间/清空/顶替 + 同值消除（§7.16）
+bash benches/shard_write.sh                     # 多实例写扩展：solo vs split × 实例数，附服务端核数（§7.17）
 bash benches/promote_smoke.sh                   # 切主的活体验证：提升 → 新主起服 → 旧主被拒（§6.6 切主）
 bash benches/sync_ratio.sh 3                    # 一次 fsync 摊了几次写（§7.9）
 bash benches/ab_durability.sh <基线 rev>        # 写轴 A/B：持久化档的吞吐与尾延迟（§7.9 第 3 条）
@@ -3171,18 +3425,19 @@ gcc -O2 -pthread -o /tmp/lb_floor benches/lb_floor.c && /tmp/lb_floor 1 64 3   #
 
 | 目标 | 数量 | 覆盖 |
 |------|------|------|
-| `--lib` | **70**（+30 属 `postgres-compat`） | codec round-trip（全 tag：41 op / 22 reply）、**fetch 应答的两条长度/计数上限在 decode 处兼得**（`fetch_reply_bounds_are_enforced_on_decode`，§6.6）、**`Log` 全变体 round-trip**、**握手两条 op 的定长字段多一字节少一字节都拒**（`handshake_fixed_fields_reject_wrong_length`，§4.4）、**自写 SHA-256/HMAC 的已知向量 10 条**（FIPS 180-4 与 RFC 4231 逐条对表 + `ct_eq` 长度严格，`src/engine/sha256.rs`）、**`Key::load` 收哪三种形状拒哪三种**（`key_load_is_strict`：32 原始字节**一个字节都不剔**、hex 档忽略尾随换行、全空白与全零拒 —— 那条「不剔」是拿真密钥踩出来的，随机密钥末位正好是 ASCII 空白的概率是 1/64，§4.4）、**`Gate` 的四档进度与双向 MAC**（`gate_gates`、`gate_without_key_is_open`、`macs_are_directional_and_nonce_bound`、`key_debug_does_not_leak_bytes`）、CRC 已知向量、**slicing-by-8 与逐字节参考实现的对拍（0..=4096 字节全长度 + 分段喂，§6.6「主侧的账」）**、碎帧/超长帧、WAL 帧与截断重放、**预分配空洞重开**（`prealloc_padding_reopens_cleanly`）、**大批次不跳写**（`huge_batch_writes_every_record`）、**交付只到 durable 水位**（`deliver_stops_at_the_durable_watermark_not_the_logical_end`，§6.6 第一条口径）、**hint 命中与退回全扫**（`deliver_streams_forward_with_the_returned_hint` / `deliver_ignores_a_stale_or_absent_hint_and_still_lands_right`）、**跨滑动窗口不丢记录**、**max_bytes 是软上限**（至少给一条 + 逐轮恰好吃完整批）、**上一代快照只多一段计数且逐字节可对**（`legacy_snapshot_is_readable_only_by_the_migration_entry`，§6.5 的前提）、**四张已删表非空就拒迁**（`legacy_snapshot_with_control_plane_rows_is_refused`）、**已删的控制面 tag 落到 `unknown`**（`removed_control_plane_tags_are_unknown`，§4.1 的「不回收」）、**seq 跳号硬错**、状态快照保留 node key、**两层 dentry 与 kind 冗余过快照不坏**（`dentries_are_two_level_and_kind_survives_snapshot`，§7.10）、**通用表行与索引过快照不坏**（`generic_tables_keep_rows_and_rebuild_indexes`，§5.1）、缓冲压缩、租约过期边界、**快照收尾只切割水位以下的记录**（`truncate_before_drops_the_covered_prefix_and_keeps_the_tail`，§8 第 7 条）、**dump 容器的四条自测**（全域往返逐字段相等、容器头独占两个 `next_*`、编解码字节稳定且 CRC 拓坏必拒、未知容器版本点名拒，§6.9）、`default_workers` 上下界、**自适应块长五条**（`net::replicate::tests`：拿不满/浅滞后→配置值、深滞后逐级翻倍并封顶、配置值即上限、以及「恒在 [floor, WAL_FETCH_MAX]」的不变量）、**跨缓冲的大记录过一遍裁剪与扫描**（`records_larger_than_the_copy_buffer_survive_compaction_and_scan`，§8 第 7 条②） |
+| `--lib` | **70**（+30 属 `postgres-compat`） | codec round-trip（全 tag：44 op / 22 reply）、**fetch 应答的两条长度/计数上限在 decode 处兼得**（`fetch_reply_bounds_are_enforced_on_decode`，§6.6）、**`Log` 全变体 round-trip**、**握手两条 op 的定长字段多一字节少一字节都拒**（`handshake_fixed_fields_reject_wrong_length`，§4.4）、**自写 SHA-256/HMAC 的已知向量 10 条**（FIPS 180-4 与 RFC 4231 逐条对表 + `ct_eq` 长度严格，`src/engine/sha256.rs`）、**`Key::load` 收哪三种形状拒哪三种**（`key_load_is_strict`：32 原始字节**一个字节都不剔**、hex 档忽略尾随换行、全空白与全零拒 —— 那条「不剔」是拿真密钥踩出来的，随机密钥末位正好是 ASCII 空白的概率是 1/64，§4.4）、**`Gate` 的四档进度与双向 MAC**（`gate_gates`、`gate_without_key_is_open`、`macs_are_directional_and_nonce_bound`、`key_debug_does_not_leak_bytes`）、CRC 已知向量、**slicing-by-8 与逐字节参考实现的对拍（0..=4096 字节全长度 + 分段喂，§6.6「主侧的账」）**、碎帧/超长帧、WAL 帧与截断重放、**预分配空洞重开**（`prealloc_padding_reopens_cleanly`）、**大批次不跳写**（`huge_batch_writes_every_record`）、**交付只到 durable 水位**（`deliver_stops_at_the_durable_watermark_not_the_logical_end`，§6.6 第一条口径）、**hint 命中与退回全扫**（`deliver_streams_forward_with_the_returned_hint` / `deliver_ignores_a_stale_or_absent_hint_and_still_lands_right`）、**跨滑动窗口不丢记录**、**max_bytes 是软上限**（至少给一条 + 逐轮恰好吃完整批）、**上一代快照只多一段计数且逐字节可对**（`legacy_snapshot_is_readable_only_by_the_migration_entry`，§6.5 的前提）、**四张已删表非空就拒迁**（`legacy_snapshot_with_control_plane_rows_is_refused`）、**已删的控制面 tag 落到 `unknown`**（`removed_control_plane_tags_are_unknown`，§4.1 的「不回收」）、**seq 跳号硬错**、状态快照保留 node key、**两层 dentry 与 kind 冗余过快照不坏**（`dentries_are_two_level_and_kind_survives_snapshot`，§7.10）、**通用表行与索引过快照不坏**（`generic_tables_keep_rows_and_rebuild_indexes`，§5.1）、缓冲压缩、租约过期边界、**快照收尾只切割水位以下的记录**（`truncate_before_drops_the_covered_prefix_and_keeps_the_tail`，§8 第 7 条）、**dump 容器的四条自测**（全域往返逐字段相等、容器头独占两个 `next_*`、编解码字节稳定且 CRC 拓坏必拒、未知容器版本点名拒，§6.9）、`default_workers` 上下界、**自适应块长五条**（`net::replicate::tests`：拿不满/浅滞后→配置值、深滞后逐级翻倍并封顶、配置值即上限、以及「恒在 [floor, WAL_FETCH_MAX]」的不变量）、**跨缓冲的大记录过一遍裁剪与扫描**（`records_larger_than_the_copy_buffer_survive_compaction_and_scan`，§8 第 7 条②） |
 | `tests/engine_crud.rs` | **36** | §5.2 全部 POSIX 语义（含 GC 线索、NOREPLACE 与硬链接）+ checkpoint 后重开 + 坏尾截断；v0.5.0 新增 3 条硬链接：多名字共享 inode 与字节（含 `drop` 后重开仍是 `nlink = 2`）、五种拒绝各报对应 errno 且不动票数、覆盖其中一个名字只减一票；再往前新增 6 条：4 条盖通用表（表形状校验与表名回收、行写边界/约束/CAS/flags、主键与索引列游标翻页、表状态过 checkpoint+重开），1 条盖 `ReadDirPlus` 与 `ReadDir`+`Getattr` 逐字段对齐，1 条盖 `Stats` 新字段；2026-11-20 又加 2 条：`a_data_dir_refuses_a_second_engine`（同一个目录开第二个引擎必须被拒，且 `drop` 后立刻可开）、`unlink_and_rmdir_report_enotdir_for_a_non_dir_parent`（§5.2 的 `ENOTDIR` 口径）；2026-11-21 又加 2 条旁路快照：`background_snapshot_costs_a_dispatch_not_a_pause`（派工 37.5 µs vs 停轮 23.2 ms @ 20 000 节点，且取水位之后的尾巴必须活过 `truncate_before`）、`explicit_checkpoint_drains_the_background_one_first`（同步 checkpoint 先收掉在编那份，不许两份抢同一个 `.tmp`）；2026-11-23 又加 3 条过期租约回收（§8 第 17 条）：`expired_leases_are_reclaimed_and_stay_gone_after_restart`（只删过期那把、永久锁与未到期锁不动、`DelLock` 进了 WAL，重开不复活）、`the_lock_sweep_walks_the_table_in_batches_and_terminates`（2 148 条锁、每轮 ≤ 1 024，四轮内扫完且能收尾）、`the_lock_sweep_never_writes_on_a_replica`（副本返回 `(0,0)`、`seq` 不动、行还在） |
 | `tests/net_protocol.rs` | **12** | TCP 端到端：CRUD、碎帧、pipeline 保序、并发连接不串扰、超长帧只杀违规者、大回包流式读完、`--stats`/`--checkpoint`/`--shutdown`（含两个磁盘长度与协议版本）、优雅停服后同地址立刻重绑、**通用表 + readdirplus 走 TCP**（1000 行 pipeline、错误帧经网络回真实 errno、8 KiB 收缓冲下大应答完整接回）、**过期租约由服务端周期回收**（`--lock-sweep-ms 50` 下 `Stats.locks` 自己从 2 降到 1，客户端一个 op 都不发，永久锁不动） |
 | `tests/dump_restore.rs` | **4** | §6.9 的目录级闭环：真造一份「每张表都有内容」的状态（视图/目录/文件/硬链接/符号链接/锁/引用/两张表与行）→ 同步 checkpoint → 再写两条尾巴 → `dump_dir` → 落文件读回 → 导进新目录 → `Engine::open` 重开逐字段相等、`snap_seq == dump.seq`、`wal_records == 0`；**再从目标目录导一次比字节**（确定性）；第二条钉拒绝路径（非空目标拒且一个字节不动、空目录可导、服务在跑时 dump 被锁拒且释放后可导）；第三条钉零票引用不进 dump、`Kind` 与冗余 `Dent::kind` 过重建不变；第四条起**真进程**钉两个命令的退出码契约（0 完成 / 1 拒绝且不动字节 / 2 参数不全，含改一个字节后的 CRC 拒收与「锁解除后立即可导」） |
 | `tests/crash_recovery.rs` | **7** | §6.4；2026-11-21 加一条多 worker（`workers=4`）下 `kill -9` 的已 ack 写验收 —— 同一套断言在两条 ack 路径（默认同步档与 `--flush-pipeline`）上各跑一遍 |
 | `tests/backup_online.rs` | **3** | §6.10 的在线面：主静置时备份，停机取源目录 `State` 作期望，恢复后 **逐字段相等**，且「备份前后 `Ping` 都通」+ `backup → load → dump` 逐字节相同；主每 400 条换一代快照且持续写时，切面 `seq ∈ [备份前, 备份后]`、`nodes` 不倒退、恢复水位 = `dump.seq` 且 `wal_records == 0`；第三条起真进程钉退出码（2 参数 / 1 连不上）并验证 `--retries N` 真的转满 N 轮 |
 | `tests/pitr.rs` | **9** | §6.11 的归档与 PITR 十面：归档段与源 WAL 前缀逐字节相同且其后只剩空洞、第二次 checkpoint 多一段 + 一份「将被覆盖」的快照；**后台旁路快照也归档且先拷旧快照再覆盖**（顺序错就把水位 `from` 那份字节永久抹掉）；目标落在两次 checkpoint 之间（归档锚点 + 归档段）与最后一次之后（数据目录快照 + 活 WAL）两条路径重放后状态逐字段相等、恢复目录能继续写；目标正好落在快照水位时零条重放；中途关掉归档后停在洞的左边（`history ends at`）；归档被外力丢一段时报缺口并指出下一个存在的 seq（`no record N` / `next one present is M`）；越过末尾拒绝；目标非空拒且一个字节不动（只允许多一个 `.lock`）；归档目录等于数据目录时开局就拒；不开归档时目录里只有快照 + WAL + `.lock` |
-| `tests/read_scaling.rs` | **8** | 只读分派表逐条对 `translate`（判错一条就是丢写；语料 41 条全变体，钉住 41/15/26 三个数）、**三档划分穷举且两两不交**（`ops_partition_into_three_classes`，15/19/7，§4.2 与副本拒写的判据同源）、`workers=1/8` 答复逐条相同（负载含表读与 `ReadDirPlus`，混合批里把 CAS 写夹在读之间）、每连接流内顺序、一写多读不读到半截状态、`ops_total` 记上 worker 就地算的读、并行档下 `kill -9` 已 ack 的写全在（目录写与表写逐条交错）、**fd 复用不会把上一任的应答塞给新任** |
+| `tests/read_scaling.rs` | **8** | 只读分派表逐条对 `translate`（判错一条就是丢写；语料 44 条全变体，钉住 44/15/29 三个数）、**三档划分穷举且两两不交**（`ops_partition_into_three_classes`，15/22/7，§4.2 与副本拒写的判据同源）、`workers=1/8` 答复逐条相同（负载含表读与 `ReadDirPlus`，混合批里把 CAS 写夹在读之间）、每连接流内顺序、一写多读不读到半截状态、`ops_total` 记上 worker 就地算的读、并行档下 `kill -9` 已 ack 的写全在（目录写与表写逐条交错）、**fd 复用不会把上一任的应答塞给新任** |
 | `tests/batch.rs` | **6** | §5.1「原子批」的六面：批内顺序可见（`create` 后直接对刚分配的 ino `setattr`，`apply_seq` 只 +1）、一条失败整批不落且父目录三个属性逐字段不变（`msg` 带 `batch op #<i>: `，失败批预留的 ino 被回收）、通用表上同样原子（唯一索引冲突让整批零行）、**整批只占一条 WAL 记录**（把末条记录截到 payload 一半，重开后批内三个子 op 全不在而批前的视图仍在）、纯读批零日志且应答与逐条单发逐字段相等、空/超限/嵌套/控制面四种拒都在 `translate` 层给 `EINVAL` 且在解码层也能拦住越界与嵌套 |
+| `tests/table_bulk.rs` | **12** | §5.1「批量形状」与「同值消除」的十二面：`TableClear` 拆行拆索引但留形状与 id（清完仍在 `TableList` 里）、**一次清空只推一个 seq**（`apply_seq` 差恰为 1）+ 砍掉尾字节的撕裂重放必须回到清空前（切点留在帧头里、只砍 payload 尾巴，因为这条只有 5 字节）、`RowRangeDelete` 跟 `RowRange` 同一条列规则（`ROW_PK` / 已索引列 / 未索引列 `EINVAL`）、**区间记录的宽度与命中数无关**（一条 `DelRange` < 40 B，一千条 `DelRow` 是它 500 倍以上，在编码层比字节）、三条新 `Log` 幂等（逐条手动 `apply` 两次与一次等价、整个 WAL 重放一遍仍是同一份 `State`）、`TableRename` 保留 id 且被顶替表级联拆干净（逐张数 `tables`/`rows`/`row_index`）、改名四个边界（空名/超长/`NOREPLACE`/`from == to`）、同值 `RowPut` 零日志零 fsync（三条闸门 `PUT_IF_ABSENT`/`PUT_IF_EXISTS`/CAS 仍在消除之前生效）、被消除的写跨重启不留痕迹、含批量 op 的 `Batch` 仍是一条记录且失败整批不落、四种形状都过得了 `Checkpoint` 与 `dump → restore` |
 | `tests/table_alter.rs` | **5** | §5.1「追加列」的五面：旧行全被拉宽到新宽度且新增的 `COL_INDEX` 列索引里每行都有一项（索引计数 `row_index.len()` 把唯一列隐含的索引也算进去）、五类拒绝（不存在/重名/已满 64 列/空名/`COL_UNIQUE`）逐条核 errno 且 `apply_seq` 不动（零日志）、**只占一条 WAL 记录**（从 payload 中间截断重开后仍是旧宽度、旧列一个不少）、`Checkpoint` 与 `dump → restore` 之后新列/旧数据/索引都在且接着能写、同一条 `Log::AddColumn` 手动 `apply` 两次与一次等价 |
 | `tests/auth.rs` | **5** | §4.4 在线协议上的握手形状（MAC 的数学性质与闸门四档在 lib 单测里，不重复）：未握手的连接一个数据 op 也拿不到（**两种 worker 形状各一跑，两条路径拦截点不是同一处代码**）、错密钥被拒但不锁死 + 旧 MAC 重放不上 + 换对密钥能过、带密钥的客户端拒绝降级、未配密钥的服务端一次往返回 `authed: false`（这是 v5 客户端连 v4 形状不卡死的依据）、握手与数据 op 挤同批时**应答次序不能被打乱** |
-| `tests/replication.rs` | **19** | §6.6 的十三件事（十九条例，端到端那一件两档各一条；主是真进程，副本是测试里的 `Engine` + `Follower`，只有最后三件起真 `treedb-standby`）：主写逐条收敛（ino/属性/readdir 与主对齐）、**主被 `kill -9` 后副本仍答读且不退出**（`replica_errors` 抬、`connected` 落 true→false）、**gap 触发分块重装快照**（4 KiB 块下 ≥ 2 块，且副本落盘的 `state.snap` 与主的逐字节相同）、**副本拒写在引擎层**（五个形状不同的写真 op 全 `EROFS` 且零 logs、零水位推进，而 `ListViews`/`Stats`/`Checkpoint` 放行）、**lag 中途为正、追平归零**（2 KiB/轮喂不饱一批）、**副本重启靠自己的日志接上**（`resyncs == 0`，快照+尾巴那条恢复路径）、端到端两档事件循环同一份断言（`workers=1`/`2`：线上 `EROFS`、`Stats` 新字段过线、追平后读到主的新写）、启动参数三道门（缺 `--primary` / 自己拉自己 / `--fetch-bytes 0` 均退出码 2）、**开了认证的主只有握得上手的副本追得动**（对密钥逐条收敛、错密钥不收敛）；v0.4.0 新增四条 fencing：令牌只升不降/落盘/坏文件不当 0、副本侧四档闸门（含“权力优先于新旧”与它的反面）、**真链路上提权后拒旧主的批**（状态不回滚、仍在答读、`replica_errors` 抬）、`--promote` 离线动作（不开端口、两次 0→1→2、与 `--primary` 同时给退出码 2）；2026-11-22 新增 `the_fetch_block_ramps_while_catching_up_and_returns_to_cfg`（64 条/批播 8 192 个文件，`--fetch-bytes` 32 KiB 下块长峰值放大到 1 MiB、收敛后回落到 32 KiB）；同日把同一条规则铺到快照段：`the_snapshot_chunk_ramps_while_downloading_and_returns_to_cfg`（8 KiB 起、4 000 条批量播出 > 8 个块长的快照，下载途中块长涨过配置值且不超 4 MiB，轮数少于定长下的块数，装完落回 8 KiB）；同日再补三条快照换代：`a_snapshot_probe_reports_the_prefix_crc`（六个 offset 上 `prefix_crc == crc32(&raw[..n])`）、`a_snapshot_generation_change_keeps_the_downloaded_prefix`（改尾部节点的 `mode` 再 checkpoint：`snap_reused > 0`、`snap_restarts == 0`、两份快照逐字节相同）、`a_snapshot_generation_change_with_a_different_prefix_restarts`（新建文件：`snap_restarts == 1`，仍然收敛） |
+| `tests/replication.rs` | **19** | §6.6 的十三件事（十九条例，端到端那一件两档各一条；主是真进程，副本是测试里的 `Engine` + `Follower`，只有最后三件起真 `treedb-standby`）：主写逐条收敛（ino/属性/readdir 与主对齐）、**主被 `kill -9` 后副本仍答读且不退出**（`replica_errors` 抬、`connected` 落 true→false）、**gap 触发分块重装快照**（4 KiB 块下 ≥ 2 块，且副本落盘的 `state.snap` 与主的逐字节相同）、**副本拒写在引擎层**（六个形状不同的写真 op 全 `EROFS` 且零 logs、零水位推进，而 `ListViews`/`Stats`/`Checkpoint` 放行）、**lag 中途为正、追平归零**（2 KiB/轮喂不饱一批）、**副本重启靠自己的日志接上**（`resyncs == 0`，快照+尾巴那条恢复路径）、端到端两档事件循环同一份断言（`workers=1`/`2`：线上 `EROFS`、`Stats` 新字段过线、追平后读到主的新写）、启动参数三道门（缺 `--primary` / 自己拉自己 / `--fetch-bytes 0` 均退出码 2）、**开了认证的主只有握得上手的副本追得动**（对密钥逐条收敛、错密钥不收敛）；v0.4.0 新增四条 fencing：令牌只升不降/落盘/坏文件不当 0、副本侧四档闸门（含“权力优先于新旧”与它的反面）、**真链路上提权后拒旧主的批**（状态不回滚、仍在答读、`replica_errors` 抬）、`--promote` 离线动作（不开端口、两次 0→1→2、与 `--primary` 同时给退出码 2）；2026-11-22 新增 `the_fetch_block_ramps_while_catching_up_and_returns_to_cfg`（64 条/批播 8 192 个文件，`--fetch-bytes` 32 KiB 下块长峰值放大到 1 MiB、收敛后回落到 32 KiB）；同日把同一条规则铺到快照段：`the_snapshot_chunk_ramps_while_downloading_and_returns_to_cfg`（8 KiB 起、4 000 条批量播出 > 8 个块长的快照，下载途中块长涨过配置值且不超 4 MiB，轮数少于定长下的块数，装完落回 8 KiB）；同日再补三条快照换代：`a_snapshot_probe_reports_the_prefix_crc`（六个 offset 上 `prefix_crc == crc32(&raw[..n])`）、`a_snapshot_generation_change_keeps_the_downloaded_prefix`（改尾部节点的 `mode` 再 checkpoint：`snap_reused > 0`、`snap_restarts == 0`、两份快照逐字节相同）、`a_snapshot_generation_change_with_a_different_prefix_restarts`（新建文件：`snap_restarts == 1`，仍然收敛） |
 | `tests/concurrency.rs` | 0（+7，整文件 feature 门控） | T1 之后整个文件在 `postgres-compat` 后面：无 PG 时跑「拨号失败不漏 live」（1 条，要 feature），其余 6 条 `#[ignore]` 需真实 PG。**它测的是共享池，不是引擎并发**（§7.8）|
 | `tests/scale_connections.rs` | 1（+1 ignored） | 1 000 连接 fd/RSS 断言每次跑；万级（`TREEDB_CONNS`，含 25 000）手动 |
 | `tests/scale_restore.rs` | 1（+1 ignored） | §8 第 2 条的规模档：10 万节点 + 2 万条尾巴走完「插入 → 同步 checkpoint → 冷/热两次恢复 → 再写尾巴 → 恢复」，钉节点数、`wal_bytes == 0`、随机名字 lookup 命中；百万到千万档（1M/3M/10M）`#[ignore]`，手动跑，打印耗时/内存供 §8 第 2 条引用 |
@@ -3373,7 +3628,7 @@ nonce 与 MAC 都是定长，decode 必须按长度硬拒 —— 少了它，一
 读密钥那一刻拒启、概率 1/64、报错文案看起来像用户手抖）是本轮最值得记下来的
 一个坑。
 
-### 9.1 四条被作废的测量（记录过程，防止有人复用假数据）
+### 9.1 五条被作废的测量（记录过程，防止有人复用假数据）
 
 1. **`pg op=… pipeline=32 → 14.7 M ops/s`**：对照器里 `ping`/`lookup`/`readdir` 只跑
    1 条语句，外层却按 `pipeline` 计数，虚高 32×。现改成 `one_op` 返回**真正执行掉的
@@ -3411,6 +3666,18 @@ nonce 与 MAC 都是定长，decode 必须按长度硬拒 —— 少了它，一
    「每核效率」会把 PG 在单核上抢不到时间片（p50 3.6–48 ms 全在等调度）洗成优势。
    所以 `benches/sc_sum.py` 里 `t1/p1` 报的是**绝对吞吐**、`t1/pf` 才除核数，两者不能
    互换 —— 上一版把 `t1/p1` 那列标成了「每核」，就是这个混淆。
+
+5. **一红一绿的两个读数：`background_snapshot_costs_a_dispatch_not_a_pause` 的那次
+   FAIL（2026-11-23）**。本轮跑三档验证时，默认档里这条报红：`paused=12.6 ms /
+   dispatch=31.1 ms`；紧接着 `--features postgres-compat` 那一档在**同一份树**上跑过
+   （exit 0）。差的不是代码 —— 那条断言拿 `dispatch * 5 < paused` 拦「派工退化成停轮」，
+   而两个读数都是**单次采样**：机器当时 load 12（上一轮 bench 收尾），`thread::spawn`
+   那一句自己被调度延迟拖到 31 ms。这种 FAIL 不是回归，是**断言的量测口径不够硬**：
+   它把「这台机此刻很忙」当成了一句「派工变成停轮」。修法与 §7.15 那条「单次采样不配
+   当基线」同一条规矩：取三次派工的最小值，每派一份就 `checkpoint_wait` 收掉，而两次
+   之间必须先写一条 op（水位没动时 `checkpoint_start` 直接回 `false`，不给读数）。
+   修后在 48 路 `yes` 负载下三次实测 `dispatch=22.6 / 32.6 / 40.2 µs`（对 `paused≈12.6 ms`
+   是 300×+），与 §8 第 7 条那句「停轮 23.2 ms → 派工 37.5 µs」对上。
 
 ---
 
@@ -4338,3 +4605,54 @@ spike 明确**没**做、也不在接入面上假装做的事 —— 一律返�
     迁移尺寸差 -24 B（`tests/migrate.rs`）；`benches/rehearse_migrate.sh` 的基线
     同步改成 `v0.5.1`、断言从 +12 B 改为 -24 B，并实跑一遍：12 条 ok / 0 FAIL
     （v3 目录 2 101 350 B → v4 2 101 326 B、回滚无损 39 696 → 39 696）。
+
+18. **批量形状与同值消除：`TableClear` / `RowRangeDelete` / `TableRename` 三条新 op
+    + `RowPut` 的空 payload 早返**（§5.1、§7.16；**改在 treedb 仓**）—— **2026-11-23
+    已落地，`v0.7.0`**。
+
+    起因是一个真实负载形状（用户原话）：「某些表随时更新替换内容或者删除，而且是
+    频繁的」。逐行 `RowDelete` 在这个形状下每条都要付一次 WAL 帧加一次 unindex，
+    而「整张表换掉」这件事的语义本来就只有「换掉」—— 所以把一批删除压成一条记录，
+    把「重写回同一个值」压成零条记录。
+
+    六处登记点全部改到（逐处对实码核对，不凭记忆）：`Op` 表与 `encode`/`decode`（tag
+    `0x007c`–`0x007e`）、`is_readonly`/`is_control` 分派表（三条都算真写）、`translate`
+    （各产一条 `Log`）、`Log` 表与 `apply`（25/26/27，**记区间不记键**）、dump 白名单
+    （三条都不落 dump，§6.9）、文档与 `bench --op` 档位。**故意不动的三处**同样要记：
+    `Reply` 表（复用 `Count`/`Ok`，仍是 23 个变体）、`EngineStats`（零新字段，同值消除
+    靠 `ops_total − writes_total` 这个差值观测）、快照布局（`SNAP_VERSION` 仍 4）。
+
+    版本判定：这一轮是 §4.1「纯追加」判据的**第六例** —— 加 op tag、不加 reply tag、
+    不碰 `EngineStats`，所以 `PROTOCOL_VERSION` 停在 7、`DUMP_VERSION` 停在 2，
+    `v0.6.0` 及更早的数据目录零迁移。旧新两侧各有一条兜底：旧服务端收新 op 在 decode
+    处 `unknown op tag 0x007c`，旧副本收 `Log` 25/26/27 在 `Log::decode_depth` 报
+    `unknown log tag` —— 两边都拒绝得点名，没有一条被静默当成别的样子。
+
+    实测（`bash benches/bench_bulk.sh`，`dur=group`，破坏性负载按**固定工作量**而不是
+    按时长量；逐格 `benches/results/bench_bulk.log`）：100 万行表删完，逐行
+    **16 064 ms / 1 000 000 条记录 / 2 075 次 fsync / 38 MB** → `RowRangeDelete`（batch
+    2000）**1 017 ms / 500 条 / 2 次 / 29.5 KB**（记录数省 2 000×、快 15.8×）→
+    `TableClear` **924 ms / 1 条 / 1 次 / 25 字节**（省 1 000 000×、快 17.4×）；同值重写
+    100 万次 **970 ms / 0 条 / 0 次 fsync**，真改值同形状 21 126 ms（17.9×，且 `seq` 根本
+    不走）。200 k 档同一批脚本一起跑，比值一致（batch 1000 → 省 1 000×）。七条读法、
+    含「时间为什么不随记录数同比例下降」（逐行 unindex 仍在提交线程上）在 §7.16。
+
+    同一轮把「单进程是不是写瓶颈」也量了（`bash benches/shard_write.sh`，§7.17）：
+    单实例有一个**与客户端压力无关**的天花板 —— `dur=never` 下把并发压力从 1 路加到
+    8 路只拿到 **0.94×**，而服务端 CPU 从 4.30 涨到 8.39 核；按表切到 8 个进程实例则
+    never **6.50×**、group **4.77×**。但分片不免费：每实例各自一个提交线程、各自备份、
+    各自追副本，`Op::Batch` 只在一个实例内原子，而**路由完全在接入方**（§8 第 19 条）。
+
+    验证（当轮实跑）：默认档 `cargo test --release` **223 passed / 3 ignored**、
+    `--features postgres-compat` **254 passed / 9 ignored**、
+    `cargo clippy --release --all-targets` 无 error 且未新增 warning（剩下的
+    `useless_vec` 全在 `src/engine/sha256.rs` 的测试模块与 `tests/engine_crud.rs:345`，
+    本轮之前就有）。新增 `tests/table_bulk.rs` **12 条**：原子性与撕裂重放、区间边界
+    （空区间 / `max` 截断 / 未索引列 `EINVAL`）、`TableRename` 保 id 且被顶替表级联拆净、
+    三条新 `Log` 幂等、同值消除零日志零 fsync 且三条闸门仍在消除之前生效、四种形状都
+    过得了 `Checkpoint` 与 `dump → restore`。分类计数跟着抬：语料 41→44 条、
+    真写 19→22（`tests/read_scaling.rs` 的 44/15/29 与三档 15/22/7 两侧同改）。
+    另一笔与该用例相关的修法：`engine_crud.rs` 的
+    `background_snapshot_costs_a_dispatch_not_a_pause` 原来拿单次采样当基线，机器被
+    压满时 `thread::spawn` 自己就能花掉几十毫秒而报假红 —— 改成三次取最小值
+    （§9.1 第 5 条），它与本轮改动无关，但混在同一轮里必须分开定性。

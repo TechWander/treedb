@@ -1,6 +1,6 @@
 [package]
 name = "treedb"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2021"
 description = "元数据引擎：单进程事件循环 + 自定义二进制协议 + WAL/checkpoint（POSIX 元数据语义，客户端无关）"
 license = "Apache-2.0"

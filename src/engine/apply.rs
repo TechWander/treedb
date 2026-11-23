@@ -1292,6 +1292,64 @@ pub fn translate(s: &State, now: i64, op: &Op) -> (Vec<Log>, Reply) {
                 Reply::Ok,
             ),
         },
+        Op::TableClear { table } => {
+            let Some(t) = s.tables.get(table) else {
+                return (vec![], no_table(table));
+            };
+            let n = s.rows.get(&t.id).map(|m| m.len()).unwrap_or(0);
+            // 本来就空 → 零日志：一条记录也不必花（与 `RowDelete` 删不存在的行
+            // 那个幂等分支同规矩）。
+            if n == 0 {
+                return (vec![], Reply::Count(0));
+            }
+            (
+                vec![Log::ClearTable { table: t.id }],
+                Reply::Count(n as u64),
+            )
+        }
+        // 影子表切换：照旧形状灌一张新表，再一条 op 把它顶到旧名上。
+        Op::TableRename { from, to, flags } => {
+            let Some(t) = s.tables.get(from) else {
+                return (vec![], no_table(from));
+            };
+            // 名字那道闸门与 `bad_def` 逐字一致：新建时拦得住的名字，改名也得拦住，
+            // 否则一个空名或超长名能从 `table_by_id` 这边遛进去、下次载入时拒收。
+            if to.is_empty() {
+                return (vec![], Reply::err(errno::EINVAL, "empty table name"));
+            }
+            if to.len() > TABLE_NAME_MAX {
+                return (
+                    vec![],
+                    Reply::err(
+                        errno::ENAMETOOLONG,
+                        format!("table name over {TABLE_NAME_MAX} bytes"),
+                    ),
+                );
+            }
+            if let Some(x) = s.tables.get(to) {
+                if x.id == t.id {
+                    // `from == to`（字节相同）就是这一支：名字没换、表没换，空操作。
+                    return (vec![], Reply::Ok);
+                }
+                if flags & RENAME_NOREPLACE != 0 {
+                    return (
+                        vec![],
+                        Reply::err(
+                            errno::EEXIST,
+                            format!("table {} exists", String::from_utf8_lossy(to)),
+                        ),
+                    );
+                }
+            }
+            (
+                vec![Log::RenameTable {
+                    id: t.id,
+                    from: from.clone(),
+                    to: to.clone(),
+                }],
+                Reply::Ok,
+            )
+        }
         // 只能追加到末尾：改名/删列/改已有标志都不在这里 —— 它们要么改变
         // 行宽（删列得迁移每一行），要么得复用已有索引（改标志），都不是
         // 一条 `AddColumn` 能承担的。
@@ -1397,6 +1455,20 @@ pub fn translate(s: &State, now: i64, op: &Op) -> (Vec<Log>, Reply) {
             if let Some(r) = cond_miss(old, *cond_col, cond_val) {
                 return (vec![], r);
             }
+            // 同值消除：新行与旧行逐字节相同 → 状态不会发生任何变化，一条日志也
+            // 不写。这不是边角优化，而是「内容随时被替换上去」那个负载的真实形状
+            // （数据源每轮把同一份值推上来）：命中时它把一条 WAL 记录连同它那一轮
+            // 的 fsync 一起摊成零 —— `commit_batch`/`stage_batch` 对空 payload 直接
+            // 返回，不 append、不 sync、`seq` 也不走。
+            //
+            // 位置必须在唯一性循环**之前**：同值不可能新造出唯一冲突 —— 索引上
+            // 这个值现在就只对应这一行（上一次写入已经维持住那个不变量），也不必
+            // 再摘装一遍索引。应答仍是那一行，客户端看不出差别（重放也不会）。
+            if let Some(prev) = old {
+                if prev.cols == *cols {
+                    return (vec![], Reply::Row(Some(prev.clone())));
+                }
+            }
             // 唯一约束：撞值的必须是这一行自己（覆盖写不算撞）。不看 `cols` 而
             // 先看索引：索引上「相同值的不同主键」就是要拒的那种碰撞。
             for (i, c) in t.def.columns.iter().enumerate() {
@@ -1463,6 +1535,40 @@ pub fn translate(s: &State, now: i64, op: &Op) -> (Vec<Log>, Reply) {
                     key: key.clone(),
                 }],
                 Reply::Ok,
+            )
+        }
+        // 区间删：一条 `Log::DelRange` 顶十万次 `RowDelete`。日志里只存区间，
+        // 所以 WAL 体积与命中数无关；代价是翻译与 apply 各扫一遍索引（O(命中)），
+        // 那两者都在唯一提交线程上 —— `max` 就是控制「一条 op 占住它多久」的旋钮。
+        Op::RowRangeDelete {
+            table,
+            column,
+            lo,
+            hi,
+            max,
+        } => {
+            let Some(t) = s.tables.get(table) else {
+                return (vec![], no_table(table));
+            };
+            // 判据与 `Op::RowRange` 逐字相同：没建索引的列直接 `EINVAL`，不退化成
+            // 全表扫（那等于把一个大区间删的成本转给别人看不见的地方）。
+            if let Some(r) = bad_column(t, *column) {
+                return (vec![], r);
+            }
+            let n = s.range_count(t.id, *column, lo, hi, *max as usize);
+            // 空区间（包括 `lo > hi`）零日志：没发生的事不该占一条 WAL 记录。
+            if n == 0 {
+                return (vec![], Reply::Count(0));
+            }
+            (
+                vec![Log::DelRange {
+                    table: t.id,
+                    column: *column,
+                    lo: lo.clone(),
+                    hi: hi.clone(),
+                    max: *max,
+                }],
+                Reply::Count(n as u64),
             )
         }
 
