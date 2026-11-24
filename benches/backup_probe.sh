@@ -123,8 +123,10 @@ start "$R/rep" $PORT --durability group --auto-checkpoint-mb 1
 stats $PORT > "$R/restored"; sed 's/^/  还原后 /' "$R/restored" | tee -a "$OUT"
 if diff <(dataof "$R/primary") <(dataof "$R/restored") >/dev/null \
    && [ "$(seqof "$R/primary")" = "$(seqof "$R/restored")" ]; then
-    say "  判定：副本目录可作为普通主起服，计数与 seq 均一致 ✓（但仍不是「提升」—— 没有 fence，"
-    say "        旧主必须确认已停，否则两边各自追加日志；§11 第 4 条③的 \`--promote\` 还欠着）"
+    say "  判定：副本目录可作为普通主起服，计数与 seq 均一致 ✓（但这一档只是「当普通主起」，"
+    say "        不带 fence —— 旧主必须确认真停，否则两边各自追加日志。令牌提升是另一条路："
+    say "        \`treedb-standby --promote\`（§6.6「切主」，v0.4.0 起有，由"
+    say "        \`benches/promote_smoke.sh\` 活体验证），本档不覆盖它）"
 else
     say "  判定：副本目录还原后与主不一致 ✗"
     diff "$R/primary" "$R/restored" | sed 's/^/    /' | tee -a "$OUT"

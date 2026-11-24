@@ -52,3 +52,59 @@ host nproc=128  数据盘：xfs /data  每档写入 2s
   判定：副本目录可作为普通主起服，计数与 seq 均一致 ✓（但仍不是「提升」—— 没有 fence，
         旧主必须确认已停，否则两边各自追加日志；§11 第 4 条③的 `--promote` 还欠着）
 --- 完
+=== 备份/还原往返 2026-11-24 02:45:08 UTC rev=a749266 ===
+host nproc=128  数据盘：xfs /data  每档写入 3s
+--- 1) 冷备份：写 → 优雅停服（SIGTERM 自带最后一次 checkpoint）→ cp -a → 从拷贝起服
+  before nodes      = 23616
+  before dentries   = 23584
+  before refs       = 0
+  before seq        = 70816 (snapshot 56128)
+  before checkpoints= 4
+  after  nodes      = 23616
+  after  dentries   = 23584
+  after  refs       = 0
+  after  seq        = 70816 (snapshot 70816)
+  after  checkpoints= 0
+  判定：冷备份一致 ✓（nodes/dentries/refs/seq 逐项相等，seq 70816）
+        附带一条行为：停服那次 checkpoint 已进拷贝（快照水位 70816 == seq），
+        所以还原不依赖尾日志重放；而 checkpoints 计数是新进程从 0 起。
+--- 2) 热拷贝：写入正在进行时 cp -a，然后从拷贝起服
+  mark   nodes      = 23616
+  mark   dentries   = 23584
+  mark   refs       = 0
+  mark   seq        = 70816 (snapshot 70816)
+  mark   checkpoints= 0
+  源终态 nodes      = 42824
+  源终态 dentries   = 42792
+  源终态 refs       = 0
+  源终态 seq        = 128440 (snapshot 112984)
+  源终态 checkpoints= 3
+  还原后 nodes      = 27432
+  还原后 dentries   = 27400
+  还原后 refs       = 0
+  还原后 seq        = 82264 (snapshot 70816)
+  还原后 checkpoints= 0
+  seq 三个读数：拷贝前一刻 70816、拷贝完成时源端 128440、还原后 82264
+  判定：切点落在写入流中间（比 mark 多 11448 条 seq）—— 这才是热拷贝的
+        真实形状：**能起服、无撕裂、自洽，但切点不可控**。你不知道还原出来的是
+        哪一刻的状态，也无法向调用方承诺 RPO —— 备份工具不该长这样。
+--- 3) 副本目录当还原点：主写 → standby 追平 → 把副本目录当普通主起服
+  主     nodes      = 22168
+  主     dentries   = 22136
+  主     refs       = 0
+  主     seq        = 66472 (snapshot 56128)
+  主     checkpoints= 4
+  副本   nodes      = 22168
+  副本   dentries   = 22136
+  副本   seq        = 66472 (snapshot 56128)
+  副本   replica    = yes (primary seq 66472 lag 0 applied 10344 resyncs 1 errors 0)
+  还原后 nodes      = 22168
+  还原后 dentries   = 22136
+  还原后 refs       = 0
+  还原后 seq        = 66472 (snapshot 66472)
+  还原后 checkpoints= 0
+  判定：副本目录可作为普通主起服，计数与 seq 均一致 ✓（但这一档只是「当普通主起」，
+        不带 fence —— 旧主必须确认真停，否则两边各自追加日志。令牌提升是另一条路：
+        `treedb-standby --promote`（§6.6「切主」，v0.4.0 起有，由
+        `benches/promote_smoke.sh` 活体验证），本档不覆盖它）
+--- 完

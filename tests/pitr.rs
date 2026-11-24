@@ -14,13 +14,17 @@
 //! 4. **越过末尾**：目标比现有历史更远时报「history ends at」，不产出半份快照。
 //! 5. **目标非空**：`--out` 里有东西就拒，一个字节不动（与 `treedb-load` 同口径）。
 //! 6. **归档目录不能是数据目录**：开局就拒，理由是两个布局会互相污染。
+//! 7. **批量形状的三条日志也走这条路**（v0.7.0 的 `Log` 25/26/27）：它们要能从
+//!    归档段里重放出来（恢复中间点时 `from_wal` 必须为 0 —— 走活 WAL 就测不到
+//!    归档），且等价判据仍是与冷 dump `cmp` 逐字节相同，不看行数。
 //!
 //! 跑法：`cargo test --release --test pitr`
 
 use std::path::PathBuf;
 use tempfile::TempDir;
 use treedb::engine::core::WAL_FILE;
-use treedb::engine::{pitr_restore, plan_pitr, Archive, Durability, Engine, Op, Reply, Wal};
+use treedb::engine::model::{ColumnDef, TableDef, COL_INDEX, COND_NONE, ROW_PK};
+use treedb::engine::{dump_dir, pitr_restore, plan_pitr, Archive, Durability, Engine, Op, Reply, Wal};
 
 // ---------------------------------------------------------------- 驱动脚手架
 
@@ -440,4 +444,195 @@ fn without_archive_nothing_appears_next_to_the_data_dir() {
     names.sort();
     assert_eq!(names, vec![".lock", "state.snap", "treedb.wal"]);
     assert!(!fx.archive().exists(), "没开归档就不该建归档目录");
+}
+
+// ------------------------------------------------ 7. 批量形状的三条日志
+
+fn b(s: &str) -> Vec<u8> {
+    s.as_bytes().to_vec()
+}
+
+fn tb(name: &str, flags: u32) -> ColumnDef {
+    ColumnDef {
+        name: name.as_bytes().to_vec(),
+        flags,
+    }
+}
+
+/// 两张索引列的表：`TableClear` / `RowRangeDelete` 删的都是带索引的列，
+/// 归档侧重放要连索引一起摘干净。
+fn mk_table(e: &mut Engine, name: &str) {
+    ok(
+        e,
+        &Op::TableCreate {
+            def: TableDef {
+                name: name.as_bytes().to_vec(),
+                columns: vec![tb("a", COL_INDEX), tb("b", COL_INDEX)],
+            },
+        },
+    );
+}
+
+fn put_row(e: &mut Engine, table: &str, key: &str) {
+    ok(
+        e,
+        &Op::RowPut {
+            table: table.as_bytes().to_vec(),
+            key: key.as_bytes().to_vec(),
+            cols: vec![key.as_bytes().to_vec(), b"v".to_vec()],
+            flags: 0,
+            cond_col: COND_NONE,
+            cond_val: Vec::new(),
+        },
+    );
+}
+
+/// 主键序全表遍历（`column == ROW_PK` 时 `value` 忽略）。
+fn keys(e: &mut Engine, table: &str) -> Vec<String> {
+    match ok(
+        e,
+        &Op::RowList {
+            table: table.as_bytes().to_vec(),
+            column: ROW_PK,
+            value: Vec::new(),
+            from: Vec::new(),
+            limit: 0,
+        },
+    ) {
+        Reply::Rows { rows, .. } => rows
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.key).into_owned())
+            .collect(),
+        other => panic!("RowList → {other:?}"),
+    }
+}
+
+/// 三条批量 op 各自只产**一条**日志 —— 这正是「一条记录不等于常数时间」那条
+/// 边界（DESIGN §8 第 18 条）在归档侧的样子：恢复仍旧逐行 apply，所以归档/重放
+/// 这条路径必须把 25/26/27 一起带上，而不是只支持行级 op。
+#[test]
+fn bulk_logs_replay_from_the_archive_segment() {
+    let fx = Fx::new("pitr-bulk");
+    let mut e = fx.open();
+    mk_table(&mut e, "k");
+    for k in ["k1", "k2", "k3", "k4"] {
+        put_row(&mut e, "k", k);
+    }
+    let s1 = e.checkpoint().unwrap(); // (s1 之前) 的记录已归档，与下面三段无关
+
+    ok(&mut e, &Op::TableClear { table: b("k") });
+    let q_clear = e.apply_seq() - 1;
+    let want_clear = e.state_snapshot();
+
+    for k in ["k1", "k2", "k3", "k4"] {
+        put_row(&mut e, "k", k); // 清空之后再灌一次，让范围删有东西可删
+    }
+    ok(
+        &mut e,
+        &Op::RowRangeDelete {
+            table: b("k"),
+            column: ROW_PK,
+            lo: b("k2"),
+            hi: b("k4"),
+            max: 0,
+        },
+    );
+    let q_range = e.apply_seq() - 1;
+    let want_range = e.state_snapshot();
+
+    ok(
+        &mut e,
+        &Op::TableRename {
+            from: b("k"),
+            to: b("k2"),
+            flags: 0,
+        },
+    );
+    let q_rename = e.apply_seq() - 1;
+    let want_rename = e.state_snapshot();
+    // checkpoint 的水位就是它覆盖的最后一条，所以要多写一行把它推到 q_rename 右边：
+    // 三个点必须**严格落在两次 checkpoint 之间**，否则恢复会从锚点快照直取，
+    // 归档段根本没被读。
+    put_row(&mut e, "k2", "k9");
+    let s2 = e.checkpoint().unwrap(); // 把 (s1, s2] 连 snap-s1 一起归档
+    assert!(q_clear < s2 && q_rename < s2, "三个点都要落在两次 checkpoint 之间");
+    drop(e);
+
+    for (q, want, tag, tname, live) in [
+        (q_clear, want_clear, "TableClear", "k", vec![]),
+        (q_range, want_range, "RowRangeDelete", "k", vec!["k1", "k4"]),
+        (q_rename, want_rename, "TableRename", "k2", vec!["k1", "k4"]),
+    ] {
+        let plan = plan_pitr(&fx.dir(), &fx.archive(), q).unwrap();
+        assert_eq!(plan.anchor, s1, "{tag}: 锚点应是归档里的 snap-{s1}");
+        assert_eq!(
+            plan.from_wal, 0,
+            "{tag}: 记录必须来自归档段，从活 WAL 取就没测到归档"
+        );
+        assert!(
+            plan.from_archive > 0,
+            "{tag}: 归档段里至少要有一条记录（同值消除不该把它省掉）"
+        );
+        assert_eq!(plan.state(), &want, "{tag}: 重放出的状态与当时内存状态不等");
+
+        let out = fx.out(&format!("restored-{tag}"));
+        pitr_restore(plan, &out).unwrap();
+        let mut r = Engine::open(&out, Durability::Always).unwrap();
+        assert_eq!(r.snap_seq(), q, "{tag}: 恢复目录的水位");
+        assert_eq!(r.state_snapshot(), want, "{tag}: 恢复目录的状态");
+        assert_eq!(keys(&mut r, tname), live, "{tag}: 恢复后表 {tname} 的行");
+    }
+}
+
+/// §6.11 的等价判据不是「能起来」而是「与停服 dump 逐字节相同」。这条把
+/// 三条批量日志全放进一次恢复的射程里（尾巴那形：锚点取数据目录快照、
+/// 记录取活 WAL），拿 `cmp` 尺寸的判据钉住 —— 只看视图数 / 行数会放过
+/// 字段级偏差（比如索引列或表的 `created_at` 没被日志带上）。
+#[test]
+fn bulk_pitr_restore_matches_a_cold_dump_byte_for_byte() {
+    let fx = Fx::new("pitr-bulk-dump");
+    let mut e = fx.open();
+    mk_table(&mut e, "k");
+    for k in ["a", "b", "c", "d", "e"] {
+        put_row(&mut e, "k", k);
+    }
+    e.checkpoint().unwrap();
+    ok(
+        &mut e,
+        &Op::RowRangeDelete {
+            table: b("k"),
+            column: ROW_PK,
+            lo: b("b"),
+            hi: b("e"),
+            max: 0,
+        },
+    );
+    ok(&mut e, &Op::TableClear { table: b("k") });
+    mk_table(&mut e, "z");
+    put_row(&mut e, "z", "q");
+    ok(
+        &mut e,
+        &Op::TableRename {
+            from: b("z"),
+            to: b("y"),
+            flags: 0,
+        },
+    );
+    let tail = e.apply_seq() - 1;
+    e.checkpoint().unwrap(); // 让源目录的 state.snap 正好落在 tail
+    drop(e);
+
+    let src = dump_dir(&fx.dir()).unwrap().encode();
+    let plan = plan_pitr(&fx.dir(), &fx.archive(), tail).unwrap();
+    assert_eq!(plan.from_archive, 0, "尾巴那形应只靠活 WAL");
+    let out = fx.out("restored-dump");
+    pitr_restore(plan, &out).unwrap();
+    let got = dump_dir(&out).unwrap().encode();
+    assert_eq!(
+        src,
+        got,
+        "PITR 恢复到 {tail} 与停服冷 dump 不是逐字节相同（{} vs {} 字节）",
+        src.len(),
+        got.len()
+    );
 }
