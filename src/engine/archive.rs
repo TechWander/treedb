@@ -307,7 +307,7 @@ fn insert_unique(map: &mut BTreeMap<u64, Log>, seq: u64, log: Log, path: &Path) 
 ///
 /// **`to_seq` 应该是一个 op 组的末尾**：一条 op 可能产生多条日志（`Create`
 /// 是三条），落在组中间会得到「该 op 只生效了一半」的状态。WAL 里没有组边界
-/// 标记，这一层查不出来 —— 所以运维该拿 `--stats` 的 `wal_seq`（永远是某次
+/// 标记，这一层查不出来 —— 所以运维该拿 `--stats` 打出的 `seq`（永远是某次
 /// ack 之后的水位）当目标，而不是自己插一个中间值。
 pub fn plan_pitr(src: &Path, archive: &Path, to_seq: u64) -> Result<PitrPlan> {
     if !src.is_dir() {
