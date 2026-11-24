@@ -1,0 +1,1478 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>treedb — 元数据引擎导览</title>
+<style>
+  :root {
+    --bg: #ffffff;
+    --fg: #1f2430;
+    --muted: #5c6475;
+    --line: #e3e7ee;
+    --accent: #2f6f4f;
+    --accent-soft: #eef6f1;
+    --code-bg: #0f1720;
+    --code-fg: #d7dee8;
+    --nav-bg: #161d26;
+    --nav-fg: #c9d3df;
+    --nav-active: #7fd1a8;
+    --warn-bg: #fff6e8;
+    --warn-line: #e0a030;
+    --note-bg: #eef4fb;
+    --note-line: #3a72b8;
+    --ok-bg: #eef8f1;
+    --ok-line: #3d8f5f;
+    --radius: 10px;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB",
+            "Microsoft YaHei", "Source Han Sans SC", sans-serif;
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; scroll-padding-top: 24px; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font: 16px/1.75 var(--sans); -webkit-font-smoothing: antialiased;
+  }
+
+  /* ---------- 左侧固定导航 ---------- */
+  nav.side {
+    position: fixed; inset: 0 auto 0 0; width: 268px; overflow-y: auto;
+    background: var(--nav-bg); color: var(--nav-fg); padding: 26px 18px 40px;
+    font-size: 14px; line-height: 1.55; z-index: 20;
+  }
+  nav.side .brand { font-size: 17px; font-weight: 700; color: #fff; letter-spacing: .3px; }
+  nav.side .brand span { color: var(--nav-active); }
+  nav.side .tagline { color: #8b97a6; font-size: 12.5px; margin: 6px 0 20px; }
+  nav.side ol { list-style: none; margin: 0; padding: 0; counter-reset: ch; }
+  nav.side > ol > li { counter-increment: ch; margin-bottom: 2px; }
+  nav.side > ol > li > a {
+    display: flex; gap: 8px; align-items: baseline;
+    color: var(--nav-fg); text-decoration: none; padding: 7px 9px; border-radius: 6px;
+    font-weight: 600;
+  }
+  nav.side > ol > li > a::before {
+    content: counter(ch, decimal-leading-zero); color: #6d7a8a; font: 600 11.5px var(--mono);
+  }
+  nav.side > ol > li > a:hover { background: #1f2836; color: #fff; }
+  nav.side ul.sub { list-style: none; margin: 0 0 6px; padding: 0 0 0 34px; }
+  nav.side ul.sub li a {
+    display: block; padding: 3px 6px; color: #8f9cac; text-decoration: none; font-size: 12.8px;
+    border-left: 1px solid #2a3441;
+  }
+  nav.side ul.sub li a:hover { color: var(--nav-active); border-left-color: var(--nav-active); }
+  nav.side .meta { margin-top: 22px; padding-top: 14px; border-top: 1px solid #26303d; color: #6d7a8a; font-size: 12px; }
+  nav.side .meta code { color: #9fb0c3; }
+
+  /* ---------- 正文 ---------- */
+  main { margin-left: 268px; padding: 44px 56px 90px; max-width: 1080px; }
+  header.hero { border-bottom: 1px solid var(--line); padding-bottom: 26px; margin-bottom: 8px; }
+  header.hero h1 { font-size: 34px; line-height: 1.25; margin: 0 0 12px; letter-spacing: -.4px; }
+  header.hero h1 code { font-size: .9em; background: var(--accent-soft); color: var(--accent); padding: 2px 8px; border-radius: 6px; }
+  header.hero p.lead { font-size: 17.5px; color: var(--muted); margin: 0 0 16px; max-width: 820px; }
+  .badges { display: flex; flex-wrap: wrap; gap: 8px; }
+  .badges span {
+    font: 600 12px/1.9 var(--mono); color: #3a4453; background: #f2f4f8;
+    border: 1px solid var(--line); border-radius: 99px; padding: 0 11px;
+  }
+
+  section { padding-top: 34px; }
+  h2 {
+    font-size: 25px; margin: 26px 0 14px; padding-bottom: 9px; border-bottom: 2px solid var(--line);
+    scroll-margin-top: 18px;
+  }
+  h2 .num { color: var(--accent); font: 700 15px var(--mono); margin-right: 10px; vertical-align: 2px; }
+  h3 { font-size: 18.5px; margin: 28px 0 10px; color: #262d3a; }
+  h4 { font-size: 15.5px; margin: 20px 0 8px; color: #333b4a; }
+  p { margin: 10px 0; }
+  ul, ol { margin: 10px 0; padding-left: 24px; }
+  li { margin: 5px 0; }
+  a { color: #1f6b46; }
+  strong { color: #101521; }
+  code {
+    font-family: var(--mono); font-size: .895em; background: #f3f5f9;
+    border: 1px solid #e6eaf1; border-radius: 5px; padding: 1px 5px; color: #23405a;
+    word-break: break-word;
+  }
+
+  /* ---------- 结论条 ---------- */
+  .verdict {
+    display: flex; gap: 10px; align-items: flex-start; margin: 16px 0 6px;
+    background: var(--accent-soft); border-left: 4px solid var(--accent);
+    border-radius: 0 var(--radius) var(--radius) 0; padding: 12px 16px;
+  }
+  .verdict b { color: var(--accent); white-space: nowrap; }
+  .verdict p { margin: 0; }
+
+  /* ---------- 提示框 ---------- */
+  .box { border-radius: 0 var(--radius) var(--radius) 0; padding: 12px 16px; margin: 16px 0; font-size: 15px; }
+  .box p:first-child { margin-top: 0; }
+  .box p:last-child { margin-bottom: 0; }
+  .box .t { font-weight: 700; display: block; margin-bottom: 4px; }
+  .box.note { background: var(--note-bg); border-left: 4px solid var(--note-line); }
+  .box.note .t { color: #26538c; }
+  .box.warn { background: var(--warn-bg); border-left: 4px solid var(--warn-line); }
+  .box.warn .t { color: #96610c; }
+  .box.ok { background: var(--ok-bg); border-left: 4px solid var(--ok-line); }
+  .box.ok .t { color: #2c7049; }
+
+  /* ---------- 代码块 ---------- */
+  .code {
+    position: relative; background: var(--code-bg); color: var(--code-fg);
+    border-radius: var(--radius); margin: 14px 0; overflow: hidden;
+    box-shadow: 0 2px 10px rgba(15,23,32,.14);
+  }
+  .code .cap {
+    display: flex; justify-content: space-between; align-items: center;
+    font: 600 11.5px var(--mono); color: #7d8b9c; letter-spacing: .4px;
+    padding: 7px 14px; background: #131c26; border-bottom: 1px solid #1e2833;
+  }
+  .code pre {
+    margin: 0; padding: 15px 18px 17px; overflow-x: auto;
+    font: 13.4px/1.72 var(--mono); tab-size: 2; white-space: pre;
+  }
+  .code pre .c { color: #6a7f8f; font-style: italic; }
+  .code pre .k { color: #c792ea; }
+  .code pre .s { color: #9bd48a; }
+  .code pre .n { color: #f2b16b; }
+  .code pre .f { color: #7fc4e8; }
+  .code pre .o { color: #e6c07b; }
+  .code pre .p { color: #5c7186; }
+  .code pre .w { color: #e08a8a; }
+
+  /* ---------- 表格 ---------- */
+  .tw { overflow-x: auto; margin: 14px 0; border: 1px solid var(--line); border-radius: var(--radius); }
+  table { border-collapse: collapse; width: 100%; font-size: 14.2px; }
+  th, td { text-align: left; padding: 9px 12px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  thead th { background: #f6f8fb; font-size: 13px; letter-spacing: .2px; color: #38414f; white-space: nowrap; }
+  tbody tr:last-child td { border-bottom: none; }
+  tbody tr:nth-child(even) { background: #fbfcfd; }
+  td code { background: #f0f3f8; }
+  .num-cell { font-family: var(--mono); font-size: 13.4px; white-space: nowrap; }
+  .yes { color: #2c7049; font-weight: 700; }
+  .no  { color: #b03a3a; font-weight: 700; }
+  .part { color: #96610c; font-weight: 700; }
+
+  /* ---------- 页脚 ---------- */
+  footer {
+    margin-top: 60px; padding-top: 20px; border-top: 1px solid var(--line);
+    color: var(--muted); font-size: 13.5px;
+  }
+  footer .row { display: flex; flex-wrap: wrap; gap: 6px 22px; }
+  footer code { font-size: 12.5px; }
+
+  /* ---------- 响应式 ---------- */
+  @media (max-width: 1080px) {
+    nav.side { position: sticky; inset: 0; width: 100%; height: auto; max-height: none; padding: 12px 14px; }
+    nav.side .brand { font-size: 15px; }
+    nav.side .tagline, nav.side .meta, nav.side ul.sub { display: none; }
+    nav.side > ol { display: flex; flex-wrap: nowrap; gap: 4px; overflow-x: auto; margin-top: 8px; padding-bottom: 2px; }
+    nav.side > ol > li { margin: 0; white-space: nowrap; }
+    nav.side > ol > li > a { padding: 5px 9px; font-size: 12.5px; }
+    nav.side > ol > li > a::before { display: none; }
+    main { margin-left: 0; padding: 26px 20px 70px; max-width: none; }
+    header.hero h1 { font-size: 26px; }
+    header.hero p.lead { font-size: 16px; }
+    h2 { font-size: 21px; }
+  }
+  @media print {
+    nav.side { display: none; }
+    main { margin: 0; padding: 0; max-width: none; }
+    .code { box-shadow: none; }
+  }
+</style>
+</head>
+<body>
+
+<nav class="side">
+  <div class="brand">tree<span>db</span></div>
+  <div class="tagline">元数据引擎 · POSIX 元数据语义 · 客户端无关</div>
+  <ol>
+    <li><a href="#s1">概览</a>
+      <ul class="sub">
+        <li><a href="#s1-shape">负载形状</a></li>
+        <li><a href="#s1-arch">核心架构</a></li>
+        <li><a href="#s1-vs">与 PG / SQLite 的定位差异</a></li>
+      </ul>
+    </li>
+    <li><a href="#s2">安装与构建</a>
+      <ul class="sub">
+        <li><a href="#s2-deps">依赖要求</a></li>
+        <li><a href="#s2-build">编译步骤</a></li>
+        <li><a href="#s2-bins">编译产物</a></li>
+        <li><a href="#s2-feat">feature flag</a></li>
+      </ul>
+    </li>
+    <li><a href="#s3">启动与连接</a>
+      <ul class="sub">
+        <li><a href="#s3-server">服务端参数</a></li>
+        <li><a href="#s3-dura">durability 三档</a></li>
+        <li><a href="#s3-client">客户端连接</a></li>
+        <li><a href="#s3-auth">认证握手</a></li>
+      </ul>
+    </li>
+    <li><a href="#s4">使用指南</a>
+      <ul class="sub">
+        <li><a href="#s4-posix">POSIX 元数据 API</a></li>
+        <li><a href="#s4-table">通用表 API</a></li>
+        <li><a href="#s4-ops">运维命令</a></li>
+        <li><a href="#s4-pipe">pipeline 批量</a></li>
+      </ul>
+    </li>
+    <li><a href="#s5">维护</a>
+      <ul class="sub">
+        <li><a href="#s5-stats">监控指标</a></li>
+        <li><a href="#s5-wal">WAL 与 checkpoint</a></li>
+        <li><a href="#s5-lock">目录互斥</a></li>
+        <li><a href="#s5-fence">fence 令牌</a></li>
+      </ul>
+    </li>
+    <li><a href="#s6">备份</a>
+      <ul class="sub">
+        <li><a href="#s6-four">六种形状</a></li>
+        <li><a href="#s6-cold">冷备份 / dump</a></li>
+        <li><a href="#s6-replica">在线热副本</a></li>
+        <li><a href="#s6-rpo">RPO 与局限</a></li>
+      </ul>
+    </li>
+    <li><a href="#s7">恢复</a>
+      <ul class="sub">
+        <li><a href="#s7-cold">冷备份 / dump 恢复</a></li>
+        <li><a href="#s7-promote">副本提升</a></li>
+        <li><a href="#s7-crash">崩溃恢复</a></li>
+        <li><a href="#s7-verify">验证清单</a></li>
+      </ul>
+    </li>
+    <li><a href="#s8">性能参考</a>
+      <ul class="sub">
+        <li><a href="#s8-conn">连接轴</a></li>
+        <li><a href="#s8-commit">组提交</a></li>
+        <li><a href="#s8-vs">对 PG 倍率</a></li>
+        <li><a href="#s8-tune">配置建议</a></li>
+      </ul>
+    </li>
+    <li><a href="#s9">已知限制与 FAQ</a>
+      <ul class="sub">
+        <li><a href="#s9-not">不做的事</a></li>
+        <li><a href="#s9-sem">可见性语义</a></li>
+        <li><a href="#s9-grovefs">grovefs 适配层</a></li>
+        <li><a href="#s9-faq">FAQ</a></li>
+      </ul>
+    </li>
+  </ol>
+  <div class="meta">
+    对应 <code>DESIGN.md</code> v0.4.0+<br>
+    当前 HEAD <code>v0.7.0</code>
+  </div>
+</nav>
+
+<main>
+
+<header class="hero">
+  <h1><code>treedb</code> 元数据引擎</h1>
+  <p class="lead">
+    面向「大量小对象 + 高频点查 + 目录遍历 + 万级常驻连接」这一负载形状的元数据引擎：
+    单进程 epoll 事件循环、自定义二进制线协议、内存状态机 + CRC32 WAL + 快照 checkpoint。
+    POSIX 元数据语义，客户端无关。
+  </p>
+  <div class="badges">
+    <span>单二进制 · 一个目录</span>
+    <span>52 个 op</span>
+    <span>协议版本 6</span>
+    <span>默认依赖仅 libc + thiserror</span>
+  </div>
+</header>
+
+<!-- ============================ 1 概览 ============================ -->
+<section id="s1">
+<h2><span class="num">01</span>概览</h2>
+
+<div class="verdict">
+  <b>一句话</b>
+  <p>treedb 不是关系库，而是「把文件系统元数据的访问路径做成数据库」：
+  它只认 <code>Lookup</code> / <code>ReadDir</code> / <code>Create</code> / <code>RowGet</code> 这类点查与遍历，
+  用一次跨连接合并的 fsync 换掉「每写一次刷一次盘」，用每连接一个 fd 换掉「每连接一个后端进程」。</p>
+</div>
+
+<h3 id="s1-shape">解决什么问题：负载形状</h3>
+<p>这四件事同时出现时，通用关系库会同时输在进程模型和写路径上：</p>
+<div class="tw">
+<table>
+<thead><tr><th>负载特征</th><th>关系库的代价</th><th>treedb 的做法</th></tr></thead>
+<tbody>
+<tr><td>大量小对象（元数据条目，几十到几百字节）</td><td>行存 + 解析执行 + 事务框架，单条开销远大于有效载荷</td><td>二进制 op 直接落在内存状态机上，无解析、无 SQL</td></tr>
+<tr><td>高频点查（按路径查 inode）</td><td>每条语句要过 planner / executor</td><td><code>Lookup</code> 一次哈希 + 一次树查，单连接 9.5–10.1× PG（§7.11）</td></tr>
+<tr><td>目录遍历（<code>readdir</code> 拉整目录属性）</td><td>N 行结果集 + 每行的类型转换</td><td><code>ReadDirPlus</code> 一次回整目录 dentry + attr，单连接 11.4–11.9×（§7.11）</td></tr>
+<tr><td>万级常驻连接（每个挂载点/客户端几条长连接）</td><td>每连接一个 backend 进程，实测 ≈14 MiB，万级连接是百 GiB 量级</td><td>每连接 1 个 fd、0.56 KiB RSS；25 000 条实测 <code>fd/conn = 1.0000</code>（§7.6）</td></tr>
+</tbody>
+</table>
+</div>
+
+<h3 id="s1-arch">核心架构</h3>
+<div class="tw">
+<table>
+<thead><tr><th>层</th><th>实现</th><th>关键位置</th></tr></thead>
+<tbody>
+<tr><td>前端</td><td>单进程 epoll；<code>--workers N</code> 时 N 条线程各自 <code>accept</code>（<code>SO_REUSEPORT</code>）、各自收发；只读 op 就地并行算</td><td><code>src/net/multi.rs</code>、<code>src/net/server.rs</code></td></tr>
+<tr><td>线协议</td><td>自定义二进制帧，<code>PROTOCOL_VERSION = 6</code>；52 个 op，两个布尔判据切成 22 只读 / 23 真写 / 7 控制面三档</td><td><code>src/engine/model.rs</code>、<code>src/net/codec.rs</code></td></tr>
+<tr><td>状态机</td><td>全内存；<code>Engine.state: Arc&lt;RwLock&lt;State&gt;&gt;</code>，worker 走读锁，唯一提交线程持 <code>&amp;mut Engine</code></td><td><code>src/engine/core.rs</code>、<code>src/engine/mem.rs</code></td></tr>
+<tr><td>写路径</td><td>CRC32 WAL + 组提交：一轮里所有连接 staged 的写打成一个 <code>WalBatch</code>，只做一次 <code>fsync</code></td><td><code>Engine::commit_batch</code></td></tr>
+<tr><td>checkpoint</td><td>快照 + 16 字节自校验尾巴（crc + seq + magic）；同步档 <code>wal.reset()</code>，自动档 <code>truncate_before</code></td><td><code>src/engine/snap.rs</code>、<code>src/engine/core.rs</code></td></tr>
+<tr><td>副本</td><td>pull 式日志传送：主只答 <code>WalFetch</code>/<code>SnapFetch</code>，不维护副本状态；副本是完整 <code>Engine</code>，只是真写被 <code>EROFS</code> 挡掉</td><td><code>src/bin/standby.rs</code>、<code>src/net/replication.rs</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<p>一次写的完整路径：</p>
+<div class="code">
+  <div class="cap"><span>一次写从客户端到落盘</span><span>pipeline / group commit</span></div>
+<pre><span class="p">client</span>  ──frame──▶ <span class="o">worker</span> ──(本批含写)──▶ <span class="o">提交线程</span>
+                                          │
+                       translate(&amp;State) ──▶ logs:<span class="k">Vec</span>&lt;<span class="k">Log</span>&gt;
+                                          │
+                    Pending::flush ──▶ commit_batch(groups)
+                                          │
+                          <span class="n">1</span>× wal.commit()  → <span class="n">1</span>× fsync  ──▶ 应答整批
+</pre>
+</div>
+
+<h3 id="s1-vs">与 PostgreSQL / SQLite 的定位差异</h3>
+<div class="tw">
+<table>
+<thead><tr><th>维度</th><th>treedb</th><th>PostgreSQL</th><th>SQLite</th></tr></thead>
+<tbody>
+<tr><td>进程模型</td><td>单进程多 worker，共享一份内存状态</td><td>每连接 fork 一个 backend</td><td>进程内库（无网络层）</td></tr>
+<tr><td>万级连接成本</td><td class="num-cell">0.56 KiB/conn，1 fd/conn</td><td class="num-cell">≈14 MiB/backend</td><td class="part">不适用（无服务端）</td></tr>
+<tr><td>写持久化</td><td>默认 <code>group</code>：跨连接合并成一次 fsync（实测 58.9–61.5 writes/sync）</td><td><code>synchronous_commit=on</code>：每事务一次</td><td><code>synchronous=FULL</code>：每条写一次，无组提交</td></tr>
+<tr><td>查询表达力</td><td class="no">无 SQL、无 JOIN、无范围/排序/聚合</td><td>完整 SQL</td><td>完整 SQL</td></tr>
+<tr><td>事务</td><td>单 op 原子；无跨 op 事务、无跨视图原子</td><td>多语句事务 + MVCC</td><td>多语句事务</td></tr>
+<tr><td>部署</td><td>一个二进制 + 一个目录</td><td>initdb + 服务 + 配置 + 连接池</td><td>一个文件（嵌入式）</td></tr>
+<tr><td>适用形状</td><td>元数据点查 + 目录遍历 + 海量长连接</td><td>通用 OLTP / 分析</td><td>单机嵌入式</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="box warn">
+  <span class="t">这是定位差异，不是功能残缺</span>
+  <p>用 treedb 存业务数据、做报表、跑 JOIN，是选错了工具。它的表达力上限就是
+  「按主键读 / 按已建索引列等值列举 / 键游标翻页 / 计数」，这条边界写在 §5.3 与 §4.2，
+  没有隐藏的全表扫兜底——查未建索引的列直接 <code>EINVAL</code>。</p>
+</div>
+</section>
+
+<!-- ============================ 2 安装与构建 ============================ -->
+<section id="s2">
+<h2><span class="num">02</span>安装与构建</h2>
+
+<div class="verdict">
+  <b>一句话</b>
+  <p>默认档 <code>cargo build --release</code> 只拉 <code>libc</code> 与 <code>thiserror</code> 两个依赖，
+  产出 7 个命令；<code>treedb-demo</code> / <code>treedb-pgbench</code> / <code>treedb-sqlitebench</code>
+  不在默认档里，必须开 <code>--features postgres-compat</code>。</p>
+</div>
+
+<h3 id="s2-deps">依赖要求</h3>
+<div class="tw">
+<table>
+<thead><tr><th>项</th><th>要求</th><th>说明</th></tr></thead>
+<tbody>
+<tr><td>Rust 工具链</td><td>稳定版，支持 edition 2021</td><td>仓库没有 <code>rust-version</code> 下限声明，也没有 <code>rust-toolchain.toml</code>；用当前 stable 即可</td></tr>
+<tr><td>运行时依赖</td><td class="yes">仅 <code>libc</code> + <code>thiserror</code></td><td>无 C 库、无 OpenSSL、无 protobuf、无异步运行时（不用 tokio）</td></tr>
+<tr><td>可选依赖（7 个）</td><td>只在 <code>postgres-compat</code> 下进入构建图</td><td><code>postgres</code> / <code>rusqlite</code>(bundled) / <code>parking_lot</code> / <code>uuid</code> / <code>sha2</code> / <code>chrono</code> / <code>tracing</code></td></tr>
+<tr><td>构建时 C 编译器</td><td>默认档不需要</td><td>开 <code>postgres-compat</code> 时 <code>rusqlite</code> 用 <code>bundled</code>，需要 <code>cc</code></td></tr>
+<tr><td>磁盘</td><td>数据目录所在盘要支持 <code>fsync</code> 与稀疏文件</td><td>WAL 预分配会形成空洞，<code>--stats</code> 把逻辑长度与磁盘长度分开报</td></tr>
+</tbody>
+</table>
+</div>
+
+<h3 id="s2-build">编译步骤</h3>
+<div class="code">
+  <div class="cap"><span>从源码到可运行</span><span>release profile: lto=true, codegen-units=1, opt-level=3</span></div>
+<pre><span class="c"># 1. 取源码</span>
+git clone &lt;repo-url&gt; treedb &amp;&amp; <span class="k">cd</span> treedb
+
+<span class="c"># 2. 默认档：纯引擎，依赖只有 libc + thiserror</span>
+cargo build <span class="f">--release</span>
+
+<span class="c"># 3. 跑测试（默认档 159 passed，引擎本体）</span>
+cargo test <span class="f">--release</span>
+
+<span class="c"># 4. 可选：开过渡档（PG 共享池 + SQLite 镜像），190 passed</span>
+cargo build <span class="f">--release</span> <span class="f">--features</span> postgres-compat
+cargo test  <span class="f">--release</span> <span class="f">--features</span> postgres-compat
+
+<span class="c"># 5. 起一个实例</span>
+./target/release/treedb-server <span class="f">--dir</span> /var/lib/treedb <span class="f">--listen</span> 127.0.0.1:7777
+</pre>
+</div>
+
+<h4>验证编译产物</h4>
+<div class="code">
+  <div class="cap"><span>默认档应恰好 7 个命令</span><span>bash</span></div>
+<pre>ls -1 target/release/treedb-*
+<span class="c"># treedb-bench  treedb-dump   treedb-load   treedb-micro</span>
+<span class="c"># treedb-migrate  treedb-server  treedb-standby</span>
+</pre>
+</div>
+
+<h3 id="s2-bins">编译产物列表</h3>
+<div class="tw">
+<table>
+<thead><tr><th>命令</th><th>作用</th><th>默认档</th></tr></thead>
+<tbody>
+<tr><td><code>treedb-server</code></td><td>服务端；兼 <code>--stats</code> 查状态、<code>--shutdown</code> 优雅停服</td><td class="yes">有</td></tr>
+<tr><td><code>treedb-standby</code></td><td>只读副本（pull 式日志传送）+ <code>--promote</code> 离线抬 fence</td><td class="yes">有</td></tr>
+<tr><td><code>treedb-dump</code></td><td>离线逻辑导出（<code>TDBDUMP1</code> 容器），要求目录独占</td><td class="yes">有</td></tr>
+<tr><td><code>treedb-load</code></td><td>把 dump 还原成新目录；单参数模式只体检</td><td class="yes">有</td></tr>
+<tr><td><code>treedb-migrate</code></td><td>旧布局快照升级（只动 <code>state.snap</code>，不动 WAL）</td><td class="yes">有</td></tr>
+<tr><td><code>treedb-bench</code></td><td>对服务端打负载（8 种 op、pipeline、连接数）</td><td class="yes">有</td></tr>
+<tr><td><code>treedb-micro</code></td><td>计算侧微基准：不经网络、不写 WAL，量 ns/op 与 allocs/op</td><td class="yes">有</td></tr>
+<tr><td><code>treedb-demo</code></td><td>过渡档演示（<code>--offline</code> / <code>--online &lt;postgres://&gt;</code> / <code>--bench</code>）</td><td class="no">需 postgres-compat</td></tr>
+<tr><td><code>treedb-pgbench</code></td><td>同一套 op 打到 PG，给引擎数字配母分母</td><td class="no">需 postgres-compat</td></tr>
+<tr><td><code>treedb-sqlitebench</code></td><td>第二个母分母：同一套 op 打到 SQLite3</td><td class="no">需 postgres-compat</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="box note">
+  <span class="t">三个被 <code>required-features</code> 挡在默认档外的命令</span>
+  <p><code>Cargo.toml</code> 里 <code>treedb-demo</code> / <code>treedb-pgbench</code> / <code>treedb-sqlitebench</code>
+  都写了 <code>required-features = ["postgres-compat"]</code>。默认 <code>cargo build --release</code>
+  不会报错，只会静默跳过它们——如果你按名单数产物发现少了三个，原因在这里，不是编译失败。</p>
+</div>
+
+<h3 id="s2-feat">feature flag 说明</h3>
+<div class="tw">
+<table>
+<thead><tr><th>feature</th><th>默认</th><th>内容</th><th>何时开</th></tr></thead>
+<tbody>
+<tr><td><code>default = []</code></td><td class="yes">是</td><td>空。构建出来的是纯引擎</td><td>始终；被 <code>tests/independence.rs</code> 门 3 钉住，保证过渡档不会渗进默认图</td></tr>
+<tr><td><code>postgres-compat</code></td><td class="no">否</td><td>拉起 7 个 optional 依赖：PG 共享池 + SQLite 镜像 + <code>grovefs_control</code> 表形</td><td>要跑 <code>treedb-demo</code> / 对照基准 / 与 grovefs 现有 PG 栈对齐时</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="box warn">
+  <span class="t">没有 <code>native</code> 这个 feature</span>
+  <p>treedb 的 <code>[features]</code> 只有 <code>default</code> 与 <code>postgres-compat</code> 两项。
+  <code>--features native</code> 会直接报 <code>package does not contain this feature</code>。
+  （<code>native</code> 是 grovefs 侧的 feature 名，两者别混。）</p>
+</div>
+
+<div class="box note">
+  <span class="t">旧数据目录要先 upgrade</span>
+  <p>从 <code>SNAP_VERSION</code> 2 的旧布局上来的目录，新二进制会拒收。这不是 bug，是
+  「不静默按错布局解字节」的故意选择。出路随包安装：</p>
+</div>
+<div class="code">
+  <div class="cap"><span>快照布局升级</span><span>treedb-migrate</span></div>
+<pre><span class="c"># 只报告，不写；退出码 10 = 需要迁移但没给 --apply</span>
+./target/release/treedb-migrate <span class="f">--dir</span> /var/lib/treedb
+
+<span class="c"># 执行迁移（只重写 state.snap，WAL 不动）；先停服务端</span>
+./target/release/treedb-migrate <span class="f">--dir</span> /var/lib/treedb <span class="f">--apply</span>
+
+<span class="c"># 覆盖既有备份文件</span>
+./target/release/treedb-migrate <span class="f">--dir</span> /var/lib/treedb <span class="f">--apply</span> <span class="f">--force</span>
+</pre>
+</div>
+<p>退出码：<code>0</code> = 无需迁移或已完成；<code>1</code> = 出错（含拒动）；<code>10</code> = 需要迁移但没给 <code>--apply</code>。
+回滚是把自动落下的 <code>state.snap.v2.bak</code> 拷回去再跑旧二进制，但无损窗口只维持到新二进制做过第一次 checkpoint 之前。</p>
+</section>
+
+<!-- ============================ 3 启动与连接 ============================ -->
+<section id="s3">
+<h2><span class="num">03</span>启动与连接</h2>
+
+<div class="verdict">
+  <b>一句话</b>
+  <p>一个二进制 + 一个目录就能起：<code>treedb-server --dir PATH --listen HOST:PORT</code>；
+  11 个 flag 全部可选，默认值即生产默认（<code>group</code> / <code>workers=auto</code> / <code>backlog=4096</code> / <code>auto-checkpoint=64 MiB</code>）。</p>
+</div>
+
+<h3 id="s3-server">服务端启动与参数详解</h3>
+<div class="code">
+  <div class="cap"><span>最小启动</span><span>默认 127.0.0.1:7777 / group / workers=auto</span></div>
+<pre><span class="c"># 目录不存在会自动创建</span>
+./target/release/treedb-server <span class="f">--dir</span> /var/lib/treedb <span class="f">--listen</span> 0.0.0.0:7777
+
+<span class="c"># 生产常配：显式 worker 数 + 心跳间隔 + 自动 checkpoint 阈值 + pid 文件</span>
+./target/release/treedb-server \
+  <span class="f">--dir</span> /var/lib/treedb \
+  <span class="f">--listen</span> 0.0.0.0:7777 \
+  <span class="f">--durability</span> group \
+  <span class="f">--workers</span> 8 \
+  <span class="f">--auto-checkpoint-mb</span> 256 \
+  <span class="f">--pid-file</span> /run/treedb.pid
+
+<span class="c"># 开接入认证（所有客户端、--stats、--shutdown 都得带同一把密钥）</span>
+./target/release/treedb-server <span class="f">--dir</span> /var/lib/treedb <span class="f">--auth-key-file</span> /etc/treedb/cluster.key
+</pre>
+</div>
+
+<div class="tw">
+<table>
+<thead><tr><th>参数</th><th>默认值</th><th>含义与注意事项</th></tr></thead>
+<tbody>
+<tr><td><code>--dir PATH</code></td><td class="num-cell">/var/lib/treedb</td><td>数据目录：WAL + 快照 + <code>.lock</code> + 可选 <code>fence</code>。目录级 <code>flock</code> 独占，第二个进程打不开同一个目录</td></tr>
+<tr><td><code>--listen HOST:PORT</code></td><td class="num-cell">127.0.0.1:7777</td><td>监听地址。<code>--workers &gt; 1</code> 时每条 worker 线程各自 <code>bind</code>（<code>SO_REUSEPORT</code>），同一端口由内核分发</td></tr>
+<tr><td><code>--durability NAME</code></td><td class="num-cell">group</td><td><code>group</code> / <code>always</code> / <code>never</code>。拼错不是静默降级，而是退出码 2（见下节）</td></tr>
+<tr><td><code>--workers N</code></td><td class="num-cell">0 = auto</td><td><code>auto</code> = <code>min(8, 核数/2)</code>，至少 1。<code>=1</code> 是单线程事件循环，也是全部历史基线数字的档。<code>&gt;1</code> 时每条 worker 多占 <strong>3 个 fd</strong>（1 监听 + 2 eventfd），且<strong>只扩展读</strong></td></tr>
+<tr><td><code>--backlog N</code></td><td class="num-cell">4096</td><td><code>listen(2)</code> 的接受队列长度，受 <code>net.core.somaxconn</code> 截断。建连风暴时真正起作用的是它和客户端源端口数</td></tr>
+<tr><td><code>--sync-ms N</code></td><td class="num-cell">20</td><td>事件循环空闲唤醒间隔。<code>0</code> 与「不给」是两件事：前者关掉周期 sync</td></tr>
+<tr><td><code>--auto-checkpoint-mb N</code></td><td class="num-cell">64</td><td>WAL 逻辑长度超此值自动 checkpoint；<code>0</code> = 关闭。<strong>别在生产关掉</strong>，否则 WAL 只增不减</td></tr>
+<tr><td><code>--max-conn N</code></td><td class="num-cell">0 = 不限</td><td>同时在册连接数上限。超额的连接<strong>accept 后立刻关闭</strong>（客户端看到 EOF，不发任何帧）；日志限速（第 1 条 + 之后每 1000 条），总数在停服汇总的 <code>accepted / refused / peak</code> 里</td></tr>
+<tr><td><code>--pid-file PATH</code></td><td class="num-cell">不写</td><td>启动后写入 pid，便于脚本 <code>kill -9</code> 做崩溃验收</td></tr>
+<tr><td><code>--auth-key-file PATH</code></td><td class="num-cell">不认证</td><td>集群共享密钥：32 原始字节或 64 个十六进制字符；全零（0/64 个 0）视为未填模板，<strong>拒接</strong></td></tr>
+<tr><td><code>--stats</code></td><td class="num-cell">—</td><td><strong>不启服务</strong>：连上去打印状态后退出。用 <code>--listen</code> 指目标，<strong>不需要</strong> <code>--dir</code></td></tr>
+<tr><td><code>--format text|prometheus</code></td><td class="num-cell">text</td><td>只对 <code>--stats</code> 生效。<code>prometheus</code> 输出 27 个指标（每条严格 HELP/TYPE/样本三行）；拓不到服务时仍输出 <code>treedb_up 0</code> 并以<strong>退出码 1</strong> 退出（面板上是 down，不是 no data）</td></tr>
+<tr><td><code>--shutdown</code></td><td class="num-cell">—</td><td><strong>不启服务</strong>：通知运行中的实例优雅停服（补 fsync + checkpoint）</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="box note">
+  <span class="t">退出码约定</span>
+  <p><code>2</code> = 参数错误（usage error，如 <code>--workers abc</code>）；<code>1</code> = 运行期 FATAL
+  （如 WAL fsync 失败）。后者绝不能当正常退出——此时内存状态可能已超前于磁盘。
+  <code>SIGINT</code>/<code>SIGTERM</code> 走优雅退出路径，<strong>不是</strong>直接 kill。</p>
+</div>
+
+<h3 id="s3-dura">durability 三档：换的是什么</h3>
+<div class="tw">
+<table>
+<thead><tr><th>档位</th><th>落盘语义</th><th>断电会丢什么</th><th>实测</th></tr></thead>
+<tbody>
+<tr><td><code>group</code>（默认）</td><td>每轮把所有连接 staged 的写打成一个批，<strong>只做一次 fsync</strong>，然后整批应答</td><td>已 ack 的写在同一次 fsync 里，正常断电不丢</td><td>每次 fsync 摊 <strong>58.86</strong> 条写（机械盘）/ <strong>61.48</strong> 条（ext4）</td></tr>
+<tr><td><code>always</code></td><td>与 <code>group</code> 同一个落盘点：已 ack 的写必已落盘。<strong>不再按连接串 fsync</strong></td><td>不丢已 ack 的写</td><td><code>syncs/writes = 1.00</code>；同负载 QPS 1 469，<code>group</code> 为 10 913（<strong>7.4×</strong>）</td></tr>
+<tr><td><code>never</code></td><td>不调 <code>fsync</code>，靠内核回写</td><td>断电丢最近若干条<strong>已 ack</strong> 的写；但 WAL 有 CRC32，不会解出错数据</td><td>只用于测试与可重放负载</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="box warn">
+  <span class="t">为什么 <code>always</code> 不再是「一条连接一个 fsync」</span>
+  <p>旧实现里 <code>always</code> 按连接串行刷盘，64 并发写时 p99 到 315 ms。现在 <code>always</code> 与
+  <code>group</code> 共用同一个落盘点，区别只在「是否等这一轮 fsync 返回才 ack」。
+  换盘/换文件系统时 <code>always</code> 的差距可达 8×，这是介质属性，不是引擎参数能消掉的。</p>
+</div>
+
+<h3 id="s3-client">客户端连接</h3>
+<p>线协议是 TCP 上的自定义二进制帧，地址格式就是 <code>host:port</code>。Rust 客户端在
+<code>treedb::net::client::Client</code>，两个构造函数：</p>
+
+<div class="code">
+  <div class="cap"><span>客户端两种建连方式</span><span>Rust</span></div>
+<pre><span class="k">use</span> treedb::engine::{Op, Reply};
+<span class="k">use</span> treedb::net::client::Client;
+<span class="k">use</span> treedb::net::auth::Key;
+
+<span class="c">// 1) 不认证（服务端没给 --auth-key-file）</span>
+<span class="k">let mut</span> c = Client::connect(<span class="s">"127.0.0.1:7777"</span>, 3000)?;   <span class="c">// 第二参数是读超时 ms，0 = 不设</span>
+
+<span class="c">// 2) 带认证：握手不通过就返回 Err，绝不静默降级成不认证</span>
+<span class="k">let</span> key = Key::load(<span class="s">"/etc/treedb/cluster.key"</span>)?;
+<span class="k">let mut</span> c = Client::connect_auth(<span class="s">"127.0.0.1:7777"</span>, 3000, <span class="k">Some</span>(&amp;key))?;
+</pre>
+</div>
+
+<div class="code">
+  <div class="cap"><span>完整调用：建视图 → mkdir → 查属性</span><span>Rust</span></div>
+<pre><span class="k">let</span> v = <span class="k">match</span> c.call(&amp;Op::CreateView { name: <span class="s">b"demo"</span>.to_vec() })? {
+    Reply::View { id, root } =&gt; { <span class="k">assert_eq!</span>(root, <span class="n">1</span>); id }   <span class="c">// root 恒为 1</span>
+    other =&gt; <span class="k">panic!</span>(<span class="s">"{other:?}"</span>),
+};
+
+c.call(&amp;Op::Mkdir {
+    view: v, parent: <span class="n">1</span>, name: <span class="s">b"etc"</span>.to_vec(),
+    mode: <span class="n">0o755</span>, uid: <span class="n">0</span>, gid: <span class="n">0</span>,
+})?;
+
+<span class="k">let</span> ino = <span class="k">match</span> c.call(&amp;Op::Lookup { view: v, parent: <span class="n">1</span>, name: <span class="s">b"etc"</span>.to_vec() })? {
+    Reply::Node(n) =&gt; n.ino,
+    Reply::Err { code, .. } =&gt; <span class="k">panic!</span>(<span class="s">"lookup 失败 errno={code}"</span>),
+    other =&gt; <span class="k">panic!</span>(<span class="s">"{other:?}"</span>),
+};
+</pre>
+</div>
+
+<h3 id="s3-auth">认证握手（CHAP 双向挑战，默认关）</h3>
+<p>四帧、两个方向各解一次挑战。两方向的 <code>ctx</code> 串不同、nonce 顺序相反，所以把一方的
+应答原样回放给另一方不成立；<code>server_nonce</code> 每轮新取，重放直接失效。</p>
+
+<div class="tw">
+<table>
+<thead><tr><th>帧</th><th>op</th><th>携带</th><th>校验</th></tr></thead>
+<tbody>
+<tr><td>1</td><td><code>AuthBegin</code> 0x0090</td><td>客户端 nonce <code>a</code></td><td>—</td></tr>
+<tr><td>2</td><td><code>AuthChallenge</code> 0x0190</td><td>服务端 nonce <code>b</code> + 服务端 MAC</td><td><code>MAC = HMAC(key, ctx_b‖VER‖b‖a)</code></td></tr>
+<tr><td>3</td><td><code>AuthFinish</code> 0x0091</td><td>客户端 MAC</td><td><code>MAC = HMAC(key, ctx_a‖VER‖a‖b)</code></td></tr>
+<tr><td>4</td><td><code>AuthOk</code> 0x0191</td><td>label / ro / view / owner</td><td>之后才允许发数据 op</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="code">
+  <div class="cap"><span>生成密钥文件</span><span>两种合法格式</span></div>
+<pre><span class="c"># 32 原始字节</span>
+head <span class="f">-c</span> 32 /dev/urandom &gt; /etc/treedb/cluster.key
+chmod 600 /etc/treedb/cluster.key
+
+<span class="c"># 或 64 个十六进制字符</span>
+head <span class="f">-c</span> 32 /dev/urandom | xxd <span class="f">-p</span> &gt; /etc/treedb/cluster.key
+
+<span class="c"># 全零模板会被拒：Key::load 对 0 字节 / 64 个 '0' 直接报错</span>
+</pre>
+</div>
+
+<div class="box warn">
+  <span class="t">开了认证之后，<code>--stats</code> 与 <code>--shutdown</code> 也要带密钥</span>
+  <p>否则它们拿到的不是「无权限」，而是握手阶段就被断开。脚本里三处要一起改：
+  服务端、运维命令、客户端。密钥必须与副本的 <code>--auth-key-file</code> 是同一把，
+  否则表现是 <strong>lag 永远追不上</strong>（副本指数退避重试），而不是一个明确的错。</p>
+</div>
+
+<div class="box note">
+  <span class="t">认证只管「你是谁」，不管「你能干什么」</span>
+  <p>一把密钥开整扇门：握手通过后 52 个 op 全部可用，包括 <code>Shutdown</code> 与
+  <code>Checkpoint</code>。不做授权、不做审计级隔离、不加密传输（明文 TCP）、不防字典攻击、
+  也不能证明对端是「当前主」而不是一个旧主。这四条写在 DESIGN §4.4 末尾与 §8 第 13 条。</p>
+</div>
+</section>
+
+<!-- ============================ 4 使用指南 ============================ -->
+<section id="s4">
+<h2><span class="num">04</span>使用指南</h2>
+
+<div class="verdict">
+  <b>一句话</b>
+  <p>两套 API 共用一条连接：<strong>POSIX 元数据 op</strong>（视图 + 目录树 + 属性 + 链接 + 引用账本 + 锁）
+  和<strong>通用表 op</strong>（9 条，等值 + 键游标，无 SQL）。运维只多三条：<code>Stats</code>、<code>Checkpoint</code>、<code>Shutdown</code>。</p>
+</div>
+
+<h3 id="s4-posix">POSIX 元数据 API</h3>
+<p>全部 op 以 <code>ViewId</code> 隔离命名空间：同一个引擎里可以有上万个视图，
+每个视图有独立的根 inode（<code>root = 1</code>）。<strong>视图隔离是命名空间隔离，不是访问控制。</strong></p>
+
+<div class="tw">
+<table>
+<thead><tr><th>分组</th><th>op</th><th>关键参数</th><th>语义 / 错误</th></tr></thead>
+<tbody>
+<tr><td>视图</td><td><code>CreateView</code> / <code>DropView</code> / <code>ListViews</code></td><td><code>name: Vec&lt;u8&gt;</code></td><td>视图名上限 25 字节；<code>CreateView</code> 回 <code>Reply::View{id, root}</code>，同名 → <code>EEXIST</code></td></tr>
+<tr><td>名字 / 属性</td><td><code>Lookup</code></td><td><code>view, parent, name</code></td><td>回 <code>Reply::Node</code>；不存在 → <code>ENOENT</code></td></tr>
+<tr><td></td><td><code>Getattr</code></td><td><code>view, ino</code></td><td>回 ino / mode / uid / gid / size / 三种时间 / 链接数 / data_ref</td></tr>
+<tr><td></td><td><code>Setattr</code></td><td><code>valid</code> 位图 + mode/uid/gid/size/atime/mtime/data_ref/ref_bytes</td><td>只改 <code>valid</code> 里置位的字段；改 <code>data_ref</code> 会同步维护引用账本</td></tr>
+<tr><td>增删</td><td><code>Create</code> / <code>Mkdir</code></td><td><code>view, parent, name, mode, uid, gid</code></td><td>同名 → <code>EEXIST</code></td></tr>
+<tr><td></td><td><code>Unlink</code> / <code>Rmdir</code></td><td><code>view, parent, name</code></td><td>回 <code>Reply::NodeRef</code>：一个内容对象<strong>刚好失去最后一个持有者</strong>时给出 GC 线索，空串也是成功</td></tr>
+<tr><td></td><td><code>Rename</code></td><td><code>old_parent, old_name, new_parent, new_name, flags</code></td><td>跨目录移动；<code>flags</code> 保留位</td></tr>
+<tr><td>符号链接</td><td><code>Symlink</code> / <code>Readlink</code></td><td><code>target</code> / <code>ino</code></td><td>目标是任意字节串，不做路径解析</td></tr>
+<tr><td>硬链接</td><td><code>Link</code></td><td><code>view, ino, parent, name</code></td><td>同一 inode 挂第二个目录项，<code>nlink += 1</code>；目录 → <code>EPERM</code>，已存在 → <code>EEXIST</code>，跨视图 → 拒</td></tr>
+<tr><td>引用账本</td><td><code>RefLookup</code> / <code>RefUp</code> / <code>RefDown</code></td><td><code>data_ref, bytes</code></td><td>只记「谁引用了哪个内容对象、多大」，<strong>不存字节本身</strong>；回 <code>{count, bytes}</code></td></tr>
+<tr><td>锁</td><td><code>LockQuery</code> / <code>LockSet</code></td><td><code>ino, owner, verb, kind, lease_expiry</code></td><td><strong>整 inode 锁</strong>，不是区间锁；<code>verb</code> 0 = 建立/续约，1 = 释放该 owner 的全部锁；过期租约只过滤不回收</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="box warn">
+  <span class="t">锁是「整 inode + 租约」，不是 POSIX 记录锁</span>
+  <p>引擎没有 <code>(pid, fd)</code> 概念，所以给不了字节区间仲裁。grovefs 适配层因此把
+  <code>lock_op</code> 做成无条件 <code>EPERM</code> 桩、<code>get_lock</code> 回 <code>None</code>——
+  「给错语义比给不了更糟」。</p>
+</div>
+
+<h3 id="s4-table">通用表 API</h3>
+<p>9 条 op，表名与行键都是任意字节串。列定义带两个标志位，<strong>唯一列隐含建索引</strong>：</p>
+
+<div class="tw">
+<table>
+<thead><tr><th>op</th><th>参数</th><th>语义</th></tr></thead>
+<tbody>
+<tr><td><code>TableCreate</code></td><td><code>def: TableDef{ name, columns: Vec&lt;ColumnDef{name, flags}&gt; }</code></td><td><code>COL_UNIQUE = 1&lt;&lt;0</code>（跨行撞值 → <code>EEXIST</code>，隐含索引）；<code>COL_INDEX = 1&lt;&lt;1</code>（允许按该列等值列举）</td></tr>
+<tr><td><code>TableDrop</code></td><td><code>name</code></td><td>级联丢掉全部行与二级索引；表不存在 → <code>ENOENT</code></td></tr>
+<tr><td><code>TableGet</code></td><td><code>name</code></td><td>回 <code>Reply::Table(Option&lt;TableDef&gt;)</code>：<strong>没有这张表是 <code>None</code>，不是错误</strong></td></tr>
+<tr><td><code>TableList</code></td><td>—</td><td>全部表定义</td></tr>
+<tr><td><code>RowPut</code></td><td><code>table, key, cols: Vec&lt;Vec&lt;u8&gt;&gt;, flags, cond_col, cond_val</code></td><td>键不存在则插入，存在则<strong>整行覆盖</strong>（不给的列被清成空字节）；<code>flags</code>：<code>PUT_IF_ABSENT</code> / <code>PUT_IF_EXISTS</code>；<code>cond_col/cond_val</code> 是 CAS，不命中 → <code>EAGAIN</code></td></tr>
+<tr><td><code>RowGet</code></td><td><code>table, key</code></td><td>回 <code>Reply::Row(Option&lt;RowRec&gt;)</code></td></tr>
+<tr><td><code>RowList</code></td><td><code>table, column, value, from, limit</code></td><td><code>column = ROW_PK</code> 按主键字节序翻页（<code>value</code> 忽略）；否则<strong>必须是已建索引的列</strong>，按该列等值列举</td></tr>
+<tr><td><code>RowDelete</code></td><td><code>table, key, flags, cond_col, cond_val</code></td><td>幂等删（不存在也成功）；<code>DEL_IF_EXISTS</code> + CAS</td></tr>
+<tr><td><code>RowCount</code></td><td><code>table, column, value</code></td><td>主键：<code>O(1)</code>；索引列：<code>O(命中数)</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="code">
+  <div class="cap"><span>通用表：建表 → 写行 → 翻页</span><span>Rust</span></div>
+<pre><span class="k">use</span> treedb::engine::model::{
+    ColumnDef, TableDef, COL_INDEX, COL_UNIQUE, COND_NONE,
+};
+
+c.call(&amp;Op::TableCreate {
+    def: TableDef {
+        name: <span class="s">b"paths"</span>.to_vec(),
+        columns: <span class="k">vec!</span>[
+            ColumnDef { name: <span class="s">b"id"</span>.to_vec(),   flags: COL_UNIQUE },
+            ColumnDef { name: <span class="s">b"owner"</span>.to_vec(), flags: COL_INDEX  },
+        ],
+    },
+})?;
+
+c.call(&amp;Op::RowPut {
+    table: <span class="s">b"paths"</span>.to_vec(),
+    key: <span class="s">b"/a.txt"</span>.to_vec(),
+    cols: <span class="k">vec!</span>[<span class="s">b"7"</span>.to_vec(), <span class="s">b"alice"</span>.to_vec()],
+    flags: <span class="n">0</span>, cond_col: <span class="o">COND_NONE</span>, cond_val: Vec::new(),
+})?;
+
+<span class="c">// 第一页：按 owner='alice' 等值列举，limit=0 → 默认 1000</span>
+<span class="k">let</span> page = c.call(&amp;Op::RowList {
+    table: <span class="s">b"paths"</span>.to_vec(),
+    column: <span class="n">1</span>,                 <span class="c">// owner 的列序号（0 起）</span>
+    value: <span class="s">b"alice"</span>.to_vec(),
+    from: Vec::new(), limit: <span class="n">0</span>,
+})?;
+
+<span class="c">// 下一页：把本页最后一行的 key 当 from 游标（不含本身），end=true 即到底</span>
+</pre>
+</div>
+
+<div class="tw">
+<table>
+<thead><tr><th>硬约束</th><th>值 / 行为</th></tr></thead>
+<tbody>
+<tr><td>行键上限</td><td><code>ROW_KEY_MAX = 4096</code></td></tr>
+<tr><td>列数上限</td><td><code>MAX_COLUMNS = 64</code></td></tr>
+<tr><td>单表行数上限</td><td><code>MAX_TABLE_ITEMS = 1 000 000</code></td></tr>
+<tr><td>查未建索引的列</td><td class="no"><code>EINVAL "column X is not indexed"</code>——<strong>不退化成全表扫</strong></td></tr>
+<tr><td><code>limit = 0</code></td><td>默认页宽 <code>1000</code></td></tr>
+<tr><td><code>from</code> 游标</td><td>「上一页最后一行的主键（不含本身）」，所以 <code>skip(n)</code> 是 <code>O(n)</code></td></tr>
+<tr><td>表达力</td><td class="no">无范围 / 前缀谓词、无跨列条件、无排序（只有 BTreeMap 字节序）、无聚合（只有 <code>RowCount</code>）、无 JOIN / NULL / 类型 / 外键 / CHECK</td></tr>
+</tbody>
+</table>
+</div>
+
+<h3 id="s4-ops">运维命令</h3>
+<div class="code">
+  <div class="cap"><span>三条运维动作</span><span>都对运行中的实例发起，不是本地文件操作</span></div>
+<pre><span class="c"># 1) 查状态（不启服务，连上去打印后退出）</span>
+./target/release/treedb-server <span class="f">--listen</span> 127.0.0.1:7777 <span class="f">--stats</span>
+
+<span class="c"># 2) 手动触发一次快照：没有独立 CLI，只有库 API `Op::Checkpoint`</span>
+<span class="c">#    （--op stat 只是读 Stats，不会触发 checkpoint）</span>
+<span class="c">#    Rust: c.call(&amp;Op::Checkpoint)?;   // 同步档写完快照后 wal.reset()</span>
+
+<span class="c"># 3) 优雅停服（补 fsync + 最后一次 checkpoint）</span>
+./target/release/treedb-server <span class="f">--listen</span> 127.0.0.1:7777 <span class="f">--shutdown</span>
+
+<span class="c"># 等价做法：给进程发 SIGTERM / SIGINT</span>
+kill <span class="f">-TERM</span> $(cat /run/treedb.pid)
+</pre>
+</div>
+
+<div class="code">
+  <div class="cap"><span>--stats 实际输出</span><span>字段含义见 05 章</span></div>
+<pre><span class="o">views</span>      = <span class="n">12</span>
+<span class="o">nodes</span>      = <span class="n">13968</span>
+<span class="o">dentries</span>   = <span class="n">13936</span>
+<span class="o">locks</span>      = <span class="n">0</span>
+<span class="o">refs</span>       = <span class="n">0</span>
+<span class="o">keys</span>       = <span class="n">0</span>
+<span class="o">audit</span>      = <span class="n">0</span>
+<span class="o">tables</span>     = <span class="n">3</span> (rows <span class="n">91</span>)
+<span class="o">seq</span>        = <span class="n">41872</span> (snapshot <span class="n">41872</span>)
+<span class="o">wal</span>        = <span class="n">0</span> B logical, <span class="n">65536</span> B on disk
+<span class="o">snapshot</span>   = <span class="n">1048576</span> B
+<span class="o">protocol</span>   = <span class="n">6</span>
+<span class="o">ops</span>        = <span class="n">0</span> (writes <span class="n">0</span>, syncs <span class="n">0</span>, avg fsync <span class="n">0</span> us)
+<span class="o">checkpoints</span>= <span class="n">1</span>
+</pre>
+</div>
+
+<div class="box note">
+  <span class="t"><code>checkpoints</code> 在新进程里从 0 起</span>
+  <p>优雅停服自带最后一次 checkpoint，所以冷备份拷贝里「快照水位 == seq、WAL 逻辑长度 0」才是正常形态。
+  拿 <code>checkpoints</code> 或 <code>wal</code> 这两行当「备份是否成功」的断言会假红——脚本只比
+  <code>nodes / dentries / refs / seq</code> 这四行。</p>
+</div>
+
+<h3 id="s4-pipe">pipeline 批量请求</h3>
+<p>一条连接上连发 N 个请求、再一次性收 N 个回包，<strong>保序</strong>。这是吞吐轴上的主要杠杆：
+它把「一次往返」和「一轮 fsync」都摊到 N 个 op 上。</p>
+
+<div class="code">
+  <div class="cap"><span>三档对照</span><span>同一台机、同一服务端</span></div>
+<pre><span class="c"># 一问一答（p50/p99 就是单 op 延迟）</span>
+./target/release/treedb-bench <span class="f">--op</span> lookup <span class="f">--conns</span> 1  <span class="f">--pipeline</span> 1  <span class="f">--secs</span> 5
+
+<span class="c"># 单连接批量：可复现历史单连接数字</span>
+./target/release/treedb-bench <span class="f">--op</span> lookup <span class="f">--conns</span> 1  <span class="f">--pipeline</span> 32 <span class="f">--secs</span> 5
+
+<span class="c"># 64 连接 + 批量：组提交摊 fsync 的主战场</span>
+./target/release/treedb-bench <span class="f">--op</span> create <span class="f">--conns</span> 64 <span class="f">--pipeline</span> 32 <span class="f">--secs</span> 5
+</pre>
+</div>
+
+<div class="tw">
+<table>
+<thead><tr><th>规则</th><th>说明</th></tr></thead>
+<tbody>
+<tr><td>保序</td><td>同连接内按发送序回填，应答身份用<strong>从不复用的连接号</strong>，不是 fd（fd 会被内核复用）</td></tr>
+<tr><td>只读就地算</td><td><code>workers &gt; 1</code> 时，整批全是只读 op 才由 worker 就地执行</td></tr>
+<tr><td>含写整批转发</td><td>一个批次里只要有一条写，<strong>整批</strong>交给提交线程；该连接上还有未回话的转发 op 时，后续批次也一律转发</td></tr>
+<tr><td>p50/p99 口径</td><td>按「批次总耗时 / N」计，即每 op 摊销延迟；报批次延迟会让 <code>pipeline=32</code> 看起来像 1 ms 级</td></tr>
+<tr><td>库 API</td><td><code>Client::pipeline(&amp;[Op]) -&gt; Vec&lt;Reply&gt;</code>，一次性写缓存区</td></tr>
+</tbody>
+</table>
+</div>
+</section>
+
+<!-- ============================ 5 维护 ============================ -->
+<section id="s5">
+<h2><span class="num">05</span>维护</h2>
+
+<div class="verdict">
+  <b>一句话</b>
+  <p>日常只有三件事要看：<code>seq</code> 有没有在涨、<code>wal</code> 的两个长度有没有脱钩、
+  <code>checkpoints</code> 有没有在动；副本健康度<strong>只能</strong>在副本上看，主那边永远报 0。</p>
+</div>
+
+<h3 id="s5-stats">日常监控指标</h3>
+<div class="tw">
+<table>
+<thead><tr><th>字段</th><th>含义</th><th>怎么看</th></tr></thead>
+<tbody>
+<tr><td><code>views</code></td><td>视图数</td><td>每个视图是一个独立命名空间（一套目录树）</td></tr>
+<tr><td><code>nodes</code></td><td>inode 数</td><td>与 <code>dentries</code> 的差就是硬链接数</td></tr>
+<tr><td><code>dentries</code></td><td>目录项数</td><td>「一名一 inode」；硬链接让 dentries &gt; nodes</td></tr>
+<tr><td><code>locks</code></td><td>未过期的锁数</td><td>过期租约<strong>只过滤不回收</strong>，这个数可能不落回 0</td></tr>
+<tr><td><code>refs</code></td><td>内容引用账本的条目数</td><td>只记引用与字节数，不存内容本身</td></tr>
+<tr><td><code>keys</code> / <code>audit</code></td><td>密钥表行数 / 审计表行数</td><td>通用表上的两块内建数据</td></tr>
+<tr><td><code>tables (rows)</code></td><td>通用表数量与总行数</td><td>与目录树是两套独立命名空间</td></tr>
+<tr><td><code>seq (snapshot)</code></td><td>当前日志序号 / 快照水位</td><td><strong>两者相等</strong> = 刚 checkpoint 过；差值 = 待重放的尾日志量</td></tr>
+<tr><td><code>wal = X B logical, Y B on disk</code></td><td>逻辑长度（决定何时 checkpoint）/ 磁盘占用</td><td>预分配空洞让两者差一个数量级，<strong>不要用磁盘长度判断膨胀</strong></td></tr>
+<tr><td><code>snapshot = N B</code></td><td>快照文件大小</td><td>与 <code>nodes + dentries + rows</code> 同向增长</td></tr>
+<tr><td><code>protocol</code></td><td>协议版本（当前 6）</td><td>主副本混版前提是 fence 也支持；v5→v6 不兼容</td></tr>
+<tr><td><code>ops (writes, syncs, avg fsync)</code></td><td>累计 op / 写批 / fsync 次数与均值</td><td><code>writes/syncs</code> 就是组提交的摊薄倍数；<code>avg fsync us</code> 应贴近裸盘延迟</td></tr>
+<tr><td><code>checkpoints</code></td><td>本进程做过的 checkpoint 次数</td><td>新进程从 0 起；<strong>不要</strong>拿它判断数据是否完整</td></tr>
+<tr><td><code>replica = yes (primary seq, lag, applied, resyncs, errors)</code></td><td><strong>只有副本才打印这一行</strong></td><td><code>lag</code> = 主 durable_seq − 本地 seq；<code>resyncs</code> &gt; 0 说明曾因 gap 重装过快照</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="code">
+  <div class="cap"><span>健康巡检脚本骨架</span><span>退出码非 0 即告警</span></div>
+<pre><span class="c">#!/bin/sh</span>
+<span class="c"># 主：seq 必须单调；wal 逻辑长度必须低于阈值</span>
+out=$(./treedb-server <span class="f">--listen</span> 127.0.0.1:7777 <span class="f">--stats</span>) || <span class="k">exit</span> 1
+<span class="k">echo</span> <span class="s">"$out"</span> | grep <span class="s">'^seq ' </span>
+<span class="k">echo</span> <span class="s">"$out"</span> | grep <span class="s">'^wal ' </span>
+
+<span class="c"># 副本：lag 与 errors 才是副本的健康度</span>
+./treedb-server <span class="f">--listen</span> 127.0.0.1:7778 <span class="f">--stats</span> | grep <span class="s">'^replica ' </span>
+<span class="c"># replica    = yes (primary seq 40024 lag 0 applied 40024 resyncs 1 errors 0)</span>
+</pre>
+</div>
+
+<div class="box warn">
+  <span class="t">主看不到副本</span>
+  <p>副本是 pull 模型，主只答 <code>WalFetch</code>/<code>SnapFetch</code>，<strong>不维护任何副本状态</strong>。
+  所以「副本挂了三天」在主侧完全无感。必须单独盯副本的 <code>lag</code> 与 <code>replica_errors</code>。</p>
+</div>
+
+<h3 id="s5-wal">WAL 膨胀与自动 checkpoint 策略</h3>
+<div class="tw">
+<table>
+<thead><tr><th>项</th><th>行为</th><th>注意</th></tr></thead>
+<tbody>
+<tr><td>触发条件</td><td>WAL <strong>逻辑长度</strong> &gt; <code>--auto-checkpoint-mb</code>（默认 64 MiB）</td><td>看的是逻辑长度，不是磁盘占用</td></tr>
+<tr><td>关闭方式</td><td><code>--auto-checkpoint-mb 0</code></td><td>WAL 只增不减，磁盘会被预分配吃光，只在测试里用</td></tr>
+<tr><td>同步 checkpoint</td><td>显式 <code>Op::Checkpoint</code> / 优雅停服；写完快照后 <code>wal.reset()</code></td><td>会<strong>物理抹掉</strong>水位以下的 WAL 文件内容</td></tr>
+<tr><td>自动 checkpoint</td><td>写完快照后 <code>truncate_before</code></td><td>不开归档时同样不保留历史分段，因此<strong>没有 PITR</strong>；带 <code>--archive-dir</code> 起步则先把段与旧快照拷进归档再抹，PITR 可用（§6.11）</td></tr>
+<tr><td>快照自校验</td><td>尾巴 16 字节 = <code>crc32 + seq + magic</code></td><td>水位对不上就拒收，不静默按错布局解字节</td></tr>
+<tr><td>启动恢复</td><td>读快照，再把 <code>snap_seq</code> 之后的 WAL 重放完</td><td>重放条数与耗时在停服日志里报一行（<code>recovered N wal recs</code>）</td></tr>
+</tbody>
+</table>
+</div>
+
+<h3 id="s5-lock">数据目录互斥：<code>.lock</code></h3>
+<p>目录里有一个 <code>.lock</code> 文件，<code>Engine::open</code> 用 <code>flock(LOCK_EX|LOCK_NB)</code> 拿独占，
+再叠一层<strong>进程内注册表</strong>（同进程再 open 同一个目录也拒，因为 flock 对同进程会放行）。
+这一层是所有离线工具的前提：</p>
+<div class="tw">
+<table>
+<thead><tr><th>命令</th><th>要求</th><th>被占时的表现</th></tr></thead>
+<tbody>
+<tr><td><code>treedb-server</code></td><td>独占 <code>--dir</code></td><td>启动失败，报目录被占</td></tr>
+<tr><td><code>treedb-dump</code></td><td>独占源目录</td><td>拒绝导出——宁可拒也不猜「快照 + 正在增长的 WAL」</td></tr>
+<tr><td><code>treedb-load</code></td><td>目标目录为空或不存在</td><td>退出码 1</td></tr>
+<tr><td><code>treedb-migrate</code></td><td><strong>不做互斥</strong>，须人工先停服</td><td>可能在服务运行中改快照，务必先停</td></tr>
+<tr><td><code>treedb-standby --promote</code></td><td>独占副本目录</td><td>须先停 standby 进程</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="box note">
+  <span class="t">目录锁挡不住「第二个进程绑同一端口」</span>
+  <p><code>SO_REUSEPORT</code> 允许另一个进程并列 bind 同一个端口。如果它指向<strong>另一个目录</strong>，
+  两个实例会同时对外服务——单实例靠部署约束，不是靠内核。指向同一目录则被 <code>.lock</code> 挡住。</p>
+</div>
+
+<h3 id="s5-fence">fence 文件与 fencing token</h3>
+<p><code>&lt;dir&gt;/fence</code> 是一个十进制整数文件。它随每条 <code>WalBatch</code> 与 <code>SnapChunk</code>
+的尾部 epoch 一起传播，<code>Engine::admit_epoch</code> 据此做三档判定：接受、拒收、要求重同步。</p>
+
+<div class="code">
+  <div class="cap"><span>看令牌 / 抬令牌</span><span>直接 cat 就能看见</span></div>
+<pre><span class="c"># 当前值（没有这个文件 = 0）</span>
+cat /var/lib/treedb/fence
+
+<span class="c"># 抬一级：离线动作，抬完就退出（不起服务）</span>
+./target/release/treedb-standby <span class="f">--dir</span> /var/lib/treedb-replica <span class="f">--promote</span>
+<span class="c"># promoted /var/lib/treedb-replica: fence 0 -&gt; 1 (snap_seq 40024, 40024 wal recs replayed)</span>
+</pre>
+</div>
+
+<div class="box warn">
+  <span class="t">三条禁令</span>
+  <p><strong>①</strong> 别把新主的 <code>fence</code> 改小——那等于把旧主的权开回来。<br>
+  <strong>②</strong> <code>--promote</code> 不能与 <code>--primary</code> 同给（自相矛盾，退出码 2）。<br>
+  <strong>③</strong> 提升<strong>不会</strong>让旧主停手：fence 只让副本拒收旧主的批，挡不住旧主继续服务它自己的客户端。
+  旧主必须真停，或者把客户端改指到新主。仍指着旧主的其他副本会拒收它的批（日志 <code>is fenced out</code>），需改指新主。</p>
+</div>
+</section>
+
+<!-- ============================ 6 备份 ============================ -->
+<section id="s6">
+<h2><span class="num">06</span>备份</h2>
+
+<div class="verdict">
+  <b>一句话</b>
+  <p>六种成文形状，各有明确适用面：<strong>冷备份</strong>（RPO = 停服时刻）、<strong>离线 dump</strong>（跨版本跨机器）、
+  <strong>在线热副本</strong>（RPO ≈ lag，当 DR 源）、<strong>快照 + 尾日志</strong>（进程崩溃后的自动恢复，不需要人操作）、<strong>在线切面</strong>（<code>treedb-backup</code> 从活着的主导出一份一致文件，§6.10）、<strong>WAL 归档 + 按 seq 的 PITR</strong>（<code>--archive-dir</code> 起步 + <code>treedb-pitr</code>，唯一能落在两次 checkpoint 之间的形状，§6.11）。
+  不做增量、不做加密、不做归档保留策略；PITR 要先开归档才算数。</p>
+</div>
+
+<h3 id="s6-four">六种形状对照</h3>
+<div class="tw">
+<table>
+<thead><tr><th>形状</th><th>做法</th><th>停服？</th><th>RPO</th><th>实测</th></tr></thead>
+<tbody>
+<tr><td><strong>冷备份</strong></td><td><code>SIGTERM</code> 优雅停服 → <code>cp -a</code> 整个目录 → 从拷贝起服</td><td class="yes">要</td><td>= 停服那一刻</td><td><code>nodes 13 968 / dentries 13 936 / refs 0 / seq 41 872</code> 逐项相等</td></tr>
+<tr><td><strong>离线 dump</strong></td><td><code>treedb-dump --dir --out</code> → <code>treedb-load</code> 到新目录</td><td class="yes">要（源端独占）</td><td>= 停服那一刻</td><td>82 888 节点：dump <strong>279 ms</strong> / 11.65 MB；gzip 后 <strong>1 133 299 B</strong>；<code>dump→load→dump</code> 字节相同</td></tr>
+<tr><td><strong>在线热副本</strong></td><td><code>treedb-standby --primary</code> 持续追平；跨机部署</td><td class="no">不要</td><td>≈ 停主那一刻的 <code>lag</code></td><td><code>lag 0 / resyncs 1 / errors 0</code>，四项与主一致</td></tr>
+<tr><td><strong>快照 + 尾日志</strong></td><td>不用操作：重启即从 <code>state.snap</code> + 尾部 WAL 重放</td><td class="no">—</td><td>丢失窗口 = 未 fsync 的尾部</td><td><code>kill -9</code> 崩溃验收覆盖：重启后已 ack 的写全在</td></tr>
+<tr><td><strong>在线切面</strong></td><td><code>treedb-backup --primary H:P --out F</code>（<code>--out -</code> 走管道）→ <code>treedb-load</code> 到新目录</td><td class="no">不要</td><td>= 首轮 <code>WalFetch</code> 时主的 <code>durable_seq</code></td><td>主持续写 3 s：64 views / 78 529 nodes / 10.97 MB → <strong>322 ms</strong>；管道档 1.47 MB → 161 KB，74 ms</td></tr>
+<tr><td><strong>WAL 归档 + 按 seq 的 PITR</strong></td><td>服务端从第一天带 <code>--archive-dir</code>；<code>treedb-pitr --dir --archive --to-seq N --out NEW</code></td><td class="part">源端要已停服，或 <code>--dir</code> 指一份冷拷</td><td>已归档的任意一条 op 末尾</td><td>恢复到活库水位后，恢复目录 dump 与活库 dump <strong>1 633 029 B 逐字节相同</strong>（11 677 nodes）；落到锚点 76 ms</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="box warn">
+  <span class="t">还有一个「看起来像备份、实际不能当备份」的形状</span>
+  <p><strong>热拷贝</strong>：写入进行中 <code>cp -a</code>，源端继续跑。实测能起服、无撕裂、状态自洽，
+  但切点落在写入流中间——拷贝前一刻 <code>seq 41 872</code>、拷完源端 <code>89 536</code>、还原出来 <code>56 272</code>。
+  <strong>无法承诺还原到哪一刻，也无法向调用方报 RPO。</strong></p>
+</div>
+
+<h3 id="s6-cold">冷备份与离线 dump</h3>
+<div class="code">
+  <div class="cap"><span>形状 A：冷备份</span><span>最简单，可逐字节校验</span></div>
+<pre><span class="c"># 1) 优雅停服（会补最后一次 fsync + checkpoint）</span>
+./target/release/treedb-server <span class="f">--listen</span> 127.0.0.1:7777 <span class="f">--shutdown</span>
+
+<span class="c"># 2) 整目录拷贝（-a 保留权限/时间/稀疏文件）</span>
+cp <span class="f">-a</span> /var/lib/treedb /backup/treedb-$(date +%F)
+
+<span class="c"># 3) 立刻起服，缩短停服窗口</span>
+./target/release/treedb-server <span class="f">--dir</span> /var/lib/treedb <span class="f">--listen</span> 0.0.0.0:7777
+</pre>
+</div>
+
+<div class="code">
+  <div class="cap"><span>形状 B：离线逻辑导出</span><span>跨版本 / 跨机器 / 可读</span></div>
+<pre><span class="c"># 停服后导出（要求目录独占）</span>
+./target/release/treedb-dump <span class="f">--dir</span> /var/lib/treedb <span class="f">--out</span> /backup/treedb-$(date +%F).dump
+
+<span class="c"># 直接压缩落盘（摘要走 stderr）</span>
+./target/release/treedb-dump <span class="f">--dir</span> /var/lib/treedb <span class="f">--out</span> - | gzip &gt; /backup/treedb-$(date +%F).dump.gz
+
+<span class="c"># 只体检，不落盘：解码并打印规模</span>
+./target/release/treedb-load <span class="f">--in</span> /backup/treedb-2026-11-21.dump
+
+<span class="c"># 还原到新目录（目标须为空或不存在）</span>
+./target/release/treedb-load <span class="f">--in</span> /backup/treedb-2026-11-21.dump <span class="f">--dir</span> /srv/treedb-new
+</pre>
+</div>
+
+<div class="tw">
+<table>
+<thead><tr><th>dump 容器</th><th>内容</th></tr></thead>
+<tbody>
+<tr><td>魔数 / 版本</td><td><code>TDBDUMP1</code> / <code>DUMP_VERSION = 1</code></td></tr>
+<tr><td>内容</td><td>把空状态重放成源状态的<strong>最小 Log 序列</strong> + 容器头（各表计数 + 三个 <code>next_*</code>）</td></tr>
+<tr><td>含哪些表</td><td><strong>含</strong>通用 <code>tables</code> 与 <code>rows</code>（先按 id 排序写表定义，再写行）；<strong>不含</strong> <code>row_index</code>——由 rows + 列定义重建</td></tr>
+<tr><td>不含什么</td><td><code>fence</code> 不搬（恢复后从 0 起步，需重新发号）；源目录一个字节都不写</td></tr>
+<tr><td>确定性</td><td>同一份状态导两次字节相同，所以 <code>dump → load → dump</code> 可用字节相等当判据</td></tr>
+<tr><td>写盘方式</td><td><code>.tmp → fsync → rename</code>，半截文件不会顶着正式名字出现</td></tr>
+</tbody>
+</table>
+</div>
+
+<h3 id="s6-replica">在线热副本（跨机部署）</h3>
+<p>副本是 pull 模型：它主动连主，主甚至不需要知道副本存在。因此跨机部署只要网络通、
+密钥一致（如果开了认证）。</p>
+
+<div class="code">
+  <div class="cap"><span>两台机器：主 A / 副本 B</span><span>主全程不停服</span></div>
+<pre><span class="c"># ── 机器 A（主）：监听对外地址</span>
+./target/release/treedb-server <span class="f">--dir</span> /var/lib/treedb <span class="f">--listen</span> 0.0.0.0:7777
+
+<span class="c"># ── 机器 B（副本）：自己的独立目录，绝不与主共用</span>
+./target/release/treedb-standby \
+  <span class="f">--primary</span> 10.0.0.11:7777 \
+  <span class="f">--dir</span> /var/lib/treedb-replica \
+  <span class="f">--listen</span> 0.0.0.0:7778 \
+  <span class="f">--interval-ms</span> 20 \
+  <span class="f">--fetch-bytes</span> 1048576
+
+<span class="c"># 开了认证时，两侧必须是同一把密钥</span>
+<span class="c"># 主：--auth-key-file /etc/treedb/cluster.key</span>
+<span class="c"># 副本：--auth-key-file /etc/treedb/cluster.key</span>
+
+<span class="c"># 在 B 上验证：lag 才是健康度</span>
+./target/release/treedb-server <span class="f">--listen</span> 127.0.0.1:7778 <span class="f">--stats</span> | grep <span class="s">'^replica ' </span>
+</pre>
+</div>
+
+<div class="tw">
+<table>
+<thead><tr><th>副本参数</th><th>默认</th><th>说明</th></tr></thead>
+<tbody>
+<tr><td><code>--primary HOST:PORT</code></td><td>必填</td><td>主的地址；副本单向拉，主不感知</td></tr>
+<tr><td><code>--dir PATH</code></td><td class="num-cell">/var/lib/treedb-replica</td><td>必须与主目录分开：各自有 WAL 与快照，落盘字节可直接比对</td></tr>
+<tr><td><code>--listen HOST:PORT</code></td><td class="num-cell">127.0.0.1:7778</td><td>对客户端提供<strong>只读</strong>服务；写被引擎以 <code>EROFS</code> 挡掉</td></tr>
+<tr><td><code>--interval-ms N</code></td><td class="num-cell">20</td><td>两次追平之间的最小间隔；下载快照期间不限频</td></tr>
+<tr><td><code>--fetch-bytes N</code></td><td class="num-cell">1048576</td><td>一次往来的负载上限，受协议 <code>WAL_FETCH_MAX</code> 约束；追得慢就调大</td></tr>
+<tr><td><code>--timeout-ms N</code></td><td class="num-cell">5000</td><td>到主的连接与读写超时；必须有上限，否则不答话的主会把读全钉死</td></tr>
+<tr><td><code>--auto-checkpoint-mb N</code></td><td class="num-cell">64</td><td>副本 WAL 只能靠追平增长，<strong>别关</strong></td></tr>
+<tr><td><code>--workers N</code></td><td class="num-cell">0 = auto</td><td>只扩展读；写永远到不了提交线程</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="box ok">
+  <span class="t">它能当什么用</span>
+  <p>主机/磁盘/机房故障时的 DR 源：副本自带 WAL + 快照，可以直接当主起服；
+  副本重启也不需要向主全量重拉（先 WAL 后 apply）。主崩后副本仍能答读。</p>
+</div>
+
+<div class="box warn">
+  <span class="t">它不能当什么用</span>
+  <p><strong>不能防误删。</strong>异步复制会把删除也传过去，副本只有「当前一份」，没有历史版本。
+  「恢复到上周三 14:00」在<strong>不开归档</strong>时给不了——checkpoint 会抹掉水位以下的日志；带上 <code>--archive-dir</code> 起步，之后 <code>treedb-pitr --to-seq</code> 就能落在这个粒度上（§6.11）。</p>
+</div>
+
+<h3 id="s6-rpo">RPO 边界与共同局限</h3>
+<div class="tw">
+<table>
+<thead><tr><th>局限</th><th>影响</th><th>出处</th></tr></thead>
+<tbody>
+<tr><td>PITR</td><td>不开归档时只能还原到「最近一次快照 + 其后的尾日志」这一条线；开了 <code>--archive-dir</code>，checkpoint 抹历史前先把 WAL 段与将被覆盖的快照拷进归档，<code>treedb-pitr --to-seq N</code> 便可落在两次 checkpoint 之间的任意一条 op 末尾</td><td>§6.11 / §8 第 14 条</td></tr>
+<tr><td class="no">无增量备份</td><td>每次都是整目录拷贝或整份 dump</td><td>§6.7</td></tr>
+<tr><td class="no">无加密备份</td><td>dump 与目录都是明文；传输也是明文 TCP</td><td>§6.9 / §8 第 13 条</td></tr>
+<tr><td class="no">热拷贝切点不可控</td><td>能起服但不承诺还原点，不能报 RPO</td><td>§6.7 表格第 2 行</td></tr>
+<tr><td class="no">无归档保留策略</td><td>归档只增不减，清老段是运维的活（清之前得确认当锚点的快照还在）；且 <code>--archive-dir</code> 必须从第一天开着，关掉期间做过的 checkpoint 在归档里留洞</td><td>§6.11 / §8 第 14 条</td></tr>
+<tr><td class="part">副本异步</td><td>RPO = 停主那一刻的 lag，可到 0 但不是承诺</td><td>§6.6</td></tr>
+<tr><td class="part"><code>load</code> 不搬 fence</td><td>从已提升过的副本导出的目录会以 fence 0 起步</td><td><code>src/engine/dump.rs</code> 头部契约</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="box note">
+  <span class="t">要覆盖「误删」，必须再加一层归档</span>
+  <p>热副本负责 RPO≈0 的切换，离线 dump 负责「回到某个日期」。单靠热副本不算完整备份：
+  可以每夜停副本 → 从副本 <code>treedb-dump</code> 一份 → 重新起副本，主全程不停；v0.6.0 起更省事的是主不停、副本也不停，直接 <code>treedb-backup --primary … --out - | gzip</code> 拿一份一致切面（§6.10）。</p>
+</div>
+</section>
+
+<!-- ============================ 7 恢复 ============================ -->
+<section id="s7">
+<h2><span class="num">07</span>恢复</h2>
+
+<div class="verdict">
+  <b>一句话</b>
+  <p>四条路各对应一种故障：目录还在 → 直接起服；有 dump → <code>treedb-load</code> 到空目录；
+  主机没了 → 副本 <code>--promote</code> 后起服；进程崩了 → <strong>什么都不用做</strong>，重启即重放。</p>
+</div>
+
+<h3 id="s7-cold">从冷备份 / dump 恢复</h3>
+<div class="code">
+  <div class="cap"><span>路径 1：目录级恢复</span><span>RPO = 备份时刻</span></div>
+<pre><span class="c"># 1) 确认目标机上没有实例占用这个目录</span>
+<span class="c"># 2) 拷回去（保持 -a：权限/时间/稀疏）</span>
+cp <span class="f">-a</span> /backup/treedb-2026-11-21 /var/lib/treedb
+
+<span class="c"># 3) 起服</span>
+./target/release/treedb-server <span class="f">--dir</span> /var/lib/treedb <span class="f">--listen</span> 0.0.0.0:7777
+
+<span class="c"># 4) 对拍四项</span>
+./target/release/treedb-server <span class="f">--listen</span> 127.0.0.1:7777 <span class="f">--stats</span> \
+  | grep <span class="s">-E '^(nodes|dentries|refs|seq) '</span>
+</pre>
+</div>
+
+<div class="code">
+  <div class="cap"><span>路径 2：dump 恢复</span><span>跨版本 / 跨机器</span></div>
+<pre><span class="c"># 先体检：只解码 + 打规模，不写盘（退出码 0 = 通过）</span>
+./target/release/treedb-load <span class="f">--in</span> /backup/treedb.dump
+
+<span class="c"># 再落成新目录（目标须为空或不存在）</span>
+./target/release/treedb-load <span class="f">--in</span> /backup/treedb.dump <span class="f">--dir</span> /srv/treedb-new
+
+<span class="c"># 从标准输入读（配合 gzip -dc）</span>
+gzip <span class="f">-dc</span> /backup/treedb.dump.gz | ./target/release/treedb-load <span class="f">--in</span> - <span class="f">--dir</span> /srv/treedb-new
+
+<span class="c"># 起服</span>
+./target/release/treedb-server <span class="f">--dir</span> /srv/treedb-new <span class="f">--listen</span> 0.0.0.0:7777
+</pre>
+</div>
+
+<div class="tw">
+<table>
+<thead><tr><th><code>treedb-load</code> 退出码</th><th>含义</th></tr></thead>
+<tbody>
+<tr><td class="num-cell">0</td><td>导入完成，或（单参数模式）体检通过</td></tr>
+<tr><td class="num-cell">1</td><td>出错：CRC 不过 / 版本不认 / 目标非空或被占</td></tr>
+<tr><td class="num-cell">2</td><td>参数不全</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="box note">
+  <span class="t"><code>load</code> 只写快照，不写 WAL</span>
+  <p>水位 = dump 的 <code>seq</code>，所以新目录起来后 <code>seq == snapshot</code>、WAL 逻辑长度为 0。
+  dump 会带上<strong>未 durable</strong> 的记录（与启动恢复同语义）——那是磁盘上真实存在的写，丢掉才是错。</p>
+</div>
+
+<h3 id="s7-promote">从副本提升为主</h3>
+<div class="code">
+  <div class="cap"><span>切主四步</span><span>顺序不能乱</span></div>
+<pre><span class="c"># 0) 前提：旧主必须真停（fence 挡不住它继续服务自己的客户端）</span>
+
+<span class="c"># 1) 停掉副本进程（它运行中是只读引擎，真写被 EROFS 挡）</span>
+<span class="c">#    kill -TERM &lt;standby-pid&gt;</span>
+
+<span class="c"># 2) 离线抬 fence：max(见过的) + 1，打印后退出，不起服务</span>
+./target/release/treedb-standby <span class="f">--dir</span> /var/lib/treedb-replica <span class="f">--promote</span>
+<span class="c"># promoted /var/lib/treedb-replica: fence 0 -&gt; 1 (snap_seq 40024, 40024 wal recs replayed)</span>
+
+<span class="c"># 3) 用同一个目录起新主</span>
+./target/release/treedb-server <span class="f">--dir</span> /var/lib/treedb-replica <span class="f">--listen</span> 0.0.0.0:7777
+
+<span class="c"># 4) 验证 + 检查 fence 值</span>
+cat /var/lib/treedb-replica/fence
+./target/release/treedb-server <span class="f">--listen</span> 127.0.0.1:7777 <span class="f">--stats</span>
+</pre>
+</div>
+
+<div class="tw">
+<table>
+<thead><tr><th>检查项</th><th>为什么</th></tr></thead>
+<tbody>
+<tr><td>旧主是否真停</td><td>fence 只让副本拒收旧主的批，旧主自己的读者不受影响</td></tr>
+<tr><td><code>fence</code> 是否 &gt; 旧主的值</td><td>否则旧主的批会被接受，两份数据分叉</td></tr>
+<tr><td>是否误把 <code>fence</code> 改小</td><td>等于把旧主的权开回来</td></tr>
+<tr><td>其他副本是否仍指着旧主</td><td>它们会拒收旧主的批（日志 <code>is fenced out</code>），必须改指新主</td></tr>
+<tr><td>客户端是否改指新主</td><td><code>--promote</code> 不改任何客户端配置</td></tr>
+</tbody>
+</table>
+</div>
+
+<h3 id="s7-crash">崩溃恢复：重启即重放</h3>
+<p>进程被 <code>kill -9</code>、机器断电（<code>group</code>/<code>always</code> 档）后，重新起服即可：
+引擎先读 <code>state.snap</code>，再把 <code>snap_seq</code> 之后的 WAL 全部重放完，然后才开始接受连接。</p>
+
+<div class="code">
+  <div class="cap"><span>崩溃后重启</span><span>停服日志会给一行重放报告</span></div>
+<pre>./target/release/treedb-server <span class="f">--dir</span> /var/lib/treedb <span class="f">--listen</span> 0.0.0.0:7777
+
+<span class="c"># 停服时的报告（stderr）：</span>
+<span class="c"># shutdown: recovered 40024 wal recs (37 ms, snap 0) | accepted ... | ops ... | checkpoints ...</span>
+</pre>
+</div>
+
+<div class="tw">
+<table>
+<thead><tr><th>故障</th><th>结果</th></tr></thead>
+<tbody>
+<tr><td><code>kill -9</code> / 进程崩溃</td><td class="yes">重启后已 ack 的写全在（有专门验收测试）</td></tr>
+<tr><td>断电（<code>group</code> 档）</td><td class="yes">已 ack 的写必已落盘；未 ack 的可能丢</td></tr>
+<tr><td>断电（<code>never</code> 档）</td><td class="part">丢最近若干条已 ack 的写；WAL CRC32 保证不会解出错数据</td></tr>
+<tr><td>快照损坏（CRC/水位对不上）</td><td class="no">拒收，不静默按错布局解字节——此时只能靠副本或备份</td></tr>
+<tr><td>WAL 尾部半条记录</td><td class="yes">CRC 不过的尾记录被丢弃，重放到最后一条完整记录</td></tr>
+</tbody>
+</table>
+</div>
+
+<h3 id="s7-verify">恢复后验证清单</h3>
+<div class="tw">
+<table>
+<thead><tr><th>对拍项</th><th>期望</th></tr></thead>
+<tbody>
+<tr><td><code>nodes</code></td><td>与备份时刻相等</td></tr>
+<tr><td><code>dentries</code></td><td>与备份时刻相等</td></tr>
+<tr><td><code>refs</code></td><td>与备份时刻相等</td></tr>
+<tr><td><code>seq (snapshot)</code></td><td>冷备份/副本：与源相等；dump 恢复：两者相等且等于 dump 的 seq</td></tr>
+<tr><td><code>tables (rows)</code></td><td>与源相等（dump 会带上通用表；<code>row_index</code> 从 rows 重建）</td></tr>
+<tr><td><code>views</code></td><td>与源相等；逐个视图 <code>ReadDir</code> 根目录不应报错</td></tr>
+<tr><td><code>protocol</code></td><td>与二进制版本一致</td></tr>
+<tr><td><code>fence</code></td><td>dump 恢复后为 0（不搬）；副本提升后 &gt; 旧主</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="box warn">
+  <span class="t">不要用 <code>checkpoints</code> 与 <code>wal</code> 判断恢复成功</span>
+  <p>新进程的 <code>checkpoints</code> 从 0 起，<code>wal</code> 逻辑长度通常是 0。
+  这两行在健康实例上也会是 0——它们不是完整性判据，只比数据面四行（+ 表与视图）。</p>
+</div>
+</section>
+
+<!-- ============================ 8 性能参考 ============================ -->
+<section id="s8">
+<h2><span class="num">08</span>性能参考</h2>
+
+<div class="verdict">
+  <b>一句话</b>
+  <p>连接轴上是<strong>每连接 0.31–0.56 KiB</strong> 与 <strong>1.0000 fd</strong>；写路径上是<strong>一次 fsync 摊 59–62 条写</strong>；
+  对 PG 的 24 格三臂对照<strong>全胜</strong>（QPS 1.45×–76.8×，p50 24 格全优，p99 23 胜 1 负）。</p>
+</div>
+
+<div class="box note">
+  <span class="t">测量环境（同一台机、同一块盘）</span>
+  <p>Xeon Gold 6338 / 128 核 / 755 GiB；数据盘 <code>/dev/sdb1</code> 161 TB XFS（<code>ROTA=1</code>，
+  裸 fsync 3.8–4.6 ms）；对照库 PostgreSQL 12.22，<code>fsync=on</code> +
+  <code>synchronous_commit=on</code>。所有倍率都是<strong>同机同盘</strong>对照，不要跨机器外推。</p>
+</div>
+
+<h3 id="s8-conn">连接轴：万级常驻</h3>
+<div class="tw">
+<table>
+<thead><tr><th>连接数</th><th>RSS 增量</th><th>每连接 RSS</th><th>fd/conn</th><th>延迟</th><th>出处</th></tr></thead>
+<tbody>
+<tr><td class="num-cell">10 000</td><td class="num-cell">+6 MiB</td><td class="num-cell">0.56 KiB</td><td class="num-cell">—</td><td>—</td><td>DESIGN §7.8（该格原始日志未入库）</td></tr>
+<tr><td class="num-cell">25 000</td><td class="num-cell">+8 MiB</td><td class="num-cell">0.31 KiB</td><td class="num-cell">1.0000</td><td class="num-cell">ping p50 23 µs / p99 65 µs</td><td><code>benches/results/scale_connections.log</code>（v0.3.5 复跑）</td></tr>
+<tr><td class="num-cell">50 000</td><td colspan="4">失败：8 线程各第 6 250 条报 <code>EADDRNOTAVAIL (os error 99)</code>——<strong>客户端源端口耗尽</strong>（<code>ip_local_port_range</code> 仅 28 232 个），不是引擎</td><td>同上</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="box warn">
+  <span class="t">两轮读数不可互减</span>
+  <p>10 000 与 25 000 是<strong>不同轮次</strong>的独立测量，不是同一条曲线上的两个点。
+  服务端没有连接数上限常量，唯一旋钮是 <code>--backlog</code>（默认 4096，受 <code>somaxconn</code> 截断）；
+  上限来自<strong>客户端可用源端口</strong>与 <code>RLIMIT_NOFILE</code>。</p>
+</div>
+
+<h3 id="s8-commit">组提交：一次 fsync 摊多少写</h3>
+<div class="tw">
+<table>
+<thead><tr><th>盘 / 文件系统</th><th>档位</th><th>writes</th><th>syncs</th><th>writes/sync</th></tr></thead>
+<tbody>
+<tr><td>机械盘</td><td><code>group</code></td><td class="num-cell">32 313</td><td class="num-cell">549</td><td class="num-cell"><strong>58.86</strong></td></tr>
+<tr><td>机械盘</td><td><code>always</code></td><td class="num-cell">6 199</td><td class="num-cell">6 199</td><td class="num-cell">1.00</td></tr>
+<tr><td>ext4</td><td><code>group</code></td><td class="num-cell">211 794</td><td class="num-cell">3 445</td><td class="num-cell"><strong>61.48</strong></td></tr>
+<tr><td>ext4</td><td><code>always</code></td><td class="num-cell">42 604</td><td class="num-cell">42 604</td><td class="num-cell">1.00</td></tr>
+</tbody>
+</table>
+</div>
+<p>原始输出 <code>benches/results/sync_ratio.log</code>；复现：<code>bash benches/sync_ratio.sh 3</code>。
+A/B 单变量对照（只换服务端二进制）：<code>group</code> 10 913 QPS vs 旧 <code>always</code> 1 469（<strong>7.4×</strong>），p50 优 17×、p99 优 5×。</p>
+
+<h3 id="s8-vs">对 PG 各 op 倍率速览</h3>
+<div class="tw">
+<table>
+<thead><tr><th>形状</th><th>lookup</th><th>readdir</th><th>create</th><th>write</th></tr></thead>
+<tbody>
+<tr><td>单连接 · 一问一答（<code>conns=1, pipeline=1</code>）</td><td class="num-cell">9.5–10.1×</td><td class="num-cell">11.4–11.9×</td><td class="num-cell">3.2–3.3×</td><td class="num-cell">2.9–7.8×</td></tr>
+<tr><td>单连接 · 批量（<code>conns=1, pipeline=32</code>）</td><td class="num-cell">77–80×</td><td class="num-cell">34–35×</td><td class="num-cell">5.0–5.6×</td><td class="num-cell">5.8–7.2×</td></tr>
+<tr><td>24 格三臂（1/8/64 连接 × pipeline 1/32）</td><td colspan="4">QPS <strong>1.45×–76.8×</strong>，24 格全胜；p50 <strong>24 格全优</strong>；p99 23 胜 1 负（唯一负格 <code>create</code> 64/32：5 078 vs 3 025 µs）</td></tr>
+<tr><td>零旗标默认档（五跑中位）</td><td class="num-cell">4.5×</td><td class="num-cell">5.0×</td><td colspan="2">ping 1.9×（单跑 1.8× / lookup 4.0× / readdir 2.9×）</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="tw">
+<table>
+<thead><tr><th>对 SQLite3 的对照（只作形状判据，不作速度判据）</th><th>结果</th></tr></thead>
+<tbody>
+<tr><td>单连接 <code>lookup</code></td><td class="no">输 5.6×（进程内零往返的账）</td></tr>
+<tr><td>单连接 <code>readdir</code></td><td class="no">输 1.24×</td></tr>
+<tr><td>单连接 <code>create</code> / <code>write</code></td><td class="yes">赢 33× / 34.6×（SQLite <code>synchronous=FULL</code> 每条写一次 fsync 且无组提交）</td></tr>
+<tr><td>64 连接档</td><td class="part">SQLite 到并发上限：<code>create</code> 24–732 ops/s、p99 到 8.8 s；这格不能当引擎速度对照</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="box warn">
+  <span class="t">四条已作废的旧读数（引用旧数字前先看这里）</span>
+  <p><strong>①</strong> 旧 <code>pg pipeline=32</code> 数字虚高 32×——分母没按批摊。<br>
+  <strong>②</strong> PG 曾以 <code>-F</code> 启动（关掉 fsync），那些倍率无效。<br>
+  <strong>③</strong> 旧脚本把 treedb 分母取在 join 前（4.8–6.2 s vs PG 3.0–3.05 s），虚低 1.6–2×——
+  所以「PG 反胜 3–8×」的结论作废。<br>
+  <strong>④</strong> <code>workers=1</code> 输 PG 0.26–0.48× 作废——那轮 PG 摊到 46–52 核，treedb 只给了一个线程。</p>
+</div>
+
+<div class="box note">
+  <span class="t">PG 那一列自身抖动 ±40%</span>
+  <p>24 格三臂表里 PG 用的是 <code>ANALYZE</code> 之后的复跑值（<code>readdir</code> 六格复跑后 +52%~+147%，
+  其余 ≤15%，例外 <code>write</code> 64/32 为 −39%）。含义是：<strong>任何小于 ±40% 的「倍率变化」都不必当结论。</strong></p>
+</div>
+
+<h3 id="s8-tune">推荐配置建议</h3>
+<div class="tw">
+<table>
+<thead><tr><th>旋钮</th><th>建议</th><th>依据</th></tr></thead>
+<tbody>
+<tr><td><code>--workers</code></td><td>读多：<code>0</code>（auto = <code>min(8, 核/2)</code>）；写多：<code>1</code></td><td>并行只偷得到读，写永远由唯一提交线程定序；每多一个 worker 多 3 个 fd。<code>w=1</code> 时 64 连接读只有 PG 的 0.55–0.60×，所以纯读高并发别收成 1</td></tr>
+<tr><td><code>--durability</code></td><td>默认 <code>group</code></td><td><code>always</code> 的 QPS 只有 1/7.4；只有「不能丢任何已 ack 写」且能接受这个代价时才换。换介质时差距可达 8×</td></tr>
+<tr><td><code>--auto-checkpoint-mb</code></td><td>默认 <code>64</code>；大批量导入时调 <code>256+</code></td><td>WAL 逻辑长度触发；调大减少快照频率，但重启重放时间变长</td></tr>
+<tr><td><code>--backlog</code></td><td>默认 <code>4096</code></td><td>受 <code>net.core.somaxconn</code> 截断；建连风暴前先抬内核值</td></tr>
+<tr><td><code>--sync-ms</code></td><td>默认 <code>20</code></td><td>只影响空闲唤醒频率，不影响持久化</td></tr>
+<tr><td>客户端侧</td><td>先看 <code>ip_local_port_range</code></td><td>50 000 连接失败在 <code>EADDRNOTAVAIL</code>，不是服务端拒绝</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="code">
+  <div class="cap"><span>复现三组关键数字</span><span>输出进 benches/results/</span></div>
+<pre>bash benches/sync_ratio.sh 3            <span class="c"># 一次 fsync 摊多少写</span>
+bash benches/single_conn.sh 3           <span class="c"># 单连接对标 PG（PIPE=32 / 并发档）</span>
+bash benches/throughput_matrix.sh 3 1 2 3 4 5   <span class="c"># 五轴复现</span>
+<span class="c"># 连接轴：10k 全量（RSS / fd / ping），50k 用 TREEDB_CONNS=50000</span>
+cargo test <span class="f">--release</span> <span class="f">--test</span> scale_connections <span class="f">--</span> <span class="f">--ignored</span> <span class="f">--nocapture</span>
+bash benches/backup_probe.sh 2          <span class="c"># 备份三形状对拍</span>
+</pre>
+</div>
+</section>
+
+<!-- ============================ 9 已知限制与 FAQ ============================ -->
+<section id="s9">
+<h2><span class="num">09</span>已知限制与 FAQ</h2>
+
+<div class="verdict">
+  <b>一句话</b>
+  <p>它把「元数据点查 + 目录遍历 + 海量长连接」这一件事做深，其余一概不做：
+  没有 SQL、没有用户体系、没有加密传输、没有同步复制、没有自动故障转移。选型时先确认你不需要这些。</p>
+</div>
+
+<h3 id="s9-not">不做的事</h3>
+<div class="tw">
+<table>
+<thead><tr><th>类别</th><th>明确不提供</th><th>后果 / 替代</th></tr></thead>
+<tbody>
+<tr><td>查询语言</td><td>SQL、JOIN、排序、范围/前缀谓词、聚合、NULL/类型、外键/CHECK</td><td>只有 9 条表 op：主键读、索引列等值列举、键游标分页、计数</td></tr>
+<tr><td>事务</td><td>多语句事务、跨视图原子</td><td>单 op 原子；跨视图一致性由调用方负责</td></tr>
+<tr><td>用户体系</td><td>账号、角色、scope / ACL、租户、配额</td><td>只有集群共享密钥（默认关）；握手通过后 52 个 op 全部可用</td></tr>
+<tr><td>传输安全</td><td>TLS、加密握手</td><td>明文 TCP；需要就套 stunnel / WireGuard / 内网</td></tr>
+<tr><td>复制</td><td>同步复制、复制槽、级联副本、传输加密</td><td>只有异步 pull 副本；跟不上就重装快照</td></tr>
+<tr><td>高可用</td><td>自动故障转移、被降级者自知</td><td><code>--promote</code> 是人工离线动作；租约/心跳与自动切换<strong>不在近期计划</strong></td></tr>
+<tr><td>备份</td><td>冷拷、离线 dump/load、热副本、在线切面、WAL 归档、按 seq 的 PITR</td><td>六形状见 06 章；增量与加密不做，要日切可以夜间 <code>treedb-backup</code> 一份</td></tr>
+<tr><td>文件语义</td><td><code>open/read/write</code>、fd 表、<code>O_TRUNC</code>、POSIX 记录锁区间仲裁</td><td>只存元数据与引用账本；内容与 fd 语义在客户端侧</td></tr>
+<tr><td>扩展属性</td><td>xattr、ACL、quota</td><td>无</td></tr>
+<tr><td>规模声明</td><td>状态全内存；最大规模未做实测</td><td>节点数上限取决于内存，部署前按「每节点字节数 × 规模」估算并留余量</td></tr>
+</tbody>
+</table>
+</div>
+
+<h3 id="s9-sem">跨连接可见性先于持久性</h3>
+<div class="box warn">
+  <span class="t">这条语义容易误读</span>
+  <p><code>workers &gt; 1</code> 时，一条连接 ack 之后，<strong>其他连接立刻能看到</strong>这条写；
+  但「可见」不等于「已 fsync 到盘」。也就是说：一个客户端可能读到另一个客户端<strong>尚未落盘</strong>的写。
+  进程崩溃不会让已 ack 的写消失（会重放），但断电在 <code>never</code> 档可能丢尾部。</p>
+</div>
+<p>同连接内的顺序是严格的：一条批次里只要有写，整批交给提交线程；该连接上还有未回话的转发 op 时，
+后续批次也一律转发——否则客户端会看到「我前一次写还没确认，后一次读已经看不到它」。</p>
+
+<h3 id="s9-grovefs">哪些能力由 grovefs 适配层维护</h3>
+<div class="tw">
+<table>
+<thead><tr><th>能力</th><th>引擎侧</th><th>适配层侧（grovefs）</th></tr></thead>
+<tbody>
+<tr><td>POSIX 记录锁 / flock 区间仲裁</td><td>只有整 inode 锁 + 租约（<code>LockSet</code>/<code>LockQuery</code>）</td><td><code>lock_op</code> 无条件 <code>EPERM</code> 桩、<code>get_lock</code> 回 <code>None</code>——「给错语义比给不了更糟」</td></tr>
+<tr><td><code>O_TRUNC</code> / fd 语义</td><td>不提供 fd 表</td><td>FUSE 层用 <code>FUSE_ATOMIC_O_TRUNC</code> + open 内 truncate 实现</td></tr>
+<tr><td>连接管理</td><td>只认 TCP 连接</td><td>连接池：<strong>每进程 4 条</strong>（<code>GROVEFS_TREEDB_CONNS</code>），10 000 视图实测引擎侧 socket 恒 4</td></tr>
+<tr><td>密钥 / 权限</td><td>只做接入认证，一把钥匙开整扇门</td><td><code>api_keys</code> 表带 <code>scope / view / ro / owner</code>，权限在适配层判</td></tr>
+<tr><td>视图导出</td><td>只有整目录二进制 dump</td><td><code>view export/import</code> 输出 JSONL，只含视图节点树与 <code>data_ref</code>，不含引擎通用表</td></tr>
+<tr><td>文件内容</td><td>只存 <code>data_ref</code> + 字节数账本</td><td>内容落在底层存储（<code>blocks/</code>），引用计数由引擎账本守</td></tr>
+</tbody>
+</table>
+</div>
+
+<h3 id="s9-faq">FAQ</h3>
+
+<h4>Q1. 能直接当 SQL 数据库用吗？</h4>
+<p><strong>不能，也不打算。</strong>没有 SQL 解析器、没有 JOIN、没有排序与范围扫描。
+需要这些就继续用 PG，treedb 只接元数据那一路。</p>
+
+<h4>Q2. 能多主同时写吗？</h4>
+<p><strong>不能。</strong>单主假设：同一目录由 <code>.lock</code> 独占；副本对真写返回 <code>EROFS</code>。
+<code>SO_REUSEPORT</code> 允许第二个进程绑同一端口，但同一个目录它打不开——单实例靠部署约束。</p>
+
+<h4>Q3. 主挂了能自动切到副本吗？</h4>
+<p><strong>不能。</strong>切主是四步人工动作（停旧主 → 停副本 → <code>--promote</code> → 起服）。
+租约/心跳与自动故障转移明确<b>不在近期计划里</b>（§11）。</p>
+
+<h4>Q4. 能存文件内容吗？</h4>
+<p><strong>只存引用，不存字节。</strong><code>RefUp</code>/<code>RefDown</code>/<code>RefLookup</code> 记的是
+「哪个 <code>data_ref</code> 被几个持有者引用、共多少字节」，用于 GC 判据；内容本体在外部存储。</p>
+
+<h4>Q5. 视图之间有权限隔离吗？</h4>
+<p><strong>没有。</strong>视图是命名空间隔离（dentry 键带 view id），不是访问控制。
+任何通过握手的客户端可以操作任意视图。权限判断在 grovefs 的 <code>api_keys</code> 层。</p>
+
+<h4>Q6. 传输加密吗？</h4>
+<p><strong>不加密。</strong>握手用的是 HMAC 挑战应答，防的是「没有密钥的连接」，不是防窃听。
+跨公网请套隧道。</p>
+
+<h4>Q7. 单机能扛多少连接？</h4>
+<p>实测 25 000 常驻全绿（<code>fd/conn = 1.0000</code>、0.31 KiB/conn）。50 000 的失败是
+<strong>客户端源端口耗尽</strong>（<code>EADDRNOTAVAIL</code>），服务端没有连接数上限常量。
+真要更高，先扩 <code>ip_local_port_range</code> / 加客户端 IP。</p>
+
+<h4>Q8. 升级会丢数据吗？</h4>
+<p><code>treedb-migrate --apply</code> 只重写 <code>state.snap</code>，不动 WAL，并自动落下
+<code>state.snap.v2.bak</code>。无损回滚窗口维持到新二进制做过第一次 checkpoint 之前——
+之后同步 checkpoint 会 <code>wal.reset()</code>，把上一代日志物理抹掉。</p>
+
+<h4>Q9. 能把数据恢复到昨天吗？</h4>
+<p><strong>热副本不行</strong>（它只有当前一份，误删会跟着复制）。要日切有两条路：
+每夜停副本 → <code>treedb-dump</code> 一份 → 重新起副本（或不停服的 <code>treedb-backup --primary</code>）；或者定期停服冷备份。
+要「恢复到昨天 14:03」这种<em>中间点</em>粒度，就得让服务端从第一天带 <code>--archive-dir</code>，之后 <code>treedb-pitr --to-seq N</code>（N 取 <code>--stats</code> 打出的 <code>seq</code> 行）——v0.6.0 起有，见 §6.11。</p>
+
+<h4>Q10. 通用表有性能数据吗？</h4>
+<p><strong>未实测。</strong><code>benches/</code> 下没有 <code>RowPut</code>/<code>RowList</code> 的基准，
+<code>treedb-micro</code> 也只测 lookup / readdir / create / unlink。
+通用表目前只有复杂度声明：<code>RowGet</code> O(1)、<code>RowCount</code> 主键 O(1) / 索引列 O(命中数)、
+<code>RowList</code> 前缀范围扫描 <code>O(limit + log n)</code>。引用时请标注「复杂度推算，未实测」。</p>
+</section>
+
+<footer>
+  <div class="row">
+    <span>文档对应版本：<code>v0.4.0+</code>（当前 HEAD <code>v0.7.0</code>，<code>PROTOCOL_VERSION 7</code>）</span>
+    <span>生成日期：2026-11-21，备份与 PITR 一节按 v0.7.0 实态复核于 2026-11-24</span>
+  </div>
+  <div class="row" style="margin-top:8px">
+    <span>数字出处：<code>DESIGN.md</code> §4.4 / §5 / §6.6–6.9 / §7.3–7.13 / §8 / §11，
+    原始日志 <code>benches/results/</code>（<code>scale_connections.log</code>、<code>sync_ratio.log</code>、
+    <code>three_way.tsv</code>、<code>final.tsv</code>、<code>backup_probe.log</code>、<code>many_views.log</code>）</span>
+  </div>
+  <div class="row" style="margin-top:8px">
+    <span>口径约定：参数名与 <code>DESIGN.md</code> 及 <code>--help</code> 一致；无实测支撑处显式标注「未实测」；
+    文档与原始日志冲突时以日志为准。</span>
+  </div>
+</footer>
+
+</main>
+</body>
+</html>
