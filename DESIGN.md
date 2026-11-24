@@ -328,6 +328,7 @@ test 现在分两档报：默认档（纯引擎）`cargo test --release` = **223
 | `src/bin/{server,bench,pgbench,sqlitebench,micro,migrate,standby,demo,dump,load,backup,pitr}.rs` | 4197 | 可执行入口；`pgbench` 是 PG 对照器，`migrate` 是快照升级 工具（§6.5），`standby` 是只读副本兼 `--promote`（§6.6），`dump`/`load` 是离线逻辑导出与重建（§6.9），`backup` 是在线一致快照导出（§6.10），`pitr` 是按 seq 恢复到新目录（§6.11）；三个面向网络的入口共用 `--auth-key-file` |
 | `benches/throughput_matrix.sh` | 188 | 五轴吞吐矩阵（§7 的数据来源） |
 | `benches/rehearse_migrate.sh` | 159 | 快照升级的真机彩排：旧 tag → 当前树，逐格核四条承诺与回滚窗口（§6.5 的外部效度） |
+| `benches/xgen_probe.sh` | 129 | 跨代混跑探针（§4.4 末）：`git archive` 取真 tag 编旧服务端，四臂分别量认证 / 非认证两条路径的混代形状，第四臂是 characterization |
 | `benches/single_conn.sh` | 99 | 单连接与并发档对标（§7.11）：treedb 默认档 vs 私有 PG 集群，`$PIPE` 选一问一答还是批量、`$CONNS`/`$WORKERS` 选形状，逐格附带引擎自计的 fsync 计数 |
 | `benches/backup_probe.sh` | 133 | 备份/还原三形状实测（§6.7）：冷拷贝、写入进行中的热拷贝、副本目录当还原点，逐档拿 `--stats` 的数据面四行对拍 |
 | `benches/handshake_cost.sh` | 126 | 接入握手的代价（§4.4 末表）：同一轮里 off/on 两臂交替跑 N 条建连，取 bench 自报的 `connected` 时间 + 那一刻的服务端 RSS + 稳态 `ping`/`create`，并校验两臂实际连上的条数一致 |
@@ -565,6 +566,32 @@ epoll 定时唤醒的零头（门限 0.2 s）。
 `a_keyed_client_refuses_to_downgrade_against_an_open_server`）。同理 `Challenge.proto`
 与本端不一致也报错：MAC 里本就有版本会算不中，但「版本不符」比「MAC 不对」是
 准确得多的诊断。
+
+**但版本闸门只长在认证路径上**（2026-11-23 用两代真二进制探的，起因是 grovefs 那次
+pin 跟版）。混代是什么形状，本仓的单测永远看不到 —— 一个二进制里两侧必然同代。所以
+拿 tag `v0.5.1` 与 `v0.7.0` 各自编出的 `treedb-server`，用新客户端的 `--stats`（它走
+`Client::connect_auth`）打旧服务端，四臂：
+
+| 臂 | 期望 | 实测 |
+|----|------|------|
+| 服务端启动行 | 自证代际 | 旧 `protocol=6`、新 `protocol=7`（新版的这一行还多了 `max_conn=` 与 `archive=` 两段） |
+| 跨代 + 两边开认证 | 必须拒 | rc=1：`stats: denied: peer speaks protocol 6, this client 7` |
+| 同代对照（新对新，开认证） | 必须通 | rc=0、`protocol = 7` —— 这条是为了证明上一行不是坏 key 或错端口造成的假红 |
+| 跨代 + **两边都不开认证** | 会怎样？ | **rc=0，不报错，但读回来的是垃圾**：`protocol = 0`、`ops = 0`、`wal = 0 B logical, 0 B on disk`（那个旧实例的 WAL 其实是 4 MiB 预分配），末尾还凭空多一行 `replica = yes (… lag 6597069766656 …)` |
+
+两条结论都不在代码里、只在运维口径上：① 升代必须服务端与接入方**成对**升，
+`treedb-migrate` 只管目录不管线；② 想让混代在第一次往返就炸出来，现成的开关只有
+**开认证** —— `key = None` 时一个字节都不发，是上面「关掉认证等于这笔改动不存在」
+那个刻意的取舍，代价就是版本这个信息在非认证路径上根本没处交换。要给它补一个不依赖
+认证的版本交换是 layout 变更，按 §4.1 得把 `PROTOCOL_VERSION` 抬到 8，本轮**未做**
+（也别拿 `EngineStats.proto_version` 当那个判据 —— 它本来就是结构体里的一个字段，而
+C2 臂证明它在错代解码下正好读回 `0`：拿一个被错读的字段去判断是否被错读，不是闸门。
+能用的形状只有把版本放在**结构体之外**的帧首，而那本身就是又一次代际抬升）。
+
+这四臂都可复现：`benches/xgen_probe.sh [基线 tag=v0.5.1]` 用 `git archive` 取真 tag
+编旧二进制，四臂连同判定追加到 `benches/results/xgen_probe.log`（本轮实跑 4 臂全 OK、
+rc=0）。第四臂刻意写成 characterization —— 它钉的是「非认证路径**没有**闸门」这个现状：
+将来谁把版本交换补进非认证路径，这条会红，那时要改的是本节措辞，不是删用例。
 
 **多 worker 下多一条次序规矩**（它是 §4.3 那条保序的直接推论）：一批帧里只要
 夹着握手 op，就不能「握手就地答 + 数据转路由」—— 两条出口的回话次序对不上
@@ -3819,7 +3846,7 @@ spike 明确**没**做、也不在接入面上假装做的事 —— 一律返�
 | 定义/密钥/账户 | 行表全部在引擎（M3，无开关），定义仍在本地 SQLite | 密钥、审计、账户、授权**已在通用表上**（M1 2026-11-20，§11 第 13/14 条），M3 删掉了开关：treedb 档读写都走引擎，没跑过搬家命令的部署**拒绝启动**并点名 `control-migrate`（§11 第 15/16 条）。视图**定义**仍在本地（引擎没有定义表）；`Key*`/`Audit*` 那套专用 op 已在 `v0.6.0`（M4）整段删除，接入面从 M1 起就只走通用表（上文第 4 步）。迁法与切写步骤见下面阶段 C 4 |
 | ~~`view list` 的物理树~~ **已闭合**（2026-11-20，M1b） | `TreedbControlStore::list_physical` 回答「本地 ∪ 引擎的 `Op::ListViews`」 | 控制面枚举器只看本地 db 文件时，引擎里的基树在 `view list`/`store.info` 里都不存在（委派也因此无法解析）。修了 `list_physical`/`has_physical` 两处双答案，枚举与存在性判据同时看见引擎 |
 | HA / 快照传送 | 手工可做（不是自动化） | 接入面用不上它：§8 限制 6 现在是「有异步只读副本、无同步复制」。v0.4.0 起有了 `treedb-standby --promote` + fencing token（§6.6「切主」），但它是**人手动的一步离线动作**：不开服务、不自动选主、旧主靠人停。grovefs 要的「主挂了自动切副本」仍然没有 |
-| ~~path 依赖的分发方式~~ | 已定：按 tag 的 git 依赖 | grovefs 侧已跟着钉到 `v0.5.1`（2026-11-21；`v0.3.7` 曾是无同级克隆也能构建的实测点）；两仓同版。`v0.4.0` 与 `v0.5.0` 都不会逼它升级：前者的线协议变更只在 `WalBatch`/`SnapChunk` 两个副本专用 reply 的尾部，后者是纯追加的新 op tag（旧服务端回 `unknown op tag`），grovefs 走的普通 CRUD 与 `Stats` 字节一个未动。升 pin 的动机到 `v0.5.0` 只有一条：把 `link_node` 接上真硬链接（上一行）；`v0.5.1` 再加一条行为动机：自动档 checkpoint 不再停轮（§8 第 7 条），对「事件循环是唯一 ack 路径」的接入方比性能数字更值钱。两档都实测过（阶段 C 1） |
+| ~~path 依赖的分发方式~~ | 已定：按 tag 的 git 依赖 | grovefs 侧已跟着钉到 `v0.7.0`（`v0.5.1` 是 2026-11-21、`v0.7.0` 是 2026-11-23，后者见 §11 第 18 条末；`v0.3.7` 曾是无同级克隆也能构建的实测点）；两仓同版。`v0.4.0` 与 `v0.5.0` 都不会逼它升级：前者的线协议变更只在 `WalBatch`/`SnapChunk` 两个副本专用 reply 的尾部，后者是纯追加的新 op tag（旧服务端回 `unknown op tag`），grovefs 走的普通 CRUD 与 `Stats` 字节一个未动。升 pin 的动机到 `v0.5.0` 只有一条：把 `link_node` 接上真硬链接（上一行）；`v0.5.1` 再加一条行为动机：自动档 checkpoint 不再停轮（§8 第 7 条），对「事件循环是唯一 ack 路径」的接入方比性能数字更值钱。三档都实测过（阶段 C 1、§11 第 18 条） |
 
 ### 阶段 C（回归与灰度）
 1. ~~`posix`/`e2e` 那种全量断言矩阵还没在 treedb 上跑过~~ **已跑**（2026-11-20，
@@ -4656,3 +4683,16 @@ spike 明确**没**做、也不在接入面上假装做的事 —— 一律返�
     `background_snapshot_costs_a_dispatch_not_a_pause` 原来拿单次采样当基线，机器被
     压满时 `thread::spawn` 自己就能花掉几十毫秒而报假红 —— 改成三次取最小值
     （§9.1 第 5 条），它与本轮改动无关，但混在同一轮里必须分开定性。
+
+    接入侧跟版（2026-11-23，grovefs `feat/treedb-hardlink`）：pin `v0.5.1` → `v0.7.0`，
+    只动 `Cargo.toml` / `Cargo.lock` 两行（lock 里 treedb 从 `0.5.0@e85e87b` 变
+    `0.7.0@315e18e`，依赖仍是 `libc` + `thiserror`），适配层零源码改动 —— 这是「M4 删帧
+    不影响这个接入方」的第二次实测。取证形状是**同一个 worktree、同一份源码、只换 dep**
+    的两臂对跑，不然很易把工具不配算成回归：`cargo check --release --features treedb
+    --all-targets` 0 error / 0 warning；`cargo test --release --features treedb` 两臂**同为
+    321 passed / 0 failed / 4 ignored**（§10 阶段 C 1 那行记的 318/0/4 是另一棵树上
+    的测量；同 pin 在本 worktree 实跑就是 321）；端到端板（真挂载文件系统 + 真引擎，53 条断言）两臂**同为 53 pass /
+    0 fail**。板子的世代必须对得上：master 世代的 `.build-bin` 在这条分支上跑不起来（它
+    的 `gfs_mgr` 要 `grovefs manager serve`，而这条分支的二进制没有 manager 子命令），
+    旧 pin 臂同样红在同一条断言 —— 那是工具与分支不配，不是回归；换到 master 跟版时要重
+    新看过。混代那一块见 §4.4 末的四臂表（不开认证时静默错读，不报错）。

@@ -1,0 +1,10 @@
+===== 2026-11-24 00:14:14 基线 v0.5.1 → v0.7.0 =====
+banner  new protocol=7  old protocol=6
+  OK: 两代服务端的 protocol= 不同（混代在字节层确实存在）
+cross+auth   rc=1 :: stats: denied: peer speaks protocol 6, this client 7
+  OK: 认证路径把混代拦下并点名版本
+same+auth    rc=0 :: protocol = 7
+  OK: 同代带密钥正常（说明 2) 的红不是坏 key 造成的）
+cross+noauth rc=0 :: protocol = 0
+  OK: 非认证路径没有闸门（错代照样 rc=0，且 proto 字段读成 0）
+
