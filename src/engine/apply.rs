@@ -871,6 +871,26 @@ pub fn translate(s: &State, now: i64, op: &Op) -> (Vec<Log>, Reply) {
                     view: *view,
                     ino,
                 });
+                // inode 消失后 LockSet 的释放入口也会返回 ENOENT；若把锁行留在
+                // 表里，永久锁就再也无法由客户端释放。最后一个名字删除时按
+                // (view, ino) 前缀级联清锁，过期租约与永久锁一视同仁。多链接
+                // 文件只摘一个名字时 inode 还在，不能提前清掉其余名字共用的锁。
+                let lock_keys: Vec<(u32, u64, Vec<u8>)> = s
+                    .locks
+                    .range((
+                        Bound::Included((*view, ino, Vec::new())),
+                        Bound::Unbounded,
+                    ))
+                    .take_while(move |k| k.0 .0 == *view && k.0 .1 == ino)
+                    .map(|(k, _)| k.clone())
+                    .collect();
+                for (lock_view, lock_ino, owner) in lock_keys {
+                    logs.push(Log::DelLock {
+                        view: lock_view,
+                        ino: lock_ino,
+                        owner,
+                    });
+                }
             } else {
                 let mut n = node.clone();
                 n.nlink -= 1;

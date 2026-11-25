@@ -1,0 +1,27 @@
+== POSIX 删除风暴联合量具 2026-11-25 07:02:01 ==
+HEAD=e013701c9c33261258643e54cf85b05cfd79d306 rows=100000 conns=8 pipeline=64 workers=8 auto_modes=0 1 sample_ms=5
+code_sha256=1446c80ddf757aa08170a63ee5c9a635744242ce509aadfe6b9e839b053bf48a
+临时现场=/data/grovefs/treedb/.spot/posix-delete-storm-rWDKDA
+
+-- auto0: POSIX Unlink/Rmdir rows=100000 conns=8 pipeline=64 workers=8 auto_checkpoint_mb=0
+   posixseed rows=100000 ops=300000 records=900000 writes=300000 baseline_nodes=1 nodes=200001 dentries=200000 refs=100000 errors=0
+   bulk mode=posixdelete rows=100000 conns=8 pipeline=64 sample_ms=5 time_ms=5823 ops=200000/200000 freed_refs=100000 records=600000 writes=200000 syncs=403 lat_p50_us=181 lat_p90_us=509 lat_p99_us=802 lat_max_us=1372 lat_samples=200000 wal_bytes=33000000 wal_start_bytes=0 wal_end_bytes=33000000 wal_peak_bytes=33000000 wal_disk_start_bytes=4194304 wal_disk_end_bytes=33554432 wal_disk_peak_bytes=33554432 checkpoints_start=0 checkpoints_end=0 checkpoints=0 snap_seq_start=900002 snap_seq_end=900002 snap_bytes_start=28800197 snap_bytes_end=28800197 nodes_left=1 dentries_left=0 locks_left=0 refs_left=0 samples=178 verify_refs=100000 errors=0 ops_per_s=34346
+   shutdown rounds=452 worst_round_us=87804
+   posixverify rows=100000 entries=0 checked_refs=100000 errors=0
+   PASS auto0: ops=200000 records=600000 writes=200000 freed_refs=100000 verify_refs=100000
+   checkpoint=0→0 snap_seq=900002→900002 wal=33000000→33000000 snap_bytes=28800197/197
+   lat_us p50/p90/p99/max=181/509/802/1372 samples=200000 worst_round_us=87804
+   RSS KiB before/after/reopen=104656/105524/4008 retained_delta=868 peak=105524 HWM=131436 samples=196
+
+-- auto1: POSIX Unlink/Rmdir rows=100000 conns=8 pipeline=64 workers=8 auto_checkpoint_mb=1
+   posixseed rows=100000 ops=300000 records=900000 writes=300000 baseline_nodes=1 nodes=200001 dentries=200000 refs=100000 errors=0
+   bulk mode=posixdelete rows=100000 conns=8 pipeline=64 sample_ms=5 time_ms=5433 ops=200000/200000 freed_refs=100000 records=600000 writes=200000 syncs=392 lat_p50_us=142 lat_p90_us=455 lat_p99_us=808 lat_max_us=1235 lat_samples=200000 wal_bytes=1332736 wal_start_bytes=0 wal_end_bytes=1332736 wal_peak_bytes=4984320 wal_disk_start_bytes=4194304 wal_disk_end_bytes=4194304 wal_disk_peak_bytes=8388608 checkpoints_start=0 checkpoints_end=20 checkpoints=20 snap_seq_start=900002 snap_seq_end=1475810 snap_bytes_start=28800197 snap_bytes_end=1160069 nodes_left=1 dentries_left=0 locks_left=0 refs_left=0 samples=181 verify_refs=100000 errors=0 ops_per_s=36812
+   shutdown rounds=415 worst_round_us=103292
+   posixverify rows=100000 entries=0 checked_refs=100000 errors=0
+   PASS auto1: ops=200000 records=600000 writes=200000 freed_refs=100000 verify_refs=100000
+   checkpoint=0→21 snap_seq=900002→1495778 wal=4984320→234496 snap_bytes=201605/197
+   lat_us p50/p90/p99/max=142/455/808/1235 samples=200000 worst_round_us=103292
+   RSS KiB before/after/reopen=104708/165144/3812 retained_delta=60436 peak=264688 HWM=266272 samples=167
+
+== PASS：POSIX 固定工作量、账本收敛、p50/p99、worst_round_us、自动 checkpoint 开关与重开核对全部通过 ==
+逐格结果=benches/results/posix_delete_storm.tsv

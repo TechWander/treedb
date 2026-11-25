@@ -151,19 +151,30 @@ reply tag（回 `Count` / `Ok`）、`EngineStats` 一个字段也不长，所以
 op / reply 计数 44 / 23 → 45 / 24，包版本定版 `v0.8.0`。跨代真二进制探针同时覆盖
 认证与不认证两条路径，旧服务端都在 `0x0092` 上被拒。
 
+`v0.8.0` 之后补的是**删除风暴**一轮（§7.18）：量具上给了两套对账脚本 —— 通用表的
+`benches/delete_storm.sh`（`rowdelete` 10 万行 + `churn` 4 轮 80 万 op，自动 checkpoint、
+RSS/HWM、SIGKILL 尾巴恢复）与 POSIX 的 `benches/posix_delete_storm.sh`（20 万
+`Unlink`/`Rmdir`、自动档开关两跑、重开逐 ref 核对）。语义上修了一处真 bug：
+`Unlink`/`Rmdir` 删掉 inode 的**最后一个名字**时，原先不清 `locks` 表，而 `LockSet`
+的释放入口是先查 inode 的 —— inode 没了，永久锁（`lease_expiry == 0`）就再也无法被
+客户端释放，也永远不会被过期 sweep 扫掉。现在这条分支按 `(view, ino)` 前缀级联产生
+`Log::DelLock`（`DropView`/`PurgeView` 本来就有级联，这里是补齐），而多链接文件只摘
+一个名字时 inode 还在、锁必须保留。**这一轮既不动线协议也不动盘上格式**：没加
+op / reply / `Log` 变体，`PROTOCOL_VERSION` 仍 8、`SNAP_VERSION` 仍 4，旧数据目录零迁移。
+
 **发布标记与 crate 版本**：历史上两者逐版对齐（`v0.4.0` 的 `Cargo.toml` 就是 `0.4.0`）；
 `v0.5.1` 是唯一例外 —— 那一笔只改行为、漏了 `version` 字段的同步，而 tag 已先推。
 按「不改写已推引用」的纪律保留现状：Cargo 解析 git 依赖只看 tag/rev 与 lock 里的
 hash，不看这个字段，所以不影响任何构建；`v0.6.0` 是下一次带 API 变更的发版，
 `Cargo.toml` 的 `version` 随它回到 `0.6.0`，两者重新对齐，此后逐版跟齐（`v0.8.0` = `0.8.0`）。
 
-test 现在分两档报：默认档（纯引擎）`cargo test --release` = **230 passed / 0 failed / 3 ignored**（71 lib +
+test 现在分两档报（2026-11-25 在本轮交付的树上实跑，含 §7.18 那批改动）：默认档（纯引擎）`cargo test --release` = **237 passed / 0 failed / 3 ignored**（71 lib +
 36 engine_crud + 14 migrate + 21 replication + 12 net_protocol + 11 pitr + 8 read_scaling
-+ 7 crash_recovery + 6 batch + 12 table_bulk + 8 auth + 5 observe + 5 table_alter
-+ 4 dump_restore +
++ 7 crash_recovery + 7 delete_storm + 6 batch + 12 table_bulk + 8 auth + 5 observe
++ 5 table_alter + 4 dump_restore +
 3 backup_online + 3 independence + 1 large_reply + 1 checkpoint_tail + 1 scale_connections
 + 1 scale_restore；另 3 条带 `#[ignore]` —— 万级连接、百万节点、64 MiB 快照收尾 ——
-只手动跑，不计入 passed）；`--features postgres-compat` = **261 passed / 0 failed / 9 ignored**，多出的 31 条 = 过渡档自己的 30 条单测 +
+只手动跑，不计入 passed）；`--features postgres-compat` = **268 passed / 0 failed / 9 ignored**，多出的 31 条 = 过渡档自己的 30 条单测 +
 `concurrency.rs` 里那条
 不需要 PG 的拨号用例（剩下 6 条要真 PG，默认 `#[ignore]`，不计入 passed）。即 PG 只出现在
 `postgres-compat` 后面的 `src/pool`、`src/store`、
@@ -340,7 +351,9 @@ test 现在分两档报：默认档（纯引擎）`cargo test --release` = **230
 | `benches/handshake_cost.sh` | 126 | 接入握手的代价（§4.4 末表）：同一轮里 off/on 两臂交替跑 N 条建连，取 bench 自报的 `connected` 时间 + 那一刻的服务端 RSS + 稳态 `ping`/`create`，并校验两臂实际连上的条数一致 |
 | `benches/three_way.sh` | 170 | 三臂同口径对照（§7.13）：treedb / PG 12 / SQLite3，24 格；头部七条口径与「不按 pipeline 乘」的计数判据都写在脚本里 |
 | `benches/three_way_table.py` | 118 | 由两份原始采集重算 §7.13 引用的 `final.tsv`；`--check` 对账、`--selftest` 自带三处注入错（上一版表是手搓 one-liner，把 p50/p99 拼成了一列） |
-| `benches/doc_table_check.py` | 95 | 把 §7.13 的 markdown 表与 `final.tsv` 逐格对账（24×14），`--selftest` 验证它真的会红 |
+| `benches/doc_table_check.py` | 394 | 把 §7.13 的 markdown 表与 `final.tsv` 逐格对账（24×14），再把 §7.18 的七张表（3 张通用表 + 4 张 POSIX）与 `delete_storm.tsv` / `posix_delete_storm.tsv` 逐格对账，并校固定工作量、WAL/快照水位、账本收敛、RSS 样本、`worst_round_us` 等不变量；`--selftest` 用 10 处注入错验证它真的会红 |
+| `benches/delete_storm.sh` | 352 | 通用表删除风暴（§7.18）：`rowdelete` N 行与 `churn` 2N×cycles 两档，自动 checkpoint、`VmRSS`/`VmHWM` 采样、停服 `rounds/worst`、SIGKILL 后拿「快照 + 2 条尾巴」重开逐行核对；任一断言失败即非零退出 |
+| `benches/posix_delete_storm.sh` | 380 | POSIX 删除风暴（§7.18）：`posixseed` → `posixdelete`（2N op / 6N records / 2N writes）→ `posixverify`（逐 ref 归零），自动档 `0/1` 两跑各核 checkpoint/水位/WAL 形状，并校四本账（nodes/dentries/locks/refs）收敛到基线 |
 | `benches/promote_smoke.sh` | 258 | 切主的活体验证（§6.6「切主」）：真主 → 真副本 → 在线拒写与被锁拒提升 → 停旧主/停副本 → 离线提升 → 新主可写 → 旧主回魂被高令牌副本拒收且副本继续答读；动态分配四个端口、独立日志落盘、任一断言失败即非零退出 |
 | `benches/replica_rate.sh` | 359 | 副本传送的三格实测（§6.6 边界 4）：冷启动端到端与传输段（两种 `--fetch-bytes`）、追赶积压、追平时的读侧 p99；每个阶段用独立 standby 进程，好把「最坏一轮」归属到相位 |
 | `benches/replica_rate_xhost.sh` | 459 | 同上的**跨机**版（§6.6 边界 5）：副本放在第二台机上，量冷启动/追赶的真实链路速率与「副本在追时主 p50/p90/p99 + 吞吐」的 A/B；A/B 从同一份种子目录派生、写入量逐字节相同，并先量链路与 fsync 上限做参照 |
@@ -2515,8 +2528,12 @@ TREEDB_CONNS=25000 cargo test --release --test scale_connections -- --ignored --
 | 根盘 ext4 | `group` | 68 758（877 / 1 441） | 211 794 | 3 445 | **61.5** |
 | 根盘 ext4 | `always` | 13 600（4 567 / 6 704） | 42 604 | 42 604 | **1.00** |
 
-同一轮独立复跑给的是 61.87 / 1.00（机械盘）与 62.55 / 1.00（根盘），即这个比值本身
-很稳。（表中两行 `always` 量的是**改前**实现，第 3 条已把它换掉；`group` 那两行仍有效。）
+同一份日志里还有更早的两轮：机械盘 `group` 61.87 / 61.71，根盘 `group` 62.55 / 61.48
+（`always` 每轮都是 1.00）。所以这个比值的**实测范围是 58.9–62.6**（机械盘 58.9–61.9、
+根盘 61.5–62.6），引用时不要再把它写成单一「≈ 55」—— 55 那个数是 §7.11 另一格
+（`conns=64`、`pipeline=1`、`dur=group`、私有 PG 集群同机对比那一组）的范围 53–58，
+两批采集不是同一次。（表中两行 `always` 量的是**改前**实现，第 3 条已把它换掉；
+`group` 那两行仍有效。）
 三条结论：
 
 1. **`group` 档一轮把 ≈ 60 次 fsync 合成了 1 次**（conns=64 几乎全部排上了同一个
@@ -2548,6 +2565,11 @@ TREEDB_CONNS=25000 cargo test --release --test scale_connections -- --ignored --
    | `always` | 改后 | **10 913**（5.77×） | **1 953**（15.2× 优） | **31 078**（2.62× 优） | 54.8 |
    | `group` | v0.3.1 | 10 580 | 1 875 | 28 876 | 55.6 |
    | `group` | 改后 | 12 232 | 1 882 | 24 485 | 57.7 |
+
+   表里取的是三次中位，逐次读数也在日志里：改后 `always` 的写/fsync 是
+   **54.79 / 53.91 / 57.74（范围 53.9–57.7）**，改后 `group` 是 57.71 / 57.74 / 58.04，
+   旧版 `group` 是 56.76 / 55.59 / 55.08 —— 即这一格的合批比在 54–58 带里抖，
+   与上面 `sync_ratio.sh` 那批（58.9–62.6）**不是同一次采集**，引用时要分清。
 
    三点判读：① `always` 现在与 `group` 同一量级（0.89×，已是同一实现，残余差在
    噪声里）；② `group` 没被改坏（p50 一致，吞吐/p99 在噪声内）；③ 本次 old 臂
@@ -3237,6 +3259,113 @@ solo/8 用 **8.39** 核，而吞吐没变；split/8 共 43.46 核、**每实例 
 **不要外推**：负载是 `rowinsert` 纯写、单表、键带 nonce，所以这一档量的是写轴上限；
 混合读写、多表热点分布不均的形状要靠 §7.15 那一套另测。
 
+### 7.18 删除风暴：通用表与 POSIX 的收敛、自动 checkpoint 和 RSS（2026-11-25）
+
+§7.16 量的是「哪一种批量删法省日志」，这一节换一个问题：**删完以后，状态、WAL、
+快照、锁与进程驻留内存是否真的收口**。两套语料不能混成一条曲线：通用表走
+`RowDelete`/put-delete churn，POSIX 走真实 `Unlink`/`Rmdir`、唯一内容引用与目录项。
+
+**采集口径**：本机 `127.0.0.1`，`workers=8`、`durability=group`；通用表
+`rows=100000 cycles=4 conns=8 pipeline=64`，POSIX `rows=100000 conns=8 pipeline=64`。
+通用表原始输出是 `benches/results/delete_storm.log` / `delete_storm.tsv`，代码指纹
+`80538c44416a5ef7ef12542c7b7069672dcc9f1d057184df3b508a822afbd969`；POSIX 原始输出是
+`posix_delete_storm.log` / `posix_delete_storm.tsv`，代码指纹
+`1446c80ddf757aa08170a63ee5c9a635744242ce509aadfe6b9e839b053bf48a`。两份日志都记录
+采集时的 `HEAD=e013701c9c33261258643e54cf85b05cfd79d306` 与本节尚未提交的工作树指纹。
+每个数字都能由对应 TSV 重算；`benches/doc_table_check.py` 同时检查七张表与下列不变量。
+
+**通用表：工作量与落盘。** `rowdelete` 删正好 N 行；`churn` 做 N×cycles 次删后重插，
+所以 op 数是 `2×N×cycles`。两相的 records/writes 都等于各自 op 数。`checkpoints_auto`
+是测量结束后再读一次 `--stats` 得到的累计值（`rowdelete` 的 bench 自报 4 → 8，第 9 次
+在收尾等待里出现；`churn` 收尾仍读到 42，即没有新增），不是显式补做的那一次。
+
+| phase | rows | cycles | ops | time_ms | records | writes | syncs | checkpoints_start | checkpoints_auto | wal_start | wal_peak | wal_end | wal_after_auto | snap_seq_start | snap_seq_auto | snap_bytes_auto | errors |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| rowdelete | 100 000 | 4 | 100 000 | 1 470 | 100 000 | 100 000 | 219 | 4 | 9 | 1 605 314 | 1 605 314 | 1 158 848 | 103 360 | 72 501 | 197 281 | 101 760 | 0 |
+| churn | 100 000 | 4 | 800 000 | 14 427 | 800 000 | 800 000 | 1 743 | 5 | 42 | 554 564 | 1 680 508 | 678 132 | 678 132 | 90 501 | 888 769 | 3 484 230 | 0 |
+
+**通用表：崩溃尾巴与终态。** 自动快照收口后只写两条终态不变的尾巴记录，然后直接
+SIGKILL；重开时 WAL 逻辑长度必须与崩溃前相同，才能证明恢复路径真的吃了「快照 +
+尾巴」。`rowdelete` 重开是空表，`churn` 重开保留 N 行并逐行核对内容。
+
+| phase | tail_records | wal_before_crash | wal_reopen | rows_reopen | verify_checked |
+|---|---:|---:|---:|---:|---:|
+| rowdelete | 2 | 103 472 | 103 472 | 0 | 0 |
+| churn | 2 | 678 244 | 678 244 | 100 000 | 100 000 |
+
+**通用表：服务端 RSS。** 采样对象是真 `treedb-server` PID 的 `/proc/<pid>/status`，不是
+bench 客户端。`retained_delta_kb = rss_after_kb − rss_before_kb`；采样在 SIGKILL 前停止，
+所以不包含崩溃与重开成本。retained RSS 是分配器/进程仍持有的驻留页，**不是**泄漏证明，
+也不是 allocator 级碎片指标。
+
+| phase | rss_before_kb | rss_after_kb | rss_reopen_kb | retained_delta_kb | rss_peak_kb | hwm_after_kb | hwm_peak_kb | rss_samples |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| rowdelete | 2 476 | 55 248 | 5 280 | 52 772 | 113 640 | 113 836 | 113 836 | 111 |
+| churn | 2 636 | 84 824 | 56 912 | 82 188 | 135 392 | 135 436 | 135 436 | 508 |
+
+**POSIX 的固定工作量形状。** seed 与 delete 分两次服务端生命周期：先造 N 个文件、N 个
+空目录与 N 个唯一 `data_ref`，优雅停服 checkpoint 后再起 delete 服务。这样删除起点 WAL=0，
+停服 Report 的 `worst_round_us` 也不会混入造 2N 个 inode 的成本。每个文件只有唯一名字，
+因此 N 个 `Unlink` 都必须回非空 `NodeRef`，N 个 `Rmdir` 回空 `NodeRef`。无锁语料下：
+
+- `Unlink` = `DelDentry + DelNode + DelRef`，3 条记录；
+- `Rmdir` = `DelDentry + DelNode + PutNode(parent)`，3 条记录；
+- 合计固定 `2N` op、`6N` records、`2N` writes。
+
+延迟沿用仓库现有 bench 口径：一个 pipeline 的往返微秒数除以实际回包数，再按 op 重复求
+nearest-rank 分位。它是 **pipeline 摊还 RTT**，不是 `pipeline=1` 的单请求延迟；两档各
+`lat_samples=200000`，与 `2N` 逐项相等。
+
+| auto_mb | rows | ops | time_ms | records | writes | syncs | lat_p50_us | lat_p90_us | lat_p99_us | lat_max_us | lat_samples | freed_refs | verify_refs | errors |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 0 | 100 000 | 200 000 | 5 823 | 600 000 | 200 000 | 403 | 181 | 509 | 802 | 1 372 | 200 000 | 100 000 | 100 000 | 0 |
+| 1 | 100 000 | 200 000 | 5 433 | 600 000 | 200 000 | 392 | 142 | 455 | 808 | 1 235 | 200 000 | 100 000 | 100 000 | 0 |
+
+**POSIX：自动 checkpoint 与账本。** 开启档在删除过程中先产生 20 次 checkpoint，等待
+收口时读到第 21 次；快照水位从 900002 前进到 1495778，WAL 从采样峰值 4 984 320 B 降到
+234 496 B。关闭档观察 500ms，checkpoint、快照水位与 WAL 均不动。关闭档的
+`snap_bytes_auto=28800197` 是 seed 停服时显式 checkpoint 留下的**旧快照**，不能当作自动
+checkpoint 证据；两档停服后的空终态快照都是 197 B。账本基线是 root view 自身的一个
+node，故 `nodes=1`、其余三项为 0。
+
+| auto_mb | checkpoints_start | checkpoints_auto | wal_start | wal_peak | wal_end | wal_after_auto | snap_seq_start | snap_seq_auto | snap_bytes_auto | snap_bytes_shutdown | nodes_left | dentries_left | locks_left | refs_left | errors |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 0 | 0 | 0 | 0 | 33 000 000 | 33 000 000 | 33 000 000 | 900 002 | 900 002 | 28 800 197 | 197 | 1 | 0 | 0 | 0 | 0 |
+| 1 | 0 | 21 | 0 | 4 984 320 | 1 332 736 | 234 496 | 900 002 | 1 495 778 | 201 605 | 197 | 1 | 0 | 0 | 0 | 0 |
+
+**POSIX：重开核对。** 10 万行联合脚本走的是优雅停服 → 同目录重开，不是崩溃恢复；重开后
+`ReadDir(root)` 必须空，且 N 个 `RefLookup` 全部返回 `(count=0, bytes=0)`。SIGKILL 下
+「自动快照 + 小尾巴」的 POSIX 恢复另有小规模真进程回归
+`posix_delete_and_small_tail_survives_sigkill_reopen`，不能把两者混称为同一轮 10 万行崩溃实测。
+
+| auto_mb | nodes_reopen | dentries_reopen | locks_reopen | refs_reopen | verify_checked_reopen | errors |
+|---:|---:|---:|---:|---:|---:|---:|
+| 0 | 1 | 0 | 0 | 0 | 100 000 | 0 |
+| 1 | 1 | 0 | 0 | 0 | 100 000 | 0 |
+
+**POSIX：服务端 RSS 与回合。** RSS 采样在优雅停服前停止，因此不含停服 checkpoint 的峰值。
+`worst_round_us` 不在 `EngineStats` 里，而从 delete 服务端唯一的停服汇总行读取；该生命周期
+包含删除、自动 checkpoint 等待、Stats 抓取与停服请求，但 seed 已在另一个进程生命周期完成。
+它是服务端最坏回合，不是客户端 p99。
+
+| auto_mb | rss_before_kb | rss_after_kb | rss_reopen_kb | retained_delta_kb | rss_peak_kb | hwm_after_kb | hwm_peak_kb | rss_samples | worst_round_us | rounds |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 0 | 104 656 | 105 524 | 4 008 | 868 | 105 524 | 131 436 | 131 436 | 196 | 87 804 | 452 |
+| 1 | 104 708 | 165 144 | 3 812 | 60 436 | 264 688 | 266 272 | 266 272 | 167 | 103 292 | 415 |
+
+**锁的修复与回归边界。** `LockSet` 的释放入口先检查 inode；inode 消失后，表里的永久锁
+无法再被客户端释放，而周期 sweep 只删过期租约。本轮在 `Unlink`/`Rmdir` 确认
+`last == true` 时按 `(view, ino)` 前缀级联写 `DelLock`；多链接文件摘掉一个名字时只减
+`nlink`，node/ref/lock 都保留。`last_posix_delete_cascades_locks_and_returns_ledger_to_baseline`
+关掉周期 sweep，分别钉住永久锁与已过期锁：中间态全保留，最后一个名字删除后文件锁消失，
+空目录删除后目录锁也消失。`DropView`/`PurgeView` 原本已有级联；`Rename` 覆盖目标与
+`Symlink` upsert 的同类路径本轮**未审计、未修改**。10 万行 POSIX 性能语料本身不带锁，不能用
+`locks_left=0` 替代锁语义回归。
+
+**这轮还不能回答的**：allocator 级碎片、跨机械盘/SSD 的绝对延迟、10 万行 POSIX 的
+SIGKILL 恢复、`Rename`/`Symlink` 覆盖路径的锁收敛，以及混合读写下万级视图的并发曲线，
+均为**未实测**。后两项分别进入后续 POSIX 审计与 P3 量具，不在本节冒充已闭合。
+
 ---
 
 ## 8. 已知限制（诚实边界）
@@ -3412,9 +3541,13 @@ solo/8 用 **8.39** 核，而吞吐没变；split/8 共 43.46 核、**每实例 
     （每条一次 fsync）是 **185.7 ms** —— 分批把 3 072 次 fsync 合并成 3 次，约 **66×**。
     常态成本（表里 10 万条**不过期**的锁）：每轮看 1 024 条 **0.198–0.274 ms**，`seq` 与
     `wal_bytes` 都不动 = 确实没写。
-    剩余边界三条：① 游标只在内存，进程重启后从表头再扫一圈（只读，代价即上一句的 0.2 ms/轮）；
+    剩余边界四条：① 游标只在内存，进程重启后从表头再扫一圈（只读，代价即上一句的 0.2 ms/轮）；
     ② `Stats.locks` 仍报**行数**，但语义从「只增不减」变成「一个 `--lock-sweep-ms` 周期内
-    收敛到有效租约数」——要看实时有效数只能等这一拍；③ 只有主扫，副本等日志。
+    收敛到有效租约数」——要看实时有效数只能等这一拍；③ 只有主扫，副本等日志；
+    ④ inode 的最后一个名字删除必须级联清锁，否则永久锁在 inode 消失后再也无法由客户端
+    释放。`Unlink`/`Rmdir` 的 `last` 分支已补 `DelLock`，多链接中间态不提前清锁，回归见
+    `tests/delete_storm.rs::last_posix_delete_cascades_locks_and_returns_ledger_to_baseline`；
+    `Rename` 覆盖目标与 `Symlink` upsert 的同类路径本轮未审计。
 18. **同值消除让「`seq` 有没有动」不再等价于「有没有写」**（§5.1，`v0.7.0` 新添的对外
     可见代价）。`RowPut` 写进去的值与现存行逐字节相同时不产生日志：不 append、
     不 fsync、`seq` 不走，而应答仍然是 `Reply::Ok` —— 客户端从应答里看不出区别。
@@ -3445,8 +3578,8 @@ solo/8 用 **8.39** 核，而吞吐没变；split/8 共 43.46 核、**每实例 
 ## 9. 测试清单
 
 ```sh
-cargo test --release                            # 默认档（纯引擎），233 条（230 passed + 0 failed + 3 ignored）
-cargo test --release --features postgres-compat # 加上过渡档，270 条（261 passed + 0 failed + 9 ignored）
+cargo test --release                            # 默认档（纯引擎），240 条（237 passed + 0 failed + 3 ignored）
+cargo test --release --features postgres-compat # 加上过渡档，277 条（268 passed + 0 failed + 9 ignored）
 cargo test --release --lib                      # 只看引擎单测
 cargo test --release --test migrate              # 快照升级：11 条走 API + 3 条真进程跑 CLI（§6.5）
 cargo test --release --test scale_connections -- --ignored   # 万级连接重压（§7.6）；并发数由 TREEDB_CONNS 控制，本机到 25 000 为限（再高是客户端源端口不够）
@@ -3461,6 +3594,8 @@ bash benches/observe.sh                         # 接入面两个旋钮：上限
 bash benches/bench_rows.sh                      # 通用表七条路径 × 落盘/单线程三形状（§7.15）
 bash benches/bench_bulk.sh                      # 批量形状固定工作量档：逐行/区间/清空/顶替 + 同值消除（§7.16）
 bash benches/shard_write.sh                     # 多实例写扩展：solo vs split × 实例数，附服务端核数（§7.17）
+bash benches/delete_storm.sh                    # 通用表删除/churn：自动 checkpoint、RSS、SIGKILL 尾巴（§7.18）
+bash benches/posix_delete_storm.sh              # POSIX Unlink/Rmdir：固定 2N op、自动 checkpoint 开关、重开核对（§7.18）
 bash benches/promote_smoke.sh                   # 切主真进程链：停旧主 → 提升 → 新主可写 → 旧主被高令牌副本拒收（§6.6）
 bash benches/sync_ratio.sh 3                    # 一次 fsync 摊了几次写（§7.9）
 bash benches/ab_durability.sh <基线 rev>        # 写轴 A/B：持久化档的吞吐与尾延迟（§7.9 第 3 条）
@@ -3478,10 +3613,11 @@ gcc -O2 -pthread -o /tmp/lb_floor benches/lb_floor.c && /tmp/lb_floor 1 64 3   #
 输出的每一格都已被本文引用过 —— 引用了就要能复算。`rehearse_migrate.sh` 是其里
 唯一不量性能、只核正确性的那条，但它必须拿两个真二进制跑，所以也不进回归板。
 
-§7.13 那两条对账脚本是例外：它们是秒级纯文本比对、不碰机器，可以随时跑 ——
+§7.13 与 §7.18 的对账脚本是例外：它们是秒级纯文本比对、不碰机器，可以随时跑 ——
 `python3 benches/three_way_table.py --check`（`final.tsv` vs 两份原始采集）与
-`python3 benches/doc_table_check.py --selftest`（文档表 vs `final.tsv`，并自带
-三处注入错）。两者都靠「从原始采集重算」而不是「人眼比对」来定对错。
+`python3 benches/doc_table_check.py --selftest`（§7.13 的 `final.tsv` 加 §7.18 的
+`delete_storm.tsv` / `posix_delete_storm.tsv`，并自带 10 处注入错）。它们都靠「从原始采集
+重算」而不是「人眼比对」来定对错。
 
 两档都跑完才是全量：`--features postgres-compat` 多出的 31 条 = 过渡档自己的 30 条
 单测 + `concurrency.rs` 里那条不需要 PG 的拨号用例。
@@ -3500,14 +3636,16 @@ gcc -O2 -pthread -o /tmp/lb_floor benches/lb_floor.c && /tmp/lb_floor 1 64 3   #
 | `tests/table_bulk.rs` | **12** | §5.1「批量形状」与「同值消除」的十二面：`TableClear` 拆行拆索引但留形状与 id（清完仍在 `TableList` 里）、**一次清空只推一个 seq**（`apply_seq` 差恰为 1）+ 砍掉尾字节的撕裂重放必须回到清空前（切点留在帧头里、只砍 payload 尾巴，因为这条只有 5 字节）、`RowRangeDelete` 跟 `RowRange` 同一条列规则（`ROW_PK` / 已索引列 / 未索引列 `EINVAL`）、**区间记录的宽度与命中数无关**（一条 `DelRange` < 40 B，一千条 `DelRow` 是它 500 倍以上，在编码层比字节）、三条新 `Log` 幂等（逐条手动 `apply` 两次与一次等价、整个 WAL 重放一遍仍是同一份 `State`）、`TableRename` 保留 id 且被顶替表级联拆干净（逐张数 `tables`/`rows`/`row_index`）、改名四个边界（空名/超长/`NOREPLACE`/`from == to`）、同值 `RowPut` 零日志零 fsync（三条闸门 `PUT_IF_ABSENT`/`PUT_IF_EXISTS`/CAS 仍在消除之前生效）、被消除的写跨重启不留痕迹、含批量 op 的 `Batch` 仍是一条记录且失败整批不落、四种形状都过得了 `Checkpoint` 与 `dump → restore` |
 | `tests/table_alter.rs` | **5** | §5.1「追加列」的五面：旧行全被拉宽到新宽度且新增的 `COL_INDEX` 列索引里每行都有一项（索引计数 `row_index.len()` 把唯一列隐含的索引也算进去）、五类拒绝（不存在/重名/已满 64 列/空名/`COL_UNIQUE`）逐条核 errno 且 `apply_seq` 不动（零日志）、**只占一条 WAL 记录**（从 payload 中间截断重开后仍是旧宽度、旧列一个不少）、`Checkpoint` 与 `dump → restore` 之后新列/旧数据/索引都在且接着能写、同一条 `Log::AddColumn` 手动 `apply` 两次与一次等价 |
 | `tests/auth.rs` | **8** | §4.4 在线协议上的版本/认证形状：未协商版本的连接一个数据 op 也拿不到（`workers=1/8` 各跑）、错版本被拒且可改回同代、客户端拒绝伪造错版本应答、错密钥被拒但不锁死 + 旧 MAC 重放不上 + 换对密钥能过、带密钥客户端拒绝降级、未配密钥服务端返回 `authed: false`、握手与数据 op 挤同批时应答保序 |
-| `tests/replication.rs` | **20** | §6.6 的十三件事（二十条例，端到端那一件两档各一条；主是真进程，副本是测试里的 `Engine` + `Follower`，只有最后三件起真 `treedb-standby`）：主写逐条收敛（ino/属性/readdir 与主对齐）、**主被 `kill -9` 后副本仍答读且不退出**（`replica_errors` 抬、`connected` 落 true→false）、**gap 触发分块重装快照**（4 KiB 块下 ≥ 2 块，且副本落盘的 `state.snap` 与主的逐字节相同）、**副本拒写在引擎层**（六个形状不同的写真 op 全 `EROFS` 且零 logs、零水位推进，而 `ListViews`/`Stats`/`Checkpoint` 放行）、**lag 中途为正、追平归零**（2 KiB/轮喂不饱一批）、**副本重启靠自己的日志接上**（`resyncs == 0`，快照+尾巴那条恢复路径）、端到端两档事件循环同一份断言（`workers=1`/`2`：线上 `EROFS`、`Stats` 新字段过线、追平后读到主的新写）、启动参数三道门（缺 `--primary` / 自己拉自己 / `--fetch-bytes 0` 均退出码 2）、**开了认证的主只有握得上手的副本追得动**（对密钥逐条收敛、错密钥不收敛）；v0.4.0 新增四条 fencing：令牌只升不降/落盘/坏文件不当 0、副本侧四档闸门（含“权力优先于新旧”与它的反面）、**真链路上提权后拒旧主的批**（状态不回滚、仍在答读、`replica_errors` 抬）、`--promote` 离线动作（不开端口、两次 0→1→2、与 `--primary` 同时给退出码 2）；2026-11-22 新增 `the_fetch_block_ramps_while_catching_up_and_returns_to_cfg`（64 条/批播 8 192 个文件，`--fetch-bytes` 32 KiB 下块长峰值放大到 1 MiB、收敛后回落到 32 KiB）；同日把同一条规则铺到快照段：`the_snapshot_chunk_ramps_while_downloading_and_returns_to_cfg`（8 KiB 起、4 000 条批量播出 > 8 个块长的快照，下载途中块长涨过配置值且不超 4 MiB，轮数少于定长下的块数，装完落回 8 KiB）；同日再补三条快照换代：`a_snapshot_probe_reports_the_prefix_crc`（六个 offset 上 `prefix_crc == crc32(&raw[..n])`）、`a_snapshot_generation_change_keeps_the_downloaded_prefix`（改尾部节点的 `mode` 再 checkpoint：`snap_reused > 0`、`snap_restarts == 0`、两份快照逐字节相同）、`a_snapshot_generation_change_with_a_different_prefix_restarts`（新建文件：`snap_restarts == 1`，仍然收敛） |
+| `tests/replication.rs` | **21** | §6.6 的十三件事（二十一条例，端到端那一件两档各一条；主是真进程，副本是测试里的 `Engine` + `Follower`，只有最后几件起真 `treedb-standby`）：主写逐条收敛（ino/属性/readdir 与主对齐）、**主被 `kill -9` 后副本仍答读且不退出**（`replica_errors` 抬、`connected` 落 true→false）、**gap 触发分块重装快照**（4 KiB 块下 ≥ 2 块，且副本落盘的 `state.snap` 与主的逐字节相同）、**副本拒写在引擎层**（六个形状不同的写真 op 全 `EROFS` 且零 logs、零水位推进，而 `ListViews`/`Stats`/`Checkpoint` 放行）、**lag 中途为正、追平归零**（2 KiB/轮喂不饱一批）、**副本重启靠自己的日志接上**（`resyncs == 0`，快照+尾巴那条恢复路径）、端到端两档事件循环同一份断言（`workers=1`/`2`：线上 `EROFS`、`Stats` 新字段过线、追平后读到主的新写）、启动参数三道门（缺 `--primary` / 自己拉自己 / `--fetch-bytes 0` 均退出码 2）、**开了认证的主只有握得上手的副本追得动**（对密钥逐条收敛、错密钥不收敛）；v0.4.0 新增四条 fencing：令牌只升不降/落盘/坏文件不当 0、副本侧四档闸门（含“权力优先于新旧”与它的反面）、**真链路上提权后拒旧主的批**（状态不回滚、仍在答读、`replica_errors` 抬）、`--promote` 离线动作（不开端口、两次 0→1→2、与 `--primary` 同时给退出码 2）；2026-11-22 新增 `the_fetch_block_ramps_while_catching_up_and_returns_to_cfg`（64 条/批播 8 192 个文件，`--fetch-bytes` 32 KiB 下块长峰值放大到 1 MiB、收敛后回落到 32 KiB）；同日把同一条规则铺到快照段：`the_snapshot_chunk_ramps_while_downloading_and_returns_to_cfg`（8 KiB 起、4 000 条批量播出 > 8 个块长的快照，下载途中块长涨过配置值且不超 4 MiB，轮数少于定长下的块数，装完落回 8 KiB）；同日再补三条快照换代：`a_snapshot_probe_reports_the_prefix_crc`（六个 offset 上 `prefix_crc == crc32(&raw[..n])`）、`a_snapshot_generation_change_keeps_the_downloaded_prefix`（改尾部节点的 `mode` 再 checkpoint：`snap_reused > 0`、`snap_restarts == 0`、两份快照逐字节相同）、`a_snapshot_generation_change_with_a_different_prefix_restarts`（新建文件：`snap_restarts == 1`，仍然收敛）；2026-11-25（P1）补上 `a_real_standby_promotion_fences_a_resurrected_primary`：真主 + 真副本都起 `treedb-standby` 进程，离线提升后旧主回魂发的 `WalBatch` 被高令牌副本拒收、副本继续答读（把 `promote_smoke.sh` 那条人工链锁进回归，§6.6「切主」） |
 | `tests/concurrency.rs` | 0（+7，整文件 feature 门控） | T1 之后整个文件在 `postgres-compat` 后面：无 PG 时跑「拨号失败不漏 live」（1 条，要 feature），其余 6 条 `#[ignore]` 需真实 PG。**它测的是共享池，不是引擎并发**（§7.8）|
 | `tests/scale_connections.rs` | 1（+1 ignored） | 1 000 连接 fd/RSS 断言每次跑；万级（`TREEDB_CONNS`，含 25 000）手动 |
 | `tests/scale_restore.rs` | 1（+1 ignored） | §8 第 2 条的规模档：10 万节点 + 2 万条尾巴走完「插入 → 同步 checkpoint → 冷/热两次恢复 → 再写尾巴 → 恢复」，钉节点数、`wal_bytes == 0`、随机名字 lookup 命中；百万到千万档（1M/3M/10M）`#[ignore]`，手动跑，打印耗时/内存供 §8 第 2 条引用 |
 | `tests/checkpoint_tail.rs` | 1（+1 ignored） | §8 第 7 条②：后台快照收尾那一轮（`Wal::truncate_before`）的正确性与代价。默认档 4 MiB 触发 + 512 KiB 尾巴，钉「尾巴留下、日志变小、不 checkpoint 直接重开能重放出最后一次 setattr」；64 MiB 档 `#[ignore]`，尾巴 0/4/32 MiB 三档打印耗时并守 1500 ms 回归线（缓冲搬运被退回去就会红） |
 | `tests/independence.rs` | **3** | 独立性三把门：内核目录（`src/engine`、`src/net`）不出现客户端名字；`[dependencies]` 非 optional 项只能是 `libc` + `thiserror`；`postgres-compat` 不得进 `default`（§11 第 7 条） |
+| `tests/large_reply.rs` | **1** | `full_chunk_crosses_a_full_socket`：`workers = 4` 下连发四个满块请求（共 16 MiB 应答）而**发完才开始读**，必让 `write` 短写返回 `WouldBlock`，钉住「`EPOLLOUT` 那条尾巴必须把剩下字节续完」—— 旧形状里多 worker 的空 `ops` 分支直接 `continue`，跨机拉快照只能收到前 ~110 KiB 后超时 |
 | `tests/migrate.rs` | **14** | §6.5 那四条承诺加 v3 → v4 的拒迁闸门。11 条直接打 API：v3 样本迁移后 `State` 逐字段相等且 WAL 文件字节不变、尺寸恰好少 24 字节、重开后每个语义面都能读到（视图/名字/锁/引用/通用表）、尾巴 seq 照搬且发号接着走、幂等重跑不动当前目录、未知版本与「正文配不上版本位」都拒动且零改动、既有备份不被覆盖、迁完的目录能直接用通用表。3 条用 `env!("CARGO_BIN_EXE_treedb-migrate")` 起**真进程**钉退出码（10 / 1 / 0）与输出里的命令、备份路径、回滚步骤 |
 | `tests/observe.rs` | **5** | §7.14 的接入面契约，全部起**真进程**：`--max-conn` 在 `workers = 1` 与 `8` 两种形状下都只放行上限内、第三条起被拒且在册连接不受牵连、日志只打第 1 条、`drop` 后能重新进；prometheus 输出与 `Op::Stats` 逐项对上（稳定项精确相等、计数器只要求 ≥、`fsync_seconds_total ≈ sync_us_total/1e6`）且默认文本档 5 行格式不变；抓不上时只剩一行 `treedb_up 0` 且退出码 1；四种参数错全 exit 2 不产出字节；`--shutdown` 在两种 worker 形状下都得到 ack 且进程干净退出（§7.14 那条真 bug 的回归锁） |
+| `tests/delete_storm.rs` | **7** | §7.18 的删除风暴回归：通用表固定删除/churn 的 checkpoint、WAL 尾巴与重开内容；多连接 churn 的半轮屏障；POSIX 最后一个名字删除时级联清永久锁/过期锁且多链接中间态不提前清；关闭自动 checkpoint 后 WAL/水位不动、显式 checkpoint 才收口；POSIX SIGKILL 后自动快照 + 小尾巴恢复；`posixseed`/`posixdelete` 真进程固定 `2N` op、`6N` records、N 个非空 NodeRef 与账本基线 |
 
 本轮（接入面旋钮，2026-11-21）新加的回归锁（全部在 `tests/observe.rs`）：
 `max_conn_bounds_the_registry_in_both_worker_shapes`（上限 2 下前两条可用、第 3~5 条
@@ -4738,3 +4876,30 @@ spike 明确**没**做、也不在接入面上假装做的事 —— 一律返�
     的 `gfs_mgr` 要 `grovefs manager serve`，而这条分支的二进制没有 manager 子命令），
     旧 pin 臂同样红在同一条断言 —— 那是工具与分支不配，不是回归；换到 master 跟版时要重
     新看过。混代那一块见 §4.4 末的四臂表（不开认证时静默错读，不报错）。
+
+19. **删除风暴的两个量具与一处锁语义修补**（§7.18，2026-11-25，**已做完**）。
+    上一轮只回答了「哪一种批量删法省日志」（§7.16），没回答「删完之后状态是否真的
+    收口」。本轮一次补了三件：
+
+    ① **通用表删除量具** `benches/delete_storm.sh` —— `rowdelete`（N 行删尽）与
+       `churn`（2N×cycles 删后重插）两档，固定工作量、自动 checkpoint、`VmRSS`/`VmHWM`
+       采样、停服 `rounds/worst`，并在自动快照后写两条终态不变的尾巴、SIGKILL、
+       重开逐行核对内容（10 万行 **errors=0**）。
+    ② **POSIX 删除量具** `benches/posix_delete_storm.sh` —— 真 `Unlink`/`Rmdir` 20 万 op、
+       60 万条记录、10 万个内容引用释放；自动档开/关各跑一遍（开：checkpoint 0 → 21、
+       WAL 峰值 4.98 MB 回落 234 KB；关：checkpoint/水位/WAL 三样全不动），重开后再逐
+       ref 核对 10 万个全部归零，四本账收敛到基线 `(1,0,0,0)`。
+    ③ **一处真 bug**：`Unlink`/`Rmdir` 删到 inode 的最后一个名字时不清 `locks` 表，
+       而 `LockSet` 的释放入口先查 inode —— 永久锁因此在 inode 消失后再也无法被客户端
+       释放（过期 sweep 也不碰 `lease_expiry == 0`）。现在按 `(view, ino)` 前缀级联
+       `Log::DelLock`，**不动协议也不动盘上格式**（无新 op/reply/`Log` 变体，
+       `PROTOCOL_VERSION` 8 / `SNAP_VERSION` 4 不变，旧目录零迁移）。
+
+    七张引用表全部由 `benches/doc_table_check.py` 从两份 TSV 重算，它自带 10 处注入
+    自测（三处在 §7.13、三处在通用表、四处在 POSIX）—— 同一类「表看着像真但手撮拼
+    出来」的错（§7.13）不允许再犯一次。
+
+    **本轮没做的事（不是做到一半，是没开工）**：`Rename` 覆盖目标与 `Symlink` upsert
+    两条同类路径的锁收敛未审计；allocator 级碎片、跨机械盘/SSD 的绝对延迟、10 万行
+    POSIX 在 SIGKILL 下的恢复（只有小规模真进程回归）、以及混合读写下万级视图的并发
+    曲线，全部**未实测**。前两项留在 §7.18 末的边界里，第三项进 P3 量具。

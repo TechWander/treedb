@@ -12,11 +12,13 @@
 //! - `--op write`：`Setattr` 提交 data_ref，会动 refs 账本，是最重的写。
 //! - `--conns N`：只把连接数堆到 N（配合 `--hold`）观察服务端 RSS。
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use treedb::engine::core::EngineStats;
 use treedb::engine::model::{
-    errno, ColumnDef, Op, Reply, TableDef, COL_INDEX, COND_NONE, PUT_IF_ABSENT, ROW_PK,
+    errno, ColumnDef, Op, Reply, TableDef, COL_INDEX, COND_NONE, DEL_IF_EXISTS, PUT_IF_ABSENT,
+    ROW_PK,
 };
 use treedb::net::client::Client;
 
@@ -53,6 +55,10 @@ struct Args {
     rows: u64,
     /// `range` 模式每批删多少行（0 = 1000）。
     batch: u64,
+    /// `churn` 的删后重插轮数；每轮正好 2N 个 op。
+    cycles: u64,
+    /// 测量窗口内的 Stats 采样间隔；0 = 不采样（保留历史脚本的零 instrumentation）。
+    sample_ms: u64,
 }
 
 fn parse() -> Args {
@@ -73,6 +79,8 @@ fn parse() -> Args {
         bulk: String::new(),
         rows: 200_000,
         batch: 1000,
+        cycles: 3,
+        sample_ms: 0,
     };
     let mut i = 1;
     while i < a.len() {
@@ -94,6 +102,8 @@ fn parse() -> Args {
             "--bulk" => args.bulk = next(&mut i),
             "--rows" => args.rows = next(&mut i).parse().unwrap_or(200_000),
             "--batch" => args.batch = next(&mut i).parse().unwrap_or(1000),
+            "--cycles" => args.cycles = next(&mut i).parse().unwrap_or(3),
+            "--sample-ms" => args.sample_ms = next(&mut i).parse().unwrap_or(0),
             "--hold" => args.hold = true,
             "--auth-key-file" => {
                 let p = next(&mut i);
@@ -276,6 +286,198 @@ fn bulk_put(i: u64, changed: bool) -> Op {
     }
 }
 
+fn bulk_delete(i: u64) -> Op {
+    Op::RowDelete {
+        table: BULK_TABLE.to_vec(),
+        key: bulk_key(i),
+        flags: DEL_IF_EXISTS,
+        cond_col: COND_NONE,
+        cond_val: Vec::new(),
+    }
+}
+
+/// churn 第 `round` 轮重插的内容。轮号进 payload，保证每次都是真写而非同值消除。
+fn bulk_churn_put(i: u64, round: u64) -> Op {
+    let mut cols = bulk_cols(i);
+    cols[1] = format!("p{i}c{round}").into_bytes();
+    Op::RowPut {
+        table: BULK_TABLE.to_vec(),
+        key: bulk_key(i),
+        cols,
+        flags: 0,
+        cond_col: COND_NONE,
+        cond_val: Vec::new(),
+    }
+}
+
+/// 逐行核对 churn 的最后一轮内容；返回实际检查的行数。
+///
+/// 重启后只看 `rows == N` 不够：旧快照、半条尾巴或重插没落盘都可能留下相同的
+/// 行数。这里连主键、索引列和带轮号的 payload 一起对。
+fn verify_churn(c: &mut Client, n: u64, round: u64) -> Result<u64, String> {
+    if rows_of(c) != n {
+        return Err(format!("churn 表行数不是 {n}"));
+    }
+    let mut checked = 0u64;
+    let mut got = 0u64;
+    while got < n {
+        let end = (got + 500).min(n);
+        let batch: Vec<Op> = (got..end)
+            .map(|i| Op::RowGet {
+                table: BULK_TABLE.to_vec(),
+                key: bulk_key(i),
+            })
+            .collect();
+        let rs = c.pipeline(&batch).map_err(|e| format!("churn verify: {e}"))?;
+        for (i, r) in (got..end).zip(rs) {
+            match r {
+                Reply::Row(Some(row)) => {
+                    let mut want = bulk_cols(i);
+                    want[1] = format!("p{i}c{round}").into_bytes();
+                    if row.cols != want {
+                        return Err(format!("第 {i} 行内容不是第 {round} 轮"));
+                    }
+                }
+                other => return Err(format!("第 {i} 行读回 {other:?}")),
+            }
+            checked += 1;
+        }
+        got = end;
+    }
+    Ok(checked)
+}
+
+#[derive(Default)]
+struct BulkPeak {
+    samples: u64,
+    wal_bytes: u64,
+    wal_disk_bytes: u64,
+    snap_bytes: u64,
+}
+
+impl BulkPeak {
+    fn observe(&mut self, s: &EngineStats) {
+        self.samples += 1;
+        self.wal_bytes = self.wal_bytes.max(s.wal_bytes);
+        self.wal_disk_bytes = self.wal_disk_bytes.max(s.wal_disk_bytes);
+        self.snap_bytes = self.snap_bytes.max(s.snap_bytes);
+    }
+}
+
+/// 只在固定工作量的测量窗口内采样。连接与握手在计时前完成，采样线程不碰 WAL。
+struct BulkSampler {
+    stop: std::sync::Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<BulkPeak>>,
+}
+
+fn start_bulk_sampler(args: &Args) -> Option<BulkSampler> {
+    if args.sample_ms == 0 {
+        return None;
+    }
+    let mut c = Client::connect_auth(&args.addr, 3000, args.auth.as_deref())
+        .expect("bulk sampler conn");
+    let interval = Duration::from_millis(args.sample_ms);
+    let stop = std::sync::Arc::new(AtomicBool::new(false));
+    let flag = stop.clone();
+    let handle = std::thread::spawn(move || {
+        let mut peak = BulkPeak::default();
+        loop {
+            peak.observe(&stats_of(&mut c));
+            if flag.load(Ordering::Relaxed) {
+                break;
+            }
+            std::thread::sleep(interval);
+        }
+        peak
+    });
+    Some(BulkSampler { stop, handle: Some(handle) })
+}
+
+impl BulkSampler {
+    fn stop(&mut self) -> BulkPeak {
+        self.stop.store(true, Ordering::Relaxed);
+        self.handle.take().expect("sampler already stopped").join().expect("bulk sampler")
+    }
+}
+
+/// churn 的每个半轮是一道屏障：所有连接先把 N 行删完，才允许任何连接进入
+/// 同一轮的重插；重插全部完成后再开下一轮。轮内仍按连续区间并行。
+///
+/// 若把 `2N × cycles` 一次性切开，后一轮删除会与前一轮重插跨连接乱序，
+/// `DEL_IF_EXISTS` 就会真实地报 `ENOENT`，量到的也不再是删后重插。
+fn run_churn_phases(
+    args: &Args,
+    phases: &[Vec<Op>],
+    conns: usize,
+    pipe: usize,
+) -> (u64, u64, u64) {
+    let widest = phases.iter().map(Vec::len).max().unwrap_or(0);
+    let active = conns.min(widest.max(1));
+    let mut clients: Vec<Client> = (0..active)
+        .map(|_| {
+            Client::connect_auth(&args.addr, 3000, args.auth.as_deref()).expect("churn conn")
+        })
+        .collect();
+    let barrier = std::sync::Barrier::new(active);
+    std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(active);
+        for (k, c) in clients.iter_mut().enumerate() {
+            let barrier = &barrier;
+            handles.push(scope.spawn(move || {
+                let (mut done, mut reported, mut errs) = (0u64, 0u64, 0u64);
+                for ops in phases {
+                    barrier.wait();
+                    let per = (ops.len() + active - 1) / active;
+                    let mut i = (k * per).min(ops.len());
+                    let hi = (i + per).min(ops.len());
+                    while i < hi {
+                        let end = (i + pipe).min(hi);
+                        let batch: Vec<Op> = ops[i..end].to_vec();
+                        match c.pipeline(&batch) {
+                            Ok(rs) => {
+                                for r in rs {
+                                    match r {
+                                        Reply::Count(v) => {
+                                            done += 1;
+                                            reported += v;
+                                        }
+                                        Reply::Ok | Reply::Row(_) | Reply::Table(_) => done += 1,
+                                        Reply::Err { code, ref msg } => {
+                                            errs += 1;
+                                            eprintln!(
+                                                "churn reply err {code} {}",
+                                                String::from_utf8_lossy(msg)
+                                            );
+                                        }
+                                        other => {
+                                            errs += 1;
+                                            eprintln!("churn reply shape {other:?}");
+                                        }
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                errs += (end - i) as u64;
+                                eprintln!("churn pipeline: {e}");
+                            }
+                        }
+                        i = end;
+                    }
+                }
+                (done, reported, errs)
+            }));
+        }
+        let mut sum = (0u64, 0u64, 0u64);
+        for h in handles {
+            let (d, r, e) = h.join().expect("churn thread");
+            sum.0 += d;
+            sum.1 += r;
+            sum.2 += e;
+        }
+        sum
+    })
+}
+
 fn stats_of(c: &mut Client) -> EngineStats {
     match c.call(&Op::Stats).expect("stats") {
         Reply::Stats(s) => *s,
@@ -297,21 +499,502 @@ fn rows_of(c: &mut Client) -> u64 {
     }
 }
 
+/// 自动 checkpoint 之后写一条小尾巴：插入一个专用键再删掉它。
+///
+/// 终态与调用前逐字段相同，但 WAL 多两条记录；联合量具随后直接 SIGKILL，
+/// 用来证明「快照 + 已 ack 尾巴」确实走完了恢复，而不是靠优雅停服替它收口。
+fn run_tail(args: &Args) {
+    let mut c = Client::connect_auth(&args.addr, 3000, args.auth.as_deref())
+        .expect("tail control conn");
+    let rows_before = rows_of(&mut c);
+    let s0 = stats_of(&mut c);
+    let ops = vec![
+        Op::RowPut {
+            table: BULK_TABLE.to_vec(),
+            key: b"delete-storm-tail".to_vec(),
+            cols: vec![b"tail".to_vec(), b"tail".to_vec()],
+            flags: 0,
+            cond_col: COND_NONE,
+            cond_val: Vec::new(),
+        },
+        Op::RowDelete {
+            table: BULK_TABLE.to_vec(),
+            key: b"delete-storm-tail".to_vec(),
+            flags: DEL_IF_EXISTS,
+            cond_col: COND_NONE,
+            cond_val: Vec::new(),
+        },
+    ];
+    let rs = c.pipeline(&ops).expect("tail pipeline");
+    if rs.len() != 2 {
+        eprintln!("tail: 收到 {} 条应答，应为 2", rs.len());
+        std::process::exit(1);
+    }
+    for r in rs {
+        if let Reply::Err { code, ref msg } = r {
+            eprintln!("tail: errno {code}: {}", String::from_utf8_lossy(msg));
+            std::process::exit(1);
+        }
+    }
+    let s1 = stats_of(&mut c);
+    let rows_left = rows_of(&mut c);
+    let records = s1.seq - s0.seq;
+    let writes = s1.writes_total - s0.writes_total;
+    if records != 2 || writes != 2 || rows_left != rows_before {
+        eprintln!(
+            "tail: records={records} writes={writes} rows={rows_before}→{rows_left}，应为 2/2/不变"
+        );
+        std::process::exit(1);
+    }
+    println!(
+        "tail ops=2/2 records={records} writes={writes} wal_start_bytes={} wal_end_bytes={} rows_left={rows_left} errors=0",
+        s0.wal_bytes, s1.wal_bytes
+    );
+}
+
+const POSIX_VIEW: &[u8] = b"delete-storm-posix";
+
+fn posix_file(i: u64) -> Vec<u8> {
+    format!("f{i:08}").into_bytes()
+}
+
+fn posix_dir(i: u64) -> Vec<u8> {
+    format!("d{i:08}").into_bytes()
+}
+
+fn posix_ref(i: u64) -> Vec<u8> {
+    format!("ref{i:08}").into_bytes()
+}
+
+fn posix_create(view: u32, i: u64) -> Op {
+    Op::Create {
+        view,
+        parent: 1,
+        name: posix_file(i),
+        mode: 0o644,
+        uid: 1,
+        gid: 1,
+    }
+}
+
+fn posix_mkdir(view: u32, i: u64) -> Op {
+    Op::Mkdir {
+        view,
+        parent: 1,
+        name: posix_dir(i),
+        mode: 0o755,
+        uid: 1,
+        gid: 1,
+    }
+}
+
+fn posix_setref(view: u32, ino: u64, i: u64) -> Op {
+    Op::Setattr {
+        view,
+        ino,
+        valid: treedb::engine::model::SA_DATA_REF,
+        mode: 0,
+        uid: 0,
+        gid: 0,
+        size: 0,
+        atime: 0,
+        mtime: 0,
+        data_ref: posix_ref(i),
+        ref_bytes: 4096,
+    }
+}
+
+fn posix_unlink(view: u32, i: u64) -> Op {
+    Op::Unlink {
+        view,
+        parent: 1,
+        name: posix_file(i),
+    }
+}
+
+fn posix_rmdir(view: u32, i: u64) -> Op {
+    Op::Rmdir {
+        view,
+        parent: 1,
+        name: posix_dir(i),
+    }
+}
+
+fn posix_view(c: &mut Client) -> (u32, u64) {
+    match c.call(&Op::ListViews).expect("ListViews") {
+        Reply::Views(views) => {
+            let (_, id, root) = views
+                .into_iter()
+                .find(|(name, _, _)| name.as_slice() == POSIX_VIEW)
+                .unwrap_or_else(|| panic!("缺少视图 {}", String::from_utf8_lossy(POSIX_VIEW)));
+            assert_eq!(root, 1, "POSIX 删除档固定打视图根");
+            (id, root)
+        }
+        other => panic!("ListViews → {other:?}"),
+    }
+}
+
+fn verify_posix_refs(c: &mut Client, n: u64) -> Result<u64, String> {
+    let mut checked = 0u64;
+    for start in (0..n).step_by(500) {
+        let end = (start + 500).min(n);
+        let batch: Vec<Op> = (start..end)
+            .map(|i| Op::RefLookup { data_ref: posix_ref(i) })
+            .collect();
+        let rs = c.pipeline(&batch).map_err(|e| format!("RefLookup: {e}"))?;
+        if rs.len() != batch.len() {
+            return Err(format!("RefLookup 应答 {} 条，请求 {} 条", rs.len(), batch.len()));
+        }
+        for (i, r) in (start..end).zip(rs) {
+            match r {
+                Reply::Ref { count: 0, bytes: 0 } => checked += 1,
+                other => return Err(format!("ref {i} 未归零：{other:?}")),
+            }
+        }
+    }
+    Ok(checked)
+}
+
+/// 造 POSIX 删除档的语料；刻意与删除测量分成两个服务端生命周期。
+///
+/// 这样 `posixdelete` 的 `worst_round_us` 只覆盖删除、自动 checkpoint 等待与停服，
+/// 不会把造 2N 个 inode 的时间混进删除轮次。
+fn run_posix_seed(args: &Args) {
+    let n = args.rows;
+    if n == 0 {
+        eprintln!("posixseed 需要 --rows >= 1");
+        std::process::exit(2);
+    }
+    let mut c = Client::connect_auth(&args.addr, 3000, args.auth.as_deref())
+        .expect("posixseed control conn");
+    match c.call(&Op::CreateView { name: POSIX_VIEW.to_vec() }).expect("CreateView") {
+        Reply::View { id: view, root: 1 } => {
+            let baseline = stats_of(&mut c);
+            if (baseline.views, baseline.nodes, baseline.dentries, baseline.locks, baseline.refs,
+                baseline.tables, baseline.rows) != (1, 1, 0, 0, 0, 0, 0)
+            {
+                eprintln!("posixseed 要求空库，实际 Stats={baseline:?}");
+                std::process::exit(1);
+            }
+            let s0 = stats_of(&mut c);
+            let mut inos: Vec<u64> = Vec::with_capacity(n as usize);
+            for start in (0..n).step_by(500) {
+                let end = (start + 500).min(n);
+                let batch: Vec<Op> = (start..end).map(|i| posix_create(view, i)).collect();
+                let rs = c.pipeline(&batch).expect("posix Create pipeline");
+                if rs.len() != batch.len() {
+                    eprintln!("posix Create 应答数不符");
+                    std::process::exit(1);
+                }
+                for (i, r) in (start..end).zip(rs) {
+                    match r {
+                        Reply::Node(node) => inos.push(node.ino),
+                        other => {
+                            eprintln!("posix Create {i} → {other:?}");
+                            std::process::exit(1);
+                        }
+                    }
+                }
+            }
+            for start in (0..n).step_by(500) {
+                let end = (start + 500).min(n);
+                let batch: Vec<Op> = (start..end)
+                    .map(|i| posix_setref(view, inos[i as usize], i))
+                    .collect();
+                for (i, r) in (start..end).zip(c.pipeline(&batch).expect("posix Setattr pipeline")) {
+                    if !matches!(r, Reply::Node(_)) {
+                        eprintln!("posix Setattr {i} → {r:?}");
+                        std::process::exit(1);
+                    }
+                }
+            }
+            for start in (0..n).step_by(500) {
+                let end = (start + 500).min(n);
+                let batch: Vec<Op> = (start..end).map(|i| posix_mkdir(view, i)).collect();
+                for (i, r) in (start..end).zip(c.pipeline(&batch).expect("posix Mkdir pipeline")) {
+                    if !matches!(r, Reply::Node(_)) {
+                        eprintln!("posix Mkdir {i} → {r:?}");
+                        std::process::exit(1);
+                    }
+                }
+            }
+            let s1 = stats_of(&mut c);
+            if (s1.views, s1.nodes, s1.dentries, s1.locks, s1.refs, s1.tables, s1.rows)
+                != (1, 1 + 2 * n, 2 * n, 0, n, 0, 0)
+            {
+                eprintln!("posixseed 终态不符：{s1:?}");
+                std::process::exit(1);
+            }
+            println!(
+                "posixseed rows={n} ops={} records={} writes={} baseline_nodes={} nodes={} dentries={} refs={} errors=0",
+                3 * n,
+                s1.seq - s0.seq,
+                s1.writes_total - s0.writes_total,
+                baseline.nodes,
+                s1.nodes,
+                s1.dentries,
+                s1.refs
+            );
+        }
+        other => {
+            eprintln!("CreateView → {other:?}");
+            std::process::exit(1);
+        }
+    }
+}
+
+fn run_posix_verify(args: &Args) {
+    let n = args.rows;
+    let mut c = Client::connect_auth(&args.addr, 3000, args.auth.as_deref())
+        .expect("posixverify control conn");
+    let (view, _) = posix_view(&mut c);
+    let s = stats_of(&mut c);
+    if (s.views, s.nodes, s.dentries, s.locks, s.refs, s.tables, s.rows) != (1, 1, 0, 0, 0, 0, 0) {
+        eprintln!("posixverify 账本未回到基线：{s:?}");
+        std::process::exit(1);
+    }
+    match c.call(&Op::ReadDir { view, parent: 1, offset: 0, limit: 1000 }).expect("ReadDir") {
+        Reply::Dirents { names, next, end, .. } if names.is_empty() && next == 0 && end => {}
+        other => {
+            eprintln!("posixverify 根目录不为空：{other:?}");
+            std::process::exit(1);
+        }
+    }
+    match verify_posix_refs(&mut c, n) {
+        Ok(checked) => println!("posixverify rows={n} entries=0 checked_refs={checked} errors=0"),
+        Err(e) => {
+            eprintln!("posixverify: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// 固定 2N 个 POSIX 删除 op：N 个 Unlink + N 个 Rmdir。
+///
+/// 每个文件持有唯一 data_ref，因此 Unlink 必须回非空 NodeRef，且账本从 N 行归零；
+/// 目录必须回空 NodeRef。无锁语料下 Unlink/Rmdir 各产 3 条 WAL 记录，总计 6N。
+/// 延迟口径与时长档相同：一个 pipeline 的往返微秒数除以实际回包数，逐 op 重复后
+/// 求 p50/p99；它衡量的是批内摊还 RTT，不是 pipeline=1 的单 op 延迟。
+fn run_posix_delete(args: &Args) {
+    let n = args.rows;
+    if n == 0 {
+        eprintln!("posixdelete 需要 --rows >= 1");
+        std::process::exit(2);
+    }
+    let mut ctrl = Client::connect_auth(&args.addr, 3000, args.auth.as_deref())
+        .expect("posixdelete control conn");
+    let (view, _) = posix_view(&mut ctrl);
+    let s0 = stats_of(&mut ctrl);
+    if (s0.views, s0.nodes, s0.dentries, s0.locks, s0.refs, s0.tables, s0.rows)
+        != (1, 1 + 2 * n, 2 * n, 0, n, 0, 0)
+    {
+        eprintln!("posixdelete 语料形状不符：{s0:?}");
+        std::process::exit(1);
+    }
+    let mut ops: Vec<Op> = Vec::with_capacity(2 * n as usize);
+    ops.extend((0..n).map(|i| posix_unlink(view, i)));
+    ops.extend((0..n).map(|i| posix_rmdir(view, i)));
+    let ops = Arc::new(ops);
+    let total = 2 * n;
+    let conns = args.conns.max(1).min(total.max(1) as usize);
+    let pipe = args.pipeline.max(1);
+    let per = (total as usize + conns - 1) / conns;
+    let mut peak = BulkPeak::default();
+    peak.observe(&s0);
+    let mut sampler = start_bulk_sampler(args);
+    let t0 = Instant::now();
+    let mut handles = Vec::with_capacity(conns);
+    for k in 0..conns {
+        let a = args.addr.clone();
+        let auth = args.auth.clone();
+        let ops = ops.clone();
+        let lo = k * per;
+        let hi = (lo + per).min(total as usize);
+        handles.push(std::thread::spawn(move || {
+            let mut c = Client::connect_auth(&a, 3000, auth.as_deref()).expect("posix conn");
+            let (mut done, mut freed, mut errs) = (0u64, 0u64, 0u64);
+            let mut lat = Vec::new();
+            let mut i = lo;
+            while i < hi {
+                let end = (i + pipe).min(hi);
+                let batch: Vec<Op> = ops[i..end].to_vec();
+                let started = Instant::now();
+                match c.pipeline(&batch) {
+                    Ok(rs) => {
+                        let us = started.elapsed().as_micros() as u64;
+                        if rs.len() != batch.len() {
+                            errs += (batch.len() - rs.len()) as u64;
+                        }
+                        let per_op = us / rs.len().max(1) as u64;
+                        for _ in 0..rs.len() {
+                            lat.push(per_op);
+                        }
+                        for r in rs {
+                            match r {
+                                Reply::NodeRef(r) => {
+                                    done += 1;
+                                    if !r.is_empty() {
+                                        freed += 1;
+                                    }
+                                }
+                                Reply::Err { code, ref msg } => {
+                                    errs += 1;
+                                    eprintln!("posix reply err {code} {}", String::from_utf8_lossy(msg));
+                                }
+                                other => {
+                                    errs += 1;
+                                    eprintln!("posix reply shape {other:?}");
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        errs += (end - i) as u64;
+                        eprintln!("posix pipeline: {e}");
+                    }
+                }
+                i = end;
+            }
+            (done, freed, errs, lat)
+        }));
+    }
+    let mut done = 0u64;
+    let mut freed = 0u64;
+    let mut errs = 0u64;
+    let mut lat = Vec::with_capacity(total as usize);
+    for h in handles {
+        let (d, f, e, mut samples) = h.join().expect("posix thread");
+        done += d;
+        freed += f;
+        errs += e;
+        lat.append(&mut samples);
+    }
+    let time_ms = t0.elapsed().as_millis() as u64;
+    if let Some(s) = sampler.as_mut() {
+        let sampled = s.stop();
+        peak.samples += sampled.samples;
+        peak.wal_bytes = peak.wal_bytes.max(sampled.wal_bytes);
+        peak.wal_disk_bytes = peak.wal_disk_bytes.max(sampled.wal_disk_bytes);
+        peak.snap_bytes = peak.snap_bytes.max(sampled.snap_bytes);
+    }
+    let s1 = stats_of(&mut ctrl);
+    peak.observe(&s1);
+    let records = s1.seq - s0.seq;
+    let writes = s1.writes_total - s0.writes_total;
+    if (s1.views, s1.nodes, s1.dentries, s1.locks, s1.refs, s1.tables, s1.rows)
+        != (1, 1, 0, 0, 0, 0, 0)
+    {
+        eprintln!("posixdelete 后账本未回到基线：{s1:?}");
+        std::process::exit(1);
+    }
+    let checked = match verify_posix_refs(&mut ctrl, n) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("posixdelete: {e}");
+            std::process::exit(1);
+        }
+    };
+    let lat_samples = lat.len();
+    let (p50, p90, p99, max) = pct(lat);
+    println!(
+        "bulk mode=posixdelete rows={n} conns={conns} pipeline={pipe} sample_ms={} \
+         time_ms={} ops={done}/{total} freed_refs={freed} records={records} writes={writes} syncs={} \
+         lat_p50_us={p50} lat_p90_us={p90} lat_p99_us={p99} lat_max_us={max} lat_samples={lat_samples} \
+         wal_bytes={} wal_start_bytes={} wal_end_bytes={} wal_peak_bytes={} \
+         wal_disk_start_bytes={} wal_disk_end_bytes={} wal_disk_peak_bytes={} \
+         checkpoints_start={} checkpoints_end={} checkpoints={} \
+         snap_seq_start={} snap_seq_end={} snap_bytes_start={} snap_bytes_end={} \
+         nodes_left={} dentries_left={} locks_left={} refs_left={} samples={} verify_refs={checked} \
+         errors={errs} ops_per_s={}",
+        args.sample_ms,
+        time_ms.max(1),
+        s1.syncs_total - s0.syncs_total,
+        s1.wal_bytes.saturating_sub(s0.wal_bytes),
+        s0.wal_bytes,
+        s1.wal_bytes,
+        peak.wal_bytes,
+        s0.wal_disk_bytes,
+        s1.wal_disk_bytes,
+        peak.wal_disk_bytes,
+        s0.checkpoints,
+        s1.checkpoints,
+        s1.checkpoints.saturating_sub(s0.checkpoints),
+        s0.snap_seq,
+        s1.snap_seq,
+        s0.snap_bytes,
+        s1.snap_bytes,
+        s1.nodes,
+        s1.dentries,
+        s1.locks,
+        s1.refs,
+        peak.samples,
+        done * 1000 / time_ms.max(1)
+    );
+    if errs != 0 || done != total || freed != n || checked != n || lat_samples != total as usize {
+        eprintln!("posixdelete: op/NodeRef/ref 核对没跑完（done={done}/{total}, freed={freed}/{n}, checked={checked}/{n}, lat={lat_samples}, errors={errs}）");
+        std::process::exit(1);
+    }
+    if records != 6 * n || writes != 2 * n {
+        eprintln!("posixdelete: records={records} writes={writes}，应为 {}/{}", 6 * n, 2 * n);
+        std::process::exit(1);
+    }
+}
+
 /// 固定工作量档：灌 `--rows` 行 → 按 `--bulk` 指定的形状处理完 → 报时间、
 /// 记录数、WAL 字节、fsync 次数与剩下的行数。
 ///
-/// 六个模式：`rowdelete`（逐行删）、`range`（按区间删，批大小 `--batch`）、
+/// 七个负载模式：`rowdelete`（逐行删）、`range`（按区间删，批大小 `--batch`）、
 /// `clear`（一条清空）、`rename`（建一张影子表再顶替）、`putsame`（逐字节相同的
-/// 覆盖写）、`putchanged`（同量但每行真的变）。最后两个是对拉组：同值消除的
-/// 收益 = 两者的 `records` / `syncs` / 时间之差。
+/// 覆盖写）、`putchanged`（同量但每行真的变）、`churn`（同一键集删后重插 `--cycles`
+/// 轮）。最后两个写档与 churn 都保证每一轮真的改值；同值消除的收益由 `putsame`
+/// 与 `putchanged` 的 `records` / `syncs` / 时间之差给出。`verifychurn` 是重启后的
+/// 独立只读验收，不重新灌数据。
 ///
 /// `records` 是服务端 `seq` 的差值，也就是「这些 op 总共写了多少条 WAL 记录」——
 /// 它才是这一档的主指标：时间跟盘走，记录数是格式自己的性质。
 fn run_bulk(args: &Args) {
+    if args.bulk == "posixseed" {
+        run_posix_seed(args);
+        return;
+    }
+    if args.bulk == "posixdelete" {
+        run_posix_delete(args);
+        return;
+    }
+    if args.bulk == "posixverify" {
+        run_posix_verify(args);
+        return;
+    }
     let n = args.rows;
     let bat = if args.batch == 0 { 1000 } else { args.batch };
     let mut ctrl =
         Client::connect_auth(&args.addr, 3000, args.auth.as_deref()).expect("bulk control conn");
+
+    if args.bulk == "tail" {
+        run_tail(args);
+        return;
+    }
+    if args.bulk == "verifychurn" {
+        if args.cycles == 0 {
+            eprintln!("verifychurn 需要 --cycles >= 1");
+            std::process::exit(2);
+        }
+        match verify_churn(&mut ctrl, n, args.cycles) {
+            Ok(checked) => println!(
+                "verifychurn rows={n} cycles={} checked={checked} errors=0",
+                args.cycles
+            ),
+            Err(e) => {
+                eprintln!("verifychurn: {e}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+    if args.bulk == "churn" && args.cycles == 0 {
+        eprintln!("churn 需要 --cycles >= 1");
+        std::process::exit(2);
+    }
 
     // 每轮都从空表开始：否则第二轮量的就是「在已经空了的表上删」，那一档的
     // 数字非但不可比，还正好是最快最好看的那一支。
@@ -351,20 +1034,11 @@ fn run_bulk(args: &Args) {
         std::process::exit(1);
     }
 
-    // 构造这一档要跑的 op。
+    // 构造这一档要跑的 op。churn 单独按半轮切 Phase，执行时有跨连接屏障。
     let mut ops: Vec<Op> = Vec::new();
+    let mut churn_phases: Vec<Vec<Op>> = Vec::new();
     match args.bulk.as_str() {
-        "rowdelete" => {
-            ops = (0..n)
-                .map(|i| Op::RowDelete {
-                    table: BULK_TABLE.to_vec(),
-                    key: bulk_key(i),
-                    flags: 0,
-                    cond_col: COND_NONE,
-                    cond_val: Vec::new(),
-                })
-                .collect();
-        }
+        "rowdelete" => ops = (0..n).map(bulk_delete).collect(),
         "range" => {
             let mut start = 0u64;
             while start < n {
@@ -421,6 +1095,12 @@ fn run_bulk(args: &Args) {
         }
         "putsame" => ops = (0..n).map(|i| bulk_put(i, false)).collect(),
         "putchanged" => ops = (0..n).map(|i| bulk_put(i, true)).collect(),
+        "churn" => {
+            for round in 1..=args.cycles {
+                churn_phases.push((0..n).map(bulk_delete).collect());
+                churn_phases.push((0..n).map(|i| bulk_churn_put(i, round)).collect());
+            }
+        }
         other => {
             eprintln!("unknown --bulk {other:?}\n{HELP}");
             std::process::exit(2);
@@ -430,71 +1110,89 @@ fn run_bulk(args: &Args) {
     // 测量窗口。
     let conns = args.conns.max(1);
     let pipe = args.pipeline.max(1);
-    let total = ops.len();
+    let total = if args.bulk == "churn" {
+        churn_phases.iter().map(Vec::len).sum()
+    } else {
+        ops.len()
+    };
     let per = (total + conns - 1) / conns;
     let ops = std::sync::Arc::new(ops);
     // `rename` 只有一条 op：多开连接等于让七条线程去抢一个空区间。
     let conns = conns.min(total.max(1));
     let s0 = stats_of(&mut ctrl);
+    let mut peak = BulkPeak::default();
+    peak.observe(&s0);
+    let mut sampler = start_bulk_sampler(args);
     let t0 = Instant::now();
-    let mut handles = Vec::new();
-    for k in 0..conns {
-        let a = args.addr.clone();
-        let auth = args.auth.clone();
-        let ops = ops.clone();
-        let lo = k * per;
-        let hi = (lo + per).min(total);
-        handles.push(std::thread::spawn(move || {
-            let mut c = Client::connect_auth(&a, 3000, auth.as_deref()).expect("bulk conn");
-            let (mut done, mut reported, mut errs) = (0u64, 0u64, 0u64);
-            let mut i = lo;
-            while i < hi {
-                let end = (i + pipe).min(hi);
-                let batch: Vec<Op> = ops[i..end].to_vec();
-                match c.pipeline(&batch) {
-                    Ok(rs) => {
-                        for r in rs {
-                            match r {
-                                Reply::Count(v) => {
-                                    done += 1;
-                                    reported += v;
-                                }
-                                Reply::Ok | Reply::Row(_) | Reply::Table(_) => done += 1,
-                                Reply::Err { code, ref msg } => {
-                                    errs += 1;
-                                    eprintln!(
-                                        "bulk reply err {code} {}",
-                                        String::from_utf8_lossy(msg)
-                                    );
-                                }
-                                other => {
-                                    errs += 1;
-                                    eprintln!("bulk reply shape {other:?}");
+    let (done, reported, errs) = if args.bulk == "churn" {
+        run_churn_phases(args, &churn_phases, conns, pipe)
+    } else {
+        let mut handles = Vec::new();
+        for k in 0..conns {
+            let a = args.addr.clone();
+            let auth = args.auth.clone();
+            let ops = ops.clone();
+            let lo = k * per;
+            let hi = (lo + per).min(total);
+            handles.push(std::thread::spawn(move || {
+                let mut c = Client::connect_auth(&a, 3000, auth.as_deref()).expect("bulk conn");
+                let (mut done, mut reported, mut errs) = (0u64, 0u64, 0u64);
+                let mut i = lo;
+                while i < hi {
+                    let end = (i + pipe).min(hi);
+                    let batch: Vec<Op> = ops[i..end].to_vec();
+                    match c.pipeline(&batch) {
+                        Ok(rs) => {
+                            for r in rs {
+                                match r {
+                                    Reply::Count(v) => {
+                                        done += 1;
+                                        reported += v;
+                                    }
+                                    Reply::Ok | Reply::Row(_) | Reply::Table(_) => done += 1,
+                                    Reply::Err { code, ref msg } => {
+                                        errs += 1;
+                                        eprintln!(
+                                            "bulk reply err {code} {}",
+                                            String::from_utf8_lossy(msg)
+                                        );
+                                    }
+                                    other => {
+                                        errs += 1;
+                                        eprintln!("bulk reply shape {other:?}");
+                                    }
                                 }
                             }
                         }
+                        Err(e) => {
+                            errs += (end - i) as u64;
+                            eprintln!("bulk pipeline: {e}");
+                        }
                     }
-                    Err(e) => {
-                        errs += (end - i) as u64;
-                        eprintln!("bulk pipeline: {e}");
-                    }
+                    i = end;
                 }
-                i = end;
-            }
-            (done, reported, errs)
-        }));
-    }
-    let mut done = 0u64;
-    let mut reported = 0u64;
-    let mut errs = 0u64;
-    for h in handles {
-        let (d, r, e) = h.join().expect("bulk thread");
-        done += d;
-        reported += r;
-        errs += e;
-    }
+                (done, reported, errs)
+            }));
+        }
+        let mut sum = (0u64, 0u64, 0u64);
+        for h in handles {
+            let (d, r, e) = h.join().expect("bulk thread");
+            sum.0 += d;
+            sum.1 += r;
+            sum.2 += e;
+        }
+        sum
+    };
     let time_ms = t0.elapsed().as_millis() as u64;
+    if let Some(s) = sampler.as_mut() {
+        let sampled = s.stop();
+        peak.samples += sampled.samples;
+        peak.wal_bytes = peak.wal_bytes.max(sampled.wal_bytes);
+        peak.wal_disk_bytes = peak.wal_disk_bytes.max(sampled.wal_disk_bytes);
+        peak.snap_bytes = peak.snap_bytes.max(sampled.snap_bytes);
+    }
     let s1 = stats_of(&mut ctrl);
+    peak.observe(&s1);
     let left = rows_of(&mut ctrl);
 
     // 影子表那一档：被顶替的那张旧表必须消失，否则「旧行还在状态里」会被
@@ -509,14 +1207,20 @@ fn run_bulk(args: &Args) {
         .unwrap_or(usize::MAX);
 
     println!(
-        "bulk mode={} rows={} batch={} conns={} pipeline={} load_ms={} time_ms={} ops={}/{} \
-         reported={} records={} writes={} syncs={} wal_bytes={} rows_left={} shadow_left={} errors={} \
-         rows_per_s={}",
+        "bulk mode={} rows={} batch={} cycles={} conns={} pipeline={} sample_ms={} \
+         load_ms={} time_ms={} ops={}/{} reported={} records={} writes={} syncs={} \
+         wal_bytes={} wal_start_bytes={} wal_end_bytes={} wal_peak_bytes={} \
+         wal_disk_start_bytes={} wal_disk_end_bytes={} wal_disk_peak_bytes={} \
+         checkpoints_start={} checkpoints_end={} checkpoints={} \
+         snap_seq_start={} snap_seq_end={} snap_bytes_start={} snap_bytes_end={} \
+         samples={} rows_left={} shadow_left={} errors={} rows_per_s={} ops_per_s={}",
         args.bulk,
         n,
         bat,
+        args.cycles,
         conns,
         pipe,
+        args.sample_ms,
         load_ms,
         time_ms.max(1),
         done,
@@ -526,10 +1230,25 @@ fn run_bulk(args: &Args) {
         s1.writes_total - s0.writes_total,
         s1.syncs_total - s0.syncs_total,
         s1.wal_bytes.saturating_sub(s0.wal_bytes),
+        s0.wal_bytes,
+        s1.wal_bytes,
+        peak.wal_bytes,
+        s0.wal_disk_bytes,
+        s1.wal_disk_bytes,
+        peak.wal_disk_bytes,
+        s0.checkpoints,
+        s1.checkpoints,
+        s1.checkpoints.saturating_sub(s0.checkpoints),
+        s0.snap_seq,
+        s1.snap_seq,
+        s0.snap_bytes,
+        s1.snap_bytes,
+        peak.samples,
         left,
         orphan,
         errs,
-        n * 1000 / time_ms.max(1)
+        n * 1000 / time_ms.max(1),
+        done * 1000 / time_ms.max(1)
     );
     // 灌数据那一段的成本也报一次：逐行写与逐行删得用同一把尺子比。
     println!(
@@ -573,6 +1292,18 @@ fn run_bulk(args: &Args) {
     if args.bulk == "rename" && orphan != 0 {
         eprintln!("bulk: 被顶替的影子表还在状态里（{orphan} 张）");
         std::process::exit(1);
+    }
+    if args.bulk == "churn" {
+        let want = n.checked_mul(2).and_then(|v| v.checked_mul(args.cycles));
+        if left != n || want != Some(s1.seq - s0.seq) || want != Some(s1.writes_total - s0.writes_total) {
+            eprintln!("bulk: churn 终态/记录数不对（left={left}, seq={}, writes={}, want={want:?}）",
+                s1.seq - s0.seq, s1.writes_total - s0.writes_total);
+            std::process::exit(1);
+        }
+        if let Err(e) = verify_churn(&mut ctrl, n, args.cycles) {
+            eprintln!("bulk: churn 内容验收失败：{e}");
+            std::process::exit(1);
+        }
     }
 }
 
@@ -1158,13 +1889,21 @@ treedb-bench — 对 treedb-server 打负载
                      一个视图。造数据时用它把整份快照压进一棵子树，中段 ino 才
                      真落在正文中段
   --hold             只建立 N 条连接并保持，用于量服务端 RSS
-  --bulk MODE        固定工作量档（§5.1 的批量形状）：灌 --rows 行再一次性处理完，
-                     rowdelete|range|clear|rename|putsame|putchanged。报的是
-                     time_ms / records(WAL 记录差) / writes / syncs / wal_bytes /
-                     rows_left，而不是 ops/s —— 破坏性负载用时长口径量，表空之后
-                     剩下的时间全在数空区间，报出来的数字反而最好看
+  --bulk MODE        固定工作量档：灌 --rows 行再一次性处理完，
+                     rowdelete|range|clear|rename|putsame|putchanged|churn。
+                     churn 在同一键集上删后重插 --cycles 轮，每轮 2N 个 op；
+                     verifychurn 只读核对重启后的最后一轮内容，不重新灌数据。
+                     posixseed 造 N 个文件（各带唯一 data_ref）+ N 个空目录；
+                     posixdelete 正好 N 个 Unlink + N 个 Rmdir，报账本收敛、
+                     非空 NodeRef 数与 pipeline 摊还 p50/p99；posixverify 重开后逐 ref 核对。
+                     tail 在自动 checkpoint 后插入并删除一个专用键，终态不变、
+                     WAL 多两条记录，供 SIGKILL 后的快照+尾巴恢复验收。
+                     报 time_ms / ops / records / writes / syncs / WAL 起止与峰值 /
+                     checkpoint 起止 / rows_left；ops_per_s 的分母是实际完成 op 数
   --rows N           批量档的表规模（默认 200000）
   --batch N          range 模式每批删多少行（默认 1000）
+  --cycles N         churn 的删后重插轮数（默认 3，必须 >= 1）
+  --sample-ms N      测量窗口内 Stats 采样间隔（默认 0 = 不采样）
   --auth-key-file P  每条连接先用这把密钥跑一次握手（§4.4）。不给 = 不握手。
                      服务端必须开着同一把密钥，否则报错退出（客户端
                      fail-closed，不会静默降级成不认证）。与 --hold 合用

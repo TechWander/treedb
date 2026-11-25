@@ -1,0 +1,20 @@
+== 删除风暴联合量具 2026-11-25 07:04:39 ==
+HEAD=e013701c9c33261258643e54cf85b05cfd79d306 rows=100000 cycles=4 conns=8 pipeline=64 workers=8 auto_checkpoint_mb=1 sample_ms=5
+code_sha256=80538c44416a5ef7ef12542c7b7069672dcc9f1d057184df3b508a822afbd969
+临时现场=/data/grovefs/treedb/.spot/delete-storm-GXWNRl
+
+-- rowdelete: mode=rowdelete rows=100000 cycles=4 workers=8 auto_checkpoint_mb=1
+   bulk mode=rowdelete rows=100000 batch=1000 cycles=4 conns=8 pipeline=64 sample_ms=5 load_ms=1997 time_ms=1470 ops=100000/100000 reported=0 records=100000 writes=100000 syncs=219 wal_bytes=0 wal_start_bytes=1605314 wal_end_bytes=1158848 wal_peak_bytes=1605314 wal_disk_start_bytes=4194304 wal_disk_end_bytes=4194304 wal_disk_peak_bytes=4194304 checkpoints_start=4 checkpoints_end=8 checkpoints=4 snap_seq_start=72501 snap_seq_end=169505 snap_bytes_start=3371426 snap_bytes_end=101760 samples=83 rows_left=0 shadow_left=0 errors=0 rows_per_s=68027 ops_per_s=68027
+   tail ops=2/2 records=2 writes=2 wal_start_bytes=103360 wal_end_bytes=103472 rows_left=0 errors=0
+   PASS rowdelete: checkpoints=4→9 seq=200001→200003 snap_seq=72501→197281 wal=1605314→103360→103472→103472
+   RSS KiB before/after/reopen=2476/55248/5280 retained_delta=52772 peak=113640 HWM=113836 samples=111
+
+-- churn: mode=churn rows=100000 cycles=4 workers=8 auto_checkpoint_mb=1
+   bulk mode=churn rows=100000 batch=1000 cycles=4 conns=8 pipeline=64 sample_ms=5 load_ms=2182 time_ms=14427 ops=800000/800000 reported=0 records=800000 writes=800000 syncs=1743 wal_bytes=123568 wal_start_bytes=554564 wal_end_bytes=678132 wal_peak_bytes=1680508 wal_disk_start_bytes=4194304 wal_disk_end_bytes=4194304 wal_disk_peak_bytes=4194304 checkpoints_start=5 checkpoints_end=42 checkpoints=37 snap_seq_start=90501 snap_seq_end=888769 snap_bytes_start=3371426 snap_bytes_end=3484230 samples=731 rows_left=100000 shadow_left=0 errors=0 rows_per_s=6931 ops_per_s=55451
+   tail ops=2/2 records=2 writes=2 wal_start_bytes=678132 wal_end_bytes=678244 rows_left=100000 errors=0
+   verifychurn rows=100000 cycles=4 checked=100000 errors=0
+   PASS churn: checkpoints=5→42 seq=900001→900003 snap_seq=90501→888769 wal=1680508→678132→678244→678244
+   RSS KiB before/after/reopen=2636/84824/56912 retained_delta=82188 peak=135392 HWM=135436 samples=508
+
+== PASS：固定工作量、自动 checkpoint、WAL 回落、服务端 RSS、重启终态/内容全部通过 ==
+逐格结果=benches/results/delete_storm.tsv

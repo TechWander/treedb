@@ -16,8 +16,8 @@ cargo build --release                                   # 默认档：依赖只�
 ./target/release/treedb-server --dir /var/lib/treedb --listen 127.0.0.1:7777
 ./target/release/treedb-bench --op lookup --conns 64 --pipeline 32 --secs 3
 
-cargo test --release                                    # 默认档 230 passed / 0 failed / 3 ignored（引擎本体）
-cargo test --release --features postgres-compat        # 261 passed / 0 failed / 9 ignored（含 PG 过渡档）
+cargo test --release                                    # 默认档 237 passed / 0 failed / 3 ignored（引擎本体）
+cargo test --release --features postgres-compat        # 268 passed / 0 failed / 9 ignored（含 PG 过渡档）
 bash benches/throughput_matrix.sh 3 1 2 3 4 5           # 五轴复现，输出进 benches/results/
 bash benches/sync_ratio.sh 3                           # 写路径机制：一次 fsync 摊了多少写
 bash benches/single_conn.sh 3                          # 单连接对标 PG（$PIPE=32 走批量档、$CONNS/$WORKERS 走并发档）
@@ -34,6 +34,8 @@ bash benches/handshake_cost.sh 20000                   # 接入握手的代价�
 bash benches/bench_rows.sh                             # 通用表九条路径（rowput/rowget/rowlist/rowidx/rowrange/…）× 三形状
 bash benches/bench_bulk.sh                             # 批量形状：逐行 vs 区间 vs 清空 vs 同值重写（固定工作量口径）
 bash benches/shard_write.sh                            # 多实例分片的写扩展（solo/split × 实例数）
+bash benches/delete_storm.sh                           # 通用表删除风暴：rowdelete/churn + 自动 checkpoint + RSS + SIGKILL 尾巴
+bash benches/posix_delete_storm.sh                     # POSIX 删除风暴：2N 个 Unlink/Rmdir、自动档开关两跑、重开逐 ref 核对
 ./target/release/treedb-micro --items 32000             # 纯计算档（不经网络/不写 WAL）+ 分配计数
 ```
 
@@ -250,12 +252,13 @@ head -c 32 /dev/urandom > /etc/treedb/auth.key && chmod 0600 /etc/treedb/auth.ke
 | **并发档**（`conns=8/64`、`pipeline=1`，与上一行同一天、同盘复核） | treedb 一侧给两档：`workers=1`（基线）与本机默认 `workers=8`。默认档：`lookup` 8 连接 **9.9–10.6×**、64 连接 **4.7×**；`readdir` 8 连接 **9.9–10.8×**、64 连接 **5.2–5.3×**；`create` 8 连接 5.1–6.5×、64 连接 5.9–6.9×（**p50 优 16×**）；`write` 64 连接 6.5–8.7×（**p50 优 17–18×**）。写那一列涨的是 group commit 跨连接合并（64 连接时引擎自计**一次 fsync 摊 53–58 条写**），不是多核 —— 提交线程始终只有一个。**要诚实说的一面**：`workers=1` 且 64 连接时纯读被 PG 反超（`lookup` 0.55–0.56×、`readdir` 0.58–0.60×），因为那一档只吃一个核；pipeline 提到 32 时倍率收窄而不是继续拉大（`create` 64/32 只 1.6–1.7×）。同样见 §7.11 |
 | 只给一个核（`workers=1`，且 PG 钉在**同一个**核上） | 同核、同并发 64/1：`ping` **153 329 vs 17 035**（**9.0×**）、`lookup` **119 001 vs 6 501**（**18.3×**）、`readdir` **87 075 vs 4 486**（**19.4×**）、`create` **65 122 vs 1 583**（**41.1×**）、`write` **71 213 vs 828**（**86.0×**）。旧版这一行写的「输给 PG 0.26–0.48×」**已作废**：那是拿一个核去比 PG 不限亲和性的 46–52 个核。同一张四臂表里还钉了另两件事：单核 `ping` 153 329 已是**同核裸 epoll echo 服务端（中位 167 999 ops/s，`benches/results/lb_floor.log`）的 91.3 %**，而这一核 90 % 的时间在系统时间里（`benches/results/split_attr.log`）—— 这一列到顶了。详见 [DESIGN.md](DESIGN.md) §7.5 末、`benches/sc_ops.sh` |
 | 零旗标默认档（照上面两行命令起服务，同格跑 5 次取中位） | 服务端 banner 就是 `workers=8`：`readdir` **654 983**（= PG 4.5×）、`lookup` **1 062 564**（**5.0×**）、`ping` **1 016 868**（1.9×）—— 领先不靠调用方传 `--workers`；矩阵连跑的那两行是**下界**（`benches/default_check.sh`） |
-| 为什么快（引擎自己的计数器） | 两个「会 fsync」的档位现在共用同一个提交点：64 并发下一轮只付 1 次 fsync、摊 **≈ 55–58 次写/fsync**（`benches/sync_ratio.sh`） |
-| 每 op 一次 fsync（`dur=always` vs PG `synchronous_commit=on`，WAL 同盘） | 改前 1 891 vs 1 469 ops/s（p99 81.5 ms vs 157 ms）；**改后 10 913 vs 1 469 = 7.4×**，p50 优 17×、p99 优 5×（受控 A/B：`benches/ab_durability.sh v0.3.1`）。旧版这句「刨掉合并 fsync，treedb 对 PG 就没有结构性优势」是当时那个**按连接串 fsync** 的实现留下的错判，已作废：两家都是靠一次 fsync 摊多次写，treedb 在这一格摊得动（≈ 55）而 `always` 档以前自己把它抵消掉了 |
+| 为什么快（引擎自己的计数器） | 两个「会 fsync」的档位现在共用同一个提交点：64 并发下一轮只付 1 次 fsync。`benches/sync_ratio.sh` 的实测范围是 **58.9–62.6 次写/fsync**（机械盘 58.9–61.9、根盘 61.5–62.6，逐次读数见 `benches/results/sync_ratio.log`）；而 `benches/ab_durability.sh` 那一轮同格只抖在 **53.9–57.7** —— 两批不是同一次采集，不要合并成一个「≈ 55」 |
+| 每 op 一次 fsync（`dur=always` vs PG `synchronous_commit=on`，WAL 同盘） | 改前 1 891 vs 1 469 ops/s（p99 81.5 ms vs 157 ms）；**改后 10 913 vs 1 469 = 7.4×**，p50 优 17×、p99 优 5×（受控 A/B：`benches/ab_durability.sh v0.3.1`）。旧版这句「刨掉合并 fsync，treedb 对 PG 就没有结构性优势」是当时那个**按连接串 fsync** 的实现留下的错判，已作废：两家都是靠一次 fsync 摊多次写，treedb 在这一格摊得动（`always` 改后三次 53.9 / 54.8 / 57.7）而 `always` 档以前自己把它抵消掉了 |
 | 持久性 | `kill -9` 六个崩溃用例零丢失（含 checkpoint 瞬间崩、连崩 3 轮）；并另有 `workers=8` 下同语义的一条，目录写与表写逐条交错 |
 | 接入认证（可选、默认关；v0.7.0 历史读数） | 20 000 条连接、两臂同轮 A/B × 3：**RSS +93 ~ 96 B/conn**（439 → 532/535 B，极可复现）、建连中位 **+90.9 µs/conn**（+232 / +1 818 / +1 885 ms —— 噪声比效应大，`off` 臂自己就摆 27 %）、稳态 `ping` 中位 1 147 239 → 1 148 689 ops/s、`create` 67 414 → 64 122（−4.9 %，**落在同臂自身 2.8 ~ 4.5 % 的散布里，既不报回归也不报变快**）。未开认证的数据面另用两臂都不带密钥的 `ab_layout.sh v0.3.5` 证零回归（八格最差 −0.90 %）。逐格原始输出 `benches/results/handshake_cost.log` 与 `ab_layout_v0.3.6.log`，读法见 §4.4 |
 | **批量形状**（`v0.7.0`，100 万行表、`dur=group`、2026-11-23） | 同样删完一百万行：逐行 `RowDelete` **16 064 ms / 1 000 000 条 WAL 记录 / 2 075 次 fsync / 38 MB**；`RowRangeDelete`（batch 2000）**1 017 ms / 500 条 / 2 次 / 29.5 KB**；`TableClear` **924 ms / 1 条 / 1 次 / 25 字节**。同值重写 100 万次：`RowPut` 同值 **970 ms / 0 条记录 / 0 次 fsync**，真改值 **21 126 ms / 1 000 000 条 / 2 046 次**。逐格 `benches/results/bench_bulk.log`，读法与「为什么时间不随记录数同比例下降」见 §7.16 |
 | **写扩展（多实例分片）**（`v0.7.0`，`rowinsert`，5 s × 8 连接 × pipeline 32） | 单实例有与客户端压力无关的天花板：`dur=never` 下 1 → 8 路并发压力只拿到 **0.94×**（114 505 → 107 356 ops/s）而服务端 CPU 从 4.30 涨到 **8.39 核**。按表分到 8 个进程实例：never **6.50×**（744 004 ops/s，每实例保留 81%）、group **4.77×**（每实例 60%）。逐格 `benches/results/shard_write.log`，见 §7.17；**路由、事务边界、每实例的备份与副本都在接入方**（§8 第 19 条） |
+| **删除风暴与自动 checkpoint**（本仓，2026-11-25，固定工作量口径） | 通用表：删完 10 万行 **1 470 ms / 100 000 条记录 / 219 次 fsync**，checkpoint 4 → 9；删后重插 **4 轮共 800 000 op / 14 427 ms / 1 743 次 fsync**，checkpoint 5 → 42，SIGKILL 后拿「快照 + 2 条尾巴」重开，100 000 行逐行核对 **errors=0**。POSIX：10 万 inode + 10 万目录，`Unlink`+`Rmdir` 共 **200 000 op / 600 000 条记录 / 200 000 次写**，**5.4–5.8 s** 跑完（pipeline=64 摊还，p50 142–181 µs / p99 802–808 µs），10 万个内容引用全部释放、重开逐 ref 核对归零。自动档开：checkpoint 0 → 21、WAL 峰值 4.98 MB 回落到 234 KB；自动档关：checkpoint/水位/WAL（33 MB）**三样全不动**。两档停服后账本（nodes/dentries/locks/refs）都收敛到基线 `(1,0,0,0)`。逐格 `benches/results/delete_storm.tsv` / `posix_delete_storm.tsv`，口径与边界见 [DESIGN.md](DESIGN.md) §7.18 |
 
 两个读数字的历史口径要提醒：旧版这张表写的是「64 并发纯读被 PG 反胜 3.6–7.5×」，
 **已作废** —— `treedb-bench` 的分母把「建连 + 预热」算进去了，而 PG 侧对照器没算，
