@@ -92,19 +92,46 @@ done
 git -C "$W" checkout -- Cargo.toml Cargo.lock
 
 echo
-echo "----- 3) 六条端到端套件 × 两臂（引擎二进制各自同代）-----"
+echo "----- 3) 六条端到端套件 × 两臂（引擎二进制与各自 pin 的 tag 同源）-----"
 mkdir -p "$T"
-[ -d "$T/old/src" ] || (mkdir -p "$T/old" && git -C "$R" archive "$OLD" | tar -x -C "$T/old")
-[ -x "$R/target/release/treedb-server" ] || cargo build --release --manifest-path "$R/Cargo.toml" --bins
-BINNEW=$R/target/release/treedb-server
-if [ ! -x "$T/oldbin/treedb-server" ]; then
-  cargo build --release --manifest-path "$T/old/Cargo.toml" --bins --target-dir "$T/oldtarget" 2>&1 | tail -1
-  mkdir -p "$T/oldbin" && cp "$T/oldtarget/release/treedb-server" "$T/oldbin/"
-fi
-sha256sum "$BINNEW" "$T/oldbin/treedb-server" | sed 's/^/  /'
+# 两臂的引擎都从**各自那个 tag 的源码**现编，不拿 $R/target 里的 HEAD 产物：臂 B 用
+# HEAD 建的服务端，测的就是「旧 tag 的客户端 + tag 之后的服务端」，与「各配同代引擎」
+# 这句话不符（差的那几笔里恰好有服务端侧的锁修补）。
+proto_of() {   # 读 stdin，取 PROTOCOL_VERSION 的**数值**：`tr -dc 0-9` 会把类型名
+  # u16 里的 16 一起留下（曾经印成 proto=168），那不是一个能拿来对照代的信息。
+  sed -n 's/.*PROTOCOL_VERSION: u16 = \([0-9]\{1,\}\).*/\1/p' | head -1
+}
+mkeng() {  # mkeng <tag> → 只吐一个引擎路径（诊断一律走 stderr，不然会被读进变量）
+  local g=$1 d b
+  d=$T/src-$g; b=$T/bin-$g/treedb-server   # 别写成 `local d=$T/src-$g`：local 的赋值词
+  # 是先整体展开再赋值的，同一句里引用前一个变量会撞上 set -u，整个函数当场空手而归
+  [ -d "$d/src" ] || (mkdir -p "$d" && git -C "$R" archive "$g" | tar -x -C "$d")
+  if [ ! -x "$b" ]; then
+    cargo build --release --manifest-path "$d/Cargo.toml" --bins \
+      --target-dir "$d/target" 2>&1 | tail -1 | sed 's/^/  build /' >&2
+    mkdir -p "$T/bin-$g" && cp -f "$d/target/release/treedb-server" "$T/bin-$g/"
+  fi
+  [ -x "$b" ] || { echo "ABORT: 从 $g 建不出引擎 $b" >&2; exit 1; }
+  echo "$b"
+}
+BINOLD=$(mkeng "$OLD")
+BINNEW=$(mkeng "$NEW")
+# 这两道闸是必须的：$TB 一旦为空，套件里的 `${TREEDB_BIN:-$PWD/../treedb/target/…}`
+# 会静默退回默认路径，整块就悄悄变成了「两臂共用 HEAD 引擎」——正是本块要排除的那种测法。
+[ -x "$BINOLD" ] || die "臂 A 的引擎不可执行：'$BINOLD'（$OLD 的构建没成）"
+[ -x "$BINNEW" ] || die "臂 B 的引擎不可执行：'$BINNEW'（$NEW 的构建没成）"
+engline() {   # 每一代引引擎的 rev / sha / 协议号：三份证据各自独立可读
+  printf '  引擎 %-8s rev=%-8s sha=%-16s proto=%s\n' "$1" \
+    "$(git -C "$R" rev-parse --short "$1^{commit}")" \
+    "$(sha256sum "$2" | cut -c1-16)" \
+    "$(git -C "$R" show "$1:src/engine/mod.rs" | proto_of)"
+}
+engline "$OLD" "$BINOLD"
+engline "$NEW" "$BINNEW"
 for arm in B A; do
   tag=$([ "$arm" = A ] && echo "$OLD" || echo "$NEW")
-  if [ "$arm" = A ]; then git -C "$W" checkout -- Cargo.toml Cargo.lock; TB=$T/oldbin/treedb-server; else setpin "$OLD" "$NEW"; TB=$BINNEW; fi
+  if [ "$arm" = A ]; then git -C "$W" checkout -- Cargo.toml Cargo.lock; TB=$BINOLD; else setpin "$OLD" "$NEW"; TB=$BINNEW; fi
+  [ -x "$TB" ] || die "臂 $arm 的引擎为空：'$TB'"
   # 每臂一整套隔离 target：套件硬编码 ./target/release/grovefs，共用的话 cargo 的
   # 新鲜判定会把上一臂的产物留着不动，两臂就在跑同一份二进制。建完再拷过去，
   # 并拷前把两臂的 sha256 印出来 —— 两个哈希不同本身就是「两臂确实是两份构建」的证据。
@@ -121,10 +148,16 @@ done
 git -C "$W" checkout -- Cargo.toml Cargo.lock
 
 echo
-echo "----- 4) 混代反证：旧 pin 的 grovefs 接新引擎二进制 -----"
-echo "# 这正是套件里 TREEDB_BIN 未设时的默认取值（\$PWD/../treedb/target/release/treedb-server）。"
+echo "----- 4) 混代反证：旧 pin 的 grovefs 接本仓 HEAD 建出的引擎 -----"
+echo "# 这正是套件里 TREEDB_BIN 未设时的默认取值（\$PWD/../treedb/target/release/treedb-server）："
+# 拿默认路径上那份真去跑，而不是拿臂 B 的 tag 构建——要证的恰好是「默认值会指到谁」。
+cargo build --release --manifest-path "$R/Cargo.toml" --bins 2>&1 | tail -1 | sed 's/^/  build /' >&2
+BINHEAD=$R/target/release/treedb-server
+printf '# HEAD 引擎 rev=%s sha=%s proto=%s\n' "$NEWH" \
+  "$(sha256sum "$BINHEAD" | cut -c1-16)" \
+  "$(proto_of < "$R/src/engine/mod.rs")"
 for s in test_treedb_control.sh test_treedb_matrix.sh; do
-  TREEDB_BIN=$BINNEW bash "$W/.build-bin/$s" > "$T/mix-$s.log" 2>&1; rc=$?
+  TREEDB_BIN=$BINHEAD bash "$W/.build-bin/$s" > "$T/mix-$s.log" 2>&1; rc=$?
   echo "  $(grep -m1 'SUMMARY' "$T/mix-$s.log")  [$s rc=$rc]"
   grep -m1 'errno 68' "$T/mix-$s.log" | sed 's/^/  /'
 done

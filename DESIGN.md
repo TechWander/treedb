@@ -164,9 +164,10 @@ op / reply / `Log` 变体，`PROTOCOL_VERSION` 仍 8、`SNAP_VERSION` 仍 4，�
 
 删除风暴之后是 **grovefs 接入侧的 pin 复核与 `v0.8.1` 发布**（§10 阶段 C 4 末、
 §11 第 21 条）：`benches/grovefs_pin_ab.sh` 拿同一份 grovefs 源码只改 `Cargo.toml`
-那行 tag，实测 `v0.3.6` → `v0.8.0` 六条端到端套件的三元组逐行相同 —— 升 pin 零源码
-改动。复核同时照出 `v0.8.0` 这个 tag 圈不住上面那笔级联清锁（tag 落在 `c455793`
-之前），所以把 tag 之后的三笔发成 `v0.8.1`：**依旧没有新 op / reply / `Log` 变体，
+那行 tag，实测 `v0.3.6` → `v0.8.1` 六条端到端套件的三元组逐行相同（两臂各配从
+自己那个 tag 现编的引擎，proto 5 对 proto 8）—— 升 pin 零源码改动。复核同时照出
+`v0.8.0` 这个 tag 圈不住上面那笔级联清锁（tag 落在 `c455793` 之前），所以把 tag
+之后的三笔发成 `v0.8.1`：**依旧没有新 op / reply / `Log` 变体，
 `PROTOCOL_VERSION` 仍 8、`SNAP_VERSION` 仍 4、`DUMP_VERSION` 仍 2，旧数据目录零迁移**，
 对 grovefs 的线协议面一个字节未动 —— 发它的唯一理由，是让「pin 提到哪」有一个含锁
 修复的目标可钉。
@@ -367,7 +368,7 @@ test 现在分两档报（2026-11-25 在本轮交付的树上实跑，含 §7.18
 | `benches/many_views_mix.sh` | 354 | 万级混合视图矩阵（§7.19）：每格 `mvseed` → 优雅停服 → 同目录重开 → `mvmix`（五 op 一组 = 5 records / 2 writes / 净零），`$VIEWS` × `$CONNS` 逐格跑，自动 checkpoint 开关、`VmRSS`/`VmHWM` 采样、停服 `rounds/worst`、落 46 列 TSV；`OUT=`/`TSV=` 把落盘指到别处，供单格隔离探针用而不覆盖正式矩阵；任一断言失败即非零退出 |
 | `benches/promote_smoke.sh` | 258 | 切主的活体验证（§6.6「切主」）：真主 → 真副本 → 在线拒写与被锁拒提升 → 停旧主/停副本 → 离线提升 → 新主可写 → 旧主回魂被高令牌副本拒收且副本继续答读；动态分配四个端口、独立日志落盘、任一断言失败即非零退出 |
 | `benches/replica_rate.sh` | 359 | 副本传送的三格实测（§6.6 边界 4）：冷启动端到端与传输段（两种 `--fetch-bytes`）、追赶积压、追平时的读侧 p99；每个阶段用独立 standby 进程，好把「最坏一轮」归属到相位 |
-| `benches/grovefs_pin_ab.sh` | 135 | grovefs 接入侧的 pin 跨代复核（§10 阶段 C 4 末、§11 第 21 条）：同一个 worktree 只改 `Cargo.toml` 那行 tag，两臂各跑编译 / 仓内测试 / 六条端到端套件，且**每臂配同代引擎二进制**（旧引擎由 `git archive <tag>` 现编并印 `sha256`）、末尾再出混代反证与 tag↔HEAD 的差；跑前要求 `Cargo.toml`/`Cargo.lock` 干净、退出即还原 |
+| `benches/grovefs_pin_ab.sh` | 168 | grovefs 接入侧的 pin 跨代复核（§10 阶段 C 4 末、§11 第 21 条）：同一个 worktree 只改 `Cargo.toml` 那行 tag，两臂各跑编译 / 仓内测试 / 六条端到端套件，且**每臂配同代引擎二进制**（两臂的引擎各由 `git archive <tag>` 现编，连同 rev / `sha256` / `PROTOCOL_VERSION` 一起印出来；路径为空就 `die`，不让套件静默退回默认引擎）、末尾再出混代反证与 tag↔HEAD 的差；跑前要求 `Cargo.toml`/`Cargo.lock` 干净、退出即还原 |
 | `benches/replica_rate_xhost.sh` | 459 | 同上的**跨机**版（§6.6 边界 5）：副本放在第二台机上，量冷启动/追赶的真实链路速率与「副本在追时主 p50/p90/p99 + 吞吐」的 A/B；A/B 从同一份种子目录派生、写入量逐字节相同，并先量链路与 fsync 上限做参照 |
 
 行是 `wc -l`，含各文件自己的 `mod tests`（旧版这张表是历史快照，已与代码脱开的
@@ -4598,8 +4599,10 @@ spike 明确**没**做、也不在接入面上假装做的事 —— 一律返�
    `benches/results/grovefs_pin_ab.log`）**：M1–M4 的代码全落在 grovefs 仓，引擎这一轮
    还欠的只有「把 pin 往上提」这件事值多少改动。做法是同一份 grovefs 源码、同一个
    worktree（`feat/treedb-read-errno` @ 16184ca），唯一变量 = `Cargo.toml` 里那行 tag；
-   两臂各跑编译、仓内测试、六条端到端套件，**且各配同代引擎二进制** —— 共用一份引擎的
-   话测的是「新引擎兼容旧客户端」，不是「pin 变了」。
+   两臂各跑编译、仓内测试、六条端到端套件，**且各配同代引擎二进制** —— 两份都由
+   `git archive <tag>` 现编：`v0.3.6` 是 rev `2193eed` / sha `fcc0fed1…` / proto 5，
+   `v0.8.1` 是 rev `5a6889c` / sha `b3e504dc…` / proto 8。共用一份引擎的话测的是「新
+   引擎兼容旧客户端」，不是「pin 变了」。
 
    | ref | pin | `control-migrate` | `Op::Link` |
    |---|---|---|---|
@@ -4610,7 +4613,7 @@ spike 明确**没**做、也不在接入面上假装做的事 —— 一律返�
    | `feat/treedb-read-errno` | `v0.3.6` | 有 | 无 |
    | `origin/feat/treedb-read-errno` | `v0.3.6` | 有 | 无 |
 
-   | 套件 | 臂 A：pin v0.3.6 | 臂 B：pin v0.8.0 |
+   | 套件 | 臂 A：pin v0.3.6 | 臂 B：pin v0.8.1 |
    |---|---|---|
    | `test_treedb_control.sh` | 111 / 0 | 111 / 0 |
    | `test_treedb_matrix.sh` | 39 / 0 / 10 | 39 / 0 / 10 |
@@ -4625,9 +4628,11 @@ spike 明确**没**做、也不在接入面上假装做的事 —— 一律返�
      23 skip），`cargo check --release --features treedb --all-targets` 两臂都是
      0 warning / 0 error，`cargo test --release --features treedb` 两臂都是
      **318 passed / 0 failed / 4 ignored**（19 个测试二进制），而两臂之间被改的文件只有
-     `Cargo.toml | 2 +-` 加 `Cargo.lock | 4 ++--` —— lock 里动的恰是 version 与 source
-     两行。套件表里的字段数 = 该套件 `SUMMARY` 印出来的字段数，只带两个计数器的不补零，
-     免得把「这套没有 skip 概念」读成「skip=0」。
+     `Cargo.toml` 那行 tag 加 `Cargo.lock` 里的 version 与 source 两行 —— 日志里那一格
+     就是 `2 files changed, 3 insertions(+), 3 deletions(-)`。两臂的 grovefs 二进制也不同
+     （sha `5478b08b…` vs `8c84a197…`、9 388 672 B vs 9 411 576 B），否则「对称」可以是
+     两份残留产物给的假象。套件表里的字段数 = 该套件 `SUMMARY` 印出来的字段数，只带两个
+     计数器的不补零，免得把「这套没有 skip 概念」读成「skip=0」。
    - **集成分支还不存在。** 控制面搬家（`src/control_migrate.rs`）只在
      `feat/treedb-read-errno` 上、pin `v0.3.6`；硬链接（`Op::Link`）只在
      `feat/treedb-hardlink` 上、pin `v0.7.0`；两边的 `master` 两样都没有。所以阶段 C 1
@@ -4642,12 +4647,13 @@ spike 明确**没**做、也不在接入面上假装做的事 —— 一律返�
      `v0.6.0` 的 M4，接入面从 M1 起就没再碰它们）。
    - **混代是硬失败，而默认值会咬人。** 拿旧 pin 建出的 grovefs 去接**新**引擎二进制
      —— 这正是套件里 `TREEDB_BIN` 不设时的默认取值
-     `$PWD/../treedb/target/release/treedb-server`，而它当时是 HEAD（613c1f9）的
-     `v0.8.0` 构建 ——
+     `$PWD/../treedb/target/release/treedb-server`，而这一轮它是 HEAD（`5a6889c`）=
+     tag `v0.8.1` 的构建（sha `b3e504dc…`，与臂 B 那份从 tag 现编的引擎逐字节相同）——
      控制面是 `33 / 81`、矩阵是 `0 / 1 / 0`（两条都 `rc=1`），点名
      `errno 68 (protocol version negotiation required: send VersionBegin first (§4.4))`：
-     §4.4 的闸门要求 `client_proto` 与 `PROTOCOL_VERSION` **精确相等**，7↔8 与 8↔7 都拒，
-     没有混代滚动窗口。这一档不该当回归读，但它是个运维坑：六条套件都**没有引擎世代门**
+     §4.4 的闸门要求 `client_proto` 与 `PROTOCOL_VERSION` **精确相等**，实测这一对是
+     proto 5 对 proto 8，跨 `v0.8.0` 那道 7↔8 同样被拒，没有混代滚动窗口。这一档不该当
+     回归读，但它是个运维坑：六条套件都**没有引擎世代门**
      （self-skip 只覆盖「没开 feature」「没找到二进制」两种），所以今天谁在迁移分支上直接
      跑板子，看到的第一现场是 `cannot reach the control plane` 而不是「引擎太新」。两臂
      各配自己的引擎、并把两份 `sha256` 随块印出来，才是「pin 变了」这一件事的测法。
@@ -5284,10 +5290,11 @@ spike 明确**没**做、也不在接入面上假装做的事 —— 一律返�
     实测，三条结论：
 
     - **「只把 pin 往上提」值多少代码：零。** 同一份 grovefs 源码、同一个 worktree，
-      `v0.3.6` → `v0.8.0` 只改 `Cargo.toml` 那行 tag（lock 跟着改 version/source），
+      `v0.3.6` → `v0.8.1` 只改 `Cargo.toml` 那行 tag（lock 跟着改 version/source），
       check 两臂 0 warning / 0 error、test 两臂 **318/0/4**、六条端到端套件的六个三元组
-      逐行相同；而那个锁修补是 `src/engine/apply.rs` 上的 20 行，不新加 op、不新加
-      `Log` 变体。量具 `benches/grovefs_pin_ab.sh`，原始输出
+      逐行相同（两臂各拿一份从自己 tag 现编的引擎：rev `2193eed`/proto 5 与 rev
+      `5a6889c`/proto 8）；而那个锁修补是 `src/engine/apply.rs` 上的 20 行，不新加 op、
+      不新加 `Log` 变体。量具 `benches/grovefs_pin_ab.sh`，原始输出
       `benches/results/grovefs_pin_ab.log`，§10 补段那两张表由
       `benches/doc_table_check.py` 逐格回对，并校三条不变量：两臂三元组相等、六条套件
       齐备、混代闸门的点名行确实在日志里。
@@ -5295,15 +5302,18 @@ spike 明确**没**做、也不在接入面上假装做的事 —— 一律返�
       §7.18 那笔「POSIX 最后一个名字删除时级联清锁」（`c455793`）在 tag **之后**（当时
       HEAD 在 tag 之后共 3 笔：`e013701`、`c455793`、`613c1f9`）—— 升到 `v0.8.0` 等于领
       一个**没有**那个锁修复的构建。所以跨仓第一件要做的不是改 grovefs，而是**再发一个
-      tag**（即下面待办 1，本笔已发）。
-    - **混代是硬失败，而 grovefs 的板子没有世代门。** §4.4 的闸门是精确等号（7↔8 与
-      8↔7 都拒），旧 pin 客户端接新引擎实测 `33 / 81` 与 `0 / 1 / 0`，点名 `errno 68`；
-      六条套件的 `TREEDB_BIN` 默认又指向本仓 HEAD 的构建，于是「分支坏了」是误读。
+      tag**（即下面待办 1，已发成 `v0.8.1`；本轮复跑的臂 B 钉的就是它，块 5 那句
+      「HEAD 在 tag 之后 0 笔」是它的直接读数）。
+    - **混代是硬失败，而 grovefs 的板子没有世代门。** §4.4 的闸门是精确等号（实测这一
+      对是 proto 5 对 proto 8，跨 `v0.8.0` 那道 7↔8 同样被拒），旧 pin 客户端接新引擎
+      实测 `33 / 81` 与 `0 / 1 / 0`，点名 `errno 68`；六条套件的 `TREEDB_BIN` 默认又
+      指向本仓 HEAD 的构建，于是「分支坏了」是误读。
 
-    剩下五条里第一条是引擎侧的发布动作（本笔已做），后四条在 grovefs 仓或运维面，
+    剩下五条里第一条是引擎侧的发布动作（已做），后四条在 grovefs 仓或运维面，
     逐条写清验收判据：
 
-    1. ~~**发 `v0.8.1`**~~ **已发**（本笔发布提交即 `v0.8.1`，把 tag 之后那三笔
+    1. ~~**发 `v0.8.1`**~~ **已发**（发布提交 `5a6889c` = tag `v0.8.1`，标注对象
+       `373c9ba`，把 `v0.8.0` 之后那三笔
        `e013701` / `c455793` / `613c1f9` 圈进来）。判据逐条实测：新 tag 上
        `PROTOCOL_VERSION` 仍 8、`SNAP_VERSION` 仍 4、`DUMP_VERSION` 仍 2（那三笔只动
        `src/engine/apply.rs` 的 20 行锁级联与测试 / 量具 / 文档，三个版本常量一行未改
@@ -5319,18 +5329,20 @@ spike 明确**没**做、也不在接入面上假装做的事 —— 一律返�
     3. **给 grovefs 那六条端到端套件加引擎世代门**（改在 grovefs 仓的 `.build-bin/`）。
        判据：引擎 `--stats` 报的 `proto_version` 与客户端 pin 不同代时，套件打 SKIP 并
        点名两侧版本号与「请先起同代引擎」，而不是抛 81 条红；沿用既有的 pass/fail/skip
-       三计数器与「自跳闸必须可见」两条规矩。
+       三计数器与「自跳闸必须可见」两条规矩。写量具时就踩过同一坑：`TREEDB_BIN` 传一个
+       **空值**等于没传（`${TREEDB_BIN:-默认}` 走的是 `:-`），整块会静默退回默认引擎，
+       所以调用方得先 `[ -x "$TB" ]` 再跑。
     4. **把版本窗口写进部署文档**（grovefs 仓）。判据：`USAGE`/README 里有一句明写
        「`client_proto == PROTOCOL_VERSION` 精确相等，7↔8 与 8↔7 都拒，没有混代滚动
        升级窗口」，并给出升级顺序（先起新引擎 → 客户端换 pin 重建 → 旧客户端进程必须
        重启，不接受新旧客户端并存）。
     5. **grovefs 主检出的分叉与 WIP 先收口**（跨仓协作项，别叠在别人的改动上）。实测
-       现状：本地 `master` 落后 `origin/master` 9 笔、独有 1 笔；主检出 48 个未提交文件，
-       最新一笔 mtime 2026-11-25 12:37:29Z。判据：这三项归零之后再谈 pin 提交，否则
-       「pin 升了」这个结论落不到一个可复现的 commit 上。
+       现状：本地 `master` 落后 `origin/master` 9 笔、独有 1 笔；主检出 50 个未提交文件，
+       最新一笔 mtime 2026-11-25 15:25Z —— 就在这次复跑的同时还在动。判据：这三项归零
+       之后再谈 pin 提交，否则「pin 升了」这个结论落不到一个可复现的 commit 上。
 
     **本轮没做的事**：不改 grovefs 任何受版本控制的文件、不推任何 pin、不在主检出上构建
     （只在临时 worktree 上临时改 tag，脚本退出即还原 `Cargo.toml`/`Cargo.lock`）；
-    `feat/treedb-hardlink`（pin `v0.7.0`）跨到 `v0.8.0` 这一格**未实测** —— 它欠的是同
+    `feat/treedb-hardlink`（pin `v0.7.0`）跨到 `v0.8.1` 这一格**未实测** —— 它欠的是同
     一行 tag 的改动，但那一半的接入代码（真发 `Op::Link` 的 provider）不在我复现的那棵
     树上，跑出来的三元组也不能替集成分支背书。
