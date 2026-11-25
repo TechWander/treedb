@@ -21,3 +21,12 @@ group  wal=treedb-sr-group op=write conns=64 threads=64 pipeline=1 → 68758 ops
 group  wal=treedb-sr-group   writes=211794 syncs=3445 → 61.48 写/fsync
 always wal=treedb-sr-always op=write conns=64 threads=64 pipeline=1 → 13600 ops/s over 3.10s | lat us: p50=4567 p90=4685 p99=6704 max=12528 | errors=0
 always wal=treedb-sr-always   writes=42604 syncs=42604 → 1.00 写/fsync
+=== sync_ratio @ 2026-11-25T13:05:31+00:00 (op=write conns=64 pipeline=1, 3s/格) ===
+group  wal=sr_group op=write conns=64 threads=64 pipeline=1 → 10501 ops/s over 3.06s | lat us: p50=1913 p90=14782 p99=32051 max=96183 | errors=0
+group  wal=sr_group   writes=32624 syncs=609 → 53.57 写/fsync
+always wal=sr_always op=write conns=64 threads=64 pipeline=1 → 9823 ops/s over 3.01s | lat us: p50=1856 p90=16443 p99=32808 max=99914 | errors=0
+always wal=sr_always   writes=30129 syncs=498 → 60.50 写/fsync
+group  wal=treedb-sr-group op=write conns=64 threads=64 pipeline=1 → 111847 ops/s over 3.00s | lat us: p50=513 p90=905 p99=1085 max=7068 | errors=0
+group  wal=treedb-sr-group   writes=336133 syncs=6129 → 54.84 写/fsync
+always wal=treedb-sr-always op=write conns=64 threads=64 pipeline=1 → 107026 ops/s over 3.00s | lat us: p50=555 p90=859 p99=1108 max=8532 | errors=0
+always wal=treedb-sr-always   writes=321693 syncs=5782 → 55.64 写/fsync

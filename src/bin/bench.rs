@@ -769,6 +769,526 @@ fn run_posix_verify(args: &Args) {
     }
 }
 
+// ---------------------------------------------------------------- 万级混合视图档
+
+/// 混合读写档每组固定五个 op：两次 `Lookup`、一次 `ReadDir`、一次 `Create` 加
+/// 一次同名 `Unlink`。
+///
+/// 3 读 2 写是刻意的：读走 worker 读锁、不产 WAL 记录，写走唯一提交线程。纯读
+/// 那一头 `--op lookup` / `--op readdir` 已经各自量过，纯写有 `--op create`；这一
+/// 档要的是两者混在**同一条连接、同一批**里时的形状 —— 那才是客户端真实形态
+/// （一次 `getattr` 打两个名字、一次 `ls`、一次 `touch` 后立刻 `rm`）。
+const MIX_GROUP_OPS: usize = 5;
+
+/// `mvseed` / `mvmix` 的视图名。刻意与压测档的 `bench<t>v<v>` 区分：那一档每线程
+/// 独占一批视图，混合档要让所有连接打**同一批**视图，量的才是「多客户端并发遍历
+/// 同一万级视图集合」，不是「各自数自己那几百个视图」。
+fn mv_view(i: u64) -> Vec<u8> {
+    format!("mv{i:06}").into_bytes()
+}
+
+/// 视图内预热出来的文件名；`Lookup` / `ReadDir` 只打这些既有名字，它们的应答
+/// 形状因此与净零断言无关。
+fn mv_child(j: u64) -> Vec<u8> {
+    format!("w{j:04}").into_bytes()
+}
+
+/// `mvmix` 每组的临时名。`nonce` 只有五位（见 [`nonce`]），组号取满 u64 也才二十
+/// 位，加上前缀与分隔符仍远在名字长度上限内；`m` 与预热的 `w` 不撞名。
+fn mv_tmp(nonce: u64, g: u64) -> Vec<u8> {
+    format!("m{nonce}-{g}").into_bytes()
+}
+
+/// 把上一档灌好的 N 个视图 id 查回来，并核对视图名就是 `mv000000` 起连号。
+///
+/// 不假设 id 从 1 递增：那是实现细节，`DropView` 之后就会留洞。这一档要的是
+/// 「N 个不同视图」，洞不洞的与结论无关。名字形如 `mv*` 但后缀不是数字的（比如
+/// 用户自己的 `mvold`）直接不计数，不拿它去碰后面的连号判定。
+fn mv_views(c: &mut Client, nviews: u64) -> Vec<u32> {
+    let all = match c.call(&Op::ListViews).expect("ListViews") {
+        Reply::Views(v) => v,
+        other => panic!("ListViews → {other:?}"),
+    };
+    let mut hits: Vec<(u64, u32)> = Vec::new();
+    for (name, id, root) in &all {
+        if !name.starts_with(b"mv") || *root != 1 {
+            continue;
+        }
+        let idx = std::str::from_utf8(&name[2..]).ok().and_then(|s| s.parse::<u64>().ok());
+        if let Some(idx) = idx {
+            hits.push((idx, *id));
+        }
+    }
+    hits.sort();
+    let gapped = hits.iter().enumerate().any(|(k, (i, _))| *i != k as u64);
+    if hits.len() as u64 != nviews || gapped {
+        eprintln!(
+            "需要 {nviews} 个 mv* 视图，实际查到 {} 个{}（ListViews 共 {} 条）",
+            hits.len(),
+            if gapped { "（编号不连续）" } else { "" },
+            all.len()
+        );
+        std::process::exit(1);
+    }
+    hits.iter().map(|(_, id)| *id).collect()
+}
+
+/// 造万级混合视图档的语料：`--views` 个视图 × `--rows` 个文件。
+///
+/// 记录数不靠猜，按 `src/engine/apply.rs` 的分支逐条给出：`CreateView` 产
+/// `PutView` + `PutNode(root)` 两条，`Create`（新名、无 data_ref）产 `bump` +
+/// `PutNode` + `PutDentry` 三条，所以终态必须是 `views=N`、`nodes=N*(W+1)`、
+/// `dentries=N*W`、`records=2N+3NW`。逐视图 `ReadDir` 是为了确认 dentry 数不是
+/// 只对了计数器 —— 账本对得上而目录翻页少几项，一样是坏语料。
+fn run_mv_seed(args: &Args) {
+    let (nv, w) = (args.views as u64, args.rows);
+    if nv == 0 || w == 0 {
+        eprintln!("mvseed 需要 --views >= 1 且 --rows >= 1");
+        std::process::exit(2);
+    }
+    if w > 1000 {
+        eprintln!("mvseed 的 --rows 是每视图的文件数，上限 1000（一页 ReadDir 就能核完）");
+        std::process::exit(2);
+    }
+    let mut c =
+        Client::connect_auth(&args.addr, 3000, args.auth.as_deref()).expect("mvseed control conn");
+    let s0 = stats_of(&mut c);
+    if (s0.views, s0.nodes, s0.dentries, s0.locks, s0.refs, s0.tables, s0.rows)
+        != (0, 0, 0, 0, 0, 0, 0)
+    {
+        eprintln!("mvseed 要求空库，实际 Stats={s0:?}");
+        std::process::exit(1);
+    }
+    let t0 = Instant::now();
+    let mut vids: Vec<u32> = Vec::with_capacity(nv as usize);
+    for start in (0..nv).step_by(500) {
+        let end = (start + 500).min(nv);
+        let batch: Vec<Op> =
+            (start..end).map(|i| Op::CreateView { name: mv_view(i) }).collect();
+        let rs = c.pipeline(&batch).expect("mv CreateView pipeline");
+        if rs.len() != batch.len() {
+            eprintln!("mv CreateView 应答 {} 条，请求 {} 条", rs.len(), batch.len());
+            std::process::exit(1);
+        }
+        for (i, r) in (start..end).zip(rs) {
+            match r {
+                Reply::View { id, root: 1 } => vids.push(id),
+                other => {
+                    eprintln!("CreateView #{i} → {other:?}");
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
+    let mut created = 0u64;
+    for &view in &vids {
+        let mut start = 0u64;
+        while start < w {
+            let end = (start + 500).min(w);
+            let batch: Vec<Op> = (start..end)
+                .map(|j| Op::Create {
+                    view,
+                    parent: 1,
+                    name: mv_child(j),
+                    mode: 0o644,
+                    uid: 1,
+                    gid: 1,
+                })
+                .collect();
+            let rs = c.pipeline(&batch).expect("mv Create pipeline");
+            if rs.len() != batch.len() {
+                eprintln!("mv Create 应答 {} 条，请求 {} 条", rs.len(), batch.len());
+                std::process::exit(1);
+            }
+            for (j, r) in (start..end).zip(rs) {
+                match r {
+                    Reply::Node(_) => created += 1,
+                    other => {
+                        eprintln!("mv Create view={view} #{j} → {other:?}");
+                        std::process::exit(1);
+                    }
+                }
+            }
+            start = end;
+        }
+    }
+    let mut dirs_ok = 0u64;
+    for chunk in vids.chunks(200) {
+        let batch: Vec<Op> = chunk
+            .iter()
+            .map(|&view| Op::ReadDir { view, parent: 1, offset: 0, limit: 1000 })
+            .collect();
+        let rs = c.pipeline(&batch).expect("mv ReadDir pipeline");
+        if rs.len() != batch.len() {
+            eprintln!("mv ReadDir 应答 {} 条，请求 {} 条", rs.len(), batch.len());
+            std::process::exit(1);
+        }
+        for (&view, r) in chunk.iter().zip(rs) {
+            match r {
+                Reply::Dirents { names, next, end, .. } if next == w && end && names.len() as u64 == w => {
+                    dirs_ok += 1
+                }
+                other => {
+                    eprintln!("mv ReadDir view={view} 的根目录不像 {w} 项：{other:?}");
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
+    let time_ms = t0.elapsed().as_millis() as u64;
+    let s1 = stats_of(&mut c);
+    let records = s1.seq - s0.seq;
+    let writes = s1.writes_total - s0.writes_total;
+    if (s1.views, s1.nodes, s1.dentries, s1.locks, s1.refs, s1.tables, s1.rows)
+        != (nv, nv * (w + 1), nv * w, 0, 0, 0, 0)
+    {
+        eprintln!("mvseed 终态不符（views={nv} rows={w}）：{s1:?}");
+        std::process::exit(1);
+    }
+    println!(
+        "mvseed views={nv} rows={w} ops={} created={created} dirs_ok={dirs_ok} \
+         records={records} writes={writes} time_ms={} nodes={} dentries={} errors=0",
+        nv * (w + 1),
+        time_ms.max(1),
+        s1.nodes,
+        s1.dentries
+    );
+    // 视图 id 也要能原样查回来，否则 `mvmix` 会在一个「账本对、视图缺」的库上跑。
+    if vids.len() as u64 != nv || mv_views(&mut c, nv).len() as u64 != nv {
+        eprintln!("mvseed 建了 {} 个视图但查回来 {} 个", nv, vids.len());
+        std::process::exit(1);
+    }
+    if records != 2 * nv + 3 * nv * w || writes != nv + nv * w {
+        eprintln!(
+            "mvseed: records={records} writes={writes}，应为 {}/{}",
+            2 * nv + 3 * nv * w,
+            nv + nv * w
+        );
+        std::process::exit(1);
+    }
+}
+
+/// 核对临时名真的没了、预热的名字真的还在：取头尾各至多 200 组号，逐组两条
+/// `Lookup`（临时名必须 ENOENT，预热名必须回 Node）。
+///
+/// 只读账本等于只信计数器。名字级核对才说明「净零」是真的净零 —— 尤其要排除
+/// 「Create 失败、Unlink 也跟着失败，两边都没记账」这种自欺形状。
+fn verify_mv_names(
+    c: &mut Client,
+    vids: &[u32],
+    nonce: u64,
+    w: u64,
+    groups: u64,
+) -> Result<(u64, u64), String> {
+    let mut ids: Vec<u64> = (0..groups.min(200)).collect();
+    ids.extend(groups.saturating_sub(200)..groups);
+    ids.sort_unstable();
+    ids.dedup();
+    let (mut gone, mut kept) = (0u64, 0u64);
+    for chunk in ids.chunks(100) {
+        let batch: Vec<Op> = chunk
+            .iter()
+            .flat_map(|&g| {
+                let view = vids[g as usize % vids.len()];
+                [
+                    Op::Lookup { view, parent: 1, name: mv_tmp(nonce, g) },
+                    Op::Lookup { view, parent: 1, name: mv_child(g % w) },
+                ]
+            })
+            .collect();
+        let rs = c.pipeline(&batch).map_err(|e| format!("mv Lookup: {e}"))?;
+        if rs.len() != batch.len() {
+            return Err(format!("mv Lookup 应答 {} 条，请求 {} 条", rs.len(), batch.len()));
+        }
+        for (k, r) in rs.into_iter().enumerate() {
+            let g = chunk[k / 2];
+            if k % 2 == 0 {
+                match r {
+                    Reply::Err { code, .. } if code == errno::ENOENT => gone += 1,
+                    other => return Err(format!("临时名 m{nonce}-{g} 还在：{other:?}")),
+                }
+            } else {
+                match r {
+                    Reply::Node(_) => kept += 1,
+                    other => {
+                        let name = mv_child(g % w);
+                        let want = String::from_utf8_lossy(&name);
+                        return Err(format!("预热名 {want} 丢了：{other:?}"));
+                    }
+                }
+            }
+        }
+    }
+    Ok((gone, kept))
+}
+
+/// 混合读写档：`--conns` 条连接在 `--secs` 秒里对 `--views` 个已灌好的视图反复跑
+/// 「2 Lookup + 1 ReadDir + 1 Create + 1 Unlink」，每组正好一个 pipeline 批。
+///
+/// 三件事必须同时成立，缺一就说明这档量的不是混合读写：
+/// 1. 账本在测量前后逐项相等（每组净零）。这依赖 `src/net/multi.rs` 的分派：
+///    含写的批整批交给唯一提交线程按序执行（只有全只读的批才分流到 worker），
+///    所以同组内的 `Create` 一定先于 `Unlink` 落地。
+/// 2. `records = 5G`、`writes = 2G`：`Create` 三条、`Unlink` 两条（无 data_ref 且
+///    nlink=1，走 `DelDentry` + `DelNode`），读不产记录也不计写。
+/// 3. `views_touched` 由所有连接共享的位图真实统计，不由 `G % N` 反推。
+///
+/// 延迟口径与 `posixdelete` 相同：一个 pipeline 的往返微秒数除以实际回包数，逐
+/// op 重复后求分位。它衡量的是批内摊还 RTT，不是 pipeline=1 的单 op 延迟。
+fn run_mixed_views(args: &Args) {
+    let nviews = args.views;
+    let w = args.rows;
+    let pipe = args.pipeline;
+    if nviews == 0 || w == 0 {
+        eprintln!("mvmix 需要 --views >= 1 且 --rows >= 1（先跑 --bulk mvseed）");
+        std::process::exit(2);
+    }
+    if pipe == 0 || pipe % MIX_GROUP_OPS != 0 {
+        eprintln!("mvmix 的 --pipeline 必须是 {MIX_GROUP_OPS} 的倍数 —— 一组五个 op 不能被切进两批");
+        std::process::exit(2);
+    }
+    let conns = args.conns.max(1);
+    let gpb = pipe / MIX_GROUP_OPS;
+    let mut ctrl =
+        Client::connect_auth(&args.addr, 3000, args.auth.as_deref()).expect("mvmix control conn");
+    let vids = mv_views(&mut ctrl, nviews as u64);
+    let s0 = stats_of(&mut ctrl);
+    if (s0.views, s0.nodes, s0.dentries, s0.locks, s0.refs, s0.tables, s0.rows)
+        != (nviews as u64, nviews as u64 * (w + 1), nviews as u64 * w, 0, 0, 0, 0)
+    {
+        eprintln!("mvmix 语料形状不符（views={nviews} rows={w}）：{s0:?}");
+        std::process::exit(1);
+    }
+    let nonce = nonce();
+    let want_page = (w as usize).min(20);
+    let want_end = w <= 20;
+    let next = Arc::new(AtomicU64::new(0));
+    let touched: Arc<Vec<AtomicU64>> =
+        Arc::new((0..(nviews + 63) / 64).map(|_| AtomicU64::new(0)).collect());
+    let window = Duration::from_secs(args.secs.max(1));
+    let mut peak = BulkPeak::default();
+    peak.observe(&s0);
+    let mut sampler = start_bulk_sampler(args);
+    let t0 = Instant::now();
+    let mut handles = Vec::with_capacity(conns);
+    for _ in 0..conns {
+        let a = args.addr.clone();
+        let auth = args.auth.clone();
+        let next = next.clone();
+        let touched = touched.clone();
+        let vids = vids.clone();
+        handles.push(std::thread::spawn(move || {
+            let mut c = Client::connect_auth(&a, 3000, auth.as_deref()).expect("mvmix conn");
+            let (mut groups, mut errs) = (0u64, 0u64);
+            let (mut lookups, mut dirs, mut creates, mut unlinks) = (0u64, 0u64, 0u64, 0u64);
+            let mut lat = Vec::new();
+            while t0.elapsed() < window {
+                let g0 = next.fetch_add(gpb as u64, Ordering::Relaxed);
+                let mut batch: Vec<Op> = Vec::with_capacity(pipe);
+                for g in g0..g0 + gpb as u64 {
+                    let slot = g as usize % nviews;
+                    let view = vids[slot];
+                    // 位图按 64 个视图一字打包：字号是 slot >> 6，不是 slot 本身。
+                    touched[slot >> 6].fetch_or(1u64 << (slot & 63), Ordering::Relaxed);
+                    batch.push(Op::Lookup { view, parent: 1, name: mv_child(g % w) });
+                    batch.push(Op::Lookup { view, parent: 1, name: mv_child(g / w.max(1) % w) });
+                    batch.push(Op::ReadDir { view, parent: 1, offset: 0, limit: 20 });
+                    batch.push(Op::Create {
+                        view,
+                        parent: 1,
+                        name: mv_tmp(nonce, g),
+                        mode: 0o644,
+                        uid: 1,
+                        gid: 1,
+                    });
+                    batch.push(Op::Unlink { view, parent: 1, name: mv_tmp(nonce, g) });
+                }
+                let started = Instant::now();
+                let ok = match c.pipeline(&batch) {
+                    Ok(rs) => {
+                        if rs.len() != batch.len() {
+                            errs += (batch.len().max(rs.len()) - batch.len().min(rs.len())) as u64;
+                            false
+                        } else {
+                            let us = started.elapsed().as_micros() as u64;
+                            let per_op = us / rs.len().max(1) as u64;
+                            for _ in 0..rs.len() {
+                                lat.push(per_op);
+                            }
+                            for (k, r) in rs.into_iter().enumerate() {
+                                let pos = k % MIX_GROUP_OPS;
+                                let good = match (pos, r) {
+                                    (0, Reply::Node(_)) | (1, Reply::Node(_)) => {
+                                        lookups += 1;
+                                        true
+                                    }
+                                    (3, Reply::Node(_)) => {
+                                        creates += 1;
+                                        true
+                                    }
+                                    (2, Reply::Dirents { names, end, .. }) => {
+                                        dirs += 1;
+                                        names.len() == want_page && end == want_end
+                                    }
+                                    (4, Reply::NodeRef(d)) => {
+                                        unlinks += 1;
+                                        d.is_empty()
+                                    }
+                                    (_, Reply::Err { code, ref msg }) => {
+                                        eprintln!("mvmix reply err {code} {}", String::from_utf8_lossy(msg));
+                                        false
+                                    }
+                                    (_, ref other) => {
+                                        eprintln!("mvmix reply shape at pos {pos}: {other:?}");
+                                        false
+                                    }
+                                };
+                                if !good {
+                                    errs += 1;
+                                }
+                            }
+                            true
+                        }
+                    }
+                    Err(e) => {
+                        errs += (pipe * gpb) as u64;
+                        eprintln!("mvmix pipeline: {e}");
+                        false
+                    }
+                };
+                if ok {
+                    groups += gpb as u64;
+                }
+            }
+            (groups, lookups, dirs, creates, unlinks, errs, lat)
+        }));
+    }
+    let mut groups = 0u64;
+    let mut lookups = 0u64;
+    let mut dirs = 0u64;
+    let mut creates = 0u64;
+    let mut unlinks = 0u64;
+    let mut errs = 0u64;
+    let mut lat = Vec::new();
+    for h in handles {
+        let (g, l, d, cr, un, e, mut samples) = h.join().expect("mvmix thread");
+        groups += g;
+        lookups += l;
+        dirs += d;
+        creates += cr;
+        unlinks += un;
+        errs += e;
+        lat.append(&mut samples);
+    }
+    let time_ms = t0.elapsed().as_millis() as u64;
+    if let Some(s) = sampler.as_mut() {
+        let sampled = s.stop();
+        peak.samples += sampled.samples;
+        peak.wal_bytes = peak.wal_bytes.max(sampled.wal_bytes);
+        peak.wal_disk_bytes = peak.wal_disk_bytes.max(sampled.wal_disk_bytes);
+        peak.snap_bytes = peak.snap_bytes.max(sampled.snap_bytes);
+    }
+    let reserved = next.load(Ordering::Relaxed);
+    if errs != 0 {
+        eprintln!("mvmix: errors={errs}，没跑完就不必再核对账本");
+        std::process::exit(1);
+    }
+    if reserved != groups {
+        eprintln!("mvmix: 领走 {reserved} 个组号、完成 {groups} 个，有批没走到底");
+        std::process::exit(1);
+    }
+    let ops = groups * MIX_GROUP_OPS as u64;
+    let mut touched_n = 0u64;
+    for word in touched.iter() {
+        let mut v = word.load(Ordering::Relaxed);
+        while v != 0 {
+            v &= v - 1;
+            touched_n += 1;
+        }
+    }
+    let s1 = stats_of(&mut ctrl);
+    peak.observe(&s1);
+    let records = s1.seq - s0.seq;
+    let writes = s1.writes_total - s0.writes_total;
+    let lat_samples = lat.len();
+    let (p50, p90, p99, max) = pct(lat);
+    let (gone, kept) = match verify_mv_names(&mut ctrl, &vids, nonce, w, groups) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("mvmix: {e}");
+            std::process::exit(1);
+        }
+    };
+    println!(
+        "bulk mode=mvmix views={nviews} rows={w} conns={conns} pipeline={pipe} secs={} \
+         time_ms={} groups={groups} ops={ops} records={records} writes={writes} syncs={} \
+         lookups={lookups} readdirs={dirs} creates={creates} unlinks={unlinks} \
+         lat_p50_us={p50} lat_p90_us={p90} lat_p99_us={p99} lat_max_us={max} lat_samples={lat_samples} \
+         views_touched={touched_n} gone_ok={gone} kept_ok={kept} \
+         wal_start_bytes={} wal_end_bytes={} wal_delta_bytes={} wal_peak_bytes={} \
+         checkpoints_start={} checkpoints_end={} checkpoints={} \
+         snap_seq_start={} snap_seq_end={} samples={} nodes_left={} dentries_left={} \
+         locks_left={} refs_left={} errors={errs} ops_per_s={}",
+        args.secs.max(1),
+        time_ms.max(1),
+        s1.syncs_total - s0.syncs_total,
+        s0.wal_bytes,
+        s1.wal_bytes,
+        s1.wal_bytes.saturating_sub(s0.wal_bytes),
+        peak.wal_bytes,
+        s0.checkpoints,
+        s1.checkpoints,
+        s1.checkpoints.saturating_sub(s0.checkpoints),
+        s0.snap_seq,
+        s1.snap_seq,
+        peak.samples,
+        s1.nodes,
+        s1.dentries,
+        s1.locks,
+        s1.refs,
+        ops * 1000 / time_ms.max(1)
+    );
+    if lookups != 2 * groups || dirs != groups || creates != groups || unlinks != groups {
+        eprintln!("mvmix: op 配比 {lookups}/{dirs}/{creates}/{unlinks}，应为 {}/{groups}/{groups}/{groups}", 2 * groups);
+        std::process::exit(1);
+    }
+    if records != 5 * groups || writes != 2 * groups {
+        eprintln!("mvmix: records={records} writes={writes}，应为 {}/{}", 5 * groups, 2 * groups);
+        std::process::exit(1);
+    }
+    if lat_samples != ops as usize {
+        eprintln!("mvmix: 延迟样本 {lat_samples}，应为 {ops}");
+        std::process::exit(1);
+    }
+    if touched_n != (nviews as u64).min(groups) {
+        eprintln!("mvmix: 实际触及 {touched_n} 个视图，应为 {}", (nviews as u64).min(groups));
+        std::process::exit(1);
+    }
+    if gone != sampled_ids(groups) || kept != sampled_ids(groups) {
+        eprintln!(
+            "mvmix: 名字级核对 gone={gone} kept={kept}，应为 {}",
+            sampled_ids(groups)
+        );
+        std::process::exit(1);
+    }
+    if (s1.views, s1.nodes, s1.dentries, s1.locks, s1.refs, s1.tables, s1.rows)
+        != (s0.views, s0.nodes, s0.dentries, s0.locks, s0.refs, s0.tables, s0.rows)
+    {
+        eprintln!("mvmix: 账本没回到测量前 {s0:?} → {s1:?}");
+        std::process::exit(1);
+    }
+    if groups == 0 {
+        eprintln!("mvmix: 一个组都没跑完，这一格没有意义");
+        std::process::exit(1);
+    }
+}
+
+/// `verify_mv_names` 会核对的组数：头尾各至多 200 组，重叠部分去重后就是
+/// `min(G, 400)`。
+fn sampled_ids(groups: u64) -> u64 {
+    groups.min(400)
+}
+
 /// 固定 2N 个 POSIX 删除 op：N 个 Unlink + N 个 Rmdir。
 ///
 /// 每个文件持有唯一 data_ref，因此 Unlink 必须回非空 NodeRef，且账本从 N 行归零；
@@ -948,7 +1468,9 @@ fn run_posix_delete(args: &Args) {
 /// 覆盖写）、`putchanged`（同量但每行真的变）、`churn`（同一键集删后重插 `--cycles`
 /// 轮）。最后两个写档与 churn 都保证每一轮真的改值；同值消除的收益由 `putsame`
 /// 与 `putchanged` 的 `records` / `syncs` / 时间之差给出。`verifychurn` 是重启后的
-/// 独立只读验收，不重新灌数据。
+/// 独立只读验收，不重新灌数据。POSIX 三档（`posixseed` / `posixdelete` /
+/// `posixverify`）与万级视图两档（`mvseed` / `mvmix`）在分派处就直接绕开整张表
+/// 的铺垫，自己建自己的语料。
 ///
 /// `records` 是服务端 `seq` 的差值，也就是「这些 op 总共写了多少条 WAL 记录」——
 /// 它才是这一档的主指标：时间跟盘走，记录数是格式自己的性质。
@@ -963,6 +1485,14 @@ fn run_bulk(args: &Args) {
     }
     if args.bulk == "posixverify" {
         run_posix_verify(args);
+        return;
+    }
+    if args.bulk == "mvseed" {
+        run_mv_seed(args);
+        return;
+    }
+    if args.bulk == "mvmix" {
+        run_mixed_views(args);
         return;
     }
     let n = args.rows;
@@ -1881,7 +2411,7 @@ treedb-bench — 对 treedb-server 打负载
   --threads N        工作线程数（默认 8）
   --pipeline N       每批请求数，1 = 一问一答（默认 1）
   --secs N           持续秒数（默认 5）
-  --views N          每线程视图数（默认 8）
+  --views N          每线程视图数（默认 8）；mvseed/mvmix 档里是视图总数
   --range N          rowrange 的区间宽度（默认 64）
   --ino N            write/lock 打的 inode（默认 1 = 根）。给一个中段 ino 就是
                      「只改正文中段某个节点」的换代负载（replica_redo.sh 的 [mid]）
@@ -1896,11 +2426,15 @@ treedb-bench — 对 treedb-server 打负载
                      posixseed 造 N 个文件（各带唯一 data_ref）+ N 个空目录；
                      posixdelete 正好 N 个 Unlink + N 个 Rmdir，报账本收敛、
                      非空 NodeRef 数与 pipeline 摊还 p50/p99；posixverify 重开后逐 ref 核对。
+                     mvseed 造 --views 个视图 × --rows 个文件（记录数 2N+3NW）；
+                     mvmix 在那些视图上按「2 Lookup + 1 ReadDir + 1 Create + 1 Unlink」
+                     成组并发 --secs 秒，每组一个 pipeline，跑完账本必须逐项回到
+                     测量前，并报 records=5G / writes=2G / views_touched 与名字级核对。
                      tail 在自动 checkpoint 后插入并删除一个专用键，终态不变、
                      WAL 多两条记录，供 SIGKILL 后的快照+尾巴恢复验收。
                      报 time_ms / ops / records / writes / syncs / WAL 起止与峰值 /
                      checkpoint 起止 / rows_left；ops_per_s 的分母是实际完成 op 数
-  --rows N           批量档的表规模（默认 200000）
+  --rows N           批量档的表规模（默认 200000）；mvseed/mvmix 档里是每视图的文件数
   --batch N          range 模式每批删多少行（默认 1000）
   --cycles N         churn 的删后重插轮数（默认 3，必须 >= 1）
   --sample-ms N      测量窗口内 Stats 采样间隔（默认 0 = 不采样）

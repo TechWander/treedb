@@ -168,13 +168,14 @@ op / reply / `Log` 变体，`PROTOCOL_VERSION` 仍 8、`SNAP_VERSION` 仍 4，�
 hash，不看这个字段，所以不影响任何构建；`v0.6.0` 是下一次带 API 变更的发版，
 `Cargo.toml` 的 `version` 随它回到 `0.6.0`，两者重新对齐，此后逐版跟齐（`v0.8.0` = `0.8.0`）。
 
-test 现在分两档报（2026-11-25 在本轮交付的树上实跑，含 §7.18 那批改动）：默认档（纯引擎）`cargo test --release` = **237 passed / 0 failed / 3 ignored**（71 lib +
+test 现在分两档报（2026-11-25 在本轮交付的树上实跑，含 §7.18 与 §7.19 那批改动）：默认档（纯引擎）`cargo test --release` = **242 passed / 0 failed / 3 ignored**（71 lib +
 36 engine_crud + 14 migrate + 21 replication + 12 net_protocol + 11 pitr + 8 read_scaling
-+ 7 crash_recovery + 7 delete_storm + 6 batch + 12 table_bulk + 8 auth + 5 observe
++ 7 crash_recovery + 7 delete_storm + 5 mixed_views + 6 batch + 12 table_bulk + 8 auth
++ 5 observe
 + 5 table_alter + 4 dump_restore +
 3 backup_online + 3 independence + 1 large_reply + 1 checkpoint_tail + 1 scale_connections
 + 1 scale_restore；另 3 条带 `#[ignore]` —— 万级连接、百万节点、64 MiB 快照收尾 ——
-只手动跑，不计入 passed）；`--features postgres-compat` = **268 passed / 0 failed / 9 ignored**，多出的 31 条 = 过渡档自己的 30 条单测 +
+只手动跑，不计入 passed）；`--features postgres-compat` = **273 passed / 0 failed / 9 ignored**，多出的 31 条 = 过渡档自己的 30 条单测 +
 `concurrency.rs` 里那条
 不需要 PG 的拨号用例（剩下 6 条要真 PG，默认 `#[ignore]`，不计入 passed）。即 PG 只出现在
 `postgres-compat` 后面的 `src/pool`、`src/store`、
@@ -342,7 +343,7 @@ test 现在分两档报（2026-11-25 在本轮交付的树上实跑，含 §7.18
 | `src/net/replicate.rs` | 729 | 副本侧跟踪器 `Follower`：拉快照 → 追 WAL → gap 重装，连不上主退避重连；拒收被提掉权的旧主（`Error::Fence`）不退出、只抬计数（§6.6） |
 | `src/net/mail.rs` | 114 | 两者之间那条能被 `epoll` 唤醒的信箱（`Mutex<VecDeque>` + eventfd） |
 | `src/net/client.rs` | 158 | 同步客户端 + pipeline；`connect` / `connect_auth` 先强制协商版本，再按需认证；`connect_raw` / `from_stream` 是只建 TCP 的显式逃生口（§4.4） |
-| `src/bin/{server,bench,pgbench,sqlitebench,micro,migrate,standby,demo,dump,load,backup,pitr}.rs` | 4197 | 可执行入口；`pgbench` 是 PG 对照器，`migrate` 是快照升级 工具（§6.5），`standby` 是只读副本兼 `--promote`（§6.6），`dump`/`load` 是离线逻辑导出与重建（§6.9），`backup` 是在线一致快照导出（§6.10），`pitr` 是按 seq 恢复到新目录（§6.11）；三个面向网络的入口共用 `--auth-key-file` |
+| `src/bin/{server,bench,pgbench,sqlitebench,micro,migrate,standby,demo,dump,load,backup,pitr}.rs` | 5470 | 可执行入口；`pgbench` 是 PG 对照器，`migrate` 是快照升级 工具（§6.5），`standby` 是只读副本兼 `--promote`（§6.6），`dump`/`load` 是离线逻辑导出与重建（§6.9），`backup` 是在线一致快照导出（§6.10），`pitr` 是按 seq 恢复到新目录（§6.11）；三个面向网络的入口共用 `--auth-key-file` |
 | `benches/throughput_matrix.sh` | 188 | 五轴吞吐矩阵（§7 的数据来源） |
 | `benches/rehearse_migrate.sh` | 159 | 快照升级的真机彩排：旧 tag → 当前树，逐格核四条承诺与回滚窗口（§6.5 的外部效度） |
 | `benches/xgen_probe.sh` | 151 | 跨代混跑探针（§4.4 末）：`git archive` 取真 tag 编旧服务端，五臂分别钉 banner、跨代认证 / 非认证拒绝与同代认证 / 非认证放行 |
@@ -351,9 +352,10 @@ test 现在分两档报（2026-11-25 在本轮交付的树上实跑，含 §7.18
 | `benches/handshake_cost.sh` | 126 | 接入握手的代价（§4.4 末表）：同一轮里 off/on 两臂交替跑 N 条建连，取 bench 自报的 `connected` 时间 + 那一刻的服务端 RSS + 稳态 `ping`/`create`，并校验两臂实际连上的条数一致 |
 | `benches/three_way.sh` | 170 | 三臂同口径对照（§7.13）：treedb / PG 12 / SQLite3，24 格；头部七条口径与「不按 pipeline 乘」的计数判据都写在脚本里 |
 | `benches/three_way_table.py` | 118 | 由两份原始采集重算 §7.13 引用的 `final.tsv`；`--check` 对账、`--selftest` 自带三处注入错（上一版表是手搓 one-liner，把 p50/p99 拼成了一列） |
-| `benches/doc_table_check.py` | 394 | 把 §7.13 的 markdown 表与 `final.tsv` 逐格对账（24×14），再把 §7.18 的七张表（3 张通用表 + 4 张 POSIX）与 `delete_storm.tsv` / `posix_delete_storm.tsv` 逐格对账，并校固定工作量、WAL/快照水位、账本收敛、RSS 样本、`worst_round_us` 等不变量；`--selftest` 用 10 处注入错验证它真的会红 |
+| `benches/doc_table_check.py` | 828 | 把 §7.13 的 markdown 表与 `final.tsv` 逐格对账（24×14），再把 §7.18 的七张表（3 张通用表 + 4 张 POSIX）与 `delete_storm.tsv` / `posix_delete_storm.tsv`、§7.19 的四张矩阵表 + 一张驻留探针表与 `many_views_mix.tsv` / `mix_isolate_auto{0,1}.tsv`、§7.9 的两张持久化表与 `sync_ratio.log` 的两个锚定块逐格对账（§7.19 的格子按 `(auto_mb, views, conns)` 三键定位、§7.9 的按块时间戳定位，都不按行序），并校固定工作量、WAL/快照水位、账本收敛、RSS 样本、`worst_round_us`、合批比与「改后两档同一提交点」等不变量；`--selftest` 用 19 处注入错验证它真的会红 |
 | `benches/delete_storm.sh` | 352 | 通用表删除风暴（§7.18）：`rowdelete` N 行与 `churn` 2N×cycles 两档，自动 checkpoint、`VmRSS`/`VmHWM` 采样、停服 `rounds/worst`、SIGKILL 后拿「快照 + 2 条尾巴」重开逐行核对；任一断言失败即非零退出 |
 | `benches/posix_delete_storm.sh` | 380 | POSIX 删除风暴（§7.18）：`posixseed` → `posixdelete`（2N op / 6N records / 2N writes）→ `posixverify`（逐 ref 归零），自动档 `0/1` 两跑各核 checkpoint/水位/WAL 形状，并校四本账（nodes/dentries/locks/refs）收敛到基线 |
+| `benches/many_views_mix.sh` | 354 | 万级混合视图矩阵（§7.19）：每格 `mvseed` → 优雅停服 → 同目录重开 → `mvmix`（五 op 一组 = 5 records / 2 writes / 净零），`$VIEWS` × `$CONNS` 逐格跑，自动 checkpoint 开关、`VmRSS`/`VmHWM` 采样、停服 `rounds/worst`、落 46 列 TSV；`OUT=`/`TSV=` 把落盘指到别处，供单格隔离探针用而不覆盖正式矩阵；任一断言失败即非零退出 |
 | `benches/promote_smoke.sh` | 258 | 切主的活体验证（§6.6「切主」）：真主 → 真副本 → 在线拒写与被锁拒提升 → 停旧主/停副本 → 离线提升 → 新主可写 → 旧主回魂被高令牌副本拒收且副本继续答读；动态分配四个端口、独立日志落盘、任一断言失败即非零退出 |
 | `benches/replica_rate.sh` | 359 | 副本传送的三格实测（§6.6 边界 4）：冷启动端到端与传输段（两种 `--fetch-bytes`）、追赶积压、追平时的读侧 p99；每个阶段用独立 standby 进程，好把「最坏一轮」归属到相位 |
 | `benches/replica_rate_xhost.sh` | 459 | 同上的**跨机**版（§6.6 边界 5）：副本放在第二台机上，量冷启动/追赶的真实链路速率与「副本在追时主 p50/p90/p99 + 吞吐」的 A/B；A/B 从同一份种子目录派生、写入量逐字节相同，并先量链路与 fsync 上限做参照 |
@@ -2513,13 +2515,15 @@ TREEDB_CONNS=25000 cargo test --release --test scale_connections -- --ignored --
   约束是 `net.core.somaxconn = 4096` 与临时端口区间，与引擎无关（§7.6 末句）。
   引擎侧只有 `ServerConfig::backlog`（默认 4096）这一个旋钮，没有连接数上限。
 
-### 7.9 合并 fsync 是量出来的，不是推断的（2026-11-19）
+### 7.9 合并 fsync 是量出来的，不是推断的（2026-11-19 首测，11-25 复跑）
 
 §7.3 那句「treedb 写路径的领先全部来自跨连接合并 fsync」以前只有两个档位之间的
 吞吐差做支撑。本轮直接读引擎自己的计数器（`--stats` 的 `writes` / `syncs`），算出
 「一次 fsync 摊了多少次写」。固定同一格 `op=write conns=64 pipeline=1`，只换盘与
 持久化档，复现命令：`benches/sync_ratio.sh 3`（原始输出追加在
-`benches/results/sync_ratio.log`，下表是最后四轮）：
+`benches/results/sync_ratio.log`；下表取 `@ 2026-11-19T06:17:12` 那一块的四格，本节末的
+复跑表取 `@ 2026-11-25T13:05:31` 那一块，两张都由 `benches/doc_table_check.py` 按块时间
+戳锚定逐格回对，抄错任一格即非零退出）：
 
 | WAL 位置 | 档位 | ops/s（p50 / p99 µs） | writes | syncs | **写/fsync** |
 |----------|------|--------------------|--------|-------|---------|
@@ -2529,16 +2533,18 @@ TREEDB_CONNS=25000 cargo test --release --test scale_connections -- --ignored --
 | 根盘 ext4 | `always` | 13 600（4 567 / 6 704） | 42 604 | 42 604 | **1.00** |
 
 同一份日志里还有更早的两轮：机械盘 `group` 61.87 / 61.71，根盘 `group` 62.55 / 61.48
-（`always` 每轮都是 1.00）。所以这个比值的**实测范围是 58.9–62.6**（机械盘 58.9–61.9、
-根盘 61.5–62.6），引用时不要再把它写成单一「≈ 55」—— 55 那个数是 §7.11 另一格
-（`conns=64`、`pipeline=1`、`dur=group`、私有 PG 集群同机对比那一组）的范围 53–58，
-两批采集不是同一次。（表中两行 `always` 量的是**改前**实现，第 3 条已把它换掉；
-`group` 那两行仍有效。）
+（`always` 每轮都是 1.00）。所以 11-19 当天这一格的比值是 **58.9–62.6**（机械盘
+58.9–61.9、根盘 61.5–62.6）。跨三批采集看，全距是 **53.6–62.6**：11-19 的 58.9–62.6、
+`benches/ab_durability.sh` 的 53.9–58.0、11-25 复跑（本节末）的 53.6–60.5。引用时不要
+再把它写成单一「≈ 55」—— 55 那个数是 §7.11 另一格（`conns=64`、`pipeline=1`、
+`dur=group`、私有 PG 集群同机对比那一组）的范围 53–58，两批采集不是同一次。（表中两行
+`always` 量的是**改前**实现，第 3 条已把它换掉；`group` 那两行仍有效。）
 三条结论：
 
-1. **`group` 档一轮把 ≈ 60 次 fsync 合成了 1 次**（conns=64 几乎全部排上了同一个
-   回合），换回 5.1–6.0× 吞吐。这就是 §7.3 那张倍率表的机制本身，现在它在计数器
-   上看得见，不用靠吞吐差反推。
+1. **`group` 档一轮把 53–63 次 fsync 合成了 1 次**（比值按采集分批见上；conns=64 几乎
+   全部排上了同一个回合）。换回的 5.1–6.0× 是**改前** `always`（按连接串 fsync）与
+   `group` 的差，那个档已不存在，见第 3 条与本节末的复跑表。这就是 §7.3 那张倍率表的
+   机制本身，现在它在计数器上看得见，不用靠吞吐差反推。
 2. **（改前）`always` 档在高并发下不领先，尾延迟差于 PG**：同一格 PG（`synchronous_commit=on`、
    WAL 同在机械盘）是 1 469 ops/s（p50 33.5 ms / p99 157 ms），treedb 三次独立量到
    1 306（p99 **556 ms**）、1 722/1 716（p99 84 / 65 ms）—— 吞吐在噪声里持平，尾部
@@ -2578,6 +2584,33 @@ TREEDB_CONNS=25000 cargo test --release --test scale_connections -- --ignored --
    WAL 同在机械盘）1 469 ops/s（p50 33.5 ms / p99 157 ms）作对照是站得住的：
    **`always` 档现在是 PG 同格的 7.4× 吞吐、p50 优 17×、p99 优 5×** —— 上一轮
    「吞吐持平、尾部差于 PG」的结论作废。
+
+**复跑（2026-11-25，`HEAD=c455793`，`bash benches/sync_ratio.sh 3`）。** 上面那张表的两行
+`always` 采于 `bef5730`（11-19 09:03Z）之前，同块的 `group` 两行仍有效；这一格在最终代码
+上重跑一次，好让「① 已修」这句话有一份落在当前 HEAD 上、且能被 checker 逐格回对的读数：
+
+| WAL 位置 | 档位 | ops/s | p50 µs | p90 µs | p99 µs | max µs | writes | syncs | 写/fsync | errors |
+|----------|------|-------|--------|--------|--------|--------|--------|-------|----------|--------|
+| 机械盘 XFS | `group` | 10 501 | 1 913 | 14 782 | 32 051 | 96 183 | 32 624 | 609 | 53.57 | 0 |
+| 机械盘 XFS | `always` | 9 823 | 1 856 | 16 443 | 32 808 | 99 914 | 30 129 | 498 | 60.50 | 0 |
+| 根盘 ext4 | `group` | 111 847 | 513 | 905 | 1 085 | 7 068 | 336 133 | 6 129 | 54.84 | 0 |
+| 根盘 ext4 | `always` | 107 026 | 555 | 859 | 1 108 | 8 532 | 321 693 | 5 782 | 55.64 | 0 |
+
+四点读数：
+
+1. **`always` 不再是 1.00**：两格分别合到 60.50 / 55.64 写/fsync，`syncs` 远小于 `writes`
+   （498 vs 30 129、5 782 vs 321 693）。「两个档走同一个提交点」这条 §8 第 11 条的结论，
+   现在在计数器上、也在当前 HEAD 上看得见，不再只有 `ab_durability` 那一份。
+2. **两档吞吐与尾部贴在一起**：机械盘 9 823 / 10 501 = 0.94×、根盘 107 026 / 111 847 =
+   0.96×，p99 32 808 vs 32 051 µs。改前同一格的 `always` 是 1 716 ops/s、p99 65 132 µs
+   —— 那 5.7× 的差已被这笔改动吃掉。
+3. **合批靠的是并发连接，不是 pipeline**：这一格 `pipeline=1` 而 `conns=64`，一轮仍然攒得
+   到几十次写。`conns=1` 时「一轮一次 fsync」自然退化成每 op 一次，这是 §8 第 11 条边界
+   ① 说的那件事：合批之后不再有「已收到但未 ack 的字节也落盘」这一档。
+4. **跨日绝对值不可照抄**：机械盘 `group` 10 322 → 10 501（+1.7 %，可复现），根盘
+   `group` 68 758 → 111 847（+62.6 %）。两块 11-19 的采集块都在 `bef5730` 与 v0.7.0 之前，
+   根盘那一格的位移本轮没有对应的受控 A/B，**不作归因**；能站住的是 `always`/`group` 的
+   比值关系与「合批发生在回合而不是连接」这两条结构性结论。
 
 ### 7.10 计算侧：readdir 一页为什么要钻 100 次树（两层 dentry + kind 冗余）
 
@@ -3174,8 +3207,8 @@ pipeline 8 secs 3`，500 行表，auto-checkpoint 关）**：
    `rename` 也是 1 条记录，只是正文里多带两个表名（25 → 51 字节）。
 2. **落盘税全在逐行那一档。** group 相对 never 的时长差：`rowdelete` +88%（200k）/
    +159%（1M），而 `range` +5% / +0%。fsync 那一列更直接：465 / 2 075 次 → 2 次 →
-   1 次；WAL 在机械盘上时这个量级就是钱（§7.9 把 `group` 的合并比量成「≈ 60 次合成
-   1 次」）。`clear` 的两档时间基本同价（168/185、1 364/924），1M 那次 group 反而更快
+   1 次；WAL 在机械盘上时这个量级就是钱（§7.9 把 `group` 的合并比量成「53–63 次合成
+   1 次，全距见 §7.9 末」）。`clear` 的两档时间基本同价（168/185、1 364/924），1M 那次 group 反而更快
    —— 一次 fsync 的差别被 run 间噪声盖住了，别拿它当「落盘变快」的结论。
 3. **时间不随记录数同比例下降。** 1M 档清空只比逐行快 17.4×（924 ms vs 16 064 ms），
    不是 1 000 000×。理由写在 §5.1：**一条记录 ≠ 常数时间** —— `ClearTable` 的 apply 仍要
@@ -3363,8 +3396,195 @@ node，故 `nodes=1`、其余三项为 0。
 `locks_left=0` 替代锁语义回归。
 
 **这轮还不能回答的**：allocator 级碎片、跨机械盘/SSD 的绝对延迟、10 万行 POSIX 的
-SIGKILL 恢复、`Rename`/`Symlink` 覆盖路径的锁收敛，以及混合读写下万级视图的并发曲线，
-均为**未实测**。后两项分别进入后续 POSIX 审计与 P3 量具，不在本节冒充已闭合。
+SIGKILL 恢复、`Rename`/`Symlink` 覆盖路径的锁收敛，均为**未实测**。「混合读写下万级视图
+的并发曲线」原先也挂在这里，现已由 §7.19 量出并单列边界；剩下四项进入后续 POSIX 审计，
+不在本节冒充已闭合。
+
+### 7.19 万级视图下的混合读写
+
+§7.18 的 POSIX 语料是「先造满、再清空」，两个相位各自纯写。真实挂载点不是这个形状：
+`ls` 与 `open`/`unlink` 混在同一条连接上，视图（一个客户端一棵树）可以到万级。这一节换
+一个问题：**读多写少、边建边删的混合负载下，万级视图是否仍然账本守恒、并发是否还在
+扩展、驻留内存到底涨在谁身上**。
+
+**语料形状与记录公式。** 两套量具共用一个形状，只差规模。种子档 `mvseed` 造 N 个视图、
+每视图 W 个文件：`CreateView` = `PutView` + `PutNode(root)` 两条记录，一次不带
+`data_ref` 的 `Create` = `bump` + `PutNode` + `PutDentry` 三条，于是
+
+- 种子固定 `records = 2N + 3NW`、`writes = N + NW`、终态
+  `(views, nodes, dentries) = (N, N(W+1), NW)`；W=20 即每视图 62 条记录，四档实测
+  `seed_records` = 6 200 / 62 000 / 310 000 / 620 000 与公式逐项相等。
+
+测量档 `mvmix` 每组固定 5 个 op：2 次 `Lookup`（同目录两个不同名字）+ 1 次
+`ReadDir(offset=0, limit=20)` + 1 次 `Create(唯一临时名)` + 1 次 `Unlink(同名)`。
+`Lookup`/`ReadDir` 不产生记录，`Create` 3 条，最后一个名字且无锁无 ref 的 `Unlink`
+2 条，所以 G 组恰好 `records = 5G`、`writes = 2G` 且**净零**。八格实测
+`ops == records == 5G`、`writes == lookups == 2G`、`readdirs == creates == unlinks == G`
+全部成立，`nodes_left`/`dentries_left` 回到种子态。
+
+**为什么一组必须落在同一个 pipeline 批里。** `src/net/multi.rs:549` 的判据是
+`has_write = route.iter().any(|o| !o.is_readonly())`：批内只要含一个写 op，整批就交给
+唯一提交线程按序执行，只有全只读批才分流到前端 worker。于是「先 Create 再 Unlink」在
+同一批里天然有序，客户端不必排队等 ack，也不会出现 unlink 先落地的乱序假错。这就是
+`PIPE` 必须取 5 的倍数的原因（脚本先验这一条）—— 否则一组被截成两批，顺序承诺消失。
+
+**两个服务端生命周期。** 每格先起一个进程跑 `mvseed`，优雅停服 checkpoint 后**重开**
+再跑 `mvmix`。所以 `nodes_left = 210 000`、`dentries_left = 200 000` 不是「引擎报自己
+的内存态」，而是重启恢复出来的账本；种子的停服 `worst_round_us` 单独打印并标注
+「不计入混合档」，表里那一列只含测量生命周期。
+
+**采集口径。** 本机 `127.0.0.1`、`durability=group`、`workers=8`、
+`--auto-checkpoint-mb 1`、`rows=20`、`pipeline=50`、`secs=5`、`sample_ms=20`，矩阵是
+`views ∈ {100, 1 000, 5 000, 10 000} × conns ∈ {8, 64}` 共 8 格。原始输出
+`benches/results/many_views_mix.log` / `many_views_mix.tsv`（46 列 × 8 行），采集时
+`HEAD=c45579370670169f6bc3f599b87c585d1e60b1a5`、代码指纹
+`92487d46f10715c491d1c85b0fab887d2c1b75e7c8cfc2e15a9b6cac6d45e373`（`src/bin/bench.rs` +
+`benches/many_views_mix.sh` + `benches/many_views.sh` 三者联合）。本节五张表由 TSV 机器
+生成，再由 `benches/doc_table_check.py` 按 `(auto_mb, views, conns)` 三键逐格回对，
+抄错任一格即非零退出。
+
+**混合负载工作量。**
+
+| views | rows | conns | pipeline | secs | time_ms | groups | ops | records | writes | syncs | lookups | readdirs | creates | unlinks | ops_per_s | errors |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 100 | 20 | 8 | 50 | 5 | 5 005 | 46 920 | 234 600 | 234 600 | 93 840 | 650 | 93 840 | 46 920 | 46 920 | 46 920 | 46 873 | 0 |
+| 100 | 20 | 64 | 50 | 5 | 5 013 | 114 610 | 573 050 | 573 050 | 229 220 | 181 | 229 220 | 114 610 | 114 610 | 114 610 | 114 312 | 0 |
+| 1 000 | 20 | 8 | 50 | 5 | 5 016 | 47 910 | 239 550 | 239 550 | 95 820 | 717 | 95 820 | 47 910 | 47 910 | 47 910 | 47 757 | 0 |
+| 1 000 | 20 | 64 | 50 | 5 | 5 032 | 108 100 | 540 500 | 540 500 | 216 200 | 170 | 216 200 | 108 100 | 108 100 | 108 100 | 107 412 | 0 |
+| 5 000 | 20 | 8 | 50 | 5 | 5 018 | 42 420 | 212 100 | 212 100 | 84 840 | 601 | 84 840 | 42 420 | 42 420 | 42 420 | 42 267 | 0 |
+| 5 000 | 20 | 64 | 50 | 5 | 5 015 | 154 100 | 770 500 | 770 500 | 308 200 | 242 | 308 200 | 154 100 | 154 100 | 154 100 | 153 639 | 0 |
+| 10 000 | 20 | 8 | 50 | 5 | 5 005 | 45 180 | 225 900 | 225 900 | 90 360 | 635 | 90 360 | 45 180 | 45 180 | 45 180 | 45 134 | 0 |
+| 10 000 | 20 | 64 | 50 | 5 | 5 021 | 117 390 | 586 950 | 586 950 | 234 780 | 185 | 234 780 | 117 390 | 117 390 | 117 390 | 116 899 | 0 |
+
+组数是 5 秒窗口积分出来的（42 420–154 100 组），每格 `lat_samples == ops`，即每个 op 都有
+一条样本；`ops_per_s` 是 bench 自报的 `ops × 1000 / time_ms`（整数除法），`time_ms` 在
+join 之后取，所以 `time_ms ≥ 5 000` 是硬事实而不是目标。
+
+**延迟与覆盖。**
+
+| views | conns | groups | lat_p50_us | lat_p90_us | lat_p99_us | lat_max_us | lat_samples | views_touched | gone_ok | kept_ok | errors |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 100 | 8 | 46 920 | 67 | 413 | 753 | 1 522 | 234 600 | 100 | 400 | 400 | 0 |
+| 100 | 64 | 114 610 | 572 | 834 | 1 423 | 2 184 | 573 050 | 100 | 400 | 400 | 0 |
+| 1 000 | 8 | 47 910 | 71 | 411 | 826 | 1 332 | 239 550 | 1 000 | 400 | 400 | 0 |
+| 1 000 | 64 | 108 100 | 630 | 920 | 1 236 | 1 306 | 540 500 | 1 000 | 400 | 400 | 0 |
+| 5 000 | 8 | 42 420 | 87 | 428 | 963 | 1 582 | 212 100 | 5 000 | 400 | 400 | 0 |
+| 5 000 | 64 | 154 100 | 403 | 733 | 1 141 | 1 601 | 770 500 | 5 000 | 400 | 400 | 0 |
+| 10 000 | 8 | 45 180 | 81 | 405 | 895 | 1 606 | 225 900 | 10 000 | 400 | 400 | 0 |
+| 10 000 | 64 | 117 390 | 514 | 937 | 1 393 | 1 871 | 586 950 | 10 000 | 400 | 400 | 0 |
+
+8→64 连接：吞吐 ×2.25–3.63（四档依次 2.44 / 2.25 / 3.63 / 2.59），p50 涨 4.6–8.9×，
+p99 只涨 1.18–1.89× —— 尾延迟的增幅明显小于中位数，因为 64 连接每次 fsync 摊到
+1 266–1 274 个写，8 连接只有 134–144 个；group commit 把「等落盘」从每个请求头上挪到
+一次批量提交的头上。`views_touched` 由 bench 内共享位图真实统计（不是 `G % N` 反推），
+四档都等于 N，也就是窗口内每个视图至少被摸过一次；`gone_ok = kept_ok = 400` 是头尾各
+`min(G, 400)` 个名字的逐名核对（临时名必须 `NotFound`、种子名必须仍在），不是抽样估计。
+
+**视图数不是这条曲线的自变量。** 同连接档内 100 → 10 000 视图，吞吐只在
+42 267–47 910（8 连接）/ 107 412–153 639（64 连接）之间摆动，看不到单调衰减；种子时长
+263 ms → 31.5 s 则是干净的 O(N)。但单轮抖动本身就有 ±10% 量级，所以「5 000 比 10 000
+快」这类读法不成立 —— 这里能读出的是**万级视图数在该形状下不构成结构性代价**；要判定
+轻微衰减需要配对复采，本节没做。
+
+**种子、checkpoint 与账本。**
+
+| views | conns | auto_mb | seed_time_ms | seed_records | checkpoints_start | checkpoints_delta | wal_start_bytes | wal_end_bytes | wal_peak_bytes | snap_seq_start | snap_seq_end | nodes_left | dentries_left | locks_left | refs_left | errors |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 100 | 8 | 1 | 263 | 6 200 | 0 | 13 | 0 | 572 220 | 1 172 310 | 6 200 | 231 450 | 2 100 | 2 000 | 0 | 0 | 0 |
+| 100 | 64 | 1 | 263 | 6 200 | 0 | 29 | 0 | 988 800 | 1 384 320 | 240 800 | 797 850 | 2 100 | 2 000 | 0 | 0 | 0 |
+| 1 000 | 8 | 1 | 3 297 | 62 000 | 0 | 13 | 0 | 859 860 | 1 441 260 | 62 000 | 287 500 | 21 000 | 20 000 | 0 | 0 | 0 |
+| 1 000 | 64 | 1 | 3 297 | 62 000 | 0 | 28 | 0 | 197 760 | 1 965 420 | 301 550 | 838 850 | 21 000 | 20 000 | 0 | 0 | 0 |
+| 5 000 | 8 | 1 | 16 148 | 310 000 | 0 | 11 | 0 | 1 029 000 | 1 701 000 | 310 000 | 504 950 | 105 000 | 100 000 | 0 | 0 | 0 |
+| 5 000 | 64 | 1 | 16 148 | 310 000 | 0 | 22 | 0 | 2 966 400 | 4 350 720 | 522 100 | 1 244 600 | 105 000 | 100 000 | 0 | 0 | 0 |
+| 10 000 | 8 | 1 | 31 513 | 620 000 | 0 | 12 | 0 | 1 074 060 | 1 890 720 | 620 000 | 828 350 | 210 000 | 200 000 | 0 | 0 | 0 |
+| 10 000 | 64 | 1 | 31 513 | 620 000 | 0 | 13 | 0 | 2 966 400 | 5 679 360 | 845 900 | 1 384 850 | 210 000 | 200 000 | 0 | 0 | 0 |
+
+种入速率 18 800–23 600 records/s。8 连接档窗口内 checkpoint 增量 11–13 次，
+`records / checkpoint` = 18 046–19 281，与「WAL 越过 1 MiB 才派快照」自洽（约 55 B/
+record，由这两个数推算，不是引擎直接报的）；64 连接档同一阈值下这个比值涨到
+19 760–45 150，WAL 峰值也跟着从 1.12–1.80 MB 涨到 1.32–5.42 MB —— 说明并发上去之后
+**旁路编码追不上写入**，阈值只是触发下限，两次落盘之间 WAL 实际跑多远由上一份快照的
+编码耗时决定。`wal_end_bytes < wal_peak_bytes` 八格全部成立（比值 0.10–0.71），即窗口内
+确实落过快照并截了 WAL。`wal_start_bytes` 八格全为 0，但**那是种子优雅停服 checkpoint +
+重开的后果，不是不变量**：若种子跑完直接 SIGKILL，这里就是一段非零尾巴，
+`benches/delete_storm.sh` 的 `tail_records` 量的正是那种形状。`locks_left`/`refs_left`
+恒 0 只说明本语料不申请锁、不挂内容引用；锁的清理语义证据仍归
+`tests/delete_storm.rs::last_posix_delete_cascades_locks_and_returns_ledger_to_baseline`，
+不能拿这里的 0 当锁语义回归。
+
+**回归测试钉住同一套公式。** `tests/mixed_views.rs`（5 条，全部起真服务端进程）实跑打印：
+
+- `seed_ledger_matches_the_documented_record_formula` →
+  `mv_seed views=2000 rows=20 records=124000 writes=42000 paged=2000 errors=0`
+  （124 000 = 2·2000 + 3·2000·20，且 `ReadDir` 分页真的走了一圈）；
+- `one_mixed_group_costs_five_records_and_two_writes` → `records_per_group=5 writes_per_group=2`；
+- `mixed_groups_leave_the_ledger_exactly_where_it_started` → `mv_netzero views=200 groups=5000
+  records=25000 writes=10000 touched=200 gone=400 kept=400 reopen_gone=400`；
+- `concurrent_mixed_groups_stay_net_zero_across_connections` → `mv_concurrent views=200
+  conns=8 groups=8000 records=40000 touched=200`；
+- `view_rotation_covers_min_of_views_and_groups` → `more_touched=60 fewer_touched=25`。
+
+第三条在重启后**另开连接**复查那批临时名仍全部 `NotFound`，所以矩阵里「重启后账本」那句
+在函数级也有一条秒级回归守着；第四条把 8 条连接打同一批视图，验证跨连接仍然净零。
+
+**服务端 RSS 与回合。** RSS 采样对象是真 `treedb-server` 的 `/proc/<pid>/status`，采样在
+优雅停服前停止，所以不含停服 checkpoint 的峰值。
+
+| views | conns | rss_before_kb | rss_after_kb | retained_delta_kb | rss_peak_kb | hwm_after_kb | rss_samples | worst_round_us | rounds |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 100 | 8 | 4 932 | 14 164 | 9 232 | 14 164 | 14 164 | 154 | 65 700 | 705 |
+| 100 | 64 | 4 876 | 17 992 | 13 116 | 17 992 | 17 992 | 150 | 117 762 | 199 |
+| 1 000 | 8 | 13 496 | 18 000 | 4 504 | 32 592 | 32 592 | 150 | 52 610 | 752 |
+| 1 000 | 64 | 13 452 | 21 388 | 7 936 | 36 912 | 36 996 | 151 | 88 671 | 190 |
+| 5 000 | 8 | 52 288 | 66 900 | 14 612 | 126 688 | 129 104 | 152 | 65 310 | 633 |
+| 5 000 | 64 | 52 180 | 107 636 | 55 456 | 139 316 | 139 316 | 150 | 115 393 | 258 |
+| 10 000 | 8 | 100 424 | 247 400 | 146 976 | 247 400 | 247 400 | 150 | 62 672 | 668 |
+| 10 000 | 64 | 100 436 | 258 644 | 158 208 | 265 592 | 267 704 | 150 | 115 390 | 204 |
+
+`retained_delta_kb` 随视图数从 9 232 涨到 158 208，`rss_peak_kb` 同向。10 000 视图那两格
+看着像「混合读写会驻留 150 MB」，但这个读法不能就这么进结论 —— 它可能是快照编码的瞬时
+缓冲恰好被采样撞上。于是做一次单格隔离。
+
+#### 7.19.1 单格隔离：那 150 MB 是 churn 的还是快照的
+
+同机、同 `views=10 000 conns=8 rows=20 pipeline=50 secs=5`，**只切
+`--auto-checkpoint-mb`**；`OUT=…`/`TSV=…` 两个旋钮把落盘指到
+`benches/results/mix_isolate_auto{0,1}.{log,tsv}`，不覆盖正式矩阵。两份日志的
+`HEAD` 与 `code_sha256` 与正式矩阵完全相同，所以这是一组可比的 A/B。
+
+| auto_mb | views | conns | groups | time_ms | ops_per_s | checkpoints_delta | wal_end_bytes | wal_peak_bytes | rss_before_kb | rss_after_kb | retained_delta_kb | rss_peak_kb | hwm_after_kb | rss_samples | errors |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 0 | 10 000 | 8 | 49 980 | 5 009 | 49 890 | 0 | 15 260 550 | 15 260 550 | 100 344 | 102 140 | 1 796 | 102 140 | 122 436 | 153 | 0 |
+| 1 | 10 000 | 8 | 40 760 | 5 014 | 40 646 | 11 | 801 720 | 2 026 770 | 100 440 | 104 012 | 3 572 | 247 624 | 247 624 | 152 | 0 |
+
+**读数。** 关闭档整段 5 秒没有任何快照（`checkpoints_delta = 0`，`snap_seq` 停在
+620 000），WAL 一路涨到 15 260 550 B —— 是矩阵同格峰值 1 890 720 B 的 8 倍，因为它没有
+东西去截它。而这一档 `VmRSS` 只涨 **1 796 KiB**；开启档涨 **3 572 KiB**，窗口末同样回到
+104 MB 量级，但采样峰值 247 624 KiB。所以：
+
+- 万级视图下 Create/Unlink churn 自身只值 MB 级驻留，**不是** 150 MB 的来源；
+- 矩阵里那 147 000 / 158 000 KiB 是「编码一次 210 000 节点 / 200 000 目录项的快照」的
+  瞬时缓冲：8 连接那格 `rss_after_kb == rss_peak_kb`（247 400），64 连接那格
+  258 644 也只比峰值 265 592 低 6 948 KiB，两次收尾采样都正吃在编码窗口里。它们报的是
+  「此刻仍在编码」，不是稳态驻留。
+
+这比 §7.18 末尾那句「retained RSS 不是泄漏证明」具体一步：**峰值 RSS 由快照编码决定，
+量级 O(节点数)；retained 由分配器仍持有的页决定，本形状下只有 KB 级。** 两者混写成一个
+「涨了多少内存」会得出完全错误的容量结论。
+
+自动 checkpoint 的价格也在这两格里，而且不只付吞吐：49 890 → 40 646 ops/s（**−18.5 %**），
+组数同比例 −18.4 %（49 980 → 40 760）；p50 73 → 87 µs、p99 643 → 1 060 µs、
+max 1 094 → 2 079 µs，服务端最坏回合 42 039 → 147 799 µs（743 → 598 轮）。快照编码跑在
+旁路线程（`src/engine/core.rs:412`），但阈值判在事件循环的周期任务里（
+`src/net/multi.rs:1234`），1 MiB 对一棵 21 万节点的树意味着五秒里派了 11 次全树重编。
+默认 64 MiB 档下这笔开销会被摊薄，代价换成 WAL 按 64 倍长；两个默认值之间的取舍本节
+**没有扫档，未实测**。
+
+**本节仍未回答的。** allocator 级碎片（需要 `malloc_info` 或换 allocator）；十万级视图
+与每视图更多文件（矩阵只到 10 000 × 20）；混合读写下的 SIGKILL 崩溃恢复（本节全程优雅
+停服 + 重开，崩溃形状只有 §7.18 通用表与 `tests/` 里的小规模真进程用例覆盖）；
+`Rename`/`Symlink` 覆盖路径的锁收敛（沿用 §7.18 同一条边界，未动）；
+`--auto-checkpoint-mb` 的摊薄曲线；跨机械盘/SSD 的绝对延迟；视图数轻微衰减的配对复采。
 
 ---
 
@@ -3461,7 +3681,9 @@ SIGKILL 恢复、`Rename`/`Symlink` 覆盖路径的锁收敛，以及混合读�
     换 `wal_compression`/`full_page_writes` 配置，绝对数字都会变，倍数关系才可信。
 11. ~~`always` 档在高并发下没有优势，尾延迟还会跑飞~~ **已修**（§7.9 第 3 条）：
     `Always` 分支删了，`always` 与 `group` 现在走同一个「一轮一次 fsync」的提交点，
-    64 并发机械盘上 1 891 → 10 913 ops/s、p99 81.5 → 31.1 ms。留下的真实边界有两条：
+    64 并发机械盘上 1 891 → 10 913 ops/s、p99 81.5 → 31.1 ms；11-25 在 `HEAD=c455793`
+    上按 `benches/sync_ratio.sh 3` 复跑同一格，读到 9 823 ops/s、p99 32.8 ms、498 次
+    fsync 摊 30 129 次写（§7.9 末的复跑表）。留下的真实边界有两条：
     ① 不再提供「已收到但未 ack 的写也立即落盘」这一档（合批后就没这个语义了，
     单连接下 `always` 自然退化为每 op 一次 fsync）；② 写扩展仍付「单提交线程 +
     每轮一次阻塞 fsync」的代价（机械盘 ≈ 3.8 ms/轮），要再进一层得把 flush 从提交
@@ -3578,8 +3800,8 @@ SIGKILL 恢复、`Rename`/`Symlink` 覆盖路径的锁收敛，以及混合读�
 ## 9. 测试清单
 
 ```sh
-cargo test --release                            # 默认档（纯引擎），240 条（237 passed + 0 failed + 3 ignored）
-cargo test --release --features postgres-compat # 加上过渡档，277 条（268 passed + 0 failed + 9 ignored）
+cargo test --release                            # 默认档（纯引擎），245 条（242 passed + 0 failed + 3 ignored）
+cargo test --release --features postgres-compat # 加上过渡档，282 条（273 passed + 0 failed + 9 ignored）
 cargo test --release --lib                      # 只看引擎单测
 cargo test --release --test migrate              # 快照升级：11 条走 API + 3 条真进程跑 CLI（§6.5）
 cargo test --release --test scale_connections -- --ignored   # 万级连接重压（§7.6）；并发数由 TREEDB_CONNS 控制，本机到 25 000 为限（再高是客户端源端口不够）
@@ -3596,8 +3818,10 @@ bash benches/bench_bulk.sh                      # 批量形状固定工作量档
 bash benches/shard_write.sh                     # 多实例写扩展：solo vs split × 实例数，附服务端核数（§7.17）
 bash benches/delete_storm.sh                    # 通用表删除/churn：自动 checkpoint、RSS、SIGKILL 尾巴（§7.18）
 bash benches/posix_delete_storm.sh              # POSIX Unlink/Rmdir：固定 2N op、自动 checkpoint 开关、重开核对（§7.18）
+bash benches/many_views_mix.sh                  # 万级视图混合读写矩阵：views 四档 × conns 两档，净零账本 + 自动 checkpoint + RSS（§7.19）
+AUTO=0 VIEWS=10000 CONNS=8 OUT=benches/results/mix_isolate_auto0.log TSV=benches/results/mix_isolate_auto0.tsv bash benches/many_views_mix.sh   # 单格隔离探针：只切 `--auto-checkpoint-mb`，不覆盖正式矩阵（§7.19.1）
 bash benches/promote_smoke.sh                   # 切主真进程链：停旧主 → 提升 → 新主可写 → 旧主被高令牌副本拒收（§6.6）
-bash benches/sync_ratio.sh 3                    # 一次 fsync 摊了几次写（§7.9）
+bash benches/sync_ratio.sh 3                    # 一次 fsync 摊了几次写（§7.9，两张表逐格对账）
 bash benches/ab_durability.sh <基线 rev>        # 写轴 A/B：持久化档的吞吐与尾延迟（§7.9 第 3 条）
 bash benches/probe_srv.sh                       # 服务端吃了几核（/proc 计数，§7.5）
 bash benches/rehearse_migrate.sh v0.3.2         # 快照升级真机彩排：旧 tag 编的二进制 → 迁移 → 回滚（§6.5）
@@ -3613,14 +3837,27 @@ gcc -O2 -pthread -o /tmp/lb_floor benches/lb_floor.c && /tmp/lb_floor 1 64 3   #
 输出的每一格都已被本文引用过 —— 引用了就要能复算。`rehearse_migrate.sh` 是其里
 唯一不量性能、只核正确性的那条，但它必须拿两个真二进制跑，所以也不进回归板。
 
-§7.13 与 §7.18 的对账脚本是例外：它们是秒级纯文本比对、不碰机器，可以随时跑 ——
-`python3 benches/three_way_table.py --check`（`final.tsv` vs 两份原始采集）与
+§7.9、§7.13、§7.18 与 §7.19 的对账脚本是例外：它们是秒级纯文本比对、不碰机器，可以随时
+跑 —— `python3 benches/three_way_table.py --check`（`final.tsv` vs 两份原始采集）与
 `python3 benches/doc_table_check.py --selftest`（§7.13 的 `final.tsv` 加 §7.18 的
-`delete_storm.tsv` / `posix_delete_storm.tsv`，并自带 10 处注入错）。它们都靠「从原始采集
-重算」而不是「人眼比对」来定对错。
+`delete_storm.tsv` / `posix_delete_storm.tsv`、§7.19 的 `many_views_mix.tsv` /
+`mix_isolate_auto{0,1}.tsv`、§7.9 的 `sync_ratio.log` —— §7.18 的七张加 §7.19 的五张再加
+§7.9 的两张，共 14 张逐格表，外加 §7.13 那张 24×14，并自带 19 处注入错）。§7.9 那两张的
+键是日志里的**块时间戳**：日志是追加式的，跑一次多一块，锚定时间戳才不会因为后来复跑而
+误报。它们都靠「从原始采集重算」而不是「人眼比对」来定对错。
 
 两档都跑完才是全量：`--features postgres-compat` 多出的 31 条 = 过渡档自己的 30 条
 单测 + `concurrency.rs` 里那条不需要 PG 的拨号用例。
+
+**端口是怎么分的。** 起真进程的用例都从 `tests/common/mod.rs::free_addr()` 拿监听地址，
+它只从 `ip_local_port_range` **之外**发号（本机是 61 000–65 534），本进程内按原子计数器
+往后走，每个号发出前再自己 `bind` 一次探活、跳过机器上别的服务占用的号。要堵的是两个
+check-then-use 窗口：旧写法「`bind :0` 拿号 → `drop` → 交给服务端去占」既允许同进程两个
+并发用例先后拿到同一个号，也允许任何一次 `connect()` 在这个窗口里把同号当源端口用掉
+（监听端口与源端口本来就是同一片地址空间）。撞上的表现是输的那个服务端
+`FATAL: Address already in use`、赢的那个还替对方接住了客户端，于是**一次撞号红两条用例**。
+2026-11-25 的两轮全量各撞过一次（默认档红 `net_protocol` 两条、`postgres-compat` 档红
+`delete_storm` 两条，服务端日志都明写撞号），换成静音段发号后两档重跑全绿。
 
 | 目标 | 数量 | 覆盖 |
 |------|------|------|
@@ -3646,6 +3883,7 @@ gcc -O2 -pthread -o /tmp/lb_floor benches/lb_floor.c && /tmp/lb_floor 1 64 3   #
 | `tests/migrate.rs` | **14** | §6.5 那四条承诺加 v3 → v4 的拒迁闸门。11 条直接打 API：v3 样本迁移后 `State` 逐字段相等且 WAL 文件字节不变、尺寸恰好少 24 字节、重开后每个语义面都能读到（视图/名字/锁/引用/通用表）、尾巴 seq 照搬且发号接着走、幂等重跑不动当前目录、未知版本与「正文配不上版本位」都拒动且零改动、既有备份不被覆盖、迁完的目录能直接用通用表。3 条用 `env!("CARGO_BIN_EXE_treedb-migrate")` 起**真进程**钉退出码（10 / 1 / 0）与输出里的命令、备份路径、回滚步骤 |
 | `tests/observe.rs` | **5** | §7.14 的接入面契约，全部起**真进程**：`--max-conn` 在 `workers = 1` 与 `8` 两种形状下都只放行上限内、第三条起被拒且在册连接不受牵连、日志只打第 1 条、`drop` 后能重新进；prometheus 输出与 `Op::Stats` 逐项对上（稳定项精确相等、计数器只要求 ≥、`fsync_seconds_total ≈ sync_us_total/1e6`）且默认文本档 5 行格式不变；抓不上时只剩一行 `treedb_up 0` 且退出码 1；四种参数错全 exit 2 不产出字节；`--shutdown` 在两种 worker 形状下都得到 ack 且进程干净退出（§7.14 那条真 bug 的回归锁） |
 | `tests/delete_storm.rs` | **7** | §7.18 的删除风暴回归：通用表固定删除/churn 的 checkpoint、WAL 尾巴与重开内容；多连接 churn 的半轮屏障；POSIX 最后一个名字删除时级联清永久锁/过期锁且多链接中间态不提前清；关闭自动 checkpoint 后 WAL/水位不动、显式 checkpoint 才收口；POSIX SIGKILL 后自动快照 + 小尾巴恢复；`posixseed`/`posixdelete` 真进程固定 `2N` op、`6N` records、N 个非空 NodeRef 与账本基线 |
+| `tests/mixed_views.rs` | **5** | §7.19 的混合读写回归，五条全部起**真服务端进程**：种子账本逐条对 `records = 2N+3NW` / `writes = N+NW` / `(views, nodes, dentries) = (N, N(W+1), NW)` 且 `ReadDir` 真的分页走完（`seed_ledger_matches_the_documented_record_formula`）；单组五 op 恰好 5 records / 2 writes，跑完账本回到**组开始前**（基线取在插入之前，不做同连接自反比对）；5 000 组净零 + 头尾各 400 个名字的逐名核对 + 重启后**另开连接**复查临时名仍全 `NotFound`；8 条连接打同一批视图仍净零；视图轮转覆盖数恰为 `min(N, G)`（60 / 25 两档） |
 
 本轮（接入面旋钮，2026-11-21）新加的回归锁（全部在 `tests/observe.rs`）：
 `max_conn_bounds_the_registry_in_both_worker_shapes`（上限 2 下前两条可用、第 3~5 条
@@ -4897,9 +5135,71 @@ spike 明确**没**做、也不在接入面上假装做的事 —— 一律返�
 
     七张引用表全部由 `benches/doc_table_check.py` 从两份 TSV 重算，它自带 10 处注入
     自测（三处在 §7.13、三处在通用表、四处在 POSIX）—— 同一类「表看着像真但手撮拼
-    出来」的错（§7.13）不允许再犯一次。
+    出来」的错（§7.13）不允许再犯一次。第 20 轮把这张表扩到 14 张（再加 §7.9 那两张）、注入扩到 19 处。
 
     **本轮没做的事（不是做到一半，是没开工）**：`Rename` 覆盖目标与 `Symlink` upsert
     两条同类路径的锁收敛未审计；allocator 级碎片、跨机械盘/SSD 的绝对延迟、10 万行
     POSIX 在 SIGKILL 下的恢复（只有小规模真进程回归）、以及混合读写下万级视图的并发
-    曲线，全部**未实测**。前两项留在 §7.18 末的边界里，第三项进 P3 量具。
+    曲线，全部**未实测**。这五项里只有「混合读写下万级视图的并发曲线」由第 20 轮量出
+    （§7.19），其余四项仍留在 §7.18 末的边界里。
+
+20. **万级混合视图量具，外加一次驻留内存的证伪**（§7.19，2026-11-25，**已做完**）。
+    第 19 轮末尾欠着一条「混合读写下万级视图的并发曲线，未实测」，本轮补上，顺带把
+    「retained RSS 不是泄漏证明」往前推一步。四件产出：
+
+    ① **bench 两档**：`--bulk mvseed`（N 视图 × W 文件，固定 `2N+3NW` 条记录、
+       `N+NW` 次写）与 `--bulk mvmix`（每组 2 `Lookup` + 1 `ReadDir` + 1 `Create` +
+       1 `Unlink`，固定 `5G` records / `2G` writes 且净零）。一组必须整批进同一个
+       pipeline —— `src/net/multi.rs:549` 的 `has_write` 判据保证含写批交给唯一提交
+       线程按序执行，所以 `PIPE` 必须是 5 的倍数（脚本先验这一条）。
+    ② **矩阵量具** `benches/many_views_mix.sh`：`views ∈ {100, 1 000, 5 000, 10 000}`
+       × `conns ∈ {8, 64}` 八格，每格两个服务端生命周期（种子停服 → 同目录重开 →
+       测量），自动 checkpoint、`VmRSS`/`VmHWM` 采样、停服 `rounds/worst`、46 列 TSV。
+       八格全绿：`ops == records == 5G`、`writes == lookups == 2G`、
+       `readdirs == creates == unlinks == G`、`views_touched = N`、
+       `nodes/dentries` 回到种子态、`errors = 0`。读数：8→64 连接吞吐 ×2.25–3.63，
+       p50 涨 4.6–8.9× 而 p99 只涨 1.18–1.89×（每次 fsync 从摊 134–144 个写涨到
+       1 266–1 274 个）；视图数从 100 到 10 000 不构成结构性代价，但单轮抖动 ±10 %
+       量级，故不据此排衰减次序。
+    ③ **一次证伪**：矩阵里 10 000 视图档 `retained_delta_kb` 是 146 976 / 158 208，
+       看着像「万级视图的混合读写驻留 150 MB」。单格 A/B（同机同参数只切
+       `--auto-checkpoint-mb`，靠 `OUT=`/`TSV=` 落到处而不覆盖正式矩阵）把它否了：
+       关闭档五秒内零快照、WAL 一路涨到 15 260 550 B，`VmRSS` 只涨 **1 796 KiB**；
+       开启档涨 3 572 KiB、窗口末回到 104 MB 量级，而采样峰值 247 624 KiB —— 那
+       150 MB 是「编码一次 21 万节点 / 20 万目录项的快照」的瞬时缓冲，矩阵的收尾
+       采样正吃在编码窗口里（`rss_after_kb == rss_peak_kb`）。顺带量到 1 MiB 档自动
+       checkpoint 的价格：49 890 → 40 646 ops/s（**−18.5 %**）、p99 643 → 1 060 µs、
+       服务端最坏回合 42 039 → 147 799 µs。
+    ④ **关掉一类测试假红**：`tests/common/mod.rs::free_addr()` 原来是「`bind :0` 拿号
+       → `drop` → 交给服务端去占」。那有两个 check-then-use 窗口 —— 同进程两个并发用例
+       可以先后拿到同一个号；任何一次 `connect()` 也可以在服务端真的 `bind` 之前把这个号
+       当源端口用掉（监听端口与源端口是同一片地址空间）。撞上的表现固定：输的那个服务端
+       `FATAL: bind ...: Address already in use`，赢的那个还替对方接住了客户端，一次撞号
+       红两条用例。本轮两次全量各撞一次 —— 默认档红 `net_protocol` 的
+       `generic_table_and_readdir_plus_over_tcp`（日志明写撞号）与
+       `fragmented_request_is_reassembled`（`BrokenPipe`），`postgres-compat` 档红
+       `delete_storm` 两条，而同一份树换个档跑就全绿。改成只从 `ip_local_port_range` 之外
+       发号 + 本进程内原子计数 + 发号前探活（§9 的「端口是怎么分的」）。这是测试脚手架，
+       不动引擎、不动协议、不动盘上格式。
+
+    ⑤ **一次复跑与一个矛盾的定性**：`benches/sync_ratio.sh 3` 在最终代码上重跑，新块追加进
+       `benches/results/sync_ratio.log`。`always` 两格读到 60.50 / 55.64 写/fsync，而 11-19 旧块
+       恒为 1.00 —— 这不是脚本坏、也不是回归：`bef5730`（11-19 09:03Z，旧块采于 06:17Z）把
+       `Always` 的按连接串 fsync 删了，两个档自此共用同一个提交点。于是「已修」这句话在
+       当前 HEAD 上有了可回对的读数（机械盘 9 823 ops/s、p99 32.8 ms、498 次 fsync 摊
+       30 129 次写，§7.9 末的复跑表）。同一块里根盘 `group` 68 758 → 111 847 ops/s，这一格
+       本轮没有受控 A/B，**不作归因**，只报数。
+
+    验证（当轮实跑）：新增 `tests/mixed_views.rs` **5 条**全绿（0.79 s，五条都起真服务
+    端进程）；默认档 `cargo test --release` **242 passed / 0 failed / 3 ignored**、
+    `--features postgres-compat` **273 passed / 0 failed / 9 ignored**。
+    `benches/doc_table_check.py` 从 394 行扩到 828 行：§7.19 的四张矩阵表 + 一张探针表按
+    `(auto_mb, views, conns)` 三键逐格回对、带 24 条不变量，§7.9 的两张按**块时间戳**锚定
+    `sync_ratio.log` 逐格回对，注入自测从 10 处增到 **19 处**全部被拦下。协议与盘上格式零改动（无新 op/reply/`Log` 变体，
+    `PROTOCOL_VERSION` 8 / `SNAP_VERSION` 4 不变，旧目录零迁移）。
+
+    **本轮没做的事**：allocator 级碎片、跨机械盘/SSD 的绝对延迟、10 万行 POSIX 的
+    SIGKILL 恢复、`Rename`/`Symlink` 覆盖路径的锁收敛（四条仍沿用第 19 条的边界）；
+    本节自己新留下的则是十万级视图、每视图更多文件、混合读写下的 SIGKILL 恢复、
+    `--auto-checkpoint-mb` 的摊薄曲线、视图数轻微衰减的配对复采 —— 均**未实测**，
+    逐条写在 §7.19 末。

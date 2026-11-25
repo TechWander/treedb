@@ -1,0 +1,81 @@
+== 万级混合视图并发曲线 2026-11-25 12:35:40 ==
+HEAD=c45579370670169f6bc3f599b87c585d1e60b1a5 views=[100 1000 5000 10000] rows=20 conns=[8 64] pipeline=50 secs=5 workers=8 auto_checkpoint_mb=1 sample_ms=20
+code_sha256=92487d46f10715c491d1c85b0fab887d2c1b75e7c8cfc2e15a9b6cac6d45e373
+临时现场=/data/grovefs/treedb/.spot/many-views-mix-Pvzz7m
+
+-- views=100（seed 与测量分属两个服务端生命周期）
+   mvseed views=100 rows=20 ops=2100 created=2000 dirs_ok=100 records=6200 writes=2100 time_ms=263 nodes=2100 dentries=2000 errors=0
+   seed 停服 rounds=109 worst_round_us=20073（不计入混合档）
+   bulk mode=mvmix views=100 rows=20 conns=8 pipeline=50 secs=5 time_ms=5005 groups=46920 ops=234600 records=234600 writes=93840 syncs=650 lookups=93840 readdirs=46920 creates=46920 unlinks=46920 lat_p50_us=67 lat_p90_us=413 lat_p99_us=753 lat_max_us=1522 lat_samples=234600 views_touched=100 gone_ok=400 kept_ok=400 wal_start_bytes=0 wal_end_bytes=572220 wal_delta_bytes=572220 wal_peak_bytes=1172310 checkpoints_start=0 checkpoints_end=13 checkpoints=13 snap_seq_start=6200 snap_seq_end=231450 samples=157 nodes_left=2100 dentries_left=2000 locks_left=0 refs_left=0 errors=0 ops_per_s=46873
+   shutdown rounds=705 worst_round_us=65700
+   PASS v100c8: groups=46920 ops=234600 records=234600 writes=93840 syncs=650
+   lat_us p50/p90/p99/max=67/413/753/1522 samples=234600 ops_per_s=46873 worst_round_us=65700
+   RSS KiB before/after=4932/14164 retained_delta=9232 peak=14164 HWM=14164 samples=154
+   checkpoint=0→13 wal=0→572220(peak 1172310) snap_seq=6200→231450 touched=100/100
+   bulk mode=mvmix views=100 rows=20 conns=64 pipeline=50 secs=5 time_ms=5013 groups=114610 ops=573050 records=573050 writes=229220 syncs=181 lookups=229220 readdirs=114610 creates=114610 unlinks=114610 lat_p50_us=572 lat_p90_us=834 lat_p99_us=1423 lat_max_us=2184 lat_samples=573050 views_touched=100 gone_ok=400 kept_ok=400 wal_start_bytes=0 wal_end_bytes=988800 wal_delta_bytes=988800 wal_peak_bytes=1384320 checkpoints_start=0 checkpoints_end=29 checkpoints=29 snap_seq_start=240800 snap_seq_end=797850 samples=88 nodes_left=2100 dentries_left=2000 locks_left=0 refs_left=0 errors=0 ops_per_s=114312
+   shutdown rounds=199 worst_round_us=117762
+   PASS v100c64: groups=114610 ops=573050 records=573050 writes=229220 syncs=181
+   lat_us p50/p90/p99/max=572/834/1423/2184 samples=573050 ops_per_s=114312 worst_round_us=117762
+   RSS KiB before/after=4876/17992 retained_delta=13116 peak=17992 HWM=17992 samples=150
+   checkpoint=0→29 wal=0→988800(peak 1384320) snap_seq=240800→797850 touched=100/100
+
+-- views=1000（seed 与测量分属两个服务端生命周期）
+   mvseed views=1000 rows=20 ops=21000 created=20000 dirs_ok=1000 records=62000 writes=21000 time_ms=3297 nodes=21000 dentries=20000 errors=0
+   seed 停服 rounds=1010 worst_round_us=47431（不计入混合档）
+   bulk mode=mvmix views=1000 rows=20 conns=8 pipeline=50 secs=5 time_ms=5016 groups=47910 ops=239550 records=239550 writes=95820 syncs=717 lookups=95820 readdirs=47910 creates=47910 unlinks=47910 lat_p50_us=71 lat_p90_us=411 lat_p99_us=826 lat_max_us=1332 lat_samples=239550 views_touched=1000 gone_ok=400 kept_ok=400 wal_start_bytes=0 wal_end_bytes=859860 wal_delta_bytes=859860 wal_peak_bytes=1441260 checkpoints_start=0 checkpoints_end=13 checkpoints=13 snap_seq_start=62000 snap_seq_end=287500 samples=156 nodes_left=21000 dentries_left=20000 locks_left=0 refs_left=0 errors=0 ops_per_s=47757
+   shutdown rounds=752 worst_round_us=52610
+   PASS v1000c8: groups=47910 ops=239550 records=239550 writes=95820 syncs=717
+   lat_us p50/p90/p99/max=71/411/826/1332 samples=239550 ops_per_s=47757 worst_round_us=52610
+   RSS KiB before/after=13496/18000 retained_delta=4504 peak=32592 HWM=32592 samples=150
+   checkpoint=0→13 wal=0→859860(peak 1441260) snap_seq=62000→287500 touched=1000/1000
+   bulk mode=mvmix views=1000 rows=20 conns=64 pipeline=50 secs=5 time_ms=5032 groups=108100 ops=540500 records=540500 writes=216200 syncs=170 lookups=216200 readdirs=108100 creates=108100 unlinks=108100 lat_p50_us=630 lat_p90_us=920 lat_p99_us=1236 lat_max_us=1306 lat_samples=540500 views_touched=1000 gone_ok=400 kept_ok=400 wal_start_bytes=0 wal_end_bytes=197760 wal_delta_bytes=197760 wal_peak_bytes=1965420 checkpoints_start=0 checkpoints_end=28 checkpoints=28 snap_seq_start=301550 snap_seq_end=838850 samples=87 nodes_left=21000 dentries_left=20000 locks_left=0 refs_left=0 errors=0 ops_per_s=107412
+   shutdown rounds=190 worst_round_us=88671
+   PASS v1000c64: groups=108100 ops=540500 records=540500 writes=216200 syncs=170
+   lat_us p50/p90/p99/max=630/920/1236/1306 samples=540500 ops_per_s=107412 worst_round_us=88671
+   RSS KiB before/after=13452/21388 retained_delta=7936 peak=36912 HWM=36996 samples=151
+   checkpoint=0→28 wal=0→197760(peak 1965420) snap_seq=301550→838850 touched=1000/1000
+
+-- views=5000（seed 与测量分属两个服务端生命周期）
+   mvseed views=5000 rows=20 ops=105000 created=100000 dirs_ok=5000 records=310000 writes=105000 time_ms=16148 nodes=105000 dentries=100000 errors=0
+   seed 停服 rounds=5020 worst_round_us=67390（不计入混合档）
+   bulk mode=mvmix views=5000 rows=20 conns=8 pipeline=50 secs=5 time_ms=5018 groups=42420 ops=212100 records=212100 writes=84840 syncs=601 lookups=84840 readdirs=42420 creates=42420 unlinks=42420 lat_p50_us=87 lat_p90_us=428 lat_p99_us=963 lat_max_us=1582 lat_samples=212100 views_touched=5000 gone_ok=400 kept_ok=400 wal_start_bytes=0 wal_end_bytes=1029000 wal_delta_bytes=1029000 wal_peak_bytes=1701000 checkpoints_start=0 checkpoints_end=11 checkpoints=11 snap_seq_start=310000 snap_seq_end=504950 samples=141 nodes_left=105000 dentries_left=100000 locks_left=0 refs_left=0 errors=0 ops_per_s=42267
+   shutdown rounds=633 worst_round_us=65310
+   PASS v5000c8: groups=42420 ops=212100 records=212100 writes=84840 syncs=601
+   lat_us p50/p90/p99/max=87/428/963/1582 samples=212100 ops_per_s=42267 worst_round_us=65310
+   RSS KiB before/after=52288/66900 retained_delta=14612 peak=126688 HWM=129104 samples=152
+   checkpoint=0→11 wal=0→1029000(peak 1701000) snap_seq=310000→504950 touched=5000/5000
+   bulk mode=mvmix views=5000 rows=20 conns=64 pipeline=50 secs=5 time_ms=5015 groups=154100 ops=770500 records=770500 writes=308200 syncs=242 lookups=308200 readdirs=154100 creates=154100 unlinks=154100 lat_p50_us=403 lat_p90_us=733 lat_p99_us=1141 lat_max_us=1601 lat_samples=770500 views_touched=5000 gone_ok=400 kept_ok=400 wal_start_bytes=0 wal_end_bytes=2966400 wal_delta_bytes=2966400 wal_peak_bytes=4350720 checkpoints_start=0 checkpoints_end=22 checkpoints=22 snap_seq_start=522100 snap_seq_end=1244600 samples=109 nodes_left=105000 dentries_left=100000 locks_left=0 refs_left=0 errors=0 ops_per_s=153639
+   shutdown rounds=258 worst_round_us=115393
+   PASS v5000c64: groups=154100 ops=770500 records=770500 writes=308200 syncs=242
+   lat_us p50/p90/p99/max=403/733/1141/1601 samples=770500 ops_per_s=153639 worst_round_us=115393
+   RSS KiB before/after=52180/107636 retained_delta=55456 peak=139316 HWM=139316 samples=150
+   checkpoint=0→22 wal=0→2966400(peak 4350720) snap_seq=522100→1244600 touched=5000/5000
+
+-- views=10000（seed 与测量分属两个服务端生命周期）
+   mvseed views=10000 rows=20 ops=210000 created=200000 dirs_ok=10000 records=620000 writes=210000 time_ms=31513 nodes=210000 dentries=200000 errors=0
+   seed 停服 rounds=10031 worst_round_us=73740（不计入混合档）
+   bulk mode=mvmix views=10000 rows=20 conns=8 pipeline=50 secs=5 time_ms=5005 groups=45180 ops=225900 records=225900 writes=90360 syncs=635 lookups=90360 readdirs=45180 creates=45180 unlinks=45180 lat_p50_us=81 lat_p90_us=405 lat_p99_us=895 lat_max_us=1606 lat_samples=225900 views_touched=10000 gone_ok=400 kept_ok=400 wal_start_bytes=0 wal_end_bytes=1074060 wal_delta_bytes=1074060 wal_peak_bytes=1890720 checkpoints_start=0 checkpoints_end=12 checkpoints=12 snap_seq_start=620000 snap_seq_end=828350 samples=152 nodes_left=210000 dentries_left=200000 locks_left=0 refs_left=0 errors=0 ops_per_s=45134
+   shutdown rounds=668 worst_round_us=62672
+   PASS v10000c8: groups=45180 ops=225900 records=225900 writes=90360 syncs=635
+   lat_us p50/p90/p99/max=81/405/895/1606 samples=225900 ops_per_s=45134 worst_round_us=62672
+   RSS KiB before/after=100424/247400 retained_delta=146976 peak=247400 HWM=247400 samples=150
+   checkpoint=0→12 wal=0→1074060(peak 1890720) snap_seq=620000→828350 touched=10000/10000
+   bulk mode=mvmix views=10000 rows=20 conns=64 pipeline=50 secs=5 time_ms=5021 groups=117390 ops=586950 records=586950 writes=234780 syncs=185 lookups=234780 readdirs=117390 creates=117390 unlinks=117390 lat_p50_us=514 lat_p90_us=937 lat_p99_us=1393 lat_max_us=1871 lat_samples=586950 views_touched=10000 gone_ok=400 kept_ok=400 wal_start_bytes=0 wal_end_bytes=2966400 wal_delta_bytes=2966400 wal_peak_bytes=5679360 checkpoints_start=0 checkpoints_end=13 checkpoints=13 snap_seq_start=845900 snap_seq_end=1384850 samples=92 nodes_left=210000 dentries_left=200000 locks_left=0 refs_left=0 errors=0 ops_per_s=116899
+   shutdown rounds=204 worst_round_us=115390
+   PASS v10000c64: groups=117390 ops=586950 records=586950 writes=234780 syncs=185
+   lat_us p50/p90/p99/max=514/937/1393/1871 samples=586950 ops_per_s=116899 worst_round_us=115390
+   RSS KiB before/after=100436/258644 retained_delta=158208 peak=265592 HWM=267704 samples=150
+   checkpoint=0→13 wal=0→2966400(peak 5679360) snap_seq=845900→1384850 touched=10000/10000
+
+== 并发曲线（同一视图档内 conns 递增）==
+   views=100    conns=8   ops/s=46873    p50=67     p99=753    max=1522    touched=100 RSS峰值=14164 KiB
+   views=100    conns=64  ops/s=114312   p50=572    p99=1423   max=2184    touched=100 RSS峰值=17992 KiB
+   views=1000   conns=8   ops/s=47757    p50=71     p99=826    max=1332    touched=1000 RSS峰值=32592 KiB
+   views=1000   conns=64  ops/s=107412   p50=630    p99=1236   max=1306    touched=1000 RSS峰值=36912 KiB
+   views=5000   conns=8   ops/s=42267    p50=87     p99=963    max=1582    touched=5000 RSS峰值=126688 KiB
+   views=5000   conns=64  ops/s=153639   p50=403    p99=1141   max=1601    touched=5000 RSS峰值=139316 KiB
+   views=10000  conns=8   ops/s=45134    p50=81     p99=895    max=1606    touched=10000 RSS峰值=247400 KiB
+   views=10000  conns=64  ops/s=116899   p50=514    p99=1393   max=1871    touched=10000 RSS峰值=265592 KiB
+
+== PASS：万级视图灌种记录数、混合读写配比、账本净零、名字级核对、RSS 与 worst_round_us 全部通过 ==
+逐格结果=benches/results/many_views_mix.tsv

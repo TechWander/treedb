@@ -1,23 +1,27 @@
 #!/usr/bin/env python3
-"""DESIGN §7.13 / §7.18 的表 vs 原始采集的逐格对账。
+"""DESIGN §7.9 / §7.13 / §7.18 / §7.19 的表 vs 原始采集的逐格对账。
 
-为什么单列一个检查器：这两组表的手抄数字都容错长得像真数字（3 和 4 拼成 34、
+为什么单列一个检查器：这三组表的手抄数字都容错长得像真数字（3 和 4 拼成 34、
 900 抄成 90）。判据只有一条：**每个数字都必须能从原始 TSV 重新算出来**。§7.13 的
 final.tsv 还要由两份三路采集重算（`benches/three_way_table.py --check`）；§7.18 的
 retained delta 由 rss_after − rss_before 派生，其余格子直接读 delete_storm.tsv 与
-posix_delete_storm.tsv。
+posix_delete_storm.tsv；§7.19 的表按 (auto_mb, views, conns) 三键索引
+many_views_mix.tsv 与两份 mix_isolate_*.tsv，retained delta 同样派生；§7.9 的两张表按
+**块时间戳**索引 sync_ratio.log —— 那份日志是追加式的，锚定块而不是取末块。
 
 用法：
   python3 benches/doc_table_check.py             # 对账（不一致 exit 1）
-  python3 benches/doc_table_check.py --selftest  # 注入 10 处错，要求全部被拦下
+  python3 benches/doc_table_check.py --selftest  # 注入 19 处错，要求全部被拦下
 """
 import os
+import re
 import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DOC = ROOT + "/DESIGN.md"
 TSV = ROOT + "/benches/results/final.tsv"
 P2_TSV = ROOT + "/benches/results/delete_storm.tsv"
+MV_TSV = ROOT + "/benches/results/many_views_mix.tsv"
 COLS = ["op", "conns", "pipe", "t_ops", "t_p50", "t_p99", "pg_ops", "pg_p50",
         "pg_p99", "s_ops", "s_p50", "s_p99", "r_pg", "r_sqlite"]
 P2_COLS = [
@@ -78,7 +82,205 @@ POSIX_TABLES = [
 ]
 
 
+# --- §7.19：万级混合视图并发曲线（benches/many_views_mix.sh）---
+MV_COLS = [
+    "views", "rows", "conns", "pipeline", "secs", "auto_mb", "seed_time_ms",
+    "seed_records",
+    "time_ms", "groups", "ops", "records", "writes", "syncs", "lookups",
+    "readdirs", "creates", "unlinks", "lat_p50_us", "lat_p90_us", "lat_p99_us",
+    "lat_max_us", "lat_samples", "views_touched", "gone_ok", "kept_ok",
+    "checkpoints_start", "checkpoints_delta", "wal_start_bytes", "wal_end_bytes",
+    "wal_peak_bytes", "snap_seq_start", "snap_seq_end", "rss_before_kb",
+    "rss_after_kb", "rss_peak_kb", "hwm_after_kb", "rss_samples",
+    "worst_round_us", "rounds", "nodes_left", "dentries_left", "locks_left",
+    "refs_left", "ops_per_s", "errors",
+]
+MV_PROBE_TSVS = [
+    ROOT + "/benches/results/mix_isolate_auto0.tsv",
+    ROOT + "/benches/results/mix_isolate_auto1.tsv",
+]
+MV_PROBE_TABLES = [
+    ("驻留隔离探针", [
+        "auto_mb", "views", "conns", "groups", "time_ms", "ops_per_s",
+        "checkpoints_delta", "wal_end_bytes", "wal_peak_bytes", "rss_before_kb",
+        "rss_after_kb", "retained_delta_kb", "rss_peak_kb", "hwm_after_kb",
+        "rss_samples", "errors",
+    ]),
+]
+MV_TABLES = [
+    ("混合负载工作量", [
+        "views", "rows", "conns", "pipeline", "secs", "time_ms", "groups", "ops",
+        "records", "writes", "syncs", "lookups", "readdirs", "creates",
+        "unlinks", "ops_per_s", "errors",
+    ]),
+    ("延迟与覆盖", [
+        "views", "conns", "groups", "lat_p50_us", "lat_p90_us", "lat_p99_us",
+        "lat_max_us", "lat_samples", "views_touched", "gone_ok", "kept_ok",
+        "errors",
+    ]),
+    ("种子、checkpoint 与账本", [
+        "views", "conns", "auto_mb", "seed_time_ms", "seed_records",
+        "checkpoints_start",
+        "checkpoints_delta", "wal_start_bytes", "wal_end_bytes",
+        "wal_peak_bytes", "snap_seq_start", "snap_seq_end", "nodes_left",
+        "dentries_left", "locks_left", "refs_left", "errors",
+    ]),
+    ("RSS 与回合", [
+        "views", "conns", "rss_before_kb", "rss_after_kb", "retained_delta_kb",
+        "rss_peak_kb", "hwm_after_kb", "rss_samples", "worst_round_us", "rounds",
+    ]),
+]
+
+
+# --- §7.9：一次 fsync 摊了几次写（benches/sync_ratio.sh）---
+SR_LOG = ROOT + "/benches/results/sync_ratio.log"
+# 日志是追加式的：跑一次多一块。文档的两张表各自锚定一块，键就是块头里的时间戳，
+# 这样后来复跑追加的新块不会把旧表的对账带偏。
+SR_BLOCKS = {"11-19": "2026-11-19T06:17:12", "11-25": "2026-11-25T13:05:31"}
+SR_WAL2DISK = {
+    "sr_group": "机械盘 XFS", "sr_always": "机械盘 XFS",
+    "treedb-sr-group": "根盘 ext4", "treedb-sr-always": "根盘 ext4",
+}
+SR_HEAD_OLD = ["WAL 位置", "档位", "ops/s（p50 / p99 µs）", "writes", "syncs",
+               "**写/fsync**"]
+SR_HEAD_NEW = ["WAL 位置", "档位", "ops/s", "p50 µs", "p90 µs", "p99 µs", "max µs",
+               "writes", "syncs", "写/fsync", "errors"]
+SR_TABLES = [("11-19 采集", "11-19", SR_HEAD_OLD), ("11-25 复跑", "11-25", SR_HEAD_NEW)]
+SR_COLMAP = {"ops/s": "ops_per_s", "p50 µs": "lat_p50_us", "p90 µs": "lat_p90_us",
+             "p99 µs": "lat_p99_us", "max µs": "lat_max_us", "writes": "writes",
+             "syncs": "syncs", "写/fsync": "per_sync", "**写/fsync**": "per_sync",
+             "errors": "errors"}
+# 采集行形如：group  wal=sr_group op=write … → 10501 ops/s over 3.06s | lat us: …
+SR_BENCH = re.compile(
+    r"^(group|always)\s+wal=(\S+)\s+op=write\b.*?\u2192\s*(\d[\d,]*) ops/s"
+    r" over [\d.]+s\s*\|\s*lat us: p50=(\d+) p90=(\d+) p99=(\d+) max=(\d+)"
+    r"\s*\|\s*errors=(\d+)")
+# 计数器行形如：group  wal=sr_group   writes=32624 syncs=609 → 53.57 写/fsync
+SR_COUNT = re.compile(
+    r"^(group|always)\s+wal=(\S+)\s+writes=(\d+) syncs=(\d+) \u2192 (\S+) "
+    r"\u5199/fsync")
+SR_MERGED = re.compile(r"^([\d ]+)（([\d ]+) / ([\d ]+)）$")
+
+
+def _si(t):
+    return int(t.replace(" ", "").replace(",", ""))
+
+
+def parse_sr_log(path):
+    """-> {块标签: {(盘, 档): {字段: 值}}}；只收 SR_BLOCKS 锚定的块。"""
+    out, tag, block = {}, None, {}
+    for raw in open(path, encoding="utf-8"):
+        line = raw.rstrip("\n")
+        if line.startswith("=== sync_ratio @"):
+            if tag is not None and block:
+                out[tag] = block
+            cells = line.split()
+            # 块头带时区后缀（…T06:17:12+00:00），所以按前缀认，不整个查表。
+            stamp = cells[3] if len(cells) > 3 else ""
+            tag = next((t for t, ts in SR_BLOCKS.items() if stamp.startswith(ts)),
+                       None)
+            block = {}
+            continue
+        if tag is None:
+            continue
+        m = SR_BENCH.match(line) or SR_COUNT.match(line)
+        if not m or m.group(2) not in SR_WAL2DISK:
+            continue
+        rec = block.setdefault((SR_WAL2DISK[m.group(2)], m.group(1)),
+                               {"per_sync": None, "errors": None})
+        if m.re is SR_BENCH:
+            (rec["ops_per_s"], rec["lat_p50_us"], rec["lat_p90_us"],
+             rec["lat_p99_us"], rec["lat_max_us"], rec["errors"]) = \
+                [_si(g) for g in m.groups()[2:]]
+        else:
+            rec["writes"], rec["syncs"] = _si(m.group(3)), _si(m.group(4))
+            rec["per_sync"] = float(m.group(5))
+    if tag is not None:
+        out[tag] = block
+    for tag_ in SR_BLOCKS:
+        if tag_ not in out:
+            raise AssertionError("sync_ratio.log 里没有块 @%s（%s）"
+                                 % (SR_BLOCKS[tag_], tag_))
+    return out
+
+
+def compare_sr_table(table, data, cols, label):
+    bad = []
+    if table[0] != cols:
+        raise AssertionError("%s: 表头不符 %r" % (label, table[0]))
+    if len(table) - 1 != len(data):
+        raise AssertionError("%s: 行数 %d != %d" % (label, len(table) - 1, len(data)))
+    for row in table[1:]:
+        key = (row[0], row[1].strip("`"))
+        if key not in data:
+            bad.append("%s: 日志里没有格 %s" % (label, key))
+            continue
+        rec = data[key]
+        for j, name in enumerate(cols):
+            if j < 2:
+                continue
+            if name == "ops/s（p50 / p99 µs）":
+                m = SR_MERGED.match(row[j])
+                if not m:
+                    bad.append("%s %s: 合并格解析不了 %r" % (label, key, row[j]))
+                    continue
+                for got, col in zip(m.groups(), ("ops/s", "p50 µs", "p99 µs")):
+                    if _si(got) != rec[SR_COLMAP[col]]:
+                        bad.append("%s %s %s: %s vs %s"
+                                   % (label, key, col, got, rec[SR_COLMAP[col]]))
+                continue
+            want = rec.get(SR_COLMAP[name])
+            if want is None:
+                bad.append("%s %s: %s 没采到" % (label, key, name))
+            elif abs(num(row[j]) - want) > (0.06 if name.endswith("写/fsync**")
+                                           or name == "写/fsync" else 1e-9):
+                bad.append("%s %s %s: %s vs %s" % (label, key, name, row[j], want))
+    return bad
+
+
+def sr_invariants(blocks):
+    """§7.9 的两条主张：改前 always 每写一次 fsync、改后两个档同一提交点。"""
+    bad = []
+    for tag, data in blocks.items():
+        for (disk, dur), r in sorted(data.items()):
+            if not r["syncs"]:
+                bad.append("%s %s/%s: syncs=0，比值无定义" % (tag, disk, dur))
+                continue
+            if abs(r["writes"] / r["syncs"] - r["per_sync"]) > 0.02:
+                bad.append("%s %s/%s: 比值 %s != writes/syncs %.2f"
+                           % (tag, disk, dur, r["per_sync"], r["writes"] / r["syncs"]))
+            if r["errors"]:
+                bad.append("%s %s/%s: errors=%s 非零" % (tag, disk, dur, r["errors"]))
+        for disk in set(d for d, _ in data):
+            g, a = data.get((disk, "group")), data.get((disk, "always"))
+            if not g or not a:
+                bad.append("%s %s: 两个档不齐" % (tag, disk))
+                continue
+            if tag == "11-19":       # 改前：always 必须逐写 fsync，且明显慢于 group
+                if abs(a["per_sync"] - 1.0) > 0.01 or a["syncs"] != a["writes"]:
+                    bad.append("11-19 %s/always: 不是 1.00 写/fsync（%s，%s/%s）"
+                               % (disk, a["per_sync"], a["writes"], a["syncs"]))
+                if a["ops_per_s"] >= g["ops_per_s"]:
+                    bad.append("11-19 %s: 改前 always 不该快过 group" % disk)
+            else:                    # 改后：两档同一提交点，合批比同量级
+                if a["per_sync"] < 10 or a["syncs"] >= a["writes"]:
+                    bad.append("11-25 %s/always: 没合批（%s 写/fsync，%s/%s）"
+                               % (disk, a["per_sync"], a["writes"], a["syncs"]))
+                if not 0.5 <= a["ops_per_s"] / g["ops_per_s"] <= 1.5:
+                    bad.append("11-25 %s: always/group 吞吐 %.2f× 不该差出 50 %%"
+                               % (disk, a["ops_per_s"] / g["ops_per_s"]))
+    for disk in set(d for d, _ in blocks["11-25"]):
+        old = blocks["11-19"][(disk, "always")]["ops_per_s"]
+        new = blocks["11-25"][(disk, "always")]["ops_per_s"]
+        if new < 3 * old:
+            bad.append("%s/always: 复跑只有改前的 %.2f×，§7.9「已修」不成立"
+                       % (disk, new / old))
+    return bad
+
+
+
 def num(s):
+
     return float(s.replace("**", "").replace("×", "").replace(" ", "").replace(",", ""))
 
 
@@ -103,15 +305,23 @@ def parse_tsv(path):
     return [l.rstrip("\n").split("\t") for l in open(path)][1:]
 
 
+HEADING = re.compile(r"^#{2,4} ")
+
+
 def parse_section_tables(path, heading, stop):
-    """把一个章节里的 Markdown 表格切成 [表头, 数据行...] 列表。"""
+    """把一个章节里的 Markdown 表格切成 [表头, 数据行...] 列表。
+
+    收口条件是「遇到下一个标题」而不仅是那个显式 stop：往章节之间插一节，不必回头
+    改上一节的 stop，也不会把下一节的表误算进上一节。
+    """
     tables, current, inside = [], None, False
     for raw in open(path):
         line = raw.rstrip("\n")
         if line.startswith(heading):
             inside = True
             continue
-        if inside and line.startswith(stop):
+        if inside and (line.startswith(stop)
+                       or (HEADING.match(line) and not line.startswith(heading))):
             break
         if not inside:
             continue
@@ -278,6 +488,108 @@ def posix_invariants(data):
     return bad
 
 
+def parse_mv_tsv(path):
+    rows = [l.rstrip("\n").split("\t") for l in open(path) if l.strip()]
+    assert rows and rows[0] == MV_COLS, "many_views_mix.tsv 表头不符"
+    out = {}
+    for cells in rows[1:]:
+        assert len(cells) == len(MV_COLS), "many_views_mix.tsv 列数不符"
+        rec = dict(zip(MV_COLS, cells))
+        for name in MV_COLS:
+            rec[name] = int(rec[name])
+            assert rec[name] >= 0, "%s 出现负数" % name
+        key = (rec["auto_mb"], rec["views"], rec["conns"])
+        assert key not in out, "(auto_mb, views, conns) 重复：%s" % (key,)
+        out[key] = rec
+    assert out, "many_views_mix.tsv 没有数据行"
+    return out
+
+
+def compare_mv_table(table, data, cols, label, auto_mb=1):
+    """逐格对账，格子由 (views, conns) 定位而不是由行序定位。
+
+    行序定位会让「把 8 连接那行抄到 64 连接下面」这种错蒙混过关；双键定位还会
+    顺手揭出漏一格与抄两遍。
+    """
+    if not table or table[0] != cols:
+        raise AssertionError("§7.19 %s 表头不符" % label)
+    doc = table[1:]
+    if len(doc) != len(data):
+        raise AssertionError("§7.19 %s 行数 %d != %d" % (label, len(doc), len(data)))
+    bad, seen = [], set()
+    for i, row in enumerate(doc):
+        if len(row) != len(cols):
+            raise AssertionError("§7.19 %s 第 %d 行列数不符" % (label, i + 1))
+        cell = dict(zip(cols, row))
+        try:
+            auto = int(num(cell["auto_mb"])) if "auto_mb" in cols else auto_mb
+            key = (auto, int(num(cell["views"])), int(num(cell["conns"])))
+        except ValueError:
+            raise AssertionError("§7.19 %s 第 %d 行的 views/conns 不是数字" % (label, i + 1))
+        if key not in data:
+            raise AssertionError("§7.19 %s 未知格子：%s" % (label, key))
+        if key in seen:
+            raise AssertionError("§7.19 %s 格子重复：%s" % (label, key))
+        seen.add(key)
+        rec = data[key]
+        for j, name in enumerate(cols):
+            if name in ("views", "conns", "auto_mb"):
+                continue
+            if name == "retained_delta_kb":
+                want = rec["rss_after_kb"] - rec["rss_before_kb"]
+            else:
+                want = rec[name]
+            try:
+                got = int(num(row[j]))
+            except ValueError:
+                got = None
+            if got != want:
+                bad.append("%s 行%d %s: %s vs %d" % (label, i + 1, name, row[j], want))
+    return bad
+
+
+def mv_invariants(data):
+    bad = []
+    for key, r in sorted(data.items()):
+        auto, views, _conns = key
+        rows, g = r["rows"], r["groups"]
+        checks = [
+            ("种子记录数 2N+3NW", r["seed_records"] == 2 * views + 3 * views * rows),
+            ("pipeline 是 5 的倍数", r["pipeline"] > 0 and r["pipeline"] % 5 == 0),
+            ("组数为正", g > 0),
+            ("固定五个 op 一组", r["ops"] == 5 * g),
+            ("记录数 5G", r["records"] == 5 * g),
+            ("写次数 2G", r["writes"] == 2 * g),
+            ("op 配比 2:1:1:1", r["lookups"] == 2 * g and r["readdirs"] == g
+             and r["creates"] == g and r["unlinks"] == g),
+            ("延迟样本等于 op", r["lat_samples"] == r["ops"]),
+            ("延迟分位有序", 0 < r["lat_p50_us"] <= r["lat_p90_us"]
+             <= r["lat_p99_us"] <= r["lat_max_us"]),
+            ("视图覆盖数等于 min(N,G)", r["views_touched"] == min(views, g)),
+            ("名字级核对跑满头尾", r["gone_ok"] == min(g, 400)
+             and r["kept_ok"] == min(g, 400)),
+            ("净零账本", r["nodes_left"] == views * (rows + 1)
+             and r["dentries_left"] == views * rows),
+            ("锁与引用归零", r["locks_left"] == 0 and r["refs_left"] == 0),
+            ("窗口不短于设定秒数", r["time_ms"] >= r["secs"] * 1000),
+            ("吞吐由 ops/time 重算", r["ops_per_s"] == r["ops"] * 1000 // max(r["time_ms"], 1)),
+            ("确有合并 fsync", r["syncs"] > 0),
+            ("WAL 峰值有效", r["wal_peak_bytes"] > 0 and r["wal_peak_bytes"] >= r["wal_end_bytes"]),
+            ("checkpoint 差值非负", r["checkpoints_delta"] >= 0),
+            ("自动档按阈值落快照", r["checkpoints_delta"] > 0 if auto else r["checkpoints_delta"] == 0),
+            ("落过快照就推水位", r["checkpoints_delta"] == 0
+             or r["snap_seq_end"] > r["snap_seq_start"]),
+            ("RSS 持续采样", r["rss_samples"] > 1 and r["rss_peak_kb"] > 0),
+            ("HWM 不低于采样峰值", r["hwm_after_kb"] >= max(r["rss_peak_kb"], r["rss_before_kb"])),
+            ("服务端回合报告", r["rounds"] > 0 and r["worst_round_us"] > 0),
+            ("零错误", r["errors"] == 0),
+        ]
+        for name, ok in checks:
+            if not ok:
+                bad.append("auto=%d views=%d conns=%d: %s" % (key + (name,)))
+    return bad
+
+
 def compare(doc, tsv):
     """-> 不一致清单（空 = 全对）。doc 行数/列数不对直接抛 AssertionError。"""
     if len(doc) != len(tsv):
@@ -336,7 +648,65 @@ if __name__ == "__main__":
         sys.exit("MISMATCH: §7.18 %d 项" % len(bad))
     print("OK: §7.18 三张通用表 + 四张 POSIX 表与两份 TSV 逐格一致，全部不变量通过")
 
+    mv_data = parse_mv_tsv(MV_TSV)
+    mv_tables = parse_section_tables(DOC, "### 7.19 ", "### 7.19.1")
+    if len(mv_tables) != len(MV_TABLES):
+        sys.exit("§7.19 找到 %d 张表，应为 %d 张" % (len(mv_tables), len(MV_TABLES)))
+    mv_doc = []
+    for label, cols in MV_TABLES:
+        matches = [t for t in mv_tables if t and t[0] == cols]
+        if len(matches) != 1:
+            sys.exit("§7.19 %s 表找到 %d 张，应为 1 张" % (label, len(matches)))
+        mv_doc.append(matches[0])
+        bad.extend(compare_mv_table(matches[0], mv_data, cols, label))
+    bad.extend(mv_invariants(mv_data))
+    if bad:
+        print("\n".join(bad))
+        sys.exit("MISMATCH: §7.19 %d 项" % len(bad))
+    print("OK: §7.19 四张矩阵表 × %d 格与 many_views_mix.tsv 逐格一致，全部不变量通过"
+          % len(mv_data))
+
+    probe_data = {}
+    for path in MV_PROBE_TSVS:
+        for key, rec in parse_mv_tsv(path).items():
+            assert key not in probe_data, "探针两份 TSV 出现同一格：%s" % (key,)
+            probe_data[key] = rec
+    probe_tables = parse_section_tables(DOC, "#### 7.19.1", "## 8.")
+    if len(probe_tables) != len(MV_PROBE_TABLES):
+        sys.exit("§7.19.1 找到 %d 张表，应为 %d 张"
+                 % (len(probe_tables), len(MV_PROBE_TABLES)))
+    mv_probe_doc = []
+    for label, cols in MV_PROBE_TABLES:
+        matches = [t for t in probe_tables if t and t[0] == cols]
+        if len(matches) != 1:
+            sys.exit("§7.19.1 %s 表找到 %d 张，应为 1 张" % (label, len(matches)))
+        mv_probe_doc.append(matches[0])
+        bad.extend(compare_mv_table(matches[0], probe_data, cols, label))
+    bad.extend(mv_invariants(probe_data))
+    if bad:
+        print("\n".join(bad))
+        sys.exit("MISMATCH: §7.19.1 %d 项" % len(bad))
+    print("OK: §7.19.1 探针 %d 格与两份 mix_isolate_*.tsv 逐格一致" % len(probe_data))
+
+    sr = parse_sr_log(SR_LOG)
+    sr_old_doc, sr_new_doc = [], []
+    sr_tables = parse_section_tables(DOC, "### 7.9 ", "### 7.10")
+    for label, tag, cols in SR_TABLES:
+        matches = [t for t in sr_tables if t and t[0] == cols]
+        if len(matches) != 1:
+            sys.exit("§7.9 %s 表找到 %d 张，应为 1 张（非缩进表）"
+                     % (label, len(matches)))
+        bad.extend(compare_sr_table(matches[0], sr[tag], cols, label))
+        (sr_old_doc if tag == "11-19" else sr_new_doc).append(matches[0])
+    bad.extend(sr_invariants(sr))
+    if bad:
+        print("\n".join(bad))
+        sys.exit("MISMATCH: §7.9 %d 项" % len(bad))
+    print("OK: §7.9 两张表 × %d 格与 sync_ratio.log 两个锚定块逐格一致，全部不变量通过"
+          % sum(len(v) for v in sr.values()))
+
     if "--selftest" in sys.argv:
+
         # §7.13 三处注入：改一个 ops、把 p50/p99 拼成一列、删一行。
         m1 = [r[:] for r in doc]
         m1[0][3] = str(num(m1[0][3]) + 1)
@@ -391,4 +761,68 @@ if __name__ == "__main__":
         if not hit:
             sys.exit("selftest FAILED: 「POSIX 缺一行」没被拦下")
         print("selftest OK: 「POSIX 缺一行」被拦下（%s）" % hit[0])
-        print("selftest 10/10")
+        ntest = 10
+        # §7.19 五处注入：改工作量、改派生 RSS delta、两行数值对调（键不动）、
+        # 缺一个格子、破坏不变量。mv_doc[*] 的第 0 行是表头，注入必须打数据行。
+        v1 = [r[:] for r in mv_doc[0]]
+        v1[1][6] = str(int(num(v1[1][6])) + 1)          # groups
+        v2 = [r[:] for r in mv_doc[3]]
+        v2[1][4] = str(int(num(v2[1][4])) + 1)          # retained_delta_kb
+        v3 = [r[:] for r in mv_doc[1]]
+        v3[1][2:], v3[2][2:] = v3[2][2:], v3[1][2:]     # 只换数值不换 views/conns
+        v4 = [r[:] for r in mv_doc[2]]
+        v4 = v4[:-1]
+        bad_mv = {k: dict(v) for k, v in mv_data.items()}
+        k0 = sorted(bad_mv)[0]
+        bad_mv[k0]["records"] += 5
+        for name, mutated, idx in (
+            ("MV 改 groups", v1, 0),
+            ("MV 改 RSS delta", v2, 3),
+            ("MV 两行数值对调", v3, 1),
+            ("MV 缺一个格子", v4, 2),
+        ):
+            label, cols = MV_TABLES[idx]
+            try:
+                hit = compare_mv_table(mutated, mv_data, cols, label)
+            except AssertionError as e:
+                hit = [str(e)]
+            if not hit:
+                sys.exit("selftest FAILED: 「%s」没被拦下" % name)
+            ntest += 1
+            print("selftest OK: 「%s」被拦下（%s）" % (name, hit[0]))
+        v5 = [r[:] for r in mv_probe_doc[0]]
+        v5[1][6] = str(int(num(v5[1][6])) + 1)          # checkpoints_delta
+        label, cols = MV_PROBE_TABLES[0]
+        hit = compare_mv_table(v5, probe_data, cols, label)
+        if not hit:
+            sys.exit("selftest FAILED: 「探针改 checkpoint」没被拦下")
+        ntest += 1
+        print("selftest OK: 「探针改 checkpoint」被拦下（%s）" % hit[0])
+        for name, hit in (("MV 记录数背离 5G", mv_invariants(bad_mv)),):
+            if not hit:
+                sys.exit("selftest FAILED: 「%s」没被拦下" % name)
+            ntest += 1
+            print("selftest OK: 「%s」被拦下（%s）" % (name, hit[0]))
+        # §7.9 三处注入：复跑表改 ops、改前表改比值（那格是 1.00）、把改后 always
+        # 假装没合批。两张表都含表头行，注入一律打数据行。
+
+        w1 = [r[:] for r in sr_new_doc[0]]
+        w1[1][2] = str(_si(w1[1][2]) + 1)
+        w2 = [r[:] for r in sr_old_doc[0]]
+        w2[2][5] = "**%.2f**" % (num(w2[2][5]) + 0.5)   # 机械盘 always 那一格
+        bad_sr = {t: {k: dict(v) for k, v in d.items()} for t, d in sr.items()}
+        dk = sorted(k for k in bad_sr["11-25"] if k[1] == "always")[0]
+        bad_sr["11-25"][dk]["per_sync"] = 1.0        # 比值自洽，但合批没了
+        bad_sr["11-25"][dk]["syncs"] = bad_sr["11-25"][dk]["writes"]
+        for name, hit in (
+            ("§7.9 复跑改 ops",
+             compare_sr_table(w1, sr["11-25"], SR_HEAD_NEW, "11-25 复跑")),
+            ("§7.9 改前改比值",
+             compare_sr_table(w2, sr["11-19"], SR_HEAD_OLD, "11-19 采集")),
+            ("§7.9 改后没合批", sr_invariants(bad_sr)),
+        ):
+            if not hit:
+                sys.exit("selftest FAILED: 「%s」没被拦下" % name)
+            ntest += 1
+            print("selftest OK: 「%s」被拦下（%s）" % (name, hit[0]))
+        print("selftest %d/%d" % (ntest, ntest))

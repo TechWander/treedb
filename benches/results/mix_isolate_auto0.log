@@ -1,0 +1,20 @@
+== 万级混合视图并发曲线 2026-11-25 12:37:55 ==
+HEAD=c45579370670169f6bc3f599b87c585d1e60b1a5 views=[10000] rows=20 conns=[8] pipeline=50 secs=5 workers=8 auto_checkpoint_mb=0 sample_ms=20
+code_sha256=92487d46f10715c491d1c85b0fab887d2c1b75e7c8cfc2e15a9b6cac6d45e373
+临时现场=/data/grovefs/treedb/.spot/many-views-mix-Mo6Pv4
+
+-- views=10000（seed 与测量分属两个服务端生命周期）
+   mvseed views=10000 rows=20 ops=210000 created=200000 dirs_ok=10000 records=620000 writes=210000 time_ms=32206 nodes=210000 dentries=200000 errors=0
+   seed 停服 rounds=10032 worst_round_us=222388（不计入混合档）
+   bulk mode=mvmix views=10000 rows=20 conns=8 pipeline=50 secs=5 time_ms=5009 groups=49980 ops=249900 records=249900 writes=99960 syncs=725 lookups=99960 readdirs=49980 creates=49980 unlinks=49980 lat_p50_us=73 lat_p90_us=350 lat_p99_us=643 lat_max_us=1094 lat_samples=249900 views_touched=10000 gone_ok=400 kept_ok=400 wal_start_bytes=0 wal_end_bytes=15260550 wal_delta_bytes=15260550 wal_peak_bytes=15260550 checkpoints_start=0 checkpoints_end=0 checkpoints=0 snap_seq_start=620000 snap_seq_end=620000 samples=153 nodes_left=210000 dentries_left=200000 locks_left=0 refs_left=0 errors=0 ops_per_s=49890
+   shutdown rounds=743 worst_round_us=42039
+   PASS v10000c8: groups=49980 ops=249900 records=249900 writes=99960 syncs=725
+   lat_us p50/p90/p99/max=73/350/643/1094 samples=249900 ops_per_s=49890 worst_round_us=42039
+   RSS KiB before/after=100344/102140 retained_delta=1796 peak=102140 HWM=122436 samples=153
+   checkpoint=0→0 wal=0→15260550(peak 15260550) snap_seq=620000→620000 touched=10000/10000
+
+== 并发曲线（同一视图档内 conns 递增）==
+   views=10000  conns=8   ops/s=49890    p50=73     p99=643    max=1094    touched=10000 RSS峰值=102140 KiB
+
+== PASS：万级视图灌种记录数、混合读写配比、账本净零、名字级核对、RSS 与 worst_round_us 全部通过 ==
+逐格结果=benches/results/mix_isolate_auto0.tsv

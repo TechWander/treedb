@@ -27,3 +27,6 @@
 /.live
 /.connprobe
 /.sqlbuild.log
+
+# Python 检查器（benches/doc_table_check.py）跑一次就生成的字节码缓存
+__pycache__/

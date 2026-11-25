@@ -19,12 +19,56 @@ use treedb::engine::sha256::DIGEST_LEN;
 use treedb::net::auth::Key;
 use treedb::net::client::Client;
 
-/// 找一个没人用的 127.0.0.1 端口。绑定后立刻释放，交给服务端去占。
+/// 分配一个测试服务端的监听地址：**只用内核自动分配源端口够不着的那段**，且本
+/// 进程内绝不重号。
+///
+/// 旧写法是「`bind :0` 拿一个号 → `drop` → 交给服务端去占」，那留着两个撞号窗口：
+///
+/// 1. 同进程的两个并发用例可以先后拿到**同一个**号（谁先 `drop`，谁的号就回到内核
+///    的自由集）；
+/// 2. 拿到号之后、服务端真的 `bind` 之前，任何一次 `connect()` 都可能把这个号当源
+///    端口用掉 —— `ip_local_port_range` 与监听端口是同一片地址空间。
+///
+/// 两种撞法都表现为：输的那个服务端 `FATAL: bind ...: Address already in use`，
+/// 而赢的那个还替对方接住了客户端，于是**一次撞号红两条用例**。2026-11-25 的两次
+/// 全量跑各撞一次（默认档红 `net_protocol` 两条、`postgres-compat` 档红
+/// `delete_storm` 两条；同一份树换个档跑又全绿 —— 时序相关，不看负载复现不出来）。
+///
+/// 现在只从 `ip_local_port_range` **之外**发号（默认机器上是 61 000–65 534），
+/// `connect()` 永远挑不到这些号；本进程内再按原子计数器往后走，同一个号不会发给两个
+/// 用例；每个号发出前先自己 `bind` 一次探活，把机器上别的服务占着的号跳过去。
 pub fn free_addr() -> String {
-    let l = TcpListener::bind("127.0.0.1:0").expect("bind :0");
-    let a = l.local_addr().expect("local_addr");
-    drop(l);
-    a.to_string()
+    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let (base, span, jitter) = quiet_window();
+    let off = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    for skip in 0..span {
+        let port = (base + (jitter + off + skip) % span) as u16;
+        if TcpListener::bind(std::net::SocketAddr::from(([127, 0, 0, 1], port))).is_ok() {
+            return format!("127.0.0.1:{port}");
+        }
+    }
+    panic!("没有可用的测试端口：{}..{} 全被占", base, base + span - 1);
+}
+
+/// 监听端口的安静窗口 `(基址, 长度, 按 PID 的错位)`：取 `ip_local_port_range` 上下
+/// 两段里的一条 —— 上段够长就用上段，否则用下段。错位是为了让同时存在的两个测试
+/// 二进制不从同一个号齐步走。
+fn quiet_window() -> (u32, u32, u32) {
+    let (lo_eph, hi_eph) = std::fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range")
+        .ok()
+        .and_then(|t| {
+            let mut it = t.split_whitespace().filter_map(|s| s.parse::<u32>().ok());
+            match (it.next(), it.next()) {
+                (Some(a), Some(b)) if a < b => Some((a, b)),
+                _ => None,
+            }
+        })
+        .unwrap_or((32_768, 60_999));
+    let above = (hi_eph + 1, 65_534 - hi_eph);
+    let below = (10_240, lo_eph.saturating_sub(10_240));
+    let (base, span) = if above.1 >= 1_024 { above } else { below };
+    let span = span.max(256);
+    (base, span, std::process::id() % (span / 2))
 }
 
 /// [`Server::start_auth`] 用的那把密钥。
