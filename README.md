@@ -16,8 +16,8 @@ cargo build --release                                   # 默认档：依赖只�
 ./target/release/treedb-server --dir /var/lib/treedb --listen 127.0.0.1:7777
 ./target/release/treedb-bench --op lookup --conns 64 --pipeline 32 --secs 3
 
-cargo test --release                                    # 默认档 237 passed / 0 failed / 3 ignored（引擎本体）
-cargo test --release --features postgres-compat        # 268 passed / 0 failed / 9 ignored（含 PG 过渡档）
+cargo test --release                                    # 默认档 242 passed / 0 failed / 3 ignored（引擎本体）
+cargo test --release --features postgres-compat        # 273 passed / 0 failed / 9 ignored（含 PG 过渡档）
 bash benches/throughput_matrix.sh 3 1 2 3 4 5           # 五轴复现，输出进 benches/results/
 bash benches/sync_ratio.sh 3                           # 写路径机制：一次 fsync 摊了多少写
 bash benches/single_conn.sh 3                          # 单连接对标 PG（$PIPE=32 走批量档、$CONNS/$WORKERS 走并发档）
@@ -36,6 +36,8 @@ bash benches/bench_bulk.sh                             # 批量形状：逐行 v
 bash benches/shard_write.sh                            # 多实例分片的写扩展（solo/split × 实例数）
 bash benches/delete_storm.sh                           # 通用表删除风暴：rowdelete/churn + 自动 checkpoint + RSS + SIGKILL 尾巴
 bash benches/posix_delete_storm.sh                     # POSIX 删除风暴：2N 个 Unlink/Rmdir、自动档开关两跑、重开逐 ref 核对
+bash benches/many_views_mix.sh                         # 万级混合视图矩阵：views 四档 × conns 两档，净零账本 + 自动 checkpoint + RSS
+bash benches/grovefs_pin_ab.sh                         # 接入侧 pin 跳代复核：同一份 grovefs 源码只改 tag 一行，两臂各配同代引擎
 ./target/release/treedb-micro --items 32000             # 纯计算档（不经网络/不写 WAL）+ 分配计数
 ```
 

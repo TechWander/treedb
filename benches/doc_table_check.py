@@ -9,11 +9,12 @@ posix_delete_storm.tsv；§7.19 的表按 (auto_mb, views, conns) 三键索引
 many_views_mix.tsv 与两份 mix_isolate_*.tsv，retained delta 同样派生；§7.9 的两张表按
 **块时间戳**索引 sync_ratio.log —— 那份日志是追加式的，锚定块而不是取末块；
 §10 阶段 C 4 末那两张（grovefs 各 ref 的现状、六条套件×两臂）索引
-grovefs_pin_ab.log，套件格照 SUMMARY 的字段数写（两个计数器的套件不补零）。
+grovefs_pin_ab.log，套件格照 SUMMARY 的字段数写（两个计数器的套件不补零），
+列头的臂号与臂上 pin 由日志的臂头校准（列序与 tag 都不是写死的常量）。
 
 用法：
   python3 benches/doc_table_check.py             # 对账（不一致 exit 1）
-  python3 benches/doc_table_check.py --selftest  # 注入 23 处错，要求全部被拦下
+  python3 benches/doc_table_check.py --selftest  # 注入 24 处错，要求全部被拦下
 """
 import os
 import re
@@ -168,7 +169,11 @@ PIN_LOG = ROOT + "/benches/results/grovefs_pin_ab.log"
 PIN_START = "4. **控制面搬家"
 PIN_STOP = "## 11. 下一步"
 PIN_REF_COLS = ["ref", "pin", "`control-migrate`", "`Op::Link`"]
-PIN_SUITE_COLS = ["套件", "臂 A：pin v0.3.6", "臂 B：pin v0.8.0"]
+# 套件表的列头只锚「臂 X：pin vY」这个形状，不写死 Y：臂上的 tag 本来就是变量
+# （本次臂 B = v0.8.0，发了 v0.8.1 后复跑就该变成 v0.8.1），拿常量去硬匹只会把一次
+# 正常的复跑报成表格结构错。标签对不对由日志的臂头校准，见 pin_suite_arms()。
+PIN_SUITE_FIRST = "套件"
+PIN_SUITE_HEAD = re.compile(r"^臂 ([AB])：pin (\S+)$")
 PIN_SUITE_COLS_ORDER = ["test_treedb_control.sh", "test_treedb_matrix.sh",
                         "test_treedb.sh", "test_locks_treedb.sh",
                         "test_govcheck_treedb.sh", "test_govtime_treedb.sh"]
@@ -308,13 +313,13 @@ def sr_invariants(blocks):
 
 
 def parse_pin_log(path):
-    """grovefs_pin_ab.log → (refs, suites, gate)。
+    """grovefs_pin_ab.log → (refs, suites, gate, 臂头 pin 标签)。
 
     refs[ref] = [ref, pin, control_migrate, Op::Link]；
     suites[臂][套件] = "pass / fail[/ skip]"——照 SUMMARY 印出来的字段数，不补零：
     只带两个计数器的套件不应被伪造成「skip=0」。
     """
-    refs, suites, gate = {}, {a: {} for a in PIN_ARMS}, False
+    refs, suites, gate, apins = {}, {a: {} for a in PIN_ARMS}, False, {}
     arm = None
     for raw in open(path):
         line = raw.strip()
@@ -326,6 +331,7 @@ def parse_pin_log(path):
         m = PIN_ARM.match(line)
         if m:
             arm = m.group(1)
+            apins[arm] = m.group(2)   # 只取块 3 那行（带「/ 引擎」），编译臂的标签不算
             continue
         m = PIN_REF.match(line)
         if m:
@@ -337,7 +343,7 @@ def parse_pin_log(path):
             suites[arm][g[3]] = " / ".join(x for x in g[:3] if x)
         if PIN_GATE in line:
             gate = True
-    return refs, suites, gate
+    return refs, suites, gate, apins
 
 
 def parse_indented_tables(path, start, stop):
@@ -391,15 +397,41 @@ def compare_pin_ref_table(table, refs, cols, label):
     return bad
 
 
-def compare_pin_suite_table(table, suites, cols, label):
+def pin_suite_arms(table, arm_pins=None):
+    """从套件表的列头读出臂号与臂上的 pin，并拿日志的臂头校准它。
+
+    列序不再靠约定（文档里写 A、B 还是 B、A 都对），但一旦被读定，下面每一格
+    就按它走 —— 把列序校错等于把两臂读数对调，而两臂又恰好应当相等，那种错只有
+    混代反证那一档才会暴露。
+    """
+    bad, arms = [], []
+    for cell in table[0][1:]:
+        m = PIN_SUITE_HEAD.match(_cell(cell))
+        if not m:
+            bad.append("套件表列头认不出臂：「%s」应形如「臂 A：pin v0.8.1」"
+                       % _cell(cell))
+            continue
+        arm, tag = m.groups()
+        arms.append(arm)
+        if arm_pins.get(arm) and arm_pins[arm] != tag:
+            bad.append("套件表列头 %s 臂写的 pin 是 %s，日志的臂头是 %s"
+                       % (arm, tag, arm_pins[arm]))
+    if sorted(arms) != sorted(PIN_ARMS):
+        bad.append("套件表列头该有 A、B 两臂，实得 %s" % arms)
+    return arms, bad
+
+
+def compare_pin_suite_table(table, suites, label, arm_pins=None):
     bad = []
-    if table[0] != cols:
-        bad.append("%s 表表头不符：%s" % (label, table[0]))
+    arms, b = pin_suite_arms(table, arm_pins)
+    bad.extend(b)
+    if len(arms) != len(PIN_ARMS):
+        return bad
     seen = set()
     for row in table[1:]:
         suite = _cell(row[0])
         seen.add(suite)
-        for i, arm in enumerate(PIN_ARMS):
+        for i, arm in enumerate(arms):
             want = suites[arm].get(suite)
             if want is None:
                 bad.append("%s 表：日志臂 %s 里没有 %s 的 SUMMARY 行"
@@ -861,18 +893,19 @@ if __name__ == "__main__":
     print("OK: §7.9 两张表 × %d 格与 sync_ratio.log 两个锚定块逐格一致，全部不变量通过"
           % sum(len(v) for v in sr.values()))
 
-    pin_refs, pin_suites, pin_gate = parse_pin_log(PIN_LOG)
+    pin_refs, pin_suites, pin_gate, pin_apins = parse_pin_log(PIN_LOG)
     pin_tables = parse_indented_tables(DOC, PIN_START, PIN_STOP)
     m = [t for t in pin_tables if t and t[0] == PIN_REF_COLS]
     if len(m) != 1:
         sys.exit("§10 补段的 ref 表找到 %d 张，应为 1 张" % len(m))
     pin_ref_doc = m[0]
     bad.extend(compare_pin_ref_table(pin_ref_doc, pin_refs, PIN_REF_COLS, "ref"))
-    m = [t for t in pin_tables if t and t[0] == PIN_SUITE_COLS]
+    m = [t for t in pin_tables
+         if t and t[0][0] == PIN_SUITE_FIRST and len(t[0]) == len(PIN_ARMS) + 1]
     if len(m) != 1:
         sys.exit("§10 补段的套件表找到 %d 张，应为 1 张" % len(m))
     pin_suite_doc = m[0]
-    bad.extend(compare_pin_suite_table(pin_suite_doc, pin_suites, PIN_SUITE_COLS, "套件"))
+    bad.extend(compare_pin_suite_table(pin_suite_doc, pin_suites, "套件", pin_apins))
     bad.extend(pin_invariants(pin_suites, pin_gate))
     if bad:
         print("\n".join(bad))
@@ -1000,21 +1033,25 @@ if __name__ == "__main__":
                 sys.exit("selftest FAILED: 「%s」没被拦下" % name)
             ntest += 1
             print("selftest OK: 「%s」被拦下（%s）" % (name, hit[0]))
-        # §10 补段四处注入：改套件表一格、改 ref 表一个 pin、破坏两臂对称、
-        # 抹掉混代闸门的点名行。前两条打文档表，后两条打不变量的入参。
+        # §10 补段五处注入：改套件表一格、改 ref 表一个 pin、把套件列头的臂 pin 写成
+        # 过期代——这三条打文档表；破坏两臂对称、抹掉混代闸门点名行两条打不变量的入参。
         y1 = [r[:] for r in pin_suite_doc]
         y1[1][2] = "%d / 0" % (int(y1[1][2].split(" / ")[0]) + 1)
         y2 = [r[:] for r in pin_ref_doc]
         y2[1][1] = "v0.0.0"
+        y4 = [r[:] for r in pin_suite_doc]
+        y4[0] = [y4[0][0], y4[0][1], "臂 B：pin v0.0.1"]
         bad_pin = {k: dict(v) for k, v in pin_suites.items()}
         bad_pin["A"]["test_treedb.sh"] = "60 / 1 / 0"
         for name, hit in (
             ("§10 套件表改一格",
-             compare_pin_suite_table(y1, pin_suites, PIN_SUITE_COLS, "套件")),
+             compare_pin_suite_table(y1, pin_suites, "套件", pin_apins)),
             ("§10 ref 表改 pin",
              compare_pin_ref_table(y2, pin_refs, PIN_REF_COLS, "ref")),
             ("§10 两臂不对称", pin_invariants(bad_pin, pin_gate)),
             ("§10 混代闸门证据被抹", pin_invariants(pin_suites, False)),
+            ("§10 套件列头的臂 pin 过期",
+             compare_pin_suite_table(y4, pin_suites, "套件", pin_apins)),
         ):
             if not hit:
                 sys.exit("selftest FAILED: 「%s」没被拦下" % name)
