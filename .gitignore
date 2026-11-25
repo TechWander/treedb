@@ -30,3 +30,6 @@
 
 # Python 检查器（benches/doc_table_check.py）跑一次就生成的字节码缓存
 __pycache__/
+
+# grovefs_pin_ab.sh 的隔离构建目录（旧 pin 的引擎二进制）
+/.pinab

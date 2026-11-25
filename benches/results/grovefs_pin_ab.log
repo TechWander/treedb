@@ -1,0 +1,73 @@
+===== grovefs 迁移分支 × 两个引擎 pin 的跨代复核（新 pin v0.8.0 / 引擎 613c1f9）=====
+# worktree /data/grovefs/.wt-errno @ 16184ca（feat/treedb-read-errno）
+# 唯一变量 = Cargo.toml 的 tag 行；两臂不共用引擎二进制，否则测的是
+# 「新引擎兼容旧客户端」而不是「pin 变了」。
+
+----- 0) grovefs 侧各 ref 的现状（pin 只读 Cargo.toml 那一行）-----
+  master                         pin=v0.3.7   control_migrate=无  Op::Link=无
+  origin/master                  pin=v0.3.7   control_migrate=无  Op::Link=无
+  feat/treedb-hardlink           pin=v0.7.0   control_migrate=无  Op::Link=有(src/treedb_store.rs)
+  origin/feat/treedb-hardlink    pin=v0.7.0   control_migrate=无  Op::Link=有(src/treedb_store.rs)
+  feat/treedb-read-errno         pin=v0.3.6   control_migrate=有  Op::Link=无
+  origin/feat/treedb-read-errno  pin=v0.3.6   control_migrate=有  Op::Link=无
+  本地 master 与 origin/master 分叉：落后 9 / 独有 1
+  主检出未提交文件 48 个
+  写进引擎的表：grovefs_control__api_keys grovefs_control__api_key_usage grovefs_control__mcp_calls grovefs_control__web_accounts grovefs_control__web_grants 
+  旧专用 op Op::Key* 在该分支 src 里的残留：0 行
+  旧专用 op Op::Audit* 在该分支 src 里的残留：0 行
+  旧专用 op Op::Def* 在该分支 src 里的残留：0 行
+  旧专用 op Op::Place* 在该分支 src 里的残留：0 行
+
+----- 1) 只改 tag 一行：cargo check --release --features treedb --all-targets -----
+# 臂 A：pin v0.3.6
+   Finished `release` profile [optimized] target(s) in 0.09s  rc=0
+  warning=0 error=0
+# 臂 B：pin v0.8.0
+   Finished `release` profile [optimized] target(s) in 0.96s  rc=0
+  warning=0 error=0
+   2 files changed, 3 insertions(+), 3 deletions(-)
+
+----- 2) cargo test --release --features treedb（同一棵树、同两个 pin）-----
+# 臂 B：pin v0.8.0
+  passed=318 failed=0 ignored=4  rc=0
+# 臂 A：pin v0.3.6
+  passed=318 failed=0 ignored=4  rc=0
+
+----- 3) 六条端到端套件 × 两臂（引擎二进制各自同代）-----
+  18306ea8a825a24f03dbe1e8af1b8497f8f757ab0955089cbbf3a6a02681564a  /data/grovefs/treedb/target/release/treedb-server
+  fcc0fed178a04c57a69217c0dcd1e9c6c7719fd3f2aec79a5cb89991fc43f5a6  /data/grovefs/treedb/.pinab/oldbin/treedb-server
+  build:     Finished `release` profile [optimized] target(s) in 2m 14s
+  grovefs 5b820890860e40a17e11f92fa4a2cc3218c884d36abb337a89cc3a004c941620  /data/grovefs/treedb/.pinab/tgt-B/release/grovefs
+  套件用的二进制： 9388984 B  mtime 14:36:28
+# 臂 B：pin v0.8.0 / 引擎 /data/grovefs/treedb/target/release/treedb-server
+  ==================== SUMMARY: pass=111 fail=0 ====================  [test_treedb_control.sh rc=0]
+  ==================== SUMMARY: pass=39 fail=0 skip=10 ====================  [test_treedb_matrix.sh rc=0]
+  ==================== SUMMARY: pass=60 fail=0 ====================  [test_treedb.sh rc=0]
+  ==================== SUMMARY: pass=6 fail=0 skip=9 ====================  [test_locks_treedb.sh rc=0]
+  ==================== SUMMARY: pass=21 fail=0 skip=4 ====================  [test_govcheck_treedb.sh rc=0]
+  ==================== SUMMARY: pass=8 fail=0 skip=0 ====================  [test_govtime_treedb.sh rc=0]
+  build:     Finished `release` profile [optimized] target(s) in 2m 15s
+  grovefs 8c84a19785316195e7d748a38242d370df94874d22ee3b7a73979114f3e405c6  /data/grovefs/treedb/.pinab/tgt-A/release/grovefs
+  套件用的二进制： 9411576 B  mtime 14:40:09
+# 臂 A：pin v0.3.6 / 引擎 /data/grovefs/treedb/.pinab/oldbin/treedb-server
+  ==================== SUMMARY: pass=111 fail=0 ====================  [test_treedb_control.sh rc=0]
+  ==================== SUMMARY: pass=39 fail=0 skip=10 ====================  [test_treedb_matrix.sh rc=0]
+  ==================== SUMMARY: pass=60 fail=0 ====================  [test_treedb.sh rc=0]
+  ==================== SUMMARY: pass=6 fail=0 skip=9 ====================  [test_locks_treedb.sh rc=0]
+  ==================== SUMMARY: pass=21 fail=0 skip=4 ====================  [test_govcheck_treedb.sh rc=0]
+  ==================== SUMMARY: pass=8 fail=0 skip=0 ====================  [test_govtime_treedb.sh rc=0]
+
+----- 4) 混代反证：旧 pin 的 grovefs 接新引擎二进制 -----
+# 这正是套件里 TREEDB_BIN 未设时的默认取值（$PWD/../treedb/target/release/treedb-server）。
+  ==================== SUMMARY: pass=33 fail=81 ====================  [test_treedb_control.sh rc=1]
+  error: creating table grovefs_control__api_keys: treedb control: errno 68 (protocol version negotiation required: send VersionBegin first (§4.4))
+  ==================== SUMMARY: pass=0 fail=1 skip=0 ====================  [test_treedb_matrix.sh rc=1]
+  error: creating table grovefs_control__api_keys: treedb control: errno 68 (protocol version negotiation required: send VersionBegin first (§4.4))
+
+----- 5) pin 锁定的 rev 与 treedb HEAD 的差 -----
+  tag v0.8.0 = 标注对象 5e9dedd → commit f9a385c
+  仓 HEAD 613c1f9 在 tag 之后 3 笔（tag 锁定的构建不含它们）：
+    613c1f9 test(views): 万级混合读写矩阵与驻留隔离探针，并补 §7.9/§7.19 的逐格对账
+    c455793 fix(engine): POSIX 最后一个名字删除时级联清锁，并补两套删除风暴量具
+    e013701 test(replication): 补齐真进程切主回归与活体证据
+PINAB rc=0

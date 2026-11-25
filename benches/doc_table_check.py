@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
-"""DESIGN §7.9 / §7.13 / §7.18 / §7.19 的表 vs 原始采集的逐格对账。
+"""DESIGN §7.9 / §7.13 / §7.18 / §7.19 / §10 阶段 C 4 补段的表 vs 原始采集的逐格对账。
 
-为什么单列一个检查器：这三组表的手抄数字都容错长得像真数字（3 和 4 拼成 34、
+为什么单列一个检查器：这几组表的手抄数字都容错长得像真数字（3 和 4 拼成 34、
 900 抄成 90）。判据只有一条：**每个数字都必须能从原始 TSV 重新算出来**。§7.13 的
 final.tsv 还要由两份三路采集重算（`benches/three_way_table.py --check`）；§7.18 的
 retained delta 由 rss_after − rss_before 派生，其余格子直接读 delete_storm.tsv 与
 posix_delete_storm.tsv；§7.19 的表按 (auto_mb, views, conns) 三键索引
 many_views_mix.tsv 与两份 mix_isolate_*.tsv，retained delta 同样派生；§7.9 的两张表按
-**块时间戳**索引 sync_ratio.log —— 那份日志是追加式的，锚定块而不是取末块。
+**块时间戳**索引 sync_ratio.log —— 那份日志是追加式的，锚定块而不是取末块；
+§10 阶段 C 4 末那两张（grovefs 各 ref 的现状、六条套件×两臂）索引
+grovefs_pin_ab.log，套件格照 SUMMARY 的字段数写（两个计数器的套件不补零）。
 
 用法：
   python3 benches/doc_table_check.py             # 对账（不一致 exit 1）
-  python3 benches/doc_table_check.py --selftest  # 注入 19 处错，要求全部被拦下
+  python3 benches/doc_table_check.py --selftest  # 注入 23 处错，要求全部被拦下
 """
 import os
 import re
@@ -161,6 +163,33 @@ SR_COUNT = re.compile(
     r"\u5199/fsync")
 SR_MERGED = re.compile(r"^([\d ]+)（([\d ]+) / ([\d ]+)）$")
 
+# --- §10 阶段 C 4 末：grovefs 接入侧的 pin 跨代复核（benches/grovefs_pin_ab.sh）---
+PIN_LOG = ROOT + "/benches/results/grovefs_pin_ab.log"
+PIN_START = "4. **控制面搬家"
+PIN_STOP = "## 11. 下一步"
+PIN_REF_COLS = ["ref", "pin", "`control-migrate`", "`Op::Link`"]
+PIN_SUITE_COLS = ["套件", "臂 A：pin v0.3.6", "臂 B：pin v0.8.0"]
+PIN_SUITE_COLS_ORDER = ["test_treedb_control.sh", "test_treedb_matrix.sh",
+                        "test_treedb.sh", "test_locks_treedb.sh",
+                        "test_govcheck_treedb.sh", "test_govtime_treedb.sh"]
+PIN_ARMS = ("A", "B")
+# 臂头形如：# 臂 B：pin v0.8.0 / 引擎 /path/treedb-server（源码 613c1f9）@ 2026-…
+PIN_ARM = re.compile(r"^#\s*臂 ([AB])：pin (\S+) / 引擎")
+# ref 行形如：master  pin=v0.3.7  control_migrate=无  Op::Link=无
+PIN_REF = re.compile(r"^(\S+)\s+pin=(\S+)\s+control_migrate=(\S+)\s+Op::Link=(.*)$")
+# 套件行形如：==================== SUMMARY: pass=39 fail=0 skip=10 ==== [test_treedb_matrix.sh rc=0]
+# 不锚行首、`fail=` 到括号之间也不按空白匹：摘要行两头都挂着 `====` 横幅
+# （`====…==== SUMMARY: pass=… fail=… ====…====  [脚本名 rc=N]`），所以上下文只锚
+# 行中的 `SUMMARY:`，计数与括号之间那串非数字交给 `\D*`。
+PIN_SUM = re.compile(r"SUMMARY: pass=(\d+) fail=(\d+)(?: skip=(\d+))?\D*\[(\S+) rc=(\d+)\]$")
+# 混代反证的点名行（§4.4 的非认证闸门）
+PIN_GATE = "protocol version negotiation required"
+
+
+def _cell(t):
+    """文档格里的小装饰不算数据：反引号、全角括号、多余空白抹掉再比。"""
+    return t.replace("`", "").replace("（", "(").replace("）", ")").strip()
+
 
 def _si(t):
     return int(t.replace(" ", "").replace(",", ""))
@@ -275,6 +304,133 @@ def sr_invariants(blocks):
         if new < 3 * old:
             bad.append("%s/always: 复跑只有改前的 %.2f×，§7.9「已修」不成立"
                        % (disk, new / old))
+    return bad
+
+
+def parse_pin_log(path):
+    """grovefs_pin_ab.log → (refs, suites, gate)。
+
+    refs[ref] = [ref, pin, control_migrate, Op::Link]；
+    suites[臂][套件] = "pass / fail[/ skip]"——照 SUMMARY 印出来的字段数，不补零：
+    只带两个计数器的套件不应被伪造成「skip=0」。
+    """
+    refs, suites, gate = {}, {a: {} for a in PIN_ARMS}, False
+    arm = None
+    for raw in open(path):
+        line = raw.strip()
+        # 第 4 块是「应当红」的混代反证，两行 SUMMARY 不属于任何一臂；不关掉臂号的话，
+        # 它会把臂 A 刚收好的六条读数覆盖成 33/81 与 0/1，两臂对称这条就假红。
+        if line.startswith("----- 4)"):
+            arm = None
+            continue
+        m = PIN_ARM.match(line)
+        if m:
+            arm = m.group(1)
+            continue
+        m = PIN_REF.match(line)
+        if m:
+            refs[m.group(1)] = list(m.groups())
+            continue
+        m = PIN_SUM.search(line)
+        if m and arm:
+            g = m.groups()
+            suites[arm][g[3]] = " / ".join(x for x in g[:3] if x)
+        if PIN_GATE in line:
+            gate = True
+    return refs, suites, gate
+
+
+def parse_indented_tables(path, start, stop):
+    """取一段里的 Markdown 表，容忍列表缩进（§10 的表挂在编号项里）。
+
+    `parse_section_tables` 只认顶格的表，那条锚点是标题；这里的锚点是一句列表项
+    开头，而表在三项缩进里，所以单独写一份只差在 strip()。
+    """
+    tables, current, inside = [], None, False
+    for raw in open(path):
+        line = raw.rstrip("\n")
+        if not inside and line.startswith(start):
+            inside = True
+        if inside and line.startswith(stop):
+            break
+        if not inside:
+            continue
+        s = line.strip()
+        if s.startswith("|"):
+            cells = [c.strip() for c in s.strip("|").split("|")]
+            if set("".join(cells)) <= set("-: "):
+                continue
+            current = [cells] if current is None else current + [cells]
+        elif current is not None:
+            tables.append(current)
+            current = None
+    if current is not None:
+        tables.append(current)
+    return tables
+
+
+def compare_pin_ref_table(table, refs, cols, label):
+    bad = []
+    if table[0] != cols:
+        bad.append("%s 表表头不符：%s" % (label, table[0]))
+    seen = set()
+    for row in table[1:]:
+        ref = _cell(row[0])
+        if ref not in refs:
+            bad.append("%s 表里的 %s 在日志里找不到" % (label, ref))
+            continue
+        seen.add(ref)
+        for i, (w, g) in enumerate(zip(refs[ref][1:], [_cell(c) for c in row[1:]])):
+            if w != g:
+                bad.append("%s 表 %s 第 %d 列：文档 %r ≠ 日志 %r"
+                           % (label, ref, i + 2, g, w))
+    for ref in refs:
+        if ref not in seen:
+            bad.append("%s 表缺日志里的 ref %s（日志 %d 行、表里 %d 行）"
+                       % (label, ref, len(refs), len(seen)))
+    return bad
+
+
+def compare_pin_suite_table(table, suites, cols, label):
+    bad = []
+    if table[0] != cols:
+        bad.append("%s 表表头不符：%s" % (label, table[0]))
+    seen = set()
+    for row in table[1:]:
+        suite = _cell(row[0])
+        seen.add(suite)
+        for i, arm in enumerate(PIN_ARMS):
+            want = suites[arm].get(suite)
+            if want is None:
+                bad.append("%s 表：日志臂 %s 里没有 %s 的 SUMMARY 行"
+                           % (label, arm, suite))
+                continue
+            got = _cell(row[1 + i]) if 1 + i < len(row) else ""
+            if got != want:
+                bad.append("%s 表：臂 %s 的 %s 文档 %r ≠ 日志 %r"
+                           % (label, arm, suite, got, want))
+    for arm in PIN_ARMS:
+        for suite in suites[arm]:
+            if suite not in seen:
+                bad.append("%s 表：日志臂 %s 的 %s 没进表" % (label, arm, suite))
+    return bad
+
+
+def pin_invariants(suites, gate):
+    bad = []
+    for suite in PIN_SUITE_COLS_ORDER:
+        a, b = suites["A"].get(suite), suites["B"].get(suite)
+        if a is None or b is None:
+            bad.append("§10 补段：臂上缺 %s 的读数（A=%r B=%r）" % (suite, a, b))
+            continue
+        if a != b:
+            bad.append("§10 补段：%s 两臂三元组不等（A=%s B=%s）—— "
+                       "「只改 tag 一行、零回归」这句话就不成立了" % (suite, a, b))
+        if a.split(" / ")[1] != "0":
+            bad.append("§10 补段：%s 有 fail（%s）" % (suite, a))
+    if not gate:
+        bad.append("§10 补段：日志里没有混代被闸门拒的点名行（%r）"
+                   "，文档里「混代是硬失败」那句失去证据" % PIN_GATE)
     return bad
 
 
@@ -705,6 +861,25 @@ if __name__ == "__main__":
     print("OK: §7.9 两张表 × %d 格与 sync_ratio.log 两个锚定块逐格一致，全部不变量通过"
           % sum(len(v) for v in sr.values()))
 
+    pin_refs, pin_suites, pin_gate = parse_pin_log(PIN_LOG)
+    pin_tables = parse_indented_tables(DOC, PIN_START, PIN_STOP)
+    m = [t for t in pin_tables if t and t[0] == PIN_REF_COLS]
+    if len(m) != 1:
+        sys.exit("§10 补段的 ref 表找到 %d 张，应为 1 张" % len(m))
+    pin_ref_doc = m[0]
+    bad.extend(compare_pin_ref_table(pin_ref_doc, pin_refs, PIN_REF_COLS, "ref"))
+    m = [t for t in pin_tables if t and t[0] == PIN_SUITE_COLS]
+    if len(m) != 1:
+        sys.exit("§10 补段的套件表找到 %d 张，应为 1 张" % len(m))
+    pin_suite_doc = m[0]
+    bad.extend(compare_pin_suite_table(pin_suite_doc, pin_suites, PIN_SUITE_COLS, "套件"))
+    bad.extend(pin_invariants(pin_suites, pin_gate))
+    if bad:
+        print("\n".join(bad))
+        sys.exit("MISMATCH: §10 补段 %d 项" % len(bad))
+    print("OK: §10 阶段 C 4 补段 %d+%d 格与 grovefs_pin_ab.log 逐格一致，全部不变量通过"
+          % (len(pin_ref_doc) - 1, len(pin_suite_doc) - 1))
+
     if "--selftest" in sys.argv:
 
         # §7.13 三处注入：改一个 ops、把 p50/p99 拼成一列、删一行。
@@ -820,6 +995,26 @@ if __name__ == "__main__":
             ("§7.9 改前改比值",
              compare_sr_table(w2, sr["11-19"], SR_HEAD_OLD, "11-19 采集")),
             ("§7.9 改后没合批", sr_invariants(bad_sr)),
+        ):
+            if not hit:
+                sys.exit("selftest FAILED: 「%s」没被拦下" % name)
+            ntest += 1
+            print("selftest OK: 「%s」被拦下（%s）" % (name, hit[0]))
+        # §10 补段四处注入：改套件表一格、改 ref 表一个 pin、破坏两臂对称、
+        # 抹掉混代闸门的点名行。前两条打文档表，后两条打不变量的入参。
+        y1 = [r[:] for r in pin_suite_doc]
+        y1[1][2] = "%d / 0" % (int(y1[1][2].split(" / ")[0]) + 1)
+        y2 = [r[:] for r in pin_ref_doc]
+        y2[1][1] = "v0.0.0"
+        bad_pin = {k: dict(v) for k, v in pin_suites.items()}
+        bad_pin["A"]["test_treedb.sh"] = "60 / 1 / 0"
+        for name, hit in (
+            ("§10 套件表改一格",
+             compare_pin_suite_table(y1, pin_suites, PIN_SUITE_COLS, "套件")),
+            ("§10 ref 表改 pin",
+             compare_pin_ref_table(y2, pin_refs, PIN_REF_COLS, "ref")),
+            ("§10 两臂不对称", pin_invariants(bad_pin, pin_gate)),
+            ("§10 混代闸门证据被抹", pin_invariants(pin_suites, False)),
         ):
             if not hit:
                 sys.exit("selftest FAILED: 「%s」没被拦下" % name)
