@@ -15,9 +15,11 @@ POSIX 元数据语义，客户端无关 —— 它是一个数据库项目，不
 cargo build --release                                   # 默认档：依赖只有 libc + thiserror
 ./target/release/treedb-server --dir /var/lib/treedb --listen 127.0.0.1:7777
 ./target/release/treedb-bench --op lookup --conns 64 --pipeline 32 --secs 3
+./target/release/treedb-cli  --addr 127.0.0.1:7777 table list          # 手活：非交互子命令
+./target/release/treedb-cli  --addr 127.0.0.1:7777 shell                # 或者进 REPL，连接只给一次
 
-cargo test --release                                    # 默认档 242 passed / 0 failed / 3 ignored（引擎本体）
-cargo test --release --features postgres-compat        # 273 passed / 0 failed / 9 ignored（含 PG 过渡档）
+cargo test --release                                    # 默认档 285 passed / 0 failed / 3 ignored（引擎本体）
+cargo test --release --features postgres-compat        # 316 passed / 0 failed / 9 ignored（含 PG 过渡档）
 bash benches/throughput_matrix.sh 3 1 2 3 4 5           # 五轴复现，输出进 benches/results/
 bash benches/sync_ratio.sh 3                           # 写路径机制：一次 fsync 摊了多少写
 bash benches/single_conn.sh 3                          # 单连接对标 PG（$PIPE=32 走批量档、$CONNS/$WORKERS 走并发档）
@@ -126,6 +128,41 @@ dump 走的是日志标签表（`Log`，tag 1..=10 与 19..=27；五条不直接
 **进程启动以来**，率在面板侧用 `rate()` 算；副本专用项在主上输出 0，面板要过滤
 `treedb_replica == 1`。口径与实测（含 `src/metrics.rs` 的三条纪律与一个顺带修掉的
 停服 ack bug）见 [DESIGN.md](DESIGN.md) §7.14，复现跑 `bash benches/observe.sh`。
+
+**手活走 `treedb-cli`**：一个二进制覆盖通用表的全部 14 条 op，非交互子命令与
+交互式 REPL 跑同一套求值。连接参数 `--dir`（独占目录）与 `--addr`（线协议）二
+选一，两者都写 WAL —— `--dir` 只是中间少一个 socket，同一个 `translate`、同一个
+`commit_batch`，服务端正跑着同一份目录时会被目录锁拒掉（退出码 3）：
+
+```sh
+./target/release/treedb-cli --addr 127.0.0.1:7777 table list --rows
+./target/release/treedb-cli --addr 127.0.0.1:7777 row get people alice
+./target/release/treedb-cli --dir /var/lib/treedb row range people --col name --lo a --hi c
+./target/release/treedb-cli --dir /var/lib/treedb stats --json
+
+# REPL：连接只给一次，`use` 之后可省表名；一行还能用 `;` 分多条
+./target/release/treedb-cli --addr 127.0.0.1:7777 shell
+treedb[tcp:127.0.0.1:7777]> use people
+using table people
+treedb[tcp:127.0.0.1:7777](people)> row list --limit 5
+key    name   age
+alice  alice  30
+bob    bob    25
+2 rows, 到底了
+treedb[tcp:127.0.0.1:7777](people)> batch { row put carol carol 40 ; row del alice }
+batch of 2 ops applied atomically (one WAL record):
+   0  Row(carol)
+   1  Ok
+```
+
+写回逐字节相同的值时引擎做同值消除（零日志、`seq` 不前进），CLI 会明说
+`note: row put 未产生日志（同值消除/幂等空操作），seq 未前进 (seq=3)`，不让人
+对着没动的计数器怀疑自己写错了。`dump`/`load`/`pitr`/`migrate`/`backup` 也收进
+同一入口（原样转给那五个二进制，参数一个不改）。退出码 0 成功 / 1 引擎回了
+errno / 2 用法错 / 3 连不上·目录被占·协议不同代，其余是被包装二进制自己的码。
+行编辑、历史、补全、tokenizer、JSON 全是自写的 —— `tests/independence.rs` 门 2
+把默认构建图钉在 `libc` + `thiserror`，`rustyline`/`clap` 都进不来。对照表与边界见
+[DESIGN.md](DESIGN.md) §5.4。
 
 只读副本是另一个二进制，它不需要主做任何配置：
 
@@ -290,7 +327,8 @@ DESIGN.md §7（含 §7.8 那次全五轴复跑）。
   没有谓词。存在理由：接入方的表形（密钥、审计、
   定义……）不该被搬进引擎内核，内核只给机制。列名、过期规则、权限语义全部由
   客户端定义；引擎不解释任何一列。
-- **运维面**：`Ping`/`Stats`/`Checkpoint`/`Shutdown`，加上命令行侧的 `treedb-migrate`。`Stats` 同时报 WAL 的逻辑长度与
+- **运维面**：`Ping`/`Stats`/`Checkpoint`/`Shutdown`，加上命令行侧的 `treedb-migrate` 与
+  人工操作入口 `treedb-cli`（14 条表 op 全命中，非交互子命令 + REPL，§5.4）。`Stats` 同时报 WAL 的逻辑长度与
   磁盘长度、快照长度与协议版本 —— v8 起线上版本首先靠建连时的 `VersionBegin` /
   `VersionOk` 协商，`proto_version` 只是协商后的交叉核对（§4.1、§4.4）。
 - **日志传送两面**：`WalFetch`（从指定 seq 起按 durable 水位送记录）、`SnapFetch`（按
@@ -365,8 +403,8 @@ DESIGN.md §7（含 §7.8 那次全五轴复跑）。
 | `src/engine/` | 线协议类型（`model.rs`，45 个 op / 24 个 Reply）、帧编码（`codec.rs`）、状态机（`mem.rs`）、应用与定序（`apply.rs`）、WAL/快照（`wal.rs`）、核心（`core.rs`）、WAL 归档与 PITR（`archive.rs`，§6.11）、离线 dump 容器（`dump.rs`，§6.9）、自写的 SHA-256/HMAC（`sha256.rs`，§4.4） |
 | `src/net/` | 单线程事件循环（`server.rs`）、多前端 worker + 唯一提交线程（`multi.rs`）、跨线程信箱（`mail.rs`）、接入认证闸门（`auth.rs`，§4.4）、副本跟踪器（`replicate.rs`）、阻塞客户端（`client.rs`） |
 | `src/{pool,store,persist,schema,probe}.rs` | `postgres-compat` 过渡档 |
-| `src/bin/` | `treedb-server` / `treedb-bench` / `treedb-pgbench`（对照工具）/ `treedb-micro`（纯计算 + 分配计数）/ `treedb-migrate`（快照升级）/ `treedb-standby`（只读副本 + `--promote`）/ `treedb-dump` + `treedb-load`（离线逻辑导出与重建）/ `treedb-backup`（在线一致快照）/ `treedb-pitr`（按 seq 恢复到新目录）/ `treedb-demo` |
-| `tests/` | `engine_crud` `net_protocol` `read_scaling` `replication` `auth` `crash_recovery` `migrate` `dump_restore` `backup_online` `pitr` `batch` `table_alter` `table_bulk` `scale_connections` `independence`（默认档全部要跑）；`concurrency` 属过渡档 |
+| `src/bin/` | `treedb-server` / `treedb-bench` / `treedb-pgbench`（对照工具）/ `treedb-micro`（纯计算 + 分配计数）/ `treedb-migrate`（快照升级）/ `treedb-standby`（只读副本 + `--promote`）/ `treedb-dump` + `treedb-load`（离线逻辑导出与重建）/ `treedb-backup`（在线一致快照）/ `treedb-pitr`（按 seq 恢复到新目录）/ `treedb-cli`（人工操作：子命令 + REPL，实现在 `src/cli/`）/ `treedb-demo` |
+| `tests/` | `engine_crud` `net_protocol` `read_scaling` `replication` `auth` `crash_recovery` `migrate` `dump_restore` `backup_online` `pitr` `batch` `table_alter` `table_bulk` `scale_connections` `independence` `cli`（默认档全部要跑）；`concurrency` 属过渡档 |
 | `benches/` | 五轴矩阵脚本与历史/复跑原始输出；通用表的九条 `row*` 路径基准在 `bench_rows.sh`（§7.15）、批量形状与同值消除在 `bench_bulk.sh`（§7.16）、多实例写扩展在 `shard_write.sh`（§7.17） |
 | `DESIGN.md` | 选型判据、协议字节布局、语义边界、五轴实测、已知限制、接入路径与下一步 |
 

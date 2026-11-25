@@ -1,6 +1,6 @@
 [package]
 name = "treedb"
-version = "0.8.1"
+version = "0.9.0"
 edition = "2021"
 description = "元数据引擎：单进程事件循环 + 自定义二进制协议 + WAL/checkpoint（POSIX 元数据语义，客户端无关）"
 license = "Apache-2.0"
@@ -59,6 +59,13 @@ path = "src/bin/backup.rs"
 [[bin]]
 name = "treedb-bench"
 path = "src/bin/bench.rs"
+
+# 人工操作入口：通用表的全套 CRUD + 统计 + 离线工具的统一转发（§5.1、§11 的工具面
+# 缺口）。逻辑在 src/cli/，这里只是壳 —— 集成测试要能在同进程里调 treedb::cli::main
+# 拿退出码，bin 里的代码不是库面、测不到。
+[[bin]]
+name = "treedb-cli"
+path = "src/bin/cli.rs"
 
 # 吞吐对照：同一套 op 打到 PG，给引擎数字装配母分母。
 [[bin]]

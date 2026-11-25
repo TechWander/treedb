@@ -9,7 +9,11 @@
 自己的仓里；本仓唯一与 PostgreSQL 有关的东西是默认关掉的 `postgres-compat` 脚手架，
 而这条约束有测试守着（`tests/independence.rs`，详见 §11 第 7 条）。
 
-**状态**：v0.8.1（2026-11-25）。`v0.8.1` 是维护号：它把 `v0.8.0` 之后的三笔（切主
+**状态**：v0.9.0（2026-11-25）。`v0.9.0` 只长**人工操作面**：一个 `treedb-cli` 二进制加
+一个 `pub mod cli`（非交互子命令 + 自写 REPL，§5.4）。**不新加 op / reply / `Log` 变体，
+`PROTOCOL_VERSION` 仍 8、`SNAP_VERSION` 仍 4、`DUMP_VERSION` 仍 2**，旧数据目录零迁移，
+与 `v0.8.1` 同代；升 minor 而不是补丁号的唯一理由，是库面多了一个公开模块（依赖它的下游
+能看到新符号，看不到任何行为变化）。上一笔 `v0.8.1` 是维护号：它把 `v0.8.0` 之后的三笔（切主
 回归、POSIX 级联清锁、万级视图量具）圈进一个钉得住的 tag，**不新加 op / reply /
 `Log` 变体，`PROTOCOL_VERSION` 仍 8**，与 `v0.8.0` 同代（理由见 §11 第 21 条）。
 引擎本体已落地并跑完五轴验收（§7.8 是 2026-11-19 的全轴复跑）；
@@ -180,16 +184,17 @@ op / reply / `Log` 变体，`PROTOCOL_VERSION` 仍 8、`SNAP_VERSION` 仍 4，�
 按「不改写已推引用」的纪律保留现状：Cargo 解析 git 依赖只看 tag/rev 与 lock 里的
 hash，不看这个字段，所以不影响任何构建；`v0.6.0` 是下一次带 API 变更的发版，
 `Cargo.toml` 的 `version` 随它回到 `0.6.0`，两者重新对齐，此后逐版跟齐（`v0.8.0` =
-`0.8.0`、`v0.8.1` = `0.8.1`）。
+`0.8.0`、`v0.8.1` = `0.8.1`、`v0.9.0` = `0.9.0`）。
 
-test 现在分两档报（2026-11-25 在本轮交付的树上实跑，含 §7.18 与 §7.19 那批改动）：默认档（纯引擎）`cargo test --release` = **242 passed / 0 failed / 3 ignored**（71 lib +
+test 现在分两档报（2026-11-25 在本轮交付的树上实跑，含 §7.18、§7.19 与 §5.4 那批改动）：默认档（纯引擎）`cargo test --release` = **285 passed / 0 failed / 3 ignored**（106 lib（其中 35 条是 `src/cli`
+自己的单测，§5.4）+ 8 cli +
 36 engine_crud + 14 migrate + 21 replication + 12 net_protocol + 11 pitr + 8 read_scaling
 + 7 crash_recovery + 7 delete_storm + 5 mixed_views + 6 batch + 12 table_bulk + 8 auth
 + 5 observe
 + 5 table_alter + 4 dump_restore +
 3 backup_online + 3 independence + 1 large_reply + 1 checkpoint_tail + 1 scale_connections
 + 1 scale_restore；另 3 条带 `#[ignore]` —— 万级连接、百万节点、64 MiB 快照收尾 ——
-只手动跑，不计入 passed）；`--features postgres-compat` = **273 passed / 0 failed / 9 ignored**，多出的 31 条 = 过渡档自己的 30 条单测 +
+只手动跑，不计入 passed）；`--features postgres-compat` = **316 passed / 0 failed / 9 ignored**，多出的 31 条 = 过渡档自己的 30 条单测 +
 `concurrency.rs` 里那条
 不需要 PG 的拨号用例（剩下 6 条要真 PG，默认 `#[ignore]`，不计入 passed）。即 PG 只出现在
 `postgres-compat` 后面的 `src/pool`、`src/store`、
@@ -334,6 +339,12 @@ test 现在分两档报（2026-11-25 在本轮交付的树上实跑，含 §7.18
      src/net/replicate.rs Follower：拉快照 → 追 WAL → gap 重装；tick 在提交线程末
                           └─► 自己的 wal + snap；真写在 Engine::exec 处拿 EROFS
 
+  人工操作面（不新增任何语义，只是把 §4.2 那些 op 摆到命令行上，§5.4）：
+     src/cli/*            ──►  treedb-cli：非交互子命令 + 交互式 REPL；行编辑、补全、
+     src/bin/cli.rs             历史、JSON 全自写（§11 第 7 条的依赖门）。--addr 走
+                                Client::call，--dir 走 Engine::submit —— 两条都过同一
+                                条 WAL，没有绕过日志改内存态的捷径
+
   过渡档（PG 后端，不参与引擎路径）：
      src/pool/shared.rs   实例级共享连接池（search_path 化）
      src/store/{keys,audit,defs}.rs   密钥/审计/定义，PG 主 + SQLite 镜像兜底
@@ -357,7 +368,7 @@ test 现在分两档报（2026-11-25 在本轮交付的树上实跑，含 §7.18
 | `src/net/replicate.rs` | 729 | 副本侧跟踪器 `Follower`：拉快照 → 追 WAL → gap 重装，连不上主退避重连；拒收被提掉权的旧主（`Error::Fence`）不退出、只抬计数（§6.6） |
 | `src/net/mail.rs` | 114 | 两者之间那条能被 `epoll` 唤醒的信箱（`Mutex<VecDeque>` + eventfd） |
 | `src/net/client.rs` | 158 | 同步客户端 + pipeline；`connect` / `connect_auth` 先强制协商版本，再按需认证；`connect_raw` / `from_stream` 是只建 TCP 的显式逃生口（§4.4） |
-| `src/bin/{server,bench,pgbench,sqlitebench,micro,migrate,standby,demo,dump,load,backup,pitr}.rs` | 5470 | 可执行入口；`pgbench` 是 PG 对照器，`migrate` 是快照升级 工具（§6.5），`standby` 是只读副本兼 `--promote`（§6.6），`dump`/`load` 是离线逻辑导出与重建（§6.9），`backup` 是在线一致快照导出（§6.10），`pitr` 是按 seq 恢复到新目录（§6.11）；三个面向网络的入口共用 `--auth-key-file` |
+| `src/bin/{cli,server,bench,pgbench,sqlitebench,micro,migrate,standby,demo,dump,load,backup,pitr}.rs` | 5491 | 可执行入口；`pgbench` 是 PG 对照器，`migrate` 是快照升级 工具（§6.5），`standby` 是只读副本兼 `--promote`（§6.6），`dump`/`load` 是离线逻辑导出与重建（§6.9），`backup` 是在线一致快照导出（§6.10），`pitr` 是按 seq 恢复到新目录（§6.11）；面向网络的那几个入口共用 `--auth-key-file`（`server`/`bench`/`standby`/`backup`，加上 `cli` 的 `--addr` 模式），`cli` 是面向人工的通用表与引擎状态入口（§5.4，14 个表 op + `Batch` + 4 个运维 op 全有对应子命令） |
 | `benches/throughput_matrix.sh` | 188 | 五轴吞吐矩阵（§7 的数据来源） |
 | `benches/rehearse_migrate.sh` | 159 | 快照升级的真机彩排：旧 tag → 当前树，逐格核四条承诺与回滚窗口（§6.5 的外部效度） |
 | `benches/xgen_probe.sh` | 151 | 跨代混跑探针（§4.4 末）：`git archive` 取真 tag 编旧服务端，五臂分别钉 banner、跨代认证 / 非认证拒绝与同代认证 / 非认证放行 |
@@ -926,7 +937,7 @@ GC 拿它当唯一依据。
   跑，本仓不代替它报数。
 - **字节区间锁**：锁的 key 是 `(view, ino, owner)`，没有 `(start, end, pid)`。POSIX 记录锁
   要的是按区间合并/拆分的那套语义，这里给不了 —— provider 只能拒，不能假装支持。
-- **通用表只给 §4.2 那十一条 op 的形状**（状态与定型见 §5.1）：没有类型、没有 JOIN 与跨表条件、没有前缀匹配与排序（`RowRange` 只给「按主键或某一个已建索引列的一段字节区间」，
+- **通用表只给 §4.2 那十四条 op 的形状**（状态与定型见 §5.1）：没有类型、没有 JOIN 与跨表条件、没有前缀匹配与排序（`RowRange` 只给「按主键或某一个已建索引列的一段字节区间」，
   不给 `LIKE 'a%'` 这种前缀语义，也不给多列组合键）、没有聚合（只有 `RowCount`）、除唯一列外没有其他约束（没 NULL 概念、没外键、没 CHECK）。
   每一条都是把「查询能力」换回「可推的索引 + 不解释的字节」：内核一旦开始解释列值，
   客户端语义就顺着类型漏进来（§11 第 7 条的约束）。
@@ -934,6 +945,101 @@ GC 拿它当唯一依据。
   命名空间。接入方如果需要多租户，表名得自己带前缀 —— 引擎只保证名字唯一，
   不保证两个客户端不撞名。
 - xattr、ACL、quota、mtime 之外的时间戳精度增强。
+
+### 5.4 通用表的人工操作面（`treedb-cli`，2026-11-25 新增）
+
+§5 前面那些 op 只有两面：Rust API 与线协议。此前人要手工看一眼某张表有几行、
+或者把一行改掉，要么写一段代码，要么去拧 `treedb-bench` —— 而 bench 是为量速而生
+的：它的 `row*` 档位把条件位写死在代码里（`rowinsert` 硬编 `PUT_IF_ABSENT`，其余
+`cond_col` 恒 `COND_NONE`），没有任何旗标可给，人拿它做不了带 CAS 的手活 —— 而接入方的表里装的恰恰是密钥、审计、定义这类需要人手核对的东西。
+`treedb-cli` 补的是第三面：**一个二进制，非交互子命令 + 交互式 REPL**，§4.2 通用表
+那一行的 14 个 op 加 `Batch`、再加运维面那 4 个 op，每一条都有对应命令，参数名与
+引擎常量一一对着（`--if-absent` = `PUT_IF_ABSENT`，`--cond-col`/`--cond-val` =
+`cond_col`/`cond_val`，`--col pk` = `ROW_PK`）。名字不做包装：把 `table clear` 叫成
+`truncate` 会让文档与命令行的说法分叉，代价是排障时对照不上。
+
+| 引擎 op | 子命令 | REPL 里 |
+|---------|--------|---------|
+| `TableList` | `table list [--rows]` | 同 |
+| `TableGet` | `table desc [t]` | `use t` 后可省表名 |
+| `TableCreate` | `table create t col[:iu]…` | 同（`i`=COL_INDEX `u`=COL_UNIQUE） |
+| `TableDrop` | `table drop t` | 同 |
+| `TableAddColumn` | `table add-column t col[:i]` | 同 |
+| `TableRename` | `table rename from to [--noreplace]` | 同 |
+| `TableClear` | `table clear t` | 同 |
+| `RowGet` | `row get t key` | 同 |
+| `RowPut` | `row put t key c0… [--if-absent\|--if-exists] [--cond-col C --cond-val V]` | 同 |
+| `RowDelete` | `row del t key [--if-exists] [--cond-col C --cond-val V]` | 同 |
+| `RowList` | `row list t [--col C] [--eq V] [--after K] [--limit N]` | 同 |
+| `RowRange` | `row range t [--col C] [--lo A] [--hi B] [--after-val V --after-key K] [--limit N]` | 同 |
+| `RowRangeDelete` | `row del-range t [--col C] [--lo A] [--hi B] [--max N]` | 同 |
+| `RowCount` | `row count t [--col C] [--eq V]` / `… --lo A --hi B [--max N]` | 同 |
+| `Batch` | `batch "row put …" "row del …"` / `batch --file F` | `batch { … ; … }` 花括号块，或分号分句 |
+| `Ping` / `Stats` / `Checkpoint` / `Shutdown` | `ping` / `stats` / `checkpoint` / `shutdown` | 同 |
+| （既有二进制） | `dump` / `load` / `pitr` / `migrate` / `backup` | 同 |
+
+**两条连接形状，一条提交路径**。`--addr` 走 `src/net/client.rs` 的 `Client::call`，
+即线协议；`--dir` 独占打开数据目录走 `Engine::submit` —— 同一个 `translate`、同一个
+`commit_batch`、同样写 WAL，中间只少了一个 socket，没有任何绕过日志直接改内存态的
+捷径。两条路的判据是「答案必须逐字节相同」，由 `tests/cli.rs::tcp_and_dir_modes_answer_identically`
+把 20 条命令的 stdout 逐条对齐钉住；`dir_mode_writes_a_real_wal` 再证 CLI 写的目录
+交给真服务端 `restart_at` 后数据一致。服务端正跑着同一份目录时，`--dir` 被目录锁拒掉
+（退出码 3，§6.8），不是各写各的。
+
+**语义的权威是引擎**。CLI 不预先拒绝引擎会拒绝的东西：给 `table add-column` 带 `:u`
+不在这里判死，让那条 `EINVAL` 原样出来（CLI 自己判一遍的结果与引擎不一致时，人会
+相信错的那一句）。错误输出带 POSIX 名（`errno 17 (EEXIST)`），`--json` 里是
+`errno` + `errno_name`。退出码四档：0 成功 / 1 引擎回了 errno / 2 用法错 /
+3 op 根本没被求值（连不上、目录被占、协议不同代），包装子命令再把自己的码原样传出
+（`treedb-migrate` 的 10 那一档也在其中）—— 把「这行已经存在」与「服务端压根没起」
+分成两个数，脚本才写得对。
+
+**同值消除必须说出来**（§5.1、§8 第 18 条）。`RowPut` 命中同值消除时新旧行逐字节相同、
+零日志、`seq` 不前进，而应答本身是 `Reply::Ok` —— 单看返回值，「写成功了」与「seq 没
+动」这两件事会打架。CLI 因此在写入前后各发一次 `Op::Stats` 比 `writes_total`，命中时
+明打 `note: row put 未产生日志（同值消除/幂等空操作），seq 未前进 (seq=N)`。两处不说这句：CAS 落空时（那次写入
+根本没生效，说「同值消除」会把人引到错的方向），以及 `--no-seq-check`（省掉那 2 个附
+加 op，批量导入时用）。`row del-range` 删到 0 行时同样单说一句「未产生日志」，那是
+`RowRangeDelete` 空区间的正常形状。
+
+**区间计数不是引擎内建**。`range_count` 只在 `RowRangeDelete` 的应答里露面，引擎没有
+「数一段区间」的 op，所以 `row count --lo/--hi` 是 CLI 侧翻 `RowRange` 页累加的，
+复杂度 O(命中数)、每页一个 op，而不是 `RowCount` 那种 O(1)。这句话印在输出里，
+不让人以为它和全表计数一样便宜。
+
+**REPL 是给手活用的，不是会话**。连接参数与 `use <table>` 设的默认表在同一会话里继承，
+行编辑支持历史（`~/.treedb_cli_history`，`TREEDB_CLI_HISTORY=0` 彻底不落盘，上限 500 条）
+与命令补全，逐字符按 UTF-8 解码 —— 表名与列名本来就可以是中文，按字节处理会把它们拆成
+乱码。但每条命令仍是一个独立 op：REPL 里没有跨命令的事务状态，要原子就用 `batch`。
+破坏性 DDL（`table clear`/`drop`/`rename`）**不吃**默认表，必须写全名字 —— 省表名这个
+便利在删表上会变成灾难。
+
+**花括号块只有一种写错的形状会被静默接受，而那最贵**。`batch { a ; b }` 的块必须写在
+一行里（REPL 没有「等闭合花括号」的续行机制），所以切句层得认块：不认的话 `;` 会把块
+从中间切开 —— a 因为不是独立命令报用法错，而 **b 会作为一条普通命令真的执行掉**，一整批
+只落了一半。这一条在开发中被实测到（`row del` 那半句真删了行），所以定死两条规则：块内
+的 `;` 属于这一条批、不结束语句；花括号只出现一边是**用法错**（退出码 2）而不是「一条
+没写完的批」，未闭合的那个块一条 op 都不发。判据看的是当前已积累的那一段是不是 `batch`，
+所以 `use t; batch { … }` 这种带前缀的行也成立。
+
+**边界**。它不是 SQL 客户端：没有 JOIN、没有表达式，条件位只有引擎给的那几种；值的展示
+按内容自动选 UTF-8 或 `hex:`，超 120 字节截断（要全量用 `--json`）；`--dir` 与在跑的服务端
+互斥；包装的五个二进制参数原样转发、不改写（所以它们的旗标格式与 `treedb-cli` 不一致时
+也不会被顺手「统一」）。
+
+**代码量与依赖**。`src/cli/{mod,commands,conn,shell,value}.rs` 共 4590 行加 `src/bin/cli.rs`
+21 行。§11 第 7 条那个依赖门（非 optional 依赖只有 `libc` + `thiserror`）意味着参数扫描器、
+语句 tokenizer、行编辑、补全、历史、JSON 输出全是自写的 —— 没有 clap，没有 rustyline，
+没有 ratatui。换来的是零新增依赖与一个静态二进制。
+
+**验证**。`src/cli` 内 35 条单测（`commands.rs` 13 / `shell.rs` 8 / `value.rs` 6 / `mod.rs` 5 /
+`conn.rs` 3），`tests/cli.rs` 8 条真进程（两种模式各起真服务端）。13 条里最值得说的是
+`every_table_op_has_a_command` —— 它是一张清单而不是一条性质：15 个 op 逐个走通，加一条
+就漏不掉；以及 `key_error_paths_keep_their_posix_names`（EEXIST/ENOENT/EAGAIN/EINVAL 四条
+都留在 POSIX 名字上）、`flags_are_matched_by_their_bare_names`（裸旗标不被当值吞掉，否则
+一次 CAS 会悄悄变成一次真写）与块形状那两条（`a_brace_block_is_not_split_on_semicolons`
+在切句层、`a_brace_block_is_one_statement` 在求值层，后者钉的是「两条子 op 只让 seq 前进 1」
+与「半截块一个字节都不写」）。
 
 ---
 
@@ -3815,9 +3921,10 @@ max 1 094 → 2 079 µs，服务端最坏回合 42 039 → 147 799 µs（743 →
 ## 9. 测试清单
 
 ```sh
-cargo test --release                            # 默认档（纯引擎），245 条（242 passed + 0 failed + 3 ignored）
-cargo test --release --features postgres-compat # 加上过渡档，282 条（273 passed + 0 failed + 9 ignored）
-cargo test --release --lib                      # 只看引擎单测
+cargo test --release                            # 默认档（纯引擎），288 条（285 passed + 0 failed + 3 ignored）
+cargo test --release --features postgres-compat # 加上过渡档，325 条（316 passed + 0 failed + 9 ignored）
+cargo test --release --lib                      # 只看单测：106 条，其中 35 条在 src/cli（§5.4）
+cargo test --release --test cli                 # 人工操作面：8 条真进程，两种连接模式各起真服务端（§5.4）
 cargo test --release --test migrate              # 快照升级：11 条走 API + 3 条真进程跑 CLI（§6.5）
 cargo test --release --test scale_connections -- --ignored   # 万级连接重压（§7.6）；并发数由 TREEDB_CONNS 控制，本机到 25 000 为限（再高是客户端源端口不够）
 TREEDB_RESTORE_NODES=10000000 TREEDB_RESTORE_TAIL=100000 cargo test --release --test scale_restore -- --ignored --nocapture   # 百 MB 到 GB 级快照的恢复成本（§8 第 2 条）
@@ -5351,3 +5458,44 @@ spike 明确**没**做、也不在接入面上假装做的事 —— 一律返�
     `feat/treedb-hardlink`（pin `v0.7.0`）跨到 `v0.8.1` 这一格**未实测** —— 它欠的是同
     一行 tag 的改动，但那一半的接入代码（真发 `Op::Link` 的 provider）不在我复现的那棵
     树上，跑出来的三元组也不能替集成分支背书。
+
+22. **面向人工的操作面：`treedb-cli`**（§5.4，2026-11-25，**已做完**）。此前通用表只有
+    两面（Rust API、线协议），运维要人肉看一行、改一行，要么写代码，要么去拧为量速而生的
+    `treedb-bench` —— 它的 `row*` 档位把条件位写死在代码里，没有旗标可给。这一笔补第三面：
+    `src/cli/{mod,commands,conn,shell,value}.rs` 4590 行加 `src/bin/cli.rs` 21 行，一个二进制，
+    非交互子命令 + REPL，§4.2 通用表那 14 个 op 加 `Batch`、运维面那 4 个 op 全有对应命令，
+    参数名与引擎常量对着（`--if-absent`/`--if-exists`/`--cond-col`/`--cond-val`/`--col pk`）。
+    做的时候定下四条，都留在代码与测试里：① **两条连接形状只有一条提交路径** —— `--addr` 走
+    `Client::call`，`--dir` 走 `Engine::submit`，同一个 `commit_batch`、同一条 WAL，没有绕过
+    日志改内存态的捷径（`tests/cli.rs::tcp_and_dir_modes_answer_identically` 逐条对齐 20 条
+    命令的 stdout，`dir_mode_writes_a_real_wal` 再把 CLI 写的目录交回真服务端复核）；② **语义的
+    权威是引擎**，CLI 不预先拒绝引擎会拒绝的东西，`EINVAL` 原话印出来；③ **退出码分四档**
+    （0 / 1 引擎回 errno / 2 用法错 / 3 op 没被求值），包装的五个二进制透传自己的码，脚本能
+    把「这行已存在」与「服务端压根没起」分开；④ **同值消除必须说出来** —— 写入前后各发一次
+    `Stats` 比 `writes_total`，命中时明打「未产生日志（同值消除/幂等空操作），seq 未前进」
+    而 CAS 落空那档（`EAGAIN`）不许说这句。
+    依赖门（§11 第 7 条）逼出来的自写件：参数扫描、语句 tokenizer、UTF-8 逐字符行编辑、补全、
+    历史、JSON 输出 —— 零新增依赖。四处是做的过程中才发现的缺口，都已补齐并钉住：`scan` 原来
+    不认 `--`，于是键名恰好长成 `--if-absent` 那种行根本写不进去；HELP 早写了 `checkpoint` /
+    `shutdown` 而分派表里没有这两条（`control_commands_answer_ok` 从此盯着「HELP 承诺的每行都
+    要有落点」）；`row get` 未命中在引擎侧是 `Reply::Row(None)` 而不是 errno，`--json` 分支原先
+    回 0、人类分支回 1，同一件事两种退出码是假的便利，统一成 1 并在 JSON 里用 `found:false`
+    说清答案；第四条最贵 —— HELP 早就承诺了 `batch { a ; b }` 的块形状，而切句层不认花括号，
+    于是块被 `;` 从中间切开：前半报用法错，**后半作为一条普通命令真的执行掉了**（实测真的
+    删掉了一行）—— 一句本该原子的批只落了一半。现在块内的 `;` 不结束语句、花括号只出现一边
+    就是退出码 2 且一个 op 都不发（`a_brace_block_is_not_split_on_semicolons` + shell 层那条
+    求值测试）。
+    验证（当轮实跑）：`src/cli` 内 35 条单测 + `tests/cli.rs` 8 条真进程；默认档
+    `cargo test --release` **285 passed / 0 failed / 3 ignored**、`--features postgres-compat`
+    **316 passed / 0 failed / 9 ignored**（两档都比上一笔多 43 条，正是这两处新增）。`cargo
+    clippy --all-targets` 在 `src/cli` 与 `src/bin/cli.rs` 上零警告（仓里既有 `tests/*.rs` 的
+    警告不在这一笔范围内）。协议与盘上格式零改动：没有新 op、新 reply、新 `Log` 变体，
+    `PROTOCOL_VERSION` 8 / `SNAP_VERSION` 4 不变，旧目录零迁移。定版为 `v0.9.0`（发布提交就是
+    这一笔，`Cargo.toml` 的 `version` 同步到 `0.9.0`，两者照旧逐版对齐）。
+    **没做与下一步**：没做全屏 TUI（约束里明确不要 ratatui 那类依赖，一个 readline 式 REPL
+    够用）；没有 shell 补全脚本（bash/zsh 的 completion 文件）、没有 man page；REPL 不是会话 ——
+    每条命令一个独立 op，跨命令没有事务状态，要原子得用 `batch`；`--dir` 与在跑的服务端被目录
+    锁互斥，这一条不做成「排队等锁」；包装的那五个二进制的旗标格式仍由各自决定，CLI 不改写也不统一
+    （统一等于把已发布的五套接口悄悄换成第六套）。真要继续，价值排序是：① `stats` 的时序视图
+    （`--watch` 打曲线或至少打增量），② 从 `dump` 里按表过滤导出（现在只能整份），③ 补全脚本
+    与 man —— 这三样都不动引擎，只在 `src/cli` 里长。

@@ -59,6 +59,12 @@
 //! | `schema` | `pg_store::schema_for` / `control::schema_name_for` | 保持字节一致，双端可解析同名 schema
 
 pub mod config;
+/// 人工操作面（`treedb-cli` 的实现）：通用表全套 CRUD、统计、既有离线工具的统一转发，
+/// 外加一个自写的 REPL。放在这儿而不是只长在 `src/bin/` 里，是因为集成测试要能在同一
+/// 个进程里跑完一条命令拿到退出码；它只走 [`net::Client`] 或 [`engine::Engine::submit`]
+/// 两条既有路径，不新开语义（依赖门与 `tests/independence.rs` 一致：只用 libc + thiserror
+/// 加标准库）。
+pub mod cli;
 pub mod engine;
 pub mod error;
 // `--stats --format prometheus` 的文本格式：纯函数 `EngineStats -> String`，
