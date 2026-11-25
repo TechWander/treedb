@@ -1,11 +1,16 @@
-//! 接入认证：一份集群共享密钥 + 双向挑战握手（DESIGN.md §4.4）。
+//! 接入认证：协议版本协商 + 一份集群共享密钥 + 双向挑战握手（DESIGN.md §4.4）。
 //!
 //! ## 它是什么形状
 //!
-//! 两次往返的 CHAP，跑在既有的帧协议上，**不是** TLS 的简化版：
+//! 先做一次版本协商，再跑两次往返的 CHAP；它们都跑在既有的帧协议上，
+//! **不是** TLS 的简化版：
 //!
 //! ```text
 //! 客户端                                 服务端
+//!   │  VersionBegin { client_proto }       │
+//!   ├───────────────────────────────────►  │
+//!   │  VersionOk { server_proto }          │
+//!   │ ◄────────────────────────────────────┤
 //!   │  AuthBegin { client_nonce }          │
 //!   ├───────────────────────────────────►  │ 生成 server_nonce（getrandom）
 //!   │  Challenge { server_nonce, proto }   │
@@ -29,7 +34,7 @@
 //!
 //! - **不防窃听**：握手之后的每一个字节仍是明文。这条握手只建立身份，
 //!   不建立机密性；要加密得另做（§11 第 4 条）。
-//! - **不做授权**：过了握手的连接与今天一样拥有全部 55 个 op。它是
+//! - **不做授权**：过了握手的连接与今天一样拥有全部 45 个 op。它是
 //!   「一把钥匙开整扇门」，不是租户模型。
 //! - **不防字典攻击**：密钥必须是 32 字节随机值。从口令派生的话，抓一次
 //!   握手就能离线试口令 —— [`Key::load`] 因此在长度上不留余地。
@@ -172,15 +177,20 @@ fn random32() -> Result<[u8; NONCE_LEN]> {
 
 /// 这条 op 是不是握手 op（两条路径的分派都判它）。
 pub fn is_handshake(op: &Op) -> bool {
-    matches!(op, Op::AuthBegin { .. } | Op::AuthFinish { .. })
+    matches!(
+        op,
+        Op::VersionBegin { .. } | Op::AuthBegin { .. } | Op::AuthFinish { .. }
+    )
 }
 
 /// 一条连接的握手进度。放在 [`crate::net::server::Conn`] 里，每连接一份。
 #[derive(Clone, Debug)]
 pub enum Stage {
-    /// 本实例没启用认证：任何 op 直通，握手也只是回一句「这里没事」。
+    /// 新连接：还没报版本，任何数据 op 与认证 op 都不得放行。
+    VersionNeeded,
+    /// 本实例没启用认证：版本协商完成后任何 op 直通。
     Off,
-    /// 启用了认证，这条连接还没开始握手。
+    /// 版本已协商，启用了认证，这条连接还没开始握手。
     Needed,
     /// 已发挑战，等 `AuthFinish`。两个随机数都得留着，MAC 是算给它们的。
     Awaiting { cn: [u8; NONCE_LEN], sn: [u8; NONCE_LEN] },
@@ -195,9 +205,9 @@ pub struct Gate {
 }
 
 impl Gate {
-    pub fn new(required: bool) -> Gate {
+    pub fn new() -> Gate {
         Gate {
-            stage: if required { Stage::Needed } else { Stage::Off },
+            stage: Stage::VersionNeeded,
         }
     }
 
@@ -208,11 +218,14 @@ impl Gate {
 
     /// 「没握手就发数据 op」的标准应答。两条事件循环路径共用这一条，
     /// 免得一边的文案与另一边的 errno 对不上。
-    pub fn denied() -> Reply {
-        Reply::err(
-            errno::EADV,
-            "authentication required: run the handshake first (§4.4)",
-        )
+    pub fn denied(&self) -> Reply {
+        let msg = match self.stage {
+            Stage::VersionNeeded => {
+                "protocol version negotiation required: send VersionBegin first (§4.4)"
+            }
+            _ => "authentication required: run the handshake first (§4.4)",
+        };
+        Reply::err(errno::EADV, msg)
     }
 
     /// 「数据 op 与握手挤在同一批帧里，且排在最后一条握手 op 之前」的标准应答。
@@ -234,15 +247,49 @@ impl Gate {
     /// 再交给引擎；`None` = 放行。判据只有一条：`allows_data()`。
     pub fn on_op(&mut self, key: Option<&Key>, op: &Op) -> Option<Reply> {
         match op {
-            Op::AuthBegin { client_nonce } => Some(self.begin(key, client_nonce)),
-            Op::AuthFinish { mac } => Some(self.finish(key, mac)),
+            Op::VersionBegin { client_proto } => Some(self.version(key, *client_proto)),
+            Op::AuthBegin { client_nonce } => {
+                if matches!(self.stage, Stage::VersionNeeded) {
+                    Some(self.denied())
+                } else {
+                    Some(self.begin(key, client_nonce))
+                }
+            }
+            Op::AuthFinish { mac } => {
+                if matches!(self.stage, Stage::VersionNeeded) {
+                    Some(self.denied())
+                } else {
+                    Some(self.finish(key, mac))
+                }
+            }
             _ => {
                 if self.allows_data() {
                     None
                 } else {
-                    Some(Self::denied())
+                    Some(self.denied())
                 }
             }
+        }
+    }
+
+    fn version(&mut self, key: Option<&Key>, client_proto: u16) -> Reply {
+        if !matches!(self.stage, Stage::VersionNeeded) {
+            return Reply::err(
+                errno::EADV,
+                "protocol version was already negotiated on this connection (§4.4)",
+            );
+        }
+        if client_proto != PROTOCOL_VERSION {
+            return Reply::err(
+                errno::EADV,
+                format!(
+                    "protocol version mismatch: client {client_proto}, server {PROTOCOL_VERSION} (§4.4)"
+                ),
+            );
+        }
+        self.stage = if key.is_some() { Stage::Needed } else { Stage::Off };
+        Reply::VersionOk {
+            server_proto: PROTOCOL_VERSION,
         }
     }
 
@@ -306,17 +353,17 @@ impl Gate {
     }
 }
 
-/// 客户端一侧跑完整次握手。
+/// 客户端一侧先协商线协议版本；`key = Some` 时再跑完整认证握手。
 ///
-/// `key = None` 时**一个字节都不发**：保持与旧客户端逐字一致的行为，这样
-/// 「带认证的开关关掉」等于这条改动不存在。
+/// `key = None` 也要先发 `VersionBegin`：认证开关不能关掉跨代静默错读的闸门。
 ///
-/// 两处刻意 fail-closed：
+/// 三处刻意 fail-closed：
 /// - 服务端回了 `AuthOk { authed: false }` 而客户端带了密钥 → 报错。否则
 ///   一个中间人可以只回一句「这里没事」就把认证整个摘掉（降级攻击）。
 /// - `Challenge.proto` 与本端不一致 → 报错。MAC 里也绑了版本、本来就会算错，
 ///   但"版本不符"比"MAC 不对"是准确得多的诊断信息。
 pub fn handshake(c: &mut crate::net::client::Client, key: Option<&Key>) -> Result<()> {
+    version_handshake(c)?;
     let Some(key) = key else {
         return Ok(());
     };
@@ -363,6 +410,31 @@ pub fn handshake(c: &mut crate::net::client::Client, key: Option<&Key>) -> Resul
     }
 }
 
+/// 所有正常连接的建连第一步：版本协商。
+///
+/// 旧服务端不认识 `0x0092` 时必须报错退出，绝不能退回「先发数据试试」。
+pub fn version_handshake(c: &mut crate::net::client::Client) -> Result<()> {
+    match c.call(&Op::VersionBegin {
+        client_proto: PROTOCOL_VERSION,
+    })? {
+        Reply::VersionOk { server_proto } => {
+            if server_proto != PROTOCOL_VERSION {
+                return Err(Error::Denied(format!(
+                    "peer speaks protocol {server_proto}, this client {PROTOCOL_VERSION}"
+                )));
+            }
+            Ok(())
+        }
+        Reply::Err { code, msg } => Err(Error::Denied(format!(
+            "version handshake refused: errno {code}: {} (a pre-v8 server does not know op tag 0x0092)",
+            String::from_utf8_lossy(&msg)
+        ))),
+        other => Err(Error::Denied(format!(
+            "unexpected reply to VersionBegin: {other:?}"
+        ))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -386,7 +458,7 @@ mod tests {
     #[test]
     fn gate_gates() {
         let k = key(7);
-        let mut g = Gate::new(true);
+        let mut g = Gate::new();
         assert!(!g.allows_data());
         // 没握手就想读数据：EADV，而且不是断连（客户端还能去握手）。
         match g.on_op(Some(&k), &Op::Ping) {
@@ -400,7 +472,17 @@ mod tests {
         ));
         assert!(!g.allows_data());
 
-        // 正常一轮。
+        // 正常一轮：先协商版本，再进入认证。
+        assert!(matches!(
+            g.on_op(
+                Some(&k),
+                &Op::VersionBegin {
+                    client_proto: PROTOCOL_VERSION,
+                },
+            ),
+            Some(Reply::VersionOk { server_proto }) if server_proto == PROTOCOL_VERSION
+        ));
+        assert!(matches!(g.stage, Stage::Needed));
         let cn = [0x11u8; NONCE_LEN];
         let sn = match g.on_op(Some(&k), &Op::AuthBegin { client_nonce: cn }) {
             Some(Reply::Challenge { server_nonce, proto }) => {
@@ -434,11 +516,24 @@ mod tests {
         assert!(g.on_op(Some(&k), &Op::Ping).is_none(), "放行后就该交给引擎");
     }
 
-    /// 没启用认证时握手不是错误而是一次空转：这条是 v4 客户端之外唯一的
-    /// 「总是握手」客户端能连通老形状服务端的依据。
+    /// 没启用认证时版本协商完成后数据面直通；显式 AuthBegin 仍是一次空转。
     #[test]
     fn gate_without_key_is_open() {
-        let mut g = Gate::new(false);
+        let mut g = Gate::new();
+        assert!(!g.allows_data());
+        assert!(matches!(
+            g.on_op(None, &Op::Ping),
+            Some(Reply::Err { code, .. }) if code == errno::EADV
+        ));
+        assert!(matches!(
+            g.on_op(
+                None,
+                &Op::VersionBegin {
+                    client_proto: PROTOCOL_VERSION,
+                },
+            ),
+            Some(Reply::VersionOk { server_proto }) if server_proto == PROTOCOL_VERSION
+        ));
         assert!(g.allows_data());
         assert!(g.on_op(None, &Op::Ping).is_none());
         assert!(matches!(
@@ -447,6 +542,28 @@ mod tests {
         ));
         // 空转之后依然放行（`Off` 不是一个需要重新获得的档位）。
         assert!(g.on_op(None, &Op::Stats).is_none());
+    }
+
+    /// 错版本必须 fail-closed，而且不能顺手把闸门打开。
+    #[test]
+    fn gate_rejects_a_protocol_mismatch() {
+        let mut g = Gate::new();
+        let wrong = PROTOCOL_VERSION + 1;
+        match g.on_op(None, &Op::VersionBegin { client_proto: wrong }) {
+            Some(Reply::Err { code, msg }) => {
+                assert_eq!(code, errno::EADV);
+                let msg = String::from_utf8_lossy(&msg);
+                assert!(msg.contains(&format!("client {wrong}")), "{msg}");
+                assert!(msg.contains(&format!("server {PROTOCOL_VERSION}")), "{msg}");
+            }
+            other => panic!("错版本不该拿到 VersionOk：{other:?}"),
+        }
+        assert!(!g.allows_data());
+        assert!(matches!(g.stage, Stage::VersionNeeded));
+        assert!(matches!(
+            g.on_op(None, &Op::Ping),
+            Some(Reply::Err { code, .. }) if code == errno::EADV
+        ));
     }
 
     /// 密钥文件的拒绝形状：太短（口令）、非十六进制、全零模板。

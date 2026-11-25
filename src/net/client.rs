@@ -19,8 +19,11 @@ pub struct Client {
 }
 
 impl Client {
-    /// 连接 `host:port`。`timeout=0` 表示不设超时（长尾 op 友好）。
-    pub fn connect(addr: &str, timeout_ms: u64) -> Result<Client> {
+    /// 只建 TCP 连接，**不协商协议版本**。
+    ///
+    /// 这是给反例测试与跨代探针用的显式逃生口：正常调用方必须用
+    /// [`Client::connect`] 或 [`Client::connect_auth`]。
+    pub fn connect_raw(addr: &str, timeout_ms: u64) -> Result<Client> {
         let stream = TcpStream::connect(addr).map_err(|e| Error::Io(format!("connect {addr}: {e}")))?;
         if timeout_ms > 0 {
             let d = Duration::from_millis(timeout_ms);
@@ -34,10 +37,21 @@ impl Client {
         })
     }
 
-    /// 用已建好、已调优的 socket 构造客户端。
+    /// 连接并完成协议版本协商。`timeout=0` 表示不设超时（长尾 op 友好）。
     ///
-    /// 给两类场景用：测试要先把缓冲区调小以触发服务端背压；调用方
-    /// 如果想自己管 socket（复用、绑定、超时）也不必经本模块的 `connect`。
+    /// 协商失败（包括连到不认 `VersionBegin` 的旧服务端）直接返回错误，
+    /// 不会退回未协商状态继续发数据 op。
+    pub fn connect(addr: &str, timeout_ms: u64) -> Result<Client> {
+        let mut c = Client::connect_raw(addr, timeout_ms)?;
+        auth::version_handshake(&mut c)?;
+        Ok(c)
+    }
+
+    /// 用已建好、已调优的 socket 构造**未协商**客户端。
+    ///
+    /// 给两类场景用：反例测试要验证服务端拒绝裸连接；调用方如果想自己管
+    /// socket（复用、绑定、超时）也必须显式选择 [`Client::from_stream_auth`]
+    /// 或 [`auth::version_handshake`] 才能进数据面。
     pub fn from_stream(stream: TcpStream) -> Client {
         let _ = stream.set_nodelay(true);
         Client {
@@ -46,21 +60,20 @@ impl Client {
         }
     }
 
-    /// 连接 + （给了密钥就）握手。`key = None` 与 [`Client::connect`] 逐字等价。
+    /// 连接 + 版本协商 + （给了密钥就）认证握手。
     ///
-    /// 为什么不把握手合进 `connect`：握手是两次往返，它会让“没打算认证”的
-    /// 调用方白付两次 RTT，也会直接弄坏 v4 服务端。存在 [`auth::handshake`]
-    /// 那一层，开关才能只落在真正需要它的地方。
+    /// `key = None` 与 [`Client::connect`] 等价；两者都先 fail-closed 地协商
+    /// 协议版本，认证只是其后的可选步骤。
     pub fn connect_auth(addr: &str, timeout_ms: u64, key: Option<&Key>) -> Result<Client> {
-        let mut c = Client::connect(addr, timeout_ms)?;
+        let mut c = Client::connect_raw(addr, timeout_ms)?;
         auth::handshake(&mut c, key)?;
         Ok(c)
     }
 
-    /// [`Client::from_stream`] 的认证版：自己调好 socket 之后也能跑握手。
+    /// [`Client::from_stream`] 的握手版：自己调好 socket 之后也能协商版本并按需认证。
     ///
-    /// 不另外提供一个 `from_stream` 是为了背压类用例：它们必须能把缓冲区调到
-    /// 很小、又得能连上开了认证的服务端。
+    /// `key = None` 也会完成版本协商；背压类用例因此既能调小缓冲区，又不会
+    /// 因为绕开正常建连入口而被服务端正确拒绝。
     pub fn from_stream_auth(stream: TcpStream, key: Option<&Key>) -> Result<Client> {
         let mut c = Client::from_stream(stream);
         auth::handshake(&mut c, key)?;

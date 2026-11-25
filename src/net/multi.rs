@@ -352,7 +352,7 @@ fn worker_loop(
                             }
                             let id = next_id;
                             next_id += 1;
-                            let c = Conn::new(stream, id, w.auth.is_some());
+                            let c = Conn::new(stream, id);
                             let nfd = c.fd;
                             epoll_set(ep, nfd, false)?;
                             by_id.insert(id, nfd);
@@ -441,9 +441,12 @@ fn worker_loop(
             }
             let mut ops: Vec<Op> = Vec::with_capacity(frames.len());
             let mut bad: Option<Reply> = None;
-            // 这批帧里有没有握手 op。记在解码循环里而不是事后重新遍历一遍
-            // `any()`，是为了让没认证的热路径一个额外遍历也不付。
-            let mut needs_gate = false;
+            // 这批帧里有没有握手 op，或者这条连接还没放行。记在解码循环里而
+            // 不是事后重新遍历一遍 `any()`，是为了让已放行的热路径不额外遍历。
+            let mut needs_gate = conns
+                .get(&fd)
+                .map(|c| !c.auth.allows_data())
+                .unwrap_or(true);
             for f in frames {
                 let payload = match f {
                     Ok(p) => p,
@@ -492,7 +495,7 @@ fn worker_loop(
             //    EAGAIN 让客户端重发（它们还没被碰过，重发安全）。
             // 单线程那条循环逐条顺序执行，天然没有这个问题。
             let mut route: Vec<Op> = ops;
-            if w.auth.is_some() || needs_gate {
+            if needs_gate {
                 let auth_key = w.auth.as_deref();
                 let cut = route
                     .iter()
@@ -521,8 +524,10 @@ fn worker_loop(
                         route = route.split_off(cut);
                     }
                 } else {
-                    for _ in cut..route.len() {
-                        inline.push(crate::net::auth::Gate::denied());
+                    if let Some(c) = conns.get_mut(&fd) {
+                        for _ in cut..route.len() {
+                            inline.push(c.auth.denied());
+                        }
                     }
                     route.clear();
                 }

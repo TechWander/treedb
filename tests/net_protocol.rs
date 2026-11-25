@@ -274,7 +274,7 @@ fn large_readdir_response_streams_out_fully() {
 
     let raw = TcpStream::connect(&srv.addr).expect("connect");
     shrink_rcvbuf(&raw, 8 * 1024);
-    let mut slow = Client::from_stream(raw);
+    let mut slow = Client::from_stream_auth(raw, None).expect("version handshake");
     let reps = slow
         .pipeline(&[Op::ReadDir { view: v, parent: 1, offset: 0, limit: N as u32 }])
         .expect("big readdir");
@@ -422,37 +422,56 @@ fn oversized_frame_kills_only_the_offender() {
 fn fragmented_request_is_reassembled() {
     let srv = Server::start("always");
     let mut raw = TcpStream::connect(&srv.addr).expect("connect");
+    let send_fragmented = |raw: &mut TcpStream, frame: &[u8]| {
+        assert!(frame.len() > 6);
+        // 先送 3 字节（连帧头都不全），再一字节一字节地喂。
+        raw.write_all(&frame[..3]).expect("partial header");
+        raw.flush().expect("flush");
+        std::thread::sleep(std::time::Duration::from_millis(120));
+        for b in &frame[3..] {
+            raw.write_all(&[*b]).expect("byte");
+            raw.flush().expect("flush byte");
+        }
+    };
+    let recv_frame = |raw: &mut TcpStream| {
+        let mut rx = RxBuf::with_capacity(256);
+        let mut buf = [0u8; 256];
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if let Some(p) = rx.peek_len() {
+                if rx.pending() >= p as usize + FRAME_HDR {
+                    return rx.take_frame().unwrap().unwrap();
+                }
+            }
+            if std::time::Instant::now() > deadline {
+                panic!("服务端没有把碎帧拼完");
+            }
+            let n = raw.read(&mut buf).expect("read");
+            assert!(n > 0, "连接被提前关闭");
+            rx.extend(&buf[..n]);
+        }
+    };
+
+    // 握手本身也走碎帧；通过后才发数据 op。
+    let mut vw = treedb::engine::W::new();
+    Op::VersionBegin {
+        client_proto: treedb::engine::PROTOCOL_VERSION,
+    }
+    .encode(&mut vw);
+    send_fragmented(&mut raw, &encode_frame(&vw.finish()));
+    match Reply::decode(&mut treedb::engine::codec::Rd::new(&recv_frame(&mut raw)))
+        .expect("decode version")
+    {
+        Reply::VersionOk { server_proto } => {
+            assert_eq!(server_proto, treedb::engine::PROTOCOL_VERSION)
+        }
+        other => panic!("expected VersionOk, got {other:?}"),
+    }
+
     let mut w = treedb::engine::W::new();
     Op::CreateView { name: b"frag".to_vec() }.encode(&mut w);
-    let frame = encode_frame(&w.finish());
-    assert!(frame.len() > 6);
-
-    // 先送 3 字节（连帧头都不全），再一字节一字节地喂。
-    raw.write_all(&frame[..3]).expect("partial header");
-    raw.flush().expect("flush");
-    std::thread::sleep(std::time::Duration::from_millis(120));
-    for b in &frame[3..] {
-        raw.write_all(&[*b]).expect("byte");
-        raw.flush().expect("flush byte");
-    }
-
-    let mut rx = RxBuf::with_capacity(256);
-    let mut buf = [0u8; 256];
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    loop {
-        if let Some(p) = rx.peek_len() {
-            if rx.pending() >= p as usize + FRAME_HDR {
-                break;
-            }
-        }
-        if std::time::Instant::now() > deadline {
-            panic!("服务端没有把碎帧拼完");
-        }
-        let n = raw.read(&mut buf).expect("read");
-        assert!(n > 0, "连接被提前关闭");
-        rx.extend(&buf[..n]);
-    }
-    let payload = rx.take_frame().unwrap().unwrap();
+    send_fragmented(&mut raw, &encode_frame(&w.finish()));
+    let payload = recv_frame(&mut raw);
     match Reply::decode(&mut treedb::engine::codec::Rd::new(&payload)).expect("decode") {
         Reply::View { id, root } => assert_eq!((id, root), (0, 1)),
         other => panic!("{other:?}"),
@@ -715,7 +734,7 @@ fn generic_table_and_readdir_plus_over_tcp() {
     // 大应答：1000 行一页取完远大于两个套接字缓冲，客户端读侧必须自己接回来。
     let raw = TcpStream::connect(&srv.addr).expect("connect");
     shrink_rcvbuf(&raw, 8 * 1024);
-    let mut slow = Client::from_stream(raw);
+    let mut slow = Client::from_stream_auth(raw, None).expect("version handshake");
     let reps = slow
         .pipeline(&[Op::RowList {
             table: b"t".to_vec(), column: ROW_PK, value: Vec::new(), from: Vec::new(), limit: N as u32,

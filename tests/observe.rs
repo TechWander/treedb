@@ -128,7 +128,7 @@ fn run_cap(workers: usize) {
     // 超额的每条都要被拒：TCP 层连得上（内核接受队列），但服务端在 accept
     // 之后立刻关闭，所以第一次往返一定是错误而不是 Pong。
     for i in cap..cap + 3 {
-        let mut c = Client::connect(&srv.addr, 2_000)
+        let mut c = Client::connect_raw(&srv.addr, 2_000)
             .unwrap_or_else(|e| panic!("workers={workers}: 第 {i} 条 TCP 都连不上：{e}"));
         assert!(
             c.call(&Op::Ping).is_err(),

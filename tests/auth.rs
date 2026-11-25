@@ -1,6 +1,6 @@
 //! 接入认证验收（DESIGN.md §4.4）。
 //!
-//! 这里只测**线协议上的握手形状**：MAC 的数学性质、闸门的四档语义、密钥文件
+//! 这里只测**线协议上的握手形状**：MAC 的数学性质、闸门的五档语义、密钥文件
 //! 的长度门禁都在 `net::auth` 与 `engine::sha256` 的单测里，不重复。
 //!
 //! 这些用例各自钉一件事（1 与 5 在同一条里：拦截与放行本来就是同一个闸门
@@ -10,10 +10,11 @@
 //!    那条路径的握手是分在 head 段就地答的，最容易漏）；
 //! 2. 错密钥被拒之后连接不锁死，换对密钥能重头握手，而**上一拍的 MAC 重放不上**；
 //! 3. 带密钥的客户端遇到没配密钥的服务端必须**拒绝降级**，而不是"就当没事"；
-//! 4. 没配密钥的服务端对握手回一次 `authed: false` 就完事 —— 这是 v5 客户端
-//!    连 v4 服务端不会卡死的依据；
-//! 5. 握手之后数据面与不开认证的实例逐字同构（写读都照常）；
-//! 6. 握手 op 与数据 op 挤在同一批帧里时，**应答次序不能被打乱**。
+//! 4. 没配密钥的服务端对认证请求回一次 `authed: false`，带密钥客户端必须拒绝降级；
+//! 5. 版本协商后，开认证与不开认证的数据面都能正常读写；
+//! 6. 握手 op 与数据 op 挤在同一批帧里时，**应答次序不能被打乱**；
+//! 7. 不认证的两种 worker 形状也必须先协商版本，错版本不能放行；
+//! 8. 客户端必须拒绝伪造服务端返回的错版本 `VersionOk`。
 //!
 //! 跑法：`cargo test --test auth`
 
@@ -23,7 +24,7 @@ mod common;
 use common::{test_key, Server};
 use treedb::engine::model::errno;
 use treedb::engine::sha256::DIGEST_LEN;
-use treedb::engine::{Op, Reply, NONCE_LEN};
+use treedb::engine::{Op, Reply, NONCE_LEN, PROTOCOL_VERSION};
 use treedb::net::auth::Key;
 use treedb::net::client::Client;
 
@@ -44,8 +45,8 @@ fn data_ops_need_a_handshake_on_both_worker_shapes() {
     for workers in [1usize, 8] {
         let srv = Server::start_auth("group", workers);
 
-        // 故意不握手：`connect` 而不是 `connect_auth`。
-        let mut raw = Client::connect(&srv.addr, 3000).expect("connect");
+        // 故意不协商版本也不认证：正常 `connect` 现在会先协商版本。
+        let mut raw = Client::connect_raw(&srv.addr, 3000).expect("connect raw");
         for op in [
             Op::Ping,
             Op::ListViews,
@@ -99,6 +100,115 @@ fn data_ops_need_a_handshake_on_both_worker_shapes() {
             other => panic!("expected View, got {other:?}"),
         }
     }
+}
+
+/// 未开认证也必须先协商版本；两种 worker 形状各跑一遍。
+#[test]
+fn an_open_server_requires_version_before_data_on_both_worker_shapes() {
+    for workers in [1usize, 8] {
+        let srv = Server::start_workers("group", workers);
+        let mut raw = Client::connect_raw(&srv.addr, 3000).expect("connect raw");
+        for op in [Op::Ping, Op::Stats, Op::ListViews] {
+            match raw.call(&op).expect("raw call") {
+                Reply::Err { code, msg } => {
+                    assert_eq!(code, errno::EADV, "workers={workers}");
+                    assert!(
+                        String::from_utf8_lossy(&msg).contains("VersionBegin"),
+                        "workers={workers} 的拒绝文案没点明版本协商：{}",
+                        String::from_utf8_lossy(&msg)
+                    );
+                }
+                other => panic!("workers={workers} 未协商版本却拿到了 {other:?}"),
+            }
+        }
+        assert!(matches!(
+            raw.call(&Op::VersionBegin {
+                client_proto: PROTOCOL_VERSION,
+            }),
+            Ok(Reply::VersionOk { server_proto }) if server_proto == PROTOCOL_VERSION
+        ));
+        assert!(matches!(raw.call(&Op::Ping), Ok(Reply::Pong)));
+        match raw.call(&Op::Stats).expect("stats") {
+            Reply::Stats(s) => assert_eq!(s.proto_version, PROTOCOL_VERSION),
+            other => panic!("同代非认证连接应能读 Stats：{other:?}"),
+        }
+    }
+}
+
+/// 错版本必须被明确拒绝，且拒绝后连接仍在 `VersionNeeded`。
+#[test]
+fn a_protocol_mismatch_is_rejected_on_both_worker_shapes() {
+    let wrong = PROTOCOL_VERSION + 1;
+    for workers in [1usize, 8] {
+        let srv = Server::start_workers("group", workers);
+        let mut raw = Client::connect_raw(&srv.addr, 3000).expect("connect raw");
+        match raw
+            .call(&Op::VersionBegin { client_proto: wrong })
+            .expect("wrong version")
+        {
+            Reply::Err { code, msg } => {
+                assert_eq!(code, errno::EADV, "workers={workers}");
+                let msg = String::from_utf8_lossy(&msg);
+                assert!(msg.contains(&format!("client {wrong}")), "{msg}");
+                assert!(msg.contains(&format!("server {PROTOCOL_VERSION}")), "{msg}");
+            }
+            other => panic!("workers={workers} 错版本不该被接受：{other:?}"),
+        }
+        assert!(matches!(
+            raw.call(&Op::Ping),
+            Ok(Reply::Err { code, .. }) if code == errno::EADV
+        ));
+        // 错版本不锁死连接：改回同代仍可协商并放行。
+        assert!(matches!(
+            raw.call(&Op::VersionBegin {
+                client_proto: PROTOCOL_VERSION,
+            }),
+            Ok(Reply::VersionOk { server_proto }) if server_proto == PROTOCOL_VERSION
+        ));
+        assert!(matches!(raw.call(&Op::Ping), Ok(Reply::Pong)));
+    }
+}
+
+/// 客户端也必须核对 VersionOk：错版本应答不能静默降级成未协商连接。
+#[test]
+fn a_client_refuses_a_mismatched_version_reply() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake server");
+    let addr = listener.local_addr().expect("addr").to_string();
+    let wrong = PROTOCOL_VERSION + 1;
+    let peer = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept");
+        let mut hdr = [0u8; 4];
+        stream.read_exact(&mut hdr).expect("read frame header");
+        let len = u32::from_le_bytes(hdr) as usize;
+        let mut payload = vec![0u8; len];
+        stream.read_exact(&mut payload).expect("read VersionBegin");
+        assert!(matches!(
+            treedb::engine::Op::decode(&mut treedb::engine::Rd::new(&payload)),
+            Ok(Op::VersionBegin { client_proto }) if client_proto == PROTOCOL_VERSION
+        ));
+        let mut w = treedb::engine::W::new();
+        Reply::VersionOk {
+            server_proto: wrong,
+        }
+        .encode(&mut w);
+        stream
+            .write_all(&treedb::engine::encode_frame(&w.finish()))
+            .expect("write wrong VersionOk");
+    });
+    let err = match Client::connect(&addr, 3000) {
+        Ok(_) => panic!("错版本应答不应让建连成功"),
+        Err(e) => e,
+    };
+    let msg = err.to_string();
+    assert!(
+        msg.contains(&format!("peer speaks protocol {wrong}")),
+        "错误没点明对端版本：{msg}"
+    );
+    assert!(msg.contains(&format!("this client {PROTOCOL_VERSION}")), "{msg}");
+    peer.join().expect("fake server join");
 }
 
 /// 2：错密钥 → 被拒但不锁死；重拿挑战后旧 MAC 重放不上；换对密钥能过。
@@ -211,32 +321,38 @@ fn an_open_server_answers_a_handshake_with_one_round_trip() {
     assert!(matches!(c.call(&Op::Ping), Ok(Reply::Pong)));
 }
 
-/// 握手与数据 op 挤在同一批帧里时，**应答次序不能被打乱**。
+/// 版本协商、认证与数据 op 挤在同一批帧里时，**应答次序不能被打乱**。
 ///
-/// 协议没有 request id，`out` 是严格 FIFO：多 worker 路径因此只能把「最后一条
-/// 握手 op 之前」的数据 op 就地回掉（EAGAIN）或整批拦掉（EADV），剩下的才交
-/// 给路由。这里断言的是不依赖 TCP 分段的不变量：第二条应答一定是 Challenge，
-/// 第一条一定是一个「还没认证」类的错误，且握手完成后同一个 op 就能正常答。
+/// 协议没有 request id，`out` 是严格 FIFO：多 worker 路径因此把最后一条握手
+/// op 之前的数据 op 就地回掉，只路由其后的数据。这里钉住三帧顺序：未协商的
+/// Ping 被拒、VersionBegin 回 VersionOk、AuthBegin 回 Challenge。
 #[test]
 fn a_straddled_batch_keeps_the_reply_order() {
     let srv = Server::start_auth("group", 8);
-    let mut c = Client::connect(&srv.addr, 3000).expect("connect");
+    let mut c = Client::connect_raw(&srv.addr, 3000).expect("connect raw");
     let cn = [0x44u8; NONCE_LEN];
     let rs = c
-        .pipeline(&[Op::Ping, Op::AuthBegin { client_nonce: cn }])
+        .pipeline(&[
+            Op::Ping,
+            Op::VersionBegin {
+                client_proto: PROTOCOL_VERSION,
+            },
+            Op::AuthBegin { client_nonce: cn },
+        ])
         .expect("pipeline");
-    assert_eq!(rs.len(), 2);
+    assert_eq!(rs.len(), 3);
+    assert_eq!(err_code(&rs[0]), Some(errno::EADV), "握手前的 Ping 必须被拒");
     assert!(
-        matches!(err_code(&rs[0]), Some(c) if c == errno::EAGAIN || c == errno::EADV),
-        "排在握手前面的数据 op 必须被就地拒掉，拿到 {:?}",
-        rs[0]
+        matches!(&rs[1], Reply::VersionOk { server_proto } if *server_proto == PROTOCOL_VERSION),
+        "第二条应答必须是 VersionOk：{:?}",
+        rs[1]
     );
-    let sn = match &rs[1] {
+    let sn = match &rs[2] {
         Reply::Challenge { server_nonce, proto } => {
             assert_eq!(*proto, treedb::engine::PROTOCOL_VERSION);
             *server_nonce
         }
-        other => panic!("第二条应答必须是这一批里那条 AuthBegin 的挑战：{other:?}"),
+        other => panic!("第三条应答必须是这一批里那条 AuthBegin 的挑战：{other:?}"),
     };
 
     let key = srv.auth_key().expect("key").clone();

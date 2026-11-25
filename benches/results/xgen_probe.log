@@ -8,3 +8,44 @@ same+auth    rc=0 :: protocol = 7
 cross+noauth rc=0 :: protocol = 0
   OK: 非认证路径没有闸门（错代照样 rc=0，且 proto 字段读成 0）
 
+===== 2026-11-25 03:45:15 基线 v0.7.0 → v0.7.0-4-g24dd00e =====
+banner  new protocol=8  old protocol=7
+  OK: 两代服务端的 protocol= 不同（混代在字节层确实存在）
+cross+auth   rc=1 :: stats: io: server closed
+  FAIL: 期望 rc≠0 且文案点名版本协商失败
+same+auth    rc=0 :: protocol = 8
+  OK: 同代带密钥正常（说明 2) 的红不是坏 key 造成的）
+same+noauth  rc=0 :: protocol = 8
+  OK: 同代无密钥正常（版本协商独立于认证）
+cross+noauth rc=1 ::
+  DIFF: 非认证路径没有按预期拒绝；要么闸门失效，要么探测本身坏了
+      stats: io: server closed
+RESULT: FAIL
+===== 2026-11-25 03:48:45 基线 v0.7.0 → v0.7.0-4-g24dd00e =====
+banner  new protocol=8  old protocol=7
+  OK: 两代服务端的 protocol= 不同（混代在字节层确实存在）
+cross+auth   rc=1 :: stats: io: server closed
+  OK: 跨代认证路径在认证之前失败（旧服务端可能直接关闭未知 tag）
+  OK: 旧服务端 ops=0 writes=0，没有任何数据 op 被当成成功执行
+same+auth    rc=0 :: protocol = 8
+  OK: 同代带密钥正常（说明 2) 的红不是坏 key 造成的）
+same+noauth  rc=0 :: protocol = 8
+  OK: 同代无密钥正常（版本协商独立于认证）
+cross+noauth rc=1 :: stats: io: server closed
+  OK: 非认证路径也在数据面之前失败
+  OK: 旧服务端 ops=0 writes=0，非认证跨代也没有静默执行
+
+===== 2026-11-25 04:47:47 基线 v0.7.0 → v0.7.0-4-g24dd00e =====
+banner  new protocol=8  old protocol=7
+  OK: 两代服务端的 protocol= 不同（混代在字节层确实存在）
+cross+auth   rc=1 :: stats: io: server closed
+  OK: 跨代认证路径在认证之前失败（旧服务端可能直接关闭未知 tag）
+  OK: 旧服务端 ops=0 writes=0，没有任何数据 op 被当成成功执行
+same+auth    rc=0 :: protocol = 8
+  OK: 同代带密钥正常（说明 2) 的红不是坏 key 造成的）
+same+noauth  rc=0 :: protocol = 8
+  OK: 同代无密钥正常（版本协商独立于认证）
+cross+noauth rc=1 :: stats: io: server closed
+  OK: 非认证路径也在数据面之前失败
+  OK: 旧服务端 ops=0 writes=0，非认证跨代也没有静默执行
+

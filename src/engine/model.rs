@@ -823,6 +823,13 @@ pub enum Op {
     },
 
     // ---- 接入认证（§4.4）----
+    /// 建连第一步：客户端报自己的线协议版本（wire tag `0x0092`）。
+    ///
+    /// 版本协商先于认证，也先于任何数据 op；服务端在收到这条之前一律 fail-closed。
+    /// 它和认证握手一样由事件循环就地处置，不进引擎、不占提交线程。
+    VersionBegin {
+        client_proto: u16,
+    },
     /// 握手第一步：客户端报自己的随机数（[`NONCE_LEN`] 字节）。
     ///
     /// 它**不进引擎**：不碰状态机、不占提交线程，在事件循环里就地处置
@@ -894,6 +901,7 @@ impl Op {
             Op::SnapFetch { .. } => 0x0081,
             Op::AuthBegin { .. } => 0x0090,
             Op::AuthFinish { .. } => 0x0091,
+            Op::VersionBegin { .. } => 0x0092,
         }
     }
 
@@ -912,6 +920,7 @@ impl Op {
                 | Op::Shutdown
                 | Op::WalFetch { .. }
                 | Op::SnapFetch { .. }
+                | Op::VersionBegin { .. }
                 | Op::AuthBegin { .. }
                 | Op::AuthFinish { .. }
         )
@@ -978,6 +987,7 @@ impl Op {
             | Op::TableRename { .. }
             | Op::WalFetch { .. }
             | Op::SnapFetch { .. }
+            | Op::VersionBegin { .. }
             | Op::AuthBegin { .. }
             | Op::AuthFinish { .. } => false,
         }
@@ -1252,6 +1262,7 @@ impl Op {
                 w.u64(*offset);
                 w.u32(*len);
             }
+            Op::VersionBegin { client_proto } => w.u16(*client_proto),
             Op::AuthBegin { client_nonce } => w.bytes(client_nonce),
             Op::AuthFinish { mac } => w.bytes(mac),
         }
@@ -1500,6 +1511,9 @@ impl Op {
             0x0091 => Op::AuthFinish {
                 mac: fixed_bytes(r)?,
             },
+            0x0092 => Op::VersionBegin {
+                client_proto: r.u16()?,
+            },
             x => return Err(Error::Codec(format!("unknown op tag 0x{x:04x}"))),
         };
         Ok(op)
@@ -1734,9 +1748,16 @@ pub enum Reply {
         snap_seq: u64,
         epoch: u64,
     },
+    /// [`Op::VersionBegin`] 的应答：服务端确认双方线协议同代。
+    ///
+    /// 所有正常连接都必须先拿到这一条；认证路径随后还会在 [`Reply::Challenge`]
+    /// 里再报一次版本，作为认证域内的交叉核对。
+    VersionOk {
+        server_proto: u16,
+    },
     /// [`Op::AuthBegin`] 的应答：服务端挑战值。收到它就是「本实例启用了
-    /// 认证，请交回 MAC」；`proto` 是服务端的线协议版本，碰巧也是全协议里
-    /// 唯一一处「在相信任何字节之前就拿到对端版本」的口子（§4.1）。
+    /// 认证，请交回 MAC」；`proto` 是服务端的线协议版本，与建连时的
+    /// [`Reply::VersionOk`] 必须一致。
     Challenge {
         server_nonce: [u8; NONCE_LEN],
         proto: u16,
@@ -1936,6 +1957,10 @@ impl Reply {
                 w.u64(*snap_seq);
                 w.u64(*epoch);
             }
+            Reply::VersionOk { server_proto } => {
+                w.u16(0x0192);
+                w.u16(*server_proto);
+            }
             Reply::Challenge {
                 server_nonce,
                 proto,
@@ -2128,6 +2153,9 @@ impl Reply {
                 total: r.u64()?,
                 snap_seq: r.u64()?,
                 epoch: r.u64()?,
+            },
+            0x0192 => Reply::VersionOk {
+                server_proto: r.u16()?,
             },
             0x0190 => Reply::Challenge {
                 server_nonce: fixed_bytes(r)?,
@@ -2410,6 +2438,9 @@ mod tests {
                 offset: 1 << 40,
                 len: 0,
             },
+            Op::VersionBegin {
+                client_proto: crate::engine::PROTOCOL_VERSION,
+            },
             Op::AuthBegin {
                 client_nonce: [0xa5; NONCE_LEN],
             },
@@ -2447,8 +2478,8 @@ mod tests {
         }
     }
 
-    /// 握手的两个定长字段在解码侧就是硬门槛：短一个字节是 `Err`，不是「少读一点」。
-    /// 短的挑战值 = 随机空间缩水，短的 MAC = 摘要被截，两种都是静默降低安全性，
+    /// 版本与认证握手的定长字段在解码侧就是硬门槛：短一个字节是 `Err`，不是「少读一点」。
+    /// 短的版本号会失去代际判据，短的挑战值 = 随机空间缩水，短的 MAC = 摘要被截，
     /// 所以宁可断连。（长的在 `bytes_bounded` 那一步就被拦掉。）
     #[test]
     fn handshake_fixed_fields_reject_wrong_length() {
@@ -2471,6 +2502,16 @@ mod tests {
         w.u16(0x0191);
         w.bytes(&[3u8; DIGEST_LEN - 1]);
         w.bool(true);
+        assert!(Reply::decode(&mut Rd::new(&w.finish())).is_err());
+
+        let mut w = W::new();
+        w.u16(0x0092);
+        w.u8(crate::engine::PROTOCOL_VERSION as u8);
+        assert!(Op::decode(&mut Rd::new(&w.finish())).is_err());
+
+        let mut w = W::new();
+        w.u16(0x0192);
+        w.u8(crate::engine::PROTOCOL_VERSION as u8);
         assert!(Reply::decode(&mut Rd::new(&w.finish())).is_err());
     }
 
@@ -2608,6 +2649,9 @@ mod tests {
                 total: 4096,
                 snap_seq: 40,
                 epoch: 3,
+            },
+            Reply::VersionOk {
+                server_proto: crate::engine::PROTOCOL_VERSION,
             },
             Reply::Challenge {
                 server_nonce: [0x11; NONCE_LEN],

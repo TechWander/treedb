@@ -42,11 +42,12 @@ pub const MAX_FRAME: u32 = 8 * 1024 * 1024;
 
 /// 线协议版本：`Op`/`Reply` 的 tag 空间与字段顺序就是它的字节布局。
 ///
-/// 加 op、加 Reply 变体、改任何字段顺序都要 +1，并按 `model.rs` 里的全 tag
-/// 往返用例补上对应语料。帧里没有版本位（那是 v1 定的形状），所以这一条
-/// 只在第一次 `Stats` 上能查到对端跑的是哪一版；新版客户端解旧服务端的
-/// `Stats` 会因多出一个字段而短读报错（大声失败），旧客户端解新服务端的
-/// 则会丢掉尾部字节（静默少一个字段）—— 升级先升服务端、后升客户端。
+/// 改既有帧字段顺序/长度、改 `EngineStats` 布局或连接建立语义时要 +1；纯追加
+/// op / reply tag 不必升版本，按 `model.rs` 里的全 tag 往返用例补上对应语料。
+/// 帧里没有版本位（那是 v1 定的形状），所以 v8 起所有
+/// 正常连接必须先交换 `VersionBegin` / `VersionOk`；协商完成前服务端拒绝一切
+/// 数据 op，客户端也不退回未协商状态。`Stats.proto_version` 仍可运维查看，但它
+/// 只是协商后的交叉核对，不能替代建连闸门。
 ///
 /// 历史：v3 加通用表（`Table*` / `Row*`）与 `ReadDirPlus`；v4 加日志传送那两条
 /// 控制面 op（`WalFetch` / `SnapFetch`）与对应应答（`WalBatch` / `SnapChunk`），
@@ -79,7 +80,11 @@ pub const MAX_FRAME: u32 = 8 * 1024 * 1024;
 /// 必须抬版本：v6 客户端发 `KeyList` 之类会撞上 `unknown op tag`，读 v6 的
 /// `Stats` 也会把后面的字段整体错位 —— 两边都在握手时就 fail-closed，好过
 /// 静默解错。
-pub const PROTOCOL_VERSION: u16 = 7;
+/// v8（2026-11-25）新增 `VersionBegin` 0x0092 / `VersionOk` 0x0192，并把版本
+/// 协商设为每条连接的强制第一步。既有帧的字段布局没变，但连接建立语义变了：
+/// 旧客户端不协商，新服务端必须拒；新客户端连旧服务端会在 `0x0092` 上大声失败。
+/// 这是一次不兼容升级，因此协议与包版本一起从 v0.7.0 抬到 v0.8.0。
+pub const PROTOCOL_VERSION: u16 = 8;
 /// 帧头长度：payload 字节数（u32 小端，不含头）。
 pub const FRAME_HDR: usize = 4;
 

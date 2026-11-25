@@ -292,9 +292,8 @@ pub(crate) struct Conn {
 }
 
 impl Conn {
-    /// `auth_required` = 本实例启用了接入认证。它只决定这条连接的闸门
-    /// 从 `Needed` 还是 `Off` 开局，之后两者走的是同一套代码。
-    pub(crate) fn new(stream: TcpStream, id: u64, auth_required: bool) -> Self {
+    /// 每条连接都从 `VersionNeeded` 开局；认证开关只决定协商后的下一档。
+    pub(crate) fn new(stream: TcpStream, id: u64) -> Self {
         let fd = stream.as_raw_fd();
         Conn {
             fd,
@@ -310,7 +309,7 @@ impl Conn {
             ep_out: false,
             read_hold: false,
             ep_hold: false,
-            auth: Gate::new(auth_required),
+            auth: Gate::new(),
         }
     }
 
@@ -574,7 +573,6 @@ pub(crate) fn serve_single(cfg: &ServerConfig, stop: &AtomicBool, live: &AtomicU
     // 握手由事件循环就地处置，不进引擎；`as_deref` 是为了下面能直接
     // 送 `Option<&Key>` 给 [`Gate::on_op`]。
     let auth_key = cfg.auth.as_deref();
-    let auth_required = cfg.auth.is_some();
     let mut events: Vec<libc::epoll_event> = vec![unsafe { std::mem::zeroed() }; MAX_EVENTS];
     let mut buf = vec![0u8; READ_CHUNK];
     let mut rep = Report::default();
@@ -634,7 +632,7 @@ pub(crate) fn serve_single(cfg: &ServerConfig, stop: &AtomicBool, live: &AtomicU
                             }
                             // id 在多 worker 模式才用得到；单线程按 fd 索引，
                             // 永远不路由应答，故统一填 0。
-                            let c = Conn::new(stream, 0, auth_required);
+                            let c = Conn::new(stream, 0);
                             let nfd = c.fd;
                             epoll_set(ep, nfd, false)?;
                             conns.insert(nfd, c);
@@ -756,17 +754,17 @@ pub(crate) fn serve_single(cfg: &ServerConfig, stop: &AtomicBool, live: &AtomicU
             }
             for op in ops {
                 // 握手拦在引擎之前：它不读也不写状态，所以就地答完就下一
-                // 条（§4.4）。未启用认证时这个 `if` 只对两个握手 tag 成立，
-                // 数据 op 一次额外分派也不付。
-                if auth_required || crate::net::auth::is_handshake(&op) {
-                    let gated = match conns.get_mut(&fd) {
-                        Some(c) => c.auth.on_op(auth_key, &op),
-                        None => None,
-                    };
-                    if let Some(reply) = gated {
-                        push(&mut conns, fd, &reply);
-                        continue;
+                // 条（§4.4）。新连接尚未协商版本时，普通数据 op 也必须进闸门；
+                // 已放行的热路径只判一个布尔，不再做握手分派。
+                let gated = match conns.get_mut(&fd) {
+                    Some(c) if crate::net::auth::is_handshake(&op) || !c.auth.allows_data() => {
+                        c.auth.on_op(auth_key, &op)
                     }
+                    _ => None,
+                };
+                if let Some(reply) = gated {
+                    push(&mut conns, fd, &reply);
+                    continue;
                 }
                 // checkpoint / shutdown 会动 WAL，必须先把本轮已 stage 的写
                 // 落盘，否则快照水位会跑到磁盘前面。

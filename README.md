@@ -16,8 +16,8 @@ cargo build --release                                   # 默认档：依赖只�
 ./target/release/treedb-server --dir /var/lib/treedb --listen 127.0.0.1:7777
 ./target/release/treedb-bench --op lookup --conns 64 --pipeline 32 --secs 3
 
-cargo test --release                                    # 默认档 225 passed / 3 ignored（引擎本体）
-cargo test --release --features postgres-compat        # 256 passed / 9 ignored（含 PG 过渡档）
+cargo test --release                                    # 默认档 229 passed / 0 failed / 3 ignored（引擎本体）
+cargo test --release --features postgres-compat        # 260 passed / 0 failed / 9 ignored（含 PG 过渡档）
 bash benches/throughput_matrix.sh 3 1 2 3 4 5           # 五轴复现，输出进 benches/results/
 bash benches/sync_ratio.sh 3                           # 写路径机制：一次 fsync 摊了多少写
 bash benches/single_conn.sh 3                          # 单连接对标 PG（$PIPE=32 走批量档、$CONNS/$WORKERS 走并发档）
@@ -28,6 +28,7 @@ bash benches/ab_layout.sh <基线 rev>                     # 受控 A/B：只换
 bash benches/default_check.sh                           # 零旗标默认档同格跑 5 次，验默认值真的生效
 bash benches/ab_durability.sh <基线 rev>                  # 写轴 A/B：只换服务端二进制比持久化档
 bash benches/rehearse_migrate.sh v0.5.1                 # 快照升级真机彩排：旧 tag 的二进制 → 迁移 → 回滚
+bash benches/xgen_probe.sh                         # 跨代真二进制：v0.7.0 旧服务端必须在 0x0092 被拒
 bash benches/handshake_cost.sh 20000                   # 接入握手的代价：两臂同轮 A/B（建连 + RSS/conn + 稳态）
 bash benches/bench_rows.sh                             # 通用表九条路径（rowput/rowget/rowlist/rowidx/rowrange/…）× 三形状
 bash benches/bench_bulk.sh                             # 批量形状：逐行 vs 区间 vs 清空 vs 同值重写（固定工作量口径）
@@ -102,7 +103,7 @@ dump 走的是日志标签表（`Log`，tag 1..=10 与 19..=27；五条不直接
 格式与实测（82 888 节点：dump 279 ms / 11.65 MB，还原快照与源逐字节相同）见
 [DESIGN.md](DESIGN.md) §6.9。
 
-**运维面两个旋钮**（都不碰协议：`PROTOCOL_VERSION` 仍 6，`Op` 表一条没加）：
+**运维面两个旋钮**（不碰数据帧；v8 起正常建连仍必须先协商协议版本）：
 
 ```sh
 # 1) 连接上限：防「一条不守规矩的客户端把 fd 吃光」。默认 0 = 不限。
@@ -224,15 +225,17 @@ head -c 32 /dev/urandom > /etc/treedb/auth.key && chmod 0600 /etc/treedb/auth.ke
 它是共享密钥的双向挑战握手（两次往返，密钥从不上线），**不是 TLS**：只建立身份，
 不建立机密性，也不做授权。带密钥的客户端遇到没开认证的服务端会直接报错退出，
 不静默降级；反过来不带密钥的客户端面对开了认证的端口，每个数据 op 拿 `EADV`。
-没配密钥时线协议与 v4 逐字相同（§4.1 的 `4 → 5`）。
+**v8 起版本协商独立于认证且必须成功**：所有正常连接先交换 `VersionBegin` /
+`VersionOk`，旧服务端不认 `0x0092` 时建连直接失败；不认证只省掉后续 CHAP，不省版本闸门。
 
-代价量过了（`bash benches/handshake_cost.sh 20000`，20 000 条连接、两臂同轮 A/B
+代价量过了（**v0.7.0 历史读数**，`bash benches/handshake_cost.sh 20000`，20 000 条连接、两臂同轮 A/B
 独立跑 3 次，逐格原始输出 `benches/results/handshake_cost.log`）：常驻内存
 **+93 ~ 96 B/conn**（每连接一个定长 `Gate`，握手做完也不还），建连时间中位
 **+90.9 µs/conn**（两次往返 + 两次 HMAC；但这一列噪声比效应还大 —— 不开认证的
 那一臂自己三次就摆 27 %，所以**单次读数不作数**）；稳态读与写与未开认证同量级
 （握手不进引擎、不占提交线程，group commit 的合并度一字不变）。形状、实现层次与
-四条「防不住什么」见 [DESIGN.md](DESIGN.md) §4.4。
+四条「防不住什么」见 [DESIGN.md](DESIGN.md) §4.4。v0.8.0 新增的强制版本往返代价
+**本轮未实测**，不得把上述历史数字当成当前版本读数。
 
 ## 实测（同一台机器、同一块盘，2026-11-19 口径修正后重跑）
 
@@ -249,7 +252,7 @@ head -c 32 /dev/urandom > /etc/treedb/auth.key && chmod 0600 /etc/treedb/auth.ke
 | 为什么快（引擎自己的计数器） | 两个「会 fsync」的档位现在共用同一个提交点：64 并发下一轮只付 1 次 fsync、摊 **≈ 55–58 次写/fsync**（`benches/sync_ratio.sh`） |
 | 每 op 一次 fsync（`dur=always` vs PG `synchronous_commit=on`，WAL 同盘） | 改前 1 891 vs 1 469 ops/s（p99 81.5 ms vs 157 ms）；**改后 10 913 vs 1 469 = 7.4×**，p50 优 17×、p99 优 5×（受控 A/B：`benches/ab_durability.sh v0.3.1`）。旧版这句「刨掉合并 fsync，treedb 对 PG 就没有结构性优势」是当时那个**按连接串 fsync** 的实现留下的错判，已作废：两家都是靠一次 fsync 摊多次写，treedb 在这一格摊得动（≈ 55）而 `always` 档以前自己把它抵消掉了 |
 | 持久性 | `kill -9` 六个崩溃用例零丢失（含 checkpoint 瞬间崩、连崩 3 轮）；并另有 `workers=8` 下同语义的一条，目录写与表写逐条交错 |
-| 接入认证（可选、默认关） | 20 000 条连接、两臂同轮 A/B × 3：**RSS +93 ~ 96 B/conn**（439 → 532/535 B，极可复现）、建连中位 **+90.9 µs/conn**（+232 / +1 818 / +1 885 ms —— 噪声比效应大，`off` 臂自己就摆 27 %）、稳态 `ping` 中位 1 147 239 → 1 148 689 ops/s、`create` 67 414 → 64 122（−4.9 %，**落在同臂自身 2.8 ~ 4.5 % 的散布里，既不报回归也不报变快**）。未开认证的数据面另用两臂都不带密钥的 `ab_layout.sh v0.3.5` 证零回归（八格最差 −0.90 %）。逐格原始输出 `benches/results/handshake_cost.log` 与 `ab_layout_v0.3.6.log`，读法见 §4.4 |
+| 接入认证（可选、默认关；v0.7.0 历史读数） | 20 000 条连接、两臂同轮 A/B × 3：**RSS +93 ~ 96 B/conn**（439 → 532/535 B，极可复现）、建连中位 **+90.9 µs/conn**（+232 / +1 818 / +1 885 ms —— 噪声比效应大，`off` 臂自己就摆 27 %）、稳态 `ping` 中位 1 147 239 → 1 148 689 ops/s、`create` 67 414 → 64 122（−4.9 %，**落在同臂自身 2.8 ~ 4.5 % 的散布里，既不报回归也不报变快**）。未开认证的数据面另用两臂都不带密钥的 `ab_layout.sh v0.3.5` 证零回归（八格最差 −0.90 %）。逐格原始输出 `benches/results/handshake_cost.log` 与 `ab_layout_v0.3.6.log`，读法见 §4.4 |
 | **批量形状**（`v0.7.0`，100 万行表、`dur=group`、2026-11-23） | 同样删完一百万行：逐行 `RowDelete` **16 064 ms / 1 000 000 条 WAL 记录 / 2 075 次 fsync / 38 MB**；`RowRangeDelete`（batch 2000）**1 017 ms / 500 条 / 2 次 / 29.5 KB**；`TableClear` **924 ms / 1 条 / 1 次 / 25 字节**。同值重写 100 万次：`RowPut` 同值 **970 ms / 0 条记录 / 0 次 fsync**，真改值 **21 126 ms / 1 000 000 条 / 2 046 次**。逐格 `benches/results/bench_bulk.log`，读法与「为什么时间不随记录数同比例下降」见 §7.16 |
 | **写扩展（多实例分片）**（`v0.7.0`，`rowinsert`，5 s × 8 连接 × pipeline 32） | 单实例有与客户端压力无关的天花板：`dur=never` 下 1 → 8 路并发压力只拿到 **0.94×**（114 505 → 107 356 ops/s）而服务端 CPU 从 4.30 涨到 **8.39 核**。按表分到 8 个进程实例：never **6.50×**（744 004 ops/s，每实例保留 81%）、group **4.77×**（每实例 60%）。逐格 `benches/results/shard_write.log`，见 §7.17；**路由、事务边界、每实例的备份与副本都在接入方**（§8 第 19 条） |
 
@@ -282,8 +285,8 @@ DESIGN.md §7（含 §7.8 那次全五轴复跑）。
   定义……）不该被搬进引擎内核，内核只给机制。列名、过期规则、权限语义全部由
   客户端定义；引擎不解释任何一列。
 - **运维面**：`Ping`/`Stats`/`Checkpoint`/`Shutdown`，加上命令行侧的 `treedb-migrate`。`Stats` 同时报 WAL 的逻辑长度与
-  磁盘长度、快照长度与协议版本 —— 帧里没有版本位，`proto_version` 是线上唯一能
-  查到对端协议版本的通道（§4.1）。
+  磁盘长度、快照长度与协议版本 —— v8 起线上版本首先靠建连时的 `VersionBegin` /
+  `VersionOk` 协商，`proto_version` 只是协商后的交叉核对（§4.1、§4.4）。
 - **日志传送两面**：`WalFetch`（从指定 seq 起按 durable 水位送记录）、`SnapFetch`（按
   字节切快照文件）。它们是服务端与副本之间的两面，客户端不会发到它们；
   客户端看见的差别只有一条：副本上写拿 `EROFS`。
@@ -308,7 +311,7 @@ DESIGN.md §7（含 §7.8 那次全五轴复跑）。
 
 - **认证只管身份，授权与传输加密仍然没有**（§4.4、§8 第 13 条）。v5 起可以
   `--auth-key-file` 打开一次共享密钥的双向握手，但它默认关、而且过了握手的连接与
-  不开时一样拥有全部 44 个 op 的权限，包括 `Shutdown` 与 `Checkpoint`；握手之后仍是
+  不开时一样拥有全部 45 个 op 的权限，包括 `Shutdown` 与 `Checkpoint`；握手之后仍是
   裸 TCP + 长度前缀 + CRC32，而 CRC32 只判损坏。所以「谁能连上 + 谁持有这把密钥」
   = 「谁能改整个状态」，多租户、配额、审计归属必须在引擎之外做（grovefs 的
   apikey + 网关白名单就是这一层），或者把端口锁在回环/私有网段。副本对主那一侧
@@ -353,7 +356,7 @@ DESIGN.md §7（含 §7.8 那次全五轴复跑）。
 
 | 路径 | 内容 |
 |------|------|
-| `src/engine/` | 线协议类型（`model.rs`，44 个 op / 23 个 Reply）、帧编码（`codec.rs`）、状态机（`mem.rs`）、应用与定序（`apply.rs`）、WAL/快照（`wal.rs`）、核心（`core.rs`）、WAL 归档与 PITR（`archive.rs`，§6.11）、离线 dump 容器（`dump.rs`，§6.9）、自写的 SHA-256/HMAC（`sha256.rs`，§4.4） |
+| `src/engine/` | 线协议类型（`model.rs`，45 个 op / 24 个 Reply）、帧编码（`codec.rs`）、状态机（`mem.rs`）、应用与定序（`apply.rs`）、WAL/快照（`wal.rs`）、核心（`core.rs`）、WAL 归档与 PITR（`archive.rs`，§6.11）、离线 dump 容器（`dump.rs`，§6.9）、自写的 SHA-256/HMAC（`sha256.rs`，§4.4） |
 | `src/net/` | 单线程事件循环（`server.rs`）、多前端 worker + 唯一提交线程（`multi.rs`）、跨线程信箱（`mail.rs`）、接入认证闸门（`auth.rs`，§4.4）、副本跟踪器（`replicate.rs`）、阻塞客户端（`client.rs`） |
 | `src/{pool,store,persist,schema,probe}.rs` | `postgres-compat` 过渡档 |
 | `src/bin/` | `treedb-server` / `treedb-bench` / `treedb-pgbench`（对照工具）/ `treedb-micro`（纯计算 + 分配计数）/ `treedb-migrate`（快照升级）/ `treedb-standby`（只读副本 + `--promote`）/ `treedb-dump` + `treedb-load`（离线逻辑导出与重建）/ `treedb-backup`（在线一致快照）/ `treedb-pitr`（按 seq 恢复到新目录）/ `treedb-demo` |

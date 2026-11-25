@@ -4,24 +4,24 @@
 #
 # 为什么要有这个脚本，`tests/` 里那几百条用例不够吗：不够，而且原理上就不够。
 # 一个二进制里客户端与服务端必然同代，`PROTOCOL_VERSION` 抬到几都测不出混代。
-# §4.1 说「布局变了必须抬版本」，§4.4 说「客户端会核对 `Challenge.proto`」，这两句
-# 合起来到底把谁拦住了、没拦住的那一路错成什么样，只有两代真二进制对跑才知道。
+# §4.1 说「布局变了必须抬版本」，§4.4 说「所有正常连接先交换
+# VersionBegin / VersionOk」，这两句合起来到底把谁拦住了，只有两代真二进制对跑才知道。
 #
-# 四臂，前三个是判据、最后一个定性：
-#   1) banner     两个服务端启动行里的 `protocol=` 必须不同（代际自证）
-#   2) cross+auth 新客户端打旧服务端、两边都带密钥 → 必须 rc≠0 且文案点名版本不符
-#   3) same+auth  新客户端打新服务端、带密钥 → 必须 rc=0（证明 2) 不是坏 key 假红）
-#   4) cross+noauth 两边都不开认证 → 钉住**当前实测形状**：不报错，但读回的是错值
-#      （`protocol = 0`、`ops = 0`、`wal … 0 B on disk`）。这一条是 characterization：
-#      哪天非认证路径也加了版本交换，它会红，那时要改的是 §4.4 的措辞而不是删掉它。
+# 五臂，前四个是判据、最后一个是当前闸门的正向自证：
+#   1) banner       两个服务端启动行里的 `protocol=` 必须不同（代际自证）
+#   2) cross+auth   新客户端打旧服务端、两边都带密钥 → 必须 rc≠0 且拒绝 0x0092
+#   3) cross+noauth 两边都不开认证 → 同样必须 rc≠0（版本闸门不依赖认证）
+#   4) same+auth    新客户端打新服务端、带密钥 → 必须 rc=0
+#   5) same+noauth  新客户端打新服务端、不带密钥 → 必须 rc=0 且读到同代版本
 #
 # 用法：
-#   benches/xgen_probe.sh [基线 tag=v0.5.1]
+#   benches/xgen_probe.sh [基线 tag=v0.7.0]
 # 前置：`cargo build --release --bin treedb-server` 已跑过（当前树当 new 档）。
 # 结果追加到 benches/results/xgen_probe.log；临时目录在 .matrix/xgen（已 gitignore）。
 set -u
+set -o pipefail
 cd "$(dirname "$0")/.." || exit 1
-BASE=${1:-v0.5.1}
+BASE=${1:-v0.7.0}
 ROOT=$(pwd)
 SRC=$ROOT/.matrix/xgen/$BASE
 WORK=$ROOT/.matrix/xgen/run
@@ -29,6 +29,7 @@ OUT=benches/results/xgen_probe.log
 P1=${XGEN_PORT:-17871}   # 旧服务端（开认证）
 P2=$((P1 + 1))           # 旧服务端（不开认证）
 P3=$((P1 + 2))           # 新服务端（开认证）
+P4=$((P1 + 3))           # 新服务端（不开认证）
 mkdir -p "$(dirname "$SRC")" "$WORK" benches/results
 # 只清理本脚本自己起的服务端：按 --dir 前缀匹配，绝不误伤同机其它实例
 mine() { pgrep -f "treedb-server --dir $WORK" 2>/dev/null; }
@@ -92,18 +93,23 @@ up() { # $1=bin $2=端口 $3=dir；$4 起为额外参数
 # 2) 跨代 + 两边开认证 → 必须拒
 up "$OLD_SRV" "$P1" "$WORK/cross-auth" --auth-key-file "$KEY" || echo "  FAIL: 旧服务端没起来"
 out=$(probe "$P1" yes 2>&1); rc=$?
-echo "cross+auth   rc=$rc :: $(echo "$out" | head -1)"
-if [ "$rc" -ne 0 ] && echo "$out" | grep -q "peer speaks protocol"; then
-    echo "  OK: 认证路径把混代拦下并点名版本"
+echo "cross+auth   rc=$rc ::$(echo "$out" | head -1 | sed 's/^/ /')"
+if [ "$rc" -ne 0 ] && echo "$out" | grep -qE "version handshake refused|unknown op tag 0x0092|protocol version mismatch|server closed"; then
+    echo "  OK: 跨代认证路径在认证之前失败（旧服务端可能直接关闭未知 tag）"
 else
-    echo "  FAIL: 期望 rc≠0 且文案含 peer speaks protocol"; fail=1
+    echo "  FAIL: 期望 rc≠0 且文案点名版本协商失败或对端关闭"; fail=1
 fi
 kill $SRV_PID 2>/dev/null; wait $SRV_PID 2>/dev/null
+if grep -qE '\| ops 0 writes 0 ' "$WORK/cross-auth.srv.log"; then
+    echo "  OK: 旧服务端 ops=0 writes=0，没有任何数据 op 被当成成功执行"
+else
+    echo "  FAIL: 旧服务端计数器不能证明零数据 op"; fail=1
+fi
 
-# 3) 同代 + 开认证 → 必须通（上一臂的对照）
+# 3) 同代 + 开认证 → 必须通（跨代臂的对照）
 up "$NEW_SRV" "$P3" "$WORK/same-auth" --auth-key-file "$KEY" || echo "  FAIL: 新服务端没起来"
 out=$(probe "$P3" yes 2>&1); rc=$?
-echo "same+auth    rc=$rc :: $(echo "$out" | grep -m1 protocol | tr -s ' ')"
+echo "same+auth    rc=$rc ::$(echo "$out" | grep -m1 protocol | tr -s ' ' | sed 's/^/ /')"
 if [ "$rc" -eq 0 ] && echo "$out" | grep -qE "protocol +=+ *$PN"; then
     echo "  OK: 同代带密钥正常（说明 2) 的红不是坏 key 造成的）"
 else
@@ -111,19 +117,35 @@ else
 fi
 kill $SRV_PID 2>/dev/null; wait $SRV_PID 2>/dev/null
 
-# 4) 跨代 + 都不开认证 → characterization：钉住「不报错但读回错值」
+# 4) 同代 + 不开认证 → 必须通；证明不是所有无密钥连接都被误拒
+up "$NEW_SRV" "$P4" "$WORK/same-noauth" || echo "  FAIL: 新服务端没起来"
+out=$(probe "$P4" no 2>&1); rc=$?
+echo "same+noauth  rc=$rc ::$(echo "$out" | grep -m1 protocol | tr -s ' ' | sed 's/^/ /')"
+if [ "$rc" -eq 0 ] && echo "$out" | grep -qE "protocol +=+ *$PN"; then
+    echo "  OK: 同代无密钥正常（版本协商独立于认证）"
+else
+    echo "  FAIL: 同代无密钥对照没通过"; fail=1
+fi
+kill $SRV_PID 2>/dev/null; wait $SRV_PID 2>/dev/null
+
+# 5) 跨代 + 都不开认证 → 也必须在首帧拒绝
 up "$OLD_SRV" "$P2" "$WORK/cross-noauth" || echo "  FAIL: 旧服务端没起来"
 out=$(probe "$P2" no 2>&1); rc=$?
-echo "cross+noauth rc=$rc :: $(echo "$out" | grep -m1 protocol | tr -s ' ')"
-if [ "$rc" -eq 0 ] && echo "$out" | grep -qE "protocol +=+ *0"; then
-    echo "  OK: 非认证路径没有闸门（错代照样 rc=0，且 proto 字段读成 0）"
+echo "cross+noauth rc=$rc ::$(echo "$out" | head -1 | sed 's/^/ /')"
+if [ "$rc" -ne 0 ] && echo "$out" | grep -qE "version handshake refused|unknown op tag 0x0092|protocol version mismatch|server closed"; then
+    echo "  OK: 非认证路径也在数据面之前失败"
 else
-    echo "  DIFF: 非认证路径的形状变了 —— 要么加了闸门（好事，去改 §4.4），要么探测本身坏了"
+    echo "  DIFF: 非认证路径没有按预期拒绝；要么闸门失效，要么探测本身坏了"
     echo "$out" | sed 's/^/      /'
     fail=1
 fi
 kill $SRV_PID 2>/dev/null; wait $SRV_PID 2>/dev/null
+if grep -qE '\| ops 0 writes 0 ' "$WORK/cross-noauth.srv.log"; then
+    echo "  OK: 旧服务端 ops=0 writes=0，非认证跨代也没有静默执行"
+else
+    echo "  FAIL: 旧服务端计数器不能证明零数据 op"; fail=1
+fi
 
-[ -z "$fail" ] || echo "RESULT: FAIL"
+[ -z "$fail" ] || { echo "RESULT: FAIL"; exit 1; }
 echo
 } 2>&1 | tee -a "$OUT"
