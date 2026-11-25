@@ -16,14 +16,15 @@ cargo build --release                                   # 默认档：依赖只�
 ./target/release/treedb-server --dir /var/lib/treedb --listen 127.0.0.1:7777
 ./target/release/treedb-bench --op lookup --conns 64 --pipeline 32 --secs 3
 
-cargo test --release                                    # 默认档 229 passed / 0 failed / 3 ignored（引擎本体）
-cargo test --release --features postgres-compat        # 260 passed / 0 failed / 9 ignored（含 PG 过渡档）
+cargo test --release                                    # 默认档 230 passed / 0 failed / 3 ignored（引擎本体）
+cargo test --release --features postgres-compat        # 261 passed / 0 failed / 9 ignored（含 PG 过渡档）
 bash benches/throughput_matrix.sh 3 1 2 3 4 5           # 五轴复现，输出进 benches/results/
 bash benches/sync_ratio.sh 3                           # 写路径机制：一次 fsync 摊了多少写
 bash benches/single_conn.sh 3                          # 单连接对标 PG（$PIPE=32 走批量档、$CONNS/$WORKERS 走并发档）
 bash benches/backup_probe.sh 2                         # 备份/还原三形状实测（冷拷贝 / 热拷贝 / 副本目录）
 bash benches/replica_rate.sh 3                         # 副本传送（同机）：冷启动 / 追赶积压 / 追平时的读侧 p99
 bash benches/replica_rate_xhost.sh 3                   # 同上跨机版（需 ssh 到第二台机）：真实链路 + 副本在追对主延迟的 A/B
+bash benches/promote_smoke.sh                          # 切主真进程链；独立日志 benches/results/promote_smoke.log
 bash benches/ab_layout.sh <基线 rev>                     # 受控 A/B：只换服务端二进制比引擎改动
 bash benches/default_check.sh                           # 零旗标默认档同格跑 5 次，验默认值真的生效
 bash benches/ab_durability.sh <基线 rev>                  # 写轴 A/B：只换服务端二进制比持久化档

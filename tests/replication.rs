@@ -4,10 +4,10 @@
 //! 副本拒写（引擎档与线协议档各一档）、lag 计数的可观测性、`treedb-standby`
 //! 这个二进制端到端跑通。
 //!
-//! 最后四组是 fencing token（§6.6 第 3 条）：令牌自身的只升不降 / 副本侧对快照
-//! 与批的闸门 / 提权后在线上拒旧主 / `--promote` 这个离线动作。切主是这套东西
-//! 唯一的存在理由，而它恰恰是平时跑不到的那条路径 —— 所以单独一组，不混在
-//! 追平用例里。
+//! 最后五条是 fencing token（§6.6 第 3 条）：令牌自身的只升不降 / 副本侧对快照
+//! 与批的闸门 / 提权后在线上拒旧主 / `--promote` 这个离线动作 / 真主与真副本的
+//! 完整切主链。切主是这套东西唯一的存在理由，而它恰恰是平时跑不到的那条路径 ——
+//! 所以单独一组，不混在追平用例里。
 //!
 //! 前五条刻意**不起副本进程**：主是真进程（走真网络、真 group commit），副本
 //! 是测试进程里的 `Engine` + `Follower`。这样"追平逻辑对不对"与"两个进程怎么
@@ -25,7 +25,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
-use treedb::engine::core::SNAP_FILE;
+use treedb::engine::core::{EngineStats, SNAP_FILE};
 use treedb::engine::model::{
     errno, ColumnDef, Kind, Node, Op, Reply, TableDef, COND_NONE, MAX_BATCH_OPS, SA_MODE,
     WAL_FETCH_MAX,
@@ -88,6 +88,13 @@ fn view_id(r: Reply) -> u32 {
             id
         }
         other => panic!("expected Reply::View, got {other:?}"),
+    }
+}
+
+fn stats(c: &mut Client) -> EngineStats {
+    match c.call(&Op::Stats).expect("stats call") {
+        Reply::Stats(s) => *s,
+        other => panic!("expected Stats, got {other:?}"),
     }
 }
 
@@ -163,6 +170,33 @@ fn read_only_dir(tag: &str) -> (TempDir, PathBuf) {
     let tmp = tempfile::tempdir().expect("tempdir");
     let dir = tmp.path().join(tag);
     (tmp, dir)
+}
+
+/// 停服后冷拷一份目录：连 `.lock` 与 `fence` 一起搬，锁本身随进程退出释放。
+fn copy_tree(src: &Path, dst: &Path) {
+    std::fs::create_dir_all(dst).expect("create copy root");
+    for entry in std::fs::read_dir(src).expect("read copy source") {
+        let entry = entry.expect("copy entry");
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        if entry.file_type().expect("copy file type").is_dir() {
+            copy_tree(&from, &to);
+        } else {
+            std::fs::copy(&from, &to).expect("copy file");
+        }
+    }
+}
+
+fn fence_value(dir: &Path) -> u64 {
+    let path = dir.join(FENCE_FILE);
+    if !path.exists() {
+        return 0;
+    }
+    std::fs::read_to_string(path)
+        .expect("read fence")
+        .trim()
+        .parse()
+        .expect("fence number")
 }
 
 // ------------------------------------------------------------------- 用例
@@ -1224,6 +1258,7 @@ struct Standby {
     child: Option<Child>,
     addr: String,
     log: PathBuf,
+    pid: u32,
 }
 
 impl Standby {
@@ -1251,10 +1286,12 @@ impl Standby {
             .stderr(err)
             .spawn()
             .expect("spawn treedb-standby");
+        let pid = child.id();
         let sb = Standby {
             child: Some(child),
             addr: addr.to_string(),
             log: log.to_path_buf(),
+            pid,
         };
         let deadline = Instant::now() + Duration::from_secs(15);
         while !Client::ping(&sb.addr) {
@@ -1272,6 +1309,28 @@ impl Standby {
 
     fn log_text(&self) -> String {
         std::fs::read_to_string(&self.log).unwrap_or_default()
+    }
+
+    /// 走真实 `Op::Shutdown`，让副本先 checkpoint 再释放目录锁。
+    fn graceful_shutdown(mut self) -> std::process::ExitStatus {
+        {
+            let mut c = self.client();
+            let _ = c.call(&Op::Shutdown);
+        }
+        let mut child = self.child.take().expect("child already reaped");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match child.try_wait().expect("try_wait standby") {
+                Some(st) => {
+                    assert!(st.success(), "standby exited {st:?}:\n{}", self.log_text());
+                    return st;
+                }
+                None if Instant::now() > deadline => {
+                    panic!("standby did not exit on Shutdown:\n{}", self.log_text())
+                }
+                None => std::thread::sleep(Duration::from_millis(20)),
+            }
+        }
     }
 }
 
@@ -1529,4 +1588,156 @@ fn the_promote_flag_bumps_the_fence_without_serving() {
         "2",
         "被拒的那一次不许改令牌"
     );
+}
+
+/// 完整切主链全部走真进程：真主 A → 真 standby B → 停 A/B → CLI promote →
+/// 真新主 B → 真 standby C → 旧主 A 回魂被 C 拒收，而 C 仍答读。
+///
+/// 这条与脚本分工不同：脚本量吞吐并留独立日志，本条把关键顺序与失败面钉进
+/// 每次 `cargo test`，防止「打印得像成功」但实际静默回滚的回归。
+#[test]
+fn a_real_standby_promotion_fences_a_resurrected_primary() {
+    let old_primary = Server::start_workers("group", 2);
+    let vid = seed_primary(&old_primary, "real-promote", 6);
+    let a_before = stats(&mut old_primary.client());
+
+    let (rep_tmp, rep_dir) = read_only_dir("real-promote-rep");
+    let b_addr = free_addr();
+    let b_log = rep_tmp.path().join("standby-b.log");
+    let standby_b = Standby::spawn(&old_primary.addr, &rep_dir, &b_addr, &b_log, 2);
+    let mut bc = standby_b.client();
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let b_before = loop {
+        let s = stats(&mut bc);
+        assert!(s.replica, "standby 必须自报副本身份");
+        if s.replica_primary_seq > 0
+            && s.replica_lag == 0
+            && s.nodes == a_before.nodes
+            && s.seq == a_before.seq
+        {
+            break s;
+        }
+        assert!(Instant::now() < deadline, "B 未追平：{s:?}\n{}", standby_b.log_text());
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(fence_value(&rep_dir), 0, "追平不抬令牌");
+
+    // 在线副本必须拒真写；失败不能改数据面水位。
+    match bc.call(&Op::Create {
+        view: vid,
+        parent: 1,
+        name: b"online-write".to_vec(),
+        mode: 0o600,
+        uid: 8,
+        gid: 8,
+    }) {
+        Ok(Reply::Err { code: errno::EROFS, .. }) => {}
+        other => panic!("副本在线写必须 EROFS，得到 {other:?}"),
+    }
+    let after_ro = stats(&mut bc);
+    assert_eq!(after_ro.nodes, b_before.nodes);
+    assert_eq!(after_ro.seq, b_before.seq);
+
+    // B 活着时提升必须被目录锁挡住，并点名持锁进程。
+    let locked = Command::new(env!("CARGO_BIN_EXE_treedb-standby"))
+        .args(["--promote", "--dir"])
+        .arg(&rep_dir)
+        .output()
+        .expect("spawn locked promote");
+    let locked_err = String::from_utf8_lossy(&locked.stderr);
+    assert_eq!(locked.status.code(), Some(1), "被锁提升应退出 1：{locked_err}");
+    assert!(locked_err.contains("already locked"), "{locked_err}");
+    assert!(
+        locked_err.contains(&format!("pid {} holds it", standby_b.pid)),
+        "{locked_err}"
+    );
+    assert_eq!(fence_value(&rep_dir), 0, "被锁提升不许改令牌");
+
+    // 运维顺序：先停旧主，再停副本，最后离线提升副本目录。
+    let stopped_a = old_primary.graceful_shutdown();
+    assert!(stopped_a.status.success());
+    let b_status = standby_b.graceful_shutdown();
+    assert!(b_status.success());
+    drop(bc);
+
+    let promoted = Command::new(env!("CARGO_BIN_EXE_treedb-standby"))
+        .args(["--promote", "--dir"])
+        .arg(&rep_dir)
+        .output()
+        .expect("spawn promote");
+    let promoted_out = String::from_utf8_lossy(&promoted.stdout);
+    assert!(promoted.status.success(), "{}", String::from_utf8_lossy(&promoted.stderr));
+    assert!(promoted_out.contains("fence 0 -> 1"), "{promoted_out}");
+    assert_eq!(fence_value(&rep_dir), 1);
+
+    // 冷拷一份已提升目录给 C；随后 B 起真服务端，初始水位必须原样保留。
+    let c_dir = rep_tmp.path().join("real-promote-cold");
+    copy_tree(&rep_dir, &c_dir);
+    assert_eq!(fence_value(&c_dir), 1);
+    let new_primary = Server::restart_at_workers(rep_tmp, rep_dir, "group", 2);
+    let initial_new = stats(&mut new_primary.client());
+    assert_eq!(initial_new.nodes, b_before.nodes);
+    assert_eq!(initial_new.seq, b_before.seq);
+    assert_eq!(fence_value(new_primary.dir()), 1);
+    okc(
+        &mut new_primary.client(),
+        &Op::Create {
+            view: vid,
+            parent: 1,
+            name: b"after-promote".to_vec(),
+            mode: 0o600,
+            uid: 11,
+            gid: 11,
+        },
+    );
+    let b_after = stats(&mut new_primary.client());
+    assert!(b_after.seq > b_before.seq, "新主必须真的接收写");
+
+    // 旧主回魂仍能对自己的客户端服务；fencing 不替代停机，也不会污染新主。
+    let zombie = Server::restart_at_workers(stopped_a.tmp, stopped_a.dir, "group", 2);
+    okc(
+        &mut zombie.client(),
+        &Op::Create {
+            view: vid,
+            parent: 1,
+            name: b"ghost".to_vec(),
+            mode: 0o644,
+            uid: 9,
+            gid: 9,
+        },
+    );
+    assert!(stats(&mut zombie.client()).seq > a_before.seq);
+    let untouched_new = stats(&mut new_primary.client());
+    assert_eq!(untouched_new.nodes, b_after.nodes);
+    assert_eq!(untouched_new.seq, b_after.seq);
+
+    // 高令牌 C 追旧主：拒收、状态不动、错误可见，但已有数据仍可读。
+    let c_addr = free_addr();
+    let c_log = c_dir
+        .parent()
+        .expect("cold copy parent")
+        .join("standby-c.log");
+    let standby_c = Standby::spawn(&zombie.addr, &c_dir, &c_addr, &c_log, 2);
+    let mut cc = standby_c.client();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let c_after = loop {
+        let s = stats(&mut cc);
+        if s.replica_errors > 0 && s.replica_lag > 0 {
+            break s;
+        }
+        assert!(Instant::now() < deadline, "C 未拒旧主：{s:?}\n{}", standby_c.log_text());
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(c_after.nodes, b_before.nodes);
+    assert_eq!(c_after.seq, b_before.seq);
+    assert_eq!(fence_value(&c_dir), 1);
+    let c_text = standby_c.log_text();
+    assert!(c_text.contains("is fenced out"), "{c_text}");
+    let old_file = node(okc(
+        &mut cc,
+        &Op::Lookup { view: vid, parent: 1, name: b"f0".to_vec() },
+    ));
+    assert_eq!(old_file.uid, 1000, "拒旧主后 C 必须继续答读");
+    assert!(Client::ping(&c_addr), "拒旧主不能把副本进程打死");
 }

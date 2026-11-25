@@ -157,13 +157,13 @@ op / reply 计数 44 / 23 → 45 / 24，包版本定版 `v0.8.0`。跨代真二�
 hash，不看这个字段，所以不影响任何构建；`v0.6.0` 是下一次带 API 变更的发版，
 `Cargo.toml` 的 `version` 随它回到 `0.6.0`，两者重新对齐，此后逐版跟齐（`v0.8.0` = `0.8.0`）。
 
-test 现在分两档报：默认档（纯引擎）`cargo test --release` = **229 passed / 0 failed / 3 ignored**（71 lib +
-36 engine_crud + 14 migrate + 20 replication + 12 net_protocol + 11 pitr + 8 read_scaling
+test 现在分两档报：默认档（纯引擎）`cargo test --release` = **230 passed / 0 failed / 3 ignored**（71 lib +
+36 engine_crud + 14 migrate + 21 replication + 12 net_protocol + 11 pitr + 8 read_scaling
 + 7 crash_recovery + 6 batch + 12 table_bulk + 8 auth + 5 observe + 5 table_alter
 + 4 dump_restore +
 3 backup_online + 3 independence + 1 large_reply + 1 checkpoint_tail + 1 scale_connections
 + 1 scale_restore；另 3 条带 `#[ignore]` —— 万级连接、百万节点、64 MiB 快照收尾 ——
-只手动跑，不计入 passed）；`--features postgres-compat` = **260 passed / 0 failed / 9 ignored**，多出的 31 条 = 过渡档自己的 30 条单测 +
+只手动跑，不计入 passed）；`--features postgres-compat` = **261 passed / 0 failed / 9 ignored**，多出的 31 条 = 过渡档自己的 30 条单测 +
 `concurrency.rs` 里那条
 不需要 PG 的拨号用例（剩下 6 条要真 PG，默认 `#[ignore]`，不计入 passed）。即 PG 只出现在
 `postgres-compat` 后面的 `src/pool`、`src/store`、
@@ -341,7 +341,7 @@ test 现在分两档报：默认档（纯引擎）`cargo test --release` = **229
 | `benches/three_way.sh` | 170 | 三臂同口径对照（§7.13）：treedb / PG 12 / SQLite3，24 格；头部七条口径与「不按 pipeline 乘」的计数判据都写在脚本里 |
 | `benches/three_way_table.py` | 118 | 由两份原始采集重算 §7.13 引用的 `final.tsv`；`--check` 对账、`--selftest` 自带三处注入错（上一版表是手搓 one-liner，把 p50/p99 拼成了一列） |
 | `benches/doc_table_check.py` | 95 | 把 §7.13 的 markdown 表与 `final.tsv` 逐格对账（24×14），`--selftest` 验证它真的会红 |
-| `benches/promote_smoke.sh` | 66 | 切主的活体验证（§6.6「切主」）：主 → 副本 → 被锁时拒提升 → 提升 → 用新主起服 → 旧主回魂被令牌更高的副本拒收；四个端口 7101–7104，不碰默认 7777 |
+| `benches/promote_smoke.sh` | 258 | 切主的活体验证（§6.6「切主」）：真主 → 真副本 → 在线拒写与被锁拒提升 → 停旧主/停副本 → 离线提升 → 新主可写 → 旧主回魂被高令牌副本拒收且副本继续答读；动态分配四个端口、独立日志落盘、任一断言失败即非零退出 |
 | `benches/replica_rate.sh` | 359 | 副本传送的三格实测（§6.6 边界 4）：冷启动端到端与传输段（两种 `--fetch-bytes`）、追赶积压、追平时的读侧 p99；每个阶段用独立 standby 进程，好把「最坏一轮」归属到相位 |
 | `benches/replica_rate_xhost.sh` | 459 | 同上的**跨机**版（§6.6 边界 5）：副本放在第二台机上，量冷启动/追赶的真实链路速率与「副本在追时主 p50/p90/p99 + 吞吐」的 A/B；A/B 从同一份种子目录派生、写入量逐字节相同，并先量链路与 fsync 上限做参照 |
 
@@ -1223,26 +1223,30 @@ sha256 迁移前后相同、备份的 sha256 等于原件、快照尺寸差**恰
 4. **没有租约/心跳**。旧主不知道自己的权被拿走；要让它自己发现，得再加一层会
    话期与续租，那是另一套机制（§8 第 6 条③）。
 
-四条测试钉住这一节：`the_fence_is_monotonic_persisted_and_never_defaults_to_zero`
+五条测试钉住这一节：`the_fence_is_monotonic_persisted_and_never_defaults_to_zero`
 （只升不降 / 落盘 / 坏文件不当 0）、`a_replica_obeys_the_fence_on_snapshots_and_
 batches`（四档闸门，含“权力优先于新旧”与它的反面）、
 `a_promoted_replica_refuses_its_old_primary_over_the_wire`（真链路上拒旧主、状态不
 回滚、仍在答读）、`the_promote_flag_bumps_the_fence_without_serving`（离线动作与两
-个拒绝面）。
+个拒绝面）、`a_real_standby_promotion_fences_a_resurrected_primary`（真主 + 真
+standby + 真 CLI promote + 真新主 + 高令牌真 standby 的完整进程链）。最后一条已经
+进 `cargo test --release` 回归板；吞吐量具仍单独跑，不把机器相关数字塞进测试断言。
 
-**活体验证**（2026-11-21，`benches/promote_smoke.sh`，不进回归板）：主 A 写 2 s →
-副本 B 追平（`nodes` 14 710、`lag 0`、banner `fence=0`）→ B 还活着时 `--promote`
-退出码 1（目录锁，错误里带持锁 pid）→ 停 B 后 `--promote` 打 `fence 0 -> 1`、
-`cat fence` 是 1 → 拿 B 起服：`nodes` 与提升前一致、`create` 14 863 ops/s 零错
-（提升真的解除了 `EROFS`）→ 旧主 A 回魂继续收写（`seq` 44 122 → 88 471），而拿着
-同一份数据、`fence` 为 1 的 C 去追它：`nodes`/`seq` 一格未动、`replica_errors` 45、
-`lag` 44 349、日志是 `is fenced out: wal batch carries fencing token 0, this
-directory is at 1`。这一条同时演示了边界 1：A 并没有因为被换掉而停止服务。
+**活体验证**（2026-11-25 05:24:52，`benches/promote_smoke.sh`，HEAD `f9a385c`、
+protocol 8，每个压测臂 1 s）：主 A `create` 1 285 ops/s、零错，`nodes=1 293`、
+`seq=3 871` → 真副本 B 追到同一 `nodes`/`seq`、`lag=0`、`errors=0`、`fence=0`；
+B 在线写拿 `EROFS(30)` 且水位不变 → B 活着时 `--promote` 退出码 1，错误点名
+持锁 pid 1 879 578，令牌仍为 0 → 按顺序停 A、停 B 后提升：`fence 0 -> 1`、
+`snap_seq=3 871`、重放 0 条，且没有监听端口 → B 起新主后初始水位不变，`create`
+1 572 ops/s 零错，`seq=8 593`、`nodes=2 867` → 旧主 A 回魂仍能写（`seq=8 125`），
+但新主 B 的 `nodes`/`seq` 一格不动 → 冷拷的同令牌 C 追 A：`replica_errors=2`、
+`lag=4 254`，`nodes=1 293`、`seq=3 871`、`fence=1` 均不回退，日志明确
+`is fenced out`，随后纯读 `ping` 51 422 ops/s 零错。旧主回魂只用于演示边界 1，
+不是推荐运维顺序；真实切主仍必须先停旧主。
 
-同一脚本隔一会儿再跑一次，结论逐条相同而数值每次不同（`nodes` 13 743、`create`
-13 977 ops/s、A 的 `seq` 41 221 → 85 441、`replica_errors` 44）—— 所以上面那串
-数是**那一次的样本**，脚本钉的是关系（追平后 `lag 0`、提升恰好抬一格、被锁时
-退出码 1、旧主被拒且副本状态不动），不是具体计数。
+脚本现在动态占四个端口、在 `.live/promote.*` 留独立现场、把结果追加到
+`benches/results/promote_smoke.log`，任一断言失败都非零退出。日志保留本轮排障时的
+失败记录与最终 PASS；文档只引用最终 PASS 块，钉的是关系而不是具体计数。
 
 #### tick 住在提交线程里
 
@@ -3441,8 +3445,8 @@ solo/8 用 **8.39** 核，而吞吐没变；split/8 共 43.46 核、**每实例 
 ## 9. 测试清单
 
 ```sh
-cargo test --release                            # 默认档（纯引擎），232 条（229 passed + 0 failed + 3 ignored）
-cargo test --release --features postgres-compat # 加上过渡档，269 条（260 passed + 0 failed + 9 ignored）
+cargo test --release                            # 默认档（纯引擎），233 条（230 passed + 0 failed + 3 ignored）
+cargo test --release --features postgres-compat # 加上过渡档，270 条（261 passed + 0 failed + 9 ignored）
 cargo test --release --lib                      # 只看引擎单测
 cargo test --release --test migrate              # 快照升级：11 条走 API + 3 条真进程跑 CLI（§6.5）
 cargo test --release --test scale_connections -- --ignored   # 万级连接重压（§7.6）；并发数由 TREEDB_CONNS 控制，本机到 25 000 为限（再高是客户端源端口不够）
@@ -3457,7 +3461,7 @@ bash benches/observe.sh                         # 接入面两个旋钮：上限
 bash benches/bench_rows.sh                      # 通用表七条路径 × 落盘/单线程三形状（§7.15）
 bash benches/bench_bulk.sh                      # 批量形状固定工作量档：逐行/区间/清空/顶替 + 同值消除（§7.16）
 bash benches/shard_write.sh                     # 多实例写扩展：solo vs split × 实例数，附服务端核数（§7.17）
-bash benches/promote_smoke.sh                   # 切主的活体验证：提升 → 新主起服 → 旧主被拒（§6.6 切主）
+bash benches/promote_smoke.sh                   # 切主真进程链：停旧主 → 提升 → 新主可写 → 旧主被高令牌副本拒收（§6.6）
 bash benches/sync_ratio.sh 3                    # 一次 fsync 摊了几次写（§7.9）
 bash benches/ab_durability.sh <基线 rev>        # 写轴 A/B：持久化档的吞吐与尾延迟（§7.9 第 3 条）
 bash benches/probe_srv.sh                       # 服务端吃了几核（/proc 计数，§7.5）

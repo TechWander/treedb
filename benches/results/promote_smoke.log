@@ -1,0 +1,221 @@
+===== 2026-11-25 05:13:02 HEAD f9a385c protocol 8 =====
+work=/data/grovefs/treedb/.live/promote.6daiau ports=127.0.0.1:56979,127.0.0.1:56595,127.0.0.1:60923,127.0.0.1:55919 secs=1
+
+=== 1. 起真主 A，写入
+  op=create conns=2 threads=2 pipeline=1 → 2068 ops/s over 1.01s | lat us: p50=696 p90=1187 p99=9758 max=38336 | errors=0
+A: views      = 8
+A: nodes      = 2090
+A: dentries   = 2082
+A: locks      = 0
+A: refs       = 0
+A: tables     = 0 (rows 0)
+A: seq        = 6262 (snapshot 0)
+A: wal        = 467396 B logical, 4194304 B on disk
+A: snapshot   = 0 B
+A: protocol   = 8
+A: ops        = 2093 (writes 2090, syncs 1827, avg fsync 536 us)
+A: checkpoints= 0
+  OK: A.nodes = 2090 > 0
+
+=== 2. 起真副本 B，等 nodes/seq 追平且 lag=0
+B: views      = 8
+B: nodes      = 2090
+B: dentries   = 2082
+B: locks      = 0
+B: refs       = 0
+B: tables     = 0 (rows 0)
+B: seq        = 6262 (snapshot 0)
+B: wal        = 467396 B logical, 4194304 B on disk
+B: snapshot   = 0 B
+B: protocol   = 8
+B: ops        = 5 (writes 0, syncs 0, avg fsync 0 us)
+B: checkpoints= 0
+B: replica    = yes (primary seq 6262 lag 0 applied 6262 resyncs 0 errors 0)
+  OK: B.nodes == A.nodes = 2090
+  OK: B.seq == A.seq = 6262
+  OK: B.fence = 0
+
+=== 3. 提升前 B 必须只读；B 活着时 --promote 必须被目录锁拒绝
+  readonly bench rc=1: create view: Err { code: 30, msg: [114, 101, 97, 100, 45, 111, 110, 108, 121, 32, 114, 101, 112, 108, 105, 99, 97, 58, 32, 116, 104, 105, 115, 32, 105, 110, 115, 116, 97, 110, 99, 101, 32, 102, 111, 108, 108, 111, 119, 115, 32, 97, 32, 112, 114, 105, 109, 97, 114, 121, 32, 40, 194, 167, 54, 46, 54, 41] }
+  OK: 只读拒写后 B.nodes = 2090
+  OK: 只读拒写后 B.seq = 6262
+  locked promote rc=1: treedb-standby --promote: cannot open /data/grovefs/treedb/.live/promote.6daiau/B: config: data dir /data/grovefs/treedb/.live/promote.6daiau/B is already locked (Resource temporarily unavailable (os error 11)): pid 1726934 holds it; two engines on one directory would each replay the same WAL and overwrite each other's snapshots
+  OK: 被锁提升后 B.fence = 0
+
+=== 4. 按切主顺序停旧主 A、停副本 B，再离线提升 B
+  promoted /data/grovefs/treedb/.live/promote.6daiau/B: fence 0 -> 1 (snap_seq 6262, 0 wal recs replayed)
+  this directory is now the highest-ranked copy; start a primary on it with
+    treedb-server --dir /data/grovefs/treedb/.live/promote.6daiau/B --listen HOST:PORT
+  any replica still pointed at the OLD primary will refuse its batches (its fence is 1) until it is repointed here
+  OK: 提升后 B.fence = 1
+  OK: --promote 没有开端口
+
+=== 5. 冷拷同令牌 C；用 B 起新主，数据不变且写可进
+  OK: 新主初始 nodes = 2090
+  OK: 新主初始 seq = 6262
+  op=create conns=2 threads=2 pipeline=1 → 2066 ops/s over 1.00s | lat us: p50=725 p90=1368 p99=9303 max=13525 | errors=0
+  OK: 新主 B.seq = 12466 > 6262
+  OK: 新主 B.fence = 1
+
+=== 6. 旧主 A 回魂仍可写；新主 B 与高令牌副本 C 都不能接收它
+  op=create conns=2 threads=2 pipeline=1 → 1999 ops/s over 1.00s | lat us: p50=701 p90=1341 p99=8568 max=18389 | errors=0
+  OK: 旧主本地 A.seq = 12262 > 6262
+  OK: 旧主写入后新主 B.seq = 12466
+  OK: 旧主写入后新主 B.nodes = 4158
+  OK: C.replica_errors = 1 > 0
+  OK: C.replica_lag = 6000 > 0
+  OK: 拒旧主后 C.seq = 6262
+  OK: 拒旧主后 C.nodes = 2090
+  OK: 拒旧主后 C.fence = 1
+C: treedb-standby: primary 127.0.0.1:56979 is fenced out: wal batch carries fencing token 0, this directory is at 1 — refusing a demoted primary (this dir was promoted; point the replica at the new primary)
+create view: Err { code: 30, msg: [114, 101, 97, 100, 45, 111, 110, 108, 121, 32, 114, 101, 112, 108, 105, 99, 97, 58, 32, 116, 104, 105, 115, 32, 105, 110, 115, 116, 97, 110, 99, 101, 32, 102, 111, 108, 108, 111, 119, 115, 32, 97, 32, 112, 114, 105, 109, 97, 114, 121, 32, 40, 194, 167, 54, 46, 54, 41] }
+  FAIL: C 拒旧主后不能答读
+RESULT: FAIL
+===== 2026-11-25 05:14:17 HEAD f9a385c protocol 8 =====
+work=/data/grovefs/treedb/.live/promote.mYPOpi ports=127.0.0.1:45247,127.0.0.1:35519,127.0.0.1:37417,127.0.0.1:46229 secs=1
+
+=== 1. 起真主 A，写入
+  op=create conns=2 threads=2 pipeline=1 → 1897 ops/s over 1.00s | lat us: p50=727 p90=1360 p99=8314 max=39857 | errors=0
+A: views      = 8
+A: nodes      = 1907
+A: dentries   = 1899
+A: locks      = 0
+A: refs       = 0
+A: tables     = 0 (rows 0)
+A: seq        = 5713 (snapshot 0)
+A: wal        = 426240 B logical, 4194304 B on disk
+A: snapshot   = 0 B
+A: protocol   = 8
+A: ops        = 1910 (writes 1907, syncs 1907, avg fsync 518 us)
+A: checkpoints= 0
+  OK: A.nodes = 1907 > 0
+
+=== 2. 起真副本 B，等 nodes/seq 追平且 lag=0
+B: views      = 8
+B: nodes      = 1907
+B: dentries   = 1899
+B: locks      = 0
+B: refs       = 0
+B: tables     = 0 (rows 0)
+B: seq        = 5713 (snapshot 0)
+B: wal        = 426240 B logical, 4194304 B on disk
+B: snapshot   = 0 B
+B: protocol   = 8
+B: ops        = 5 (writes 0, syncs 0, avg fsync 0 us)
+B: checkpoints= 0
+B: replica    = yes (primary seq 5713 lag 0 applied 5713 resyncs 0 errors 0)
+  OK: B.nodes == A.nodes = 1907
+  OK: B.seq == A.seq = 5713
+  OK: B.fence = 0
+
+=== 3. 提升前 B 必须只读；B 活着时 --promote 必须被目录锁拒绝
+  readonly bench rc=1: create view: Err { code: 30, msg: [114, 101, 97, 100, 45, 111, 110, 108, 121, 32, 114, 101, 112, 108, 105, 99, 97, 58, 32, 116, 104, 105, 115, 32, 105, 110, 115, 116, 97, 110, 99, 101, 32, 102, 111, 108, 108, 111, 119, 115, 32, 97, 32, 112, 114, 105, 109, 97, 114, 121, 32, 40, 194, 167, 54, 46, 54, 41] }
+  OK: 只读拒写后 B.nodes = 1907
+  OK: 只读拒写后 B.seq = 5713
+  locked promote rc=1: treedb-standby --promote: cannot open /data/grovefs/treedb/.live/promote.mYPOpi/B: config: data dir /data/grovefs/treedb/.live/promote.mYPOpi/B is already locked (Resource temporarily unavailable (os error 11)): pid 1756195 holds it; two engines on one directory would each replay the same WAL and overwrite each other's snapshots
+  OK: 被锁提升后 B.fence = 0
+
+=== 4. 按切主顺序停旧主 A、停副本 B，再离线提升 B
+  promoted /data/grovefs/treedb/.live/promote.mYPOpi/B: fence 0 -> 1 (snap_seq 5713, 0 wal recs replayed)
+  this directory is now the highest-ranked copy; start a primary on it with
+    treedb-server --dir /data/grovefs/treedb/.live/promote.mYPOpi/B --listen HOST:PORT
+  any replica still pointed at the OLD primary will refuse its batches (its fence is 1) until it is repointed here
+  OK: 提升后 B.fence = 1
+  OK: --promote 没有开端口
+
+=== 5. 冷拷同令牌 C；用 B 起新主，数据不变且写可进
+  OK: 新主初始 nodes = 1907
+  OK: 新主初始 seq = 5713
+  op=create conns=2 threads=2 pipeline=1 → 2194 ops/s over 1.00s | lat us: p50=715 p90=1403 p99=2057 max=14748 | errors=0
+  OK: 新主 B.seq = 12298 > 5713
+  OK: 新主 B.fence = 1
+
+=== 6. 旧主 A 回魂仍可写；新主 B 与高令牌副本 C 都不能接收它
+  op=create conns=2 threads=2 pipeline=1 → 1831 ops/s over 1.00s | lat us: p50=736 p90=1470 p99=9808 max=32076 | errors=0
+  OK: 旧主本地 A.seq = 11209 > 5713
+  OK: 旧主写入后新主 B.seq = 12298
+  OK: 旧主写入后新主 B.nodes = 4102
+  OK: C.replica_errors = 2 > 0
+  OK: C.replica_lag = 5496 > 0
+  OK: 拒旧主后 C.seq = 5713
+  OK: 拒旧主后 C.nodes = 1907
+  OK: 拒旧主后 C.fence = 1
+C: treedb-standby: primary 127.0.0.1:45247 is fenced out: wal batch carries fencing token 0, this directory is at 1 — refusing a demoted primary (this dir was promoted; point the replica at the new primary)
+C read: op=ping conns=1 threads=1 pipeline=1 → 46693 ops/s over 1.00s | lat us: p50=19 p90=29 p99=38 max=824 | errors=0
+
+=== 7. 全部断言通过
+RESULT: PASS
+===== 2026-11-25 05:24:52 HEAD f9a385c protocol 8 =====
+work=/data/grovefs/treedb/.live/promote.AjwSnc ports=127.0.0.1:55083,127.0.0.1:42487,127.0.0.1:52559,127.0.0.1:60801 secs=1
+
+=== 1. 起真主 A，写入
+  op=create conns=2 threads=2 pipeline=1 → 1285 ops/s over 1.00s | lat us: p50=1116 p90=2111 p99=14552 max=29752 | errors=0
+A: views      = 8
+A: nodes      = 1293
+A: dentries   = 1285
+A: locks      = 0
+A: refs       = 0
+A: tables     = 0 (rows 0)
+A: seq        = 3871 (snapshot 0)
+A: wal        = 288704 B logical, 4194304 B on disk
+A: snapshot   = 0 B
+A: protocol   = 8
+A: ops        = 1296 (writes 1293, syncs 1293, avg fsync 781 us)
+A: checkpoints= 0
+  OK: A.nodes = 1293 > 0
+
+=== 2. 起真副本 B，等 nodes/seq 追平且 lag=0
+B: views      = 8
+B: nodes      = 1293
+B: dentries   = 1285
+B: locks      = 0
+B: refs       = 0
+B: tables     = 0 (rows 0)
+B: seq        = 3871 (snapshot 0)
+B: wal        = 288704 B logical, 4194304 B on disk
+B: snapshot   = 0 B
+B: protocol   = 8
+B: ops        = 5 (writes 0, syncs 0, avg fsync 0 us)
+B: checkpoints= 0
+B: replica    = yes (primary seq 3871 lag 0 applied 3871 resyncs 0 errors 0)
+  OK: B.nodes == A.nodes = 1293
+  OK: B.seq == A.seq = 3871
+  OK: B.fence = 0
+
+=== 3. 提升前 B 必须只读；B 活着时 --promote 必须被目录锁拒绝
+  readonly bench rc=1: create view: Err { code: 30, msg: [114, 101, 97, 100, 45, 111, 110, 108, 121, 32, 114, 101, 112, 108, 105, 99, 97, 58, 32, 116, 104, 105, 115, 32, 105, 110, 115, 116, 97, 110, 99, 101, 32, 102, 111, 108, 108, 111, 119, 115, 32, 97, 32, 112, 114, 105, 109, 97, 114, 121, 32, 40, 194, 167, 54, 46, 54, 41] }
+  OK: 只读拒写后 B.nodes = 1293
+  OK: 只读拒写后 B.seq = 3871
+  locked promote rc=1: treedb-standby --promote: cannot open /data/grovefs/treedb/.live/promote.AjwSnc/B: config: data dir /data/grovefs/treedb/.live/promote.AjwSnc/B is already locked (Resource temporarily unavailable (os error 11)): pid 1879578 holds it; two engines on one directory would each replay the same WAL and overwrite each other's snapshots
+  OK: 被锁提升后 B.fence = 0
+
+=== 4. 按切主顺序停旧主 A、停副本 B，再离线提升 B
+  promoted /data/grovefs/treedb/.live/promote.AjwSnc/B: fence 0 -> 1 (snap_seq 3871, 0 wal recs replayed)
+  this directory is now the highest-ranked copy; start a primary on it with
+    treedb-server --dir /data/grovefs/treedb/.live/promote.AjwSnc/B --listen HOST:PORT
+  any replica still pointed at the OLD primary will refuse its batches (its fence is 1) until it is repointed here
+  OK: 提升后 B.fence = 1
+  OK: --promote 没有开端口
+
+=== 5. 冷拷同令牌 C；用 B 起新主，数据不变且写可进
+  OK: 新主初始 nodes = 1293
+  OK: 新主初始 seq = 3871
+  op=create conns=2 threads=2 pipeline=1 → 1572 ops/s over 1.00s | lat us: p50=815 p90=1624 p99=13196 max=36440 | errors=0
+  OK: 新主 B.seq = 8593 > 3871
+  OK: 新主 B.fence = 1
+
+=== 6. 旧主 A 回魂仍可写；新主 B 与高令牌副本 C 都不能接收它
+  op=create conns=2 threads=2 pipeline=1 → 1413 ops/s over 1.00s | lat us: p50=1100 p90=2034 p99=11891 max=24065 | errors=0
+  OK: 旧主本地 A.seq = 8125 > 3871
+  OK: 旧主写入后新主 B.seq = 8593
+  OK: 旧主写入后新主 B.nodes = 2867
+  OK: C.replica_errors = 2 > 0
+  OK: C.replica_lag = 4254 > 0
+  OK: 拒旧主后 C.seq = 3871
+  OK: 拒旧主后 C.nodes = 1293
+  OK: 拒旧主后 C.fence = 1
+C: treedb-standby: primary 127.0.0.1:55083 is fenced out: wal batch carries fencing token 0, this directory is at 1 — refusing a demoted primary (this dir was promoted; point the replica at the new primary)
+C read: op=ping conns=1 threads=1 pipeline=1 → 51422 ops/s over 1.00s | lat us: p50=18 p90=24 p99=39 max=508 | errors=0
+
+=== 7. 全部断言通过
+RESULT: PASS
