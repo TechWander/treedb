@@ -184,17 +184,18 @@ op / reply / `Log` 变体，`PROTOCOL_VERSION` 仍 8、`SNAP_VERSION` 仍 4，�
 按「不改写已推引用」的纪律保留现状：Cargo 解析 git 依赖只看 tag/rev 与 lock 里的
 hash，不看这个字段，所以不影响任何构建；`v0.6.0` 是下一次带 API 变更的发版，
 `Cargo.toml` 的 `version` 随它回到 `0.6.0`，两者重新对齐，此后逐版跟齐（`v0.8.0` =
-`0.8.0`、`v0.8.1` = `0.8.1`、`v0.9.0` = `0.9.0`）。
+`0.8.0`、`v0.8.1` = `0.8.1`、`v0.9.0` = `0.9.0`、`v0.9.1` = `0.9.1`）。
 
-test 现在分两档报（2026-11-25 在本轮交付的树上实跑，含 §7.18、§7.19 与 §5.4 那批改动）：默认档（纯引擎）`cargo test --release` = **285 passed / 0 failed / 3 ignored**（106 lib（其中 35 条是 `src/cli`
+test 现在分两档报（2026-11-26 在本轮交付的树上实跑，含 §5.4 那处 `--cond-col pk` 修复与
+§5.1 那两条并发对抗用例）：默认档（纯引擎）`cargo test --release` = **288 passed / 0 failed / 3 ignored**（107 lib（其中 36 条是 `src/cli`
 自己的单测，§5.4）+ 8 cli +
 36 engine_crud + 14 migrate + 21 replication + 12 net_protocol + 11 pitr + 8 read_scaling
-+ 7 crash_recovery + 7 delete_storm + 5 mixed_views + 6 batch + 12 table_bulk + 8 auth
++ 7 crash_recovery + 7 delete_storm + 5 mixed_views + 8 batch + 12 table_bulk + 8 auth
 + 5 observe
 + 5 table_alter + 4 dump_restore +
 3 backup_online + 3 independence + 1 large_reply + 1 checkpoint_tail + 1 scale_connections
 + 1 scale_restore；另 3 条带 `#[ignore]` —— 万级连接、百万节点、64 MiB 快照收尾 ——
-只手动跑，不计入 passed）；`--features postgres-compat` = **316 passed / 0 failed / 9 ignored**，多出的 31 条 = 过渡档自己的 30 条单测 +
+只手动跑，不计入 passed）；`--features postgres-compat` = **319 passed / 0 failed / 9 ignored**，多出的 31 条 = 过渡档自己的 30 条单测 +
 `concurrency.rs` 里那条
 不需要 PG 的拨号用例（剩下 6 条要真 PG，默认 `#[ignore]`，不计入 passed）。即 PG 只出现在
 `postgres-compat` 后面的 `src/pool`、`src/store`、
@@ -782,7 +783,15 @@ GC 拿它当唯一依据。
   「整批在」或「整批不在」。这条比单 op 的多条 `Log` 更强 —— 后者在同一个 fsync 里
   只是**运行期**原子，崩溃时仍可能只落前几条（§6.1 的那条注）。
 - **可见性也是整批的**：容器的 `apply` 在写锁内一次完成，读者要么看不到整批、要么
-  看到整批；不存在「批内一半可见」的窗口。
+  看到整批；不存在「批内一半可见」的窗口。纯读批同理 —— 全部子 op 在同一次读锁持有期
+  内翻译完，所以「两条 `RowGet` 装进一条批」拿到的是一个**切面**而不是两个时刻，可以拿
+  来采样不变量。这一条有并发对抗证据，不只是单线程断言：
+  `tests/batch.rs::contended_cas_batches_never_lose_a_transfer`（4 个连接在同一对余额行上
+  做 CAS 转账，另有一个连接不断用只读批采样；`workers=1` 与 `workers=8` 两种前端形状各
+  跑一遍；断言 `a + b` 恒等于总额度、`(seq, writes_total)` 的增量恰好等于成功笔数）与
+  `contended_put_if_absent_elects_exactly_one_winner`（8 个连接抢同一个键，恰好一个成功、
+  其余 `EEXIST`、落盘的是赢家那一份）。若 `translate` 与 `apply` 之间让出过锁，这两条会
+  当场红：丢失更新在统计上看不出来（`seq` 照样 +2），只有钱的总数与创建者计数会揭穿它。
 
 边界（都是刻意的）：
 
@@ -907,7 +916,7 @@ GC 拿它当唯一依据。
 | `TableDrop` 级联掉行与二级索引，一条不剩；空内层表不留；`next_table_id` 不回收 | `generic_tables_keep_rows_and_rebuild_indexes`、`table_state_survives_checkpoint_and_reopen` |
 | 表与行走完全部四条持久化路径：WAL 重放、checkpoint 截断、`kill -9`、TCP 端到端 | `reopen_replays_wal_into_identical_state`、`control_plane_survives_sigkill`、`generic_table_and_readdir_plus_over_tcp` |
 | 硬链接：`Op::Link`（`v0.5.0`）给已有 inode 加第二根 dentry，两个名字指向同一个 ino、`nlink` 按引用计数增减、内容对象只在最后一个名字离开时下账。此前 `nlink` 只在目录意义上活动（`2 + 子目录数`）；现在文件与符号链接的 `nlink` 是真实引用计数，`Unlink` / `Rename` 覆盖 / `Symlink` upsert 三条路径都按「是不是最后一个名字」分流 —— 不是的话只减一票且**不下内容引用账**，应答里的空键保证调用方不会把还有人用的对象当孤儿回收。三条拒绝：目录 `EPERM`、名字已存在 `EEXIST`（`link(2)` 没有 upsert，`ln f f` 也是 `EEXIST`）、跨视图不成立（一个 op 只落在一个命名空间里） | `hard_links_share_the_inode_and_keep_bytes_alive`、`link_refusals_name_the_posix_errno`、`overwriting_one_of_several_links_only_drops_one_vote` |
-| 原子批：子 op 顺序可见（`create` 完直接 `setattr` 刚分配的 ino、同一张表上第二条 `RowPut` 看得出第一条占住的唯一值）；任一子 op 失败则整批不落，目录 `nlink`/`size`/`mtime`/`ctime`、`next_ino` 与两个名字全都不动（零日志）；整批只推进一个 seq，把那条 WAL 记录从 payload 中间截断重开后整批一条不剩，而它前面的记录照旧重放 | `a_batch_sees_its_own_writes`、`one_bad_op_leaves_the_whole_batch_unapplied`、`a_batch_on_the_generic_table_is_atomic_too`、`a_batch_is_one_wal_record_that_a_torn_tail_drops_whole`、`a_read_only_batch_costs_no_log_and_answers_like_separate_calls`、`batch_refuses_empty_oversize_nested_and_control_ops` |
+| 原子批：子 op 顺序可见（`create` 完直接 `setattr` 刚分配的 ino、同一张表上第二条 `RowPut` 看得出第一条占住的唯一值）；任一子 op 失败则整批不落，目录 `nlink`/`size`/`mtime`/`ctime`、`next_ino` 与两个名字全都不动（零日志）；整批只推进一个 seq，把那条 WAL 记录从 payload 中间截断重开后整批一条不剩，而它前面的记录照旧重放；并发对抗下不许丢转账、不许让观察者看到半批 | `a_batch_sees_its_own_writes`、`one_bad_op_leaves_the_whole_batch_unapplied`、`a_batch_on_the_generic_table_is_atomic_too`、`a_batch_is_one_wal_record_that_a_torn_tail_drops_whole`、`a_read_only_batch_costs_no_log_and_answers_like_separate_calls`、`batch_refuses_empty_oversize_nested_and_control_ops`、`contended_cas_batches_never_lose_a_transfer`、`contended_put_if_absent_elects_exactly_one_winner` |
 | 追加列：只能追加到末尾，旧行按新宽度补**空字节**（补出的空与显式空不可区分）；`COL_INDEX` 允许且补出的索引项立即生效，`COL_UNIQUE` 一律 `EINVAL`（无回填手段）；写侧拒绝：表不存在回 `ENOENT`，其余（重名/已满 64 列/空名/超长/`COL_UNIQUE`）回 `EINVAL`，且全部**零日志**；整次变更只有一条 WAL 记录，把它从 payload 中间截断重开后仍是旧宽度；同一条日志 `apply` 两次等价；checkpoint 与 dump → restore 之后新列、旧数据与索引都在，且接着能写 | `add_column_widens_every_row_and_indexes_the_default_value`、`add_column_refusals_leave_the_shape_alone`、`add_column_is_one_record_and_a_torn_tail_keeps_the_old_shape`、`widened_table_survives_checkpoint_and_dump_restore`、`add_column_log_replays_idempotently` |
 
 ### 5.3 明确**不**提供的东西
@@ -994,6 +1003,20 @@ GC 拿它当唯一依据。
 （`treedb-migrate` 的 10 那一档也在其中）—— 把「这行已经存在」与「服务端压根没起」
 分成两个数，脚本才写得对。
 
+**唯一一处 CLI 抢在引擎前面说不：`--cond-col pk`**（2026-11-26 修）。编码层里
+`ROW_PK` 与 `COND_NONE` 是同一个数（`u32::MAX`），而引擎的 CAS 闸门写的是
+`if cond_col != COND_NONE` —— 把 `pk` 递过去走的是「没有条件」那一条分支，
+`--cond-val` 整个被忽略，一句本该 CAS 的覆盖写静默成了裸写：回 `Reply::Ok`、不报
+任何错。主键 CAS 本身也是空命题（行就是按主键寻址的，比较 `key == key` 恒真），
+所以这里不存在「让引擎把它答对」的修法，正确出口只有报错。于是
+`commands.rs::read_cond` 当场 `EX_USAGE`（退出码 2），并把两条真入口指回去：存在性
+用 `--if-exists` / `--if-absent`，值用列序号或列名。`row put`、`row del` 与 `batch` 里的
+子 op 共用这一个入口，一处闸门覆盖三面。引擎侧语义零改动（`COND_NONE` / `ROW_PK` 两个
+常量的文档互相指回对方并指向本节），HELP 与 `table desc` 里「pk 可以用在 `--cond-col`」
+那两句错话同时改掉 —— 它们正是把人引进这个坑的东西。回归用例：
+`src/cli/commands.rs::a_pk_cond_col_is_rejected_not_silently_unconditional`，四种写法
+（`pk`、`-1`、`row del`、批内子 op）全部 rc=2 且行内容一个字节不动。
+
 **同值消除必须说出来**（§5.1、§8 第 18 条）。`RowPut` 命中同值消除时新旧行逐字节相同、
 零日志、`seq` 不前进，而应答本身是 `Reply::Ok` —— 单看返回值，「写成功了」与「seq 没
 动」这两件事会打架。CLI 因此在写入前后各发一次 `Op::Stats` 比 `writes_total`，命中时
@@ -1027,13 +1050,13 @@ GC 拿它当唯一依据。
 互斥；包装的五个二进制参数原样转发、不改写（所以它们的旗标格式与 `treedb-cli` 不一致时
 也不会被顺手「统一」）。
 
-**代码量与依赖**。`src/cli/{mod,commands,conn,shell,value}.rs` 共 4590 行加 `src/bin/cli.rs`
+**代码量与依赖**。`src/cli/{mod,commands,conn,shell,value}.rs` 共 4641 行加 `src/bin/cli.rs`
 21 行。§11 第 7 条那个依赖门（非 optional 依赖只有 `libc` + `thiserror`）意味着参数扫描器、
 语句 tokenizer、行编辑、补全、历史、JSON 输出全是自写的 —— 没有 clap，没有 rustyline，
 没有 ratatui。换来的是零新增依赖与一个静态二进制。
 
-**验证**。`src/cli` 内 35 条单测（`commands.rs` 13 / `shell.rs` 8 / `value.rs` 6 / `mod.rs` 5 /
-`conn.rs` 3），`tests/cli.rs` 8 条真进程（两种模式各起真服务端）。13 条里最值得说的是
+**验证**。`src/cli` 内 36 条单测（`commands.rs` 14 / `shell.rs` 8 / `value.rs` 6 / `mod.rs` 5 /
+`conn.rs` 3），`tests/cli.rs` 8 条真进程（两种模式各起真服务端）。14 条里最值得说的是
 `every_table_op_has_a_command` —— 它是一张清单而不是一条性质：15 个 op 逐个走通，加一条
 就漏不掉；以及 `key_error_paths_keep_their_posix_names`（EEXIST/ENOENT/EAGAIN/EINVAL 四条
 都留在 POSIX 名字上）、`flags_are_matched_by_their_bare_names`（裸旗标不被当值吞掉，否则
@@ -3916,14 +3939,23 @@ max 1 094 → 2 079 µs，服务端最坏回合 42 039 → 147 799 µs（743 →
     与视图也各自一份 —— 本来就不能拆。引擎侧没有 rebalance、没有目录发现，那些只能建在
     接入层（§10 阶段 C）。
 
+20. **`cond_col` 里没有「主键」这一档**（§5.4，2026-11-26）。`ROW_PK` 与 `COND_NONE` 在
+    编码层是同一个数（`u32::MAX`），而 CAS 闸门写作 `if cond_col != COND_NONE`，所以从
+    Rust API 直接把 `ROW_PK` 当条件列递进来等于**不带条件**：`cond_val` 被忽略、写照常落、
+    回 `Reply::Ok`。两个保留值撞在一个数上是历史事实，而主键 CAS 本身是空命题（行就按
+    主键寻址，比较 `key == key` 恒真），引擎既没东西可判也就给不出 errno。因此这一条的
+    防线在调用侧：存在性用 `PUT_IF_ABSENT` / `PUT_IF_EXISTS` / `DEL_IF_EXISTS`，值比较用列
+    序号或列名。`treedb-cli` 已在 `read_cond` 里当场拒掉这一档（退出码 2，§5.4），直接
+    用 API 的接入方只能靠本条与 `model.rs` 里那两个常量的文档注释。
+
 ---
 
 ## 9. 测试清单
 
 ```sh
-cargo test --release                            # 默认档（纯引擎），288 条（285 passed + 0 failed + 3 ignored）
-cargo test --release --features postgres-compat # 加上过渡档，325 条（316 passed + 0 failed + 9 ignored）
-cargo test --release --lib                      # 只看单测：106 条，其中 35 条在 src/cli（§5.4）
+cargo test --release                            # 默认档（纯引擎），291 条（288 passed + 0 failed + 3 ignored）
+cargo test --release --features postgres-compat # 加上过渡档，328 条（319 passed + 0 failed + 9 ignored）
+cargo test --release --lib                      # 只看单测：107 条，其中 36 条在 src/cli（§5.4）
 cargo test --release --test cli                 # 人工操作面：8 条真进程，两种连接模式各起真服务端（§5.4）
 cargo test --release --test migrate              # 快照升级：11 条走 API + 3 条真进程跑 CLI（§6.5）
 cargo test --release --test scale_connections -- --ignored   # 万级连接重压（§7.6）；并发数由 TREEDB_CONNS 控制，本机到 25 000 为限（再高是客户端源端口不够）
@@ -3996,7 +4028,7 @@ check-then-use 窗口：旧写法「`bind :0` 拿号 → `drop` → 交给服务
 | `tests/backup_online.rs` | **3** | §6.10 的在线面：主静置时备份，停机取源目录 `State` 作期望，恢复后 **逐字段相等**，且「备份前后 `Ping` 都通」+ `backup → load → dump` 逐字节相同；主每 400 条换一代快照且持续写时，切面 `seq ∈ [备份前, 备份后]`、`nodes` 不倒退、恢复水位 = `dump.seq` 且 `wal_records == 0`；第三条起真进程钉退出码（2 参数 / 1 连不上）并验证 `--retries N` 真的转满 N 轮 |
 | `tests/pitr.rs` | **11** | §6.11 的归档与 PITR 十二面：归档段与源 WAL 前缀逐字节相同且其后只剩空洞、第二次 checkpoint 多一段 + 一份「将被覆盖」的快照；**后台旁路快照也归档且先拷旧快照再覆盖**（顺序错就把水位 `from` 那份字节永久抹掉）；目标落在两次 checkpoint 之间（归档锚点 + 归档段）与最后一次之后（数据目录快照 + 活 WAL）两条路径重放后状态逐字段相等、恢复目录能继续写；目标正好落在快照水位时零条重放；中途关掉归档后停在洞的左边（`history ends at`）；归档被外力丢一段时报缺口并指出下一个存在的 seq（`no record N` / `next one present is M`）；越过末尾拒绝；目标非空拒且一个字节不动（只允许多一个 `.lock`）；归档目录等于数据目录时开局就拒；不开归档时目录里只有快照 + WAL + `.lock`；**v0.7.0 的三条批量记录（25/26/27）严格落在两次 checkpoint 之间时从归档段重放**（`anchor == s1`、`from_wal == 0`、`from_archive > 0`，即同值消除没把批量记录省掉）且恢复目录行集也对、含三条批量 op 的尾巴恢复与停服冷 dump `encode()` 逐字节相同 |
 | `tests/read_scaling.rs` | **8** | 只读分派表逐条对 `translate`（判错一条就是丢写；语料 45 条全变体，钉住 45/15/30 三个数）、**三档划分穷举且两两不交**（`ops_partition_into_three_classes`，15/22/8，§4.2 与副本拒写的判据同源）、`workers=1/8` 答复逐条相同（负载含表读与 `ReadDirPlus`，混合批里把 CAS 写夹在读之间）、每连接流内顺序、一写多读不读到半截状态、`ops_total` 记上 worker 就地算的读、并行档下 `kill -9` 已 ack 的写全在（目录写与表写逐条交错）、**fd 复用不会把上一任的应答塞给新任** |
-| `tests/batch.rs` | **6** | §5.1「原子批」的六面：批内顺序可见（`create` 后直接对刚分配的 ino `setattr`，`apply_seq` 只 +1）、一条失败整批不落且父目录三个属性逐字段不变（`msg` 带 `batch op #<i>: `，失败批预留的 ino 被回收）、通用表上同样原子（唯一索引冲突让整批零行）、**整批只占一条 WAL 记录**（把末条记录截到 payload 一半，重开后批内三个子 op 全不在而批前的视图仍在）、纯读批零日志且应答与逐条单发逐字段相等、空/超限/嵌套/控制面四种拒都在 `translate` 层给 `EINVAL` 且在解码层也能拦住越界与嵌套 |
+| `tests/batch.rs` | **8** | §5.1「原子批」的八面：批内顺序可见（`create` 后直接对刚分配的 ino `setattr`，`apply_seq` 只 +1）、一条失败整批不落且父目录三个属性逐字段不变（`msg` 带 `batch op #<i>: `，失败批预留的 ino 被回收）、通用表上同样原子（唯一索引冲突让整批零行）、**整批只占一条 WAL 记录**（把末条记录截到 payload 一半，重开后批内三个子 op 全不在而批前的视图仍在）、纯读批零日志且应答与逐条单发逐字段相等、空/超限/嵌套/控制面四种拒都在 `translate` 层给 `EINVAL` 且在解码层也能拦住越界与嵌套；**两条并发对抗**（真服务端 + 真 TCP + 真 fsync：4 个连接在同一对余额行上做 CAS 转账、另一个连接用只读批不断采样，`workers=1`/`8` 各跑一遍，断言 `a + b` 恒等于总额度且 `(seq, writes_total)` 增量恰好等于成功笔数；8 个连接抢同一个 `PUT_IF_ABSENT` 键只能有一个赢家） |
 | `tests/table_bulk.rs` | **12** | §5.1「批量形状」与「同值消除」的十二面：`TableClear` 拆行拆索引但留形状与 id（清完仍在 `TableList` 里）、**一次清空只推一个 seq**（`apply_seq` 差恰为 1）+ 砍掉尾字节的撕裂重放必须回到清空前（切点留在帧头里、只砍 payload 尾巴，因为这条只有 5 字节）、`RowRangeDelete` 跟 `RowRange` 同一条列规则（`ROW_PK` / 已索引列 / 未索引列 `EINVAL`）、**区间记录的宽度与命中数无关**（一条 `DelRange` < 40 B，一千条 `DelRow` 是它 500 倍以上，在编码层比字节）、三条新 `Log` 幂等（逐条手动 `apply` 两次与一次等价、整个 WAL 重放一遍仍是同一份 `State`）、`TableRename` 保留 id 且被顶替表级联拆干净（逐张数 `tables`/`rows`/`row_index`）、改名四个边界（空名/超长/`NOREPLACE`/`from == to`）、同值 `RowPut` 零日志零 fsync（三条闸门 `PUT_IF_ABSENT`/`PUT_IF_EXISTS`/CAS 仍在消除之前生效）、被消除的写跨重启不留痕迹、含批量 op 的 `Batch` 仍是一条记录且失败整批不落、四种形状都过得了 `Checkpoint` 与 `dump → restore` |
 | `tests/table_alter.rs` | **5** | §5.1「追加列」的五面：旧行全被拉宽到新宽度且新增的 `COL_INDEX` 列索引里每行都有一项（索引计数 `row_index.len()` 把唯一列隐含的索引也算进去）、五类拒绝（不存在/重名/已满 64 列/空名/`COL_UNIQUE`）逐条核 errno 且 `apply_seq` 不动（零日志）、**只占一条 WAL 记录**（从 payload 中间截断重开后仍是旧宽度、旧列一个不少）、`Checkpoint` 与 `dump → restore` 之后新列/旧数据/索引都在且接着能写、同一条 `Log::AddColumn` 手动 `apply` 两次与一次等价 |
 | `tests/auth.rs` | **8** | §4.4 在线协议上的版本/认证形状：未协商版本的连接一个数据 op 也拿不到（`workers=1/8` 各跑）、错版本被拒且可改回同代、客户端拒绝伪造错版本应答、错密钥被拒但不锁死 + 旧 MAC 重放不上 + 换对密钥能过、带密钥客户端拒绝降级、未配密钥服务端返回 `authed: false`、握手与数据 op 挤同批时应答保序 |
@@ -5499,3 +5531,56 @@ spike 明确**没**做、也不在接入面上假装做的事 —— 一律返�
     （统一等于把已发布的五套接口悄悄换成第六套）。真要继续，价值排序是：① `stats` 的时序视图
     （`--watch` 打曲线或至少打增量），② 从 `dump` 里按表过滤导出（现在只能整份），③ 补全脚本
     与 man —— 这三样都不动引擎，只在 `src/cli` 里长。
+
+23. **一轮八维度功能完备性评估挖出来的三格，已在同一轮还掉**（§5.1、§5.4、§8 第 20 条，
+    2026-11-26，**已做完**）。按通用嵌入式数据库的标准逐维度对着代码与真跑输出评了一遍
+    （数据模型与 CRUD、条件写与原子性、索引与查询、持久化与恢复、高可用与复制、可观测与
+    运维、schema 演化边界、与 LevelDB/RocksDB·SQLite·FoundationDB 的逐条对照）。结论：**功能
+    完备但生态薄弱** —— 作为 grovefs 的元数据引擎与单机嵌入式表存储已到「生产可用带边界」，
+    作为对外交付的产品未到生产就绪，三条 blocker 是产品级而非引擎级的：无授权矩阵与传输
+    加密、无同步复制与自动 failover（`treedb-standby --promote` 是离线动作，`failover` /
+    `quorum` 在 src/ 与本文里零命中）、全内存状态 + 单实例写天花板要接入方自己分片（§8 第 19
+    条）。评估当轮发现三处该修的，都在这一格落地：
+
+    1. **`--cond-col pk` 静默空条件**（真缺陷，§5.4 与 §8 第 20 条）。`ROW_PK == COND_NONE ==
+       u32::MAX`，而 CAS 闸门写的是 `if cond_col != COND_NONE` —— 递过去的 `pk` 走的是「没有
+       条件」那一条分支：`--cond-val` 整个被忽略，一句本该 CAS 的覆盖写静默成了裸写，还回
+       `Reply::Ok`，而 HELP 明写着 pk 可用。活体复现过两条（`row put ... --cond-col pk
+       --cond-val ...` 与 `row del ...` 都 rc=0 且真的执行了）。修法在 CLI 侧：`read_cond`
+       当场 `EX_USAGE` 并把两条真入口指回去（存在性 = `--if-absent`/`--if-exists`，值 = 列序号
+       或列名），`row put`、`row del`、`batch` 子 op 共用这一个入口，一处闸门覆盖三面。不改
+       引擎语义的理由是主键 CAS 是空命题（行按主键寻址，`key == key` 恒真），要给它新语义
+       等于凭空多一个永不复用的编码位。HELP 第 68 行、`table desc` 的 pk 行、`model.rs` 两个
+       常量的文档同时更正。
+    2. **批的原子性此前只有单线程证据**（§5.1「可见性也是整批的」那一格）。批真正要防的是
+       多个连接同时在同一批行上做乐观锁：若 `translate` 与 `apply` 之间让出过锁，两个转账批会
+       各自基于同一份旧余额预演，后落地的把前一笔覆盖掉 —— 而 `seq` 与 `writes_total` 照样各
+       +2，从账本上完全看不出来，只有钱的总数会少一块。补两条真进程 + 真 TCP + `dur=group`
+       真 fsync 的对抗用例：`contended_cas_batches_never_lose_a_transfer`（4 连接 × 40 笔转账，
+       每笔是一条含两个 CAS 的批，`EAGAIN` 重试；另一个连接不停用只读批采样 `a + b`；`workers
+       = 1` 与 `workers = 8` 两种前端形状各跑一遍；末态断言 `(A, B) == (0, total)`、`seq` 与
+       `writes_total` 的增量都恰好等于 total、坏样本 0，并且**必须真的发生过 CAS 冲突**，否则
+       用例退化成伪装成并发的串行跑）与 `contended_put_if_absent_elects_exactly_one_winner`
+       （8 连接同键抢 `PUT_IF_ABSENT`：恰好一个成功、其余 `EEXIST`、落盘的是赢家那一份、只有
+       一条记录落地）。
+    3. **`--durability always` 的名字在骗人**。文档一直写着 `always` 与 `group` 共用同一条
+       fsync 路径（§7.9：按连接切开并不给已 ack 的写增加任何持久性，只是让第 k 条连接多等
+       (k−1) × fsync），但启动横幅只印 `durability=always`，运维读成「每条写单独落一次盘」。
+       横幅现在把实际落盘点跟在名字后面（`always (same fsync point as group; acked writes are
+       durable)`；`never` 那档同步点明「提交路径不 fsync，已确认的写可能丢，仅测试/基准」）。
+       已 grep 确认没有任何测试或 bench 脚本解析这一个字段，改动零风险；三档横幅已实跑核对。
+
+    验证（当轮实跑）：默认档 `cargo test --release` **288 passed / 0 failed / 3 ignored**、
+    `--features postgres-compat` **319 passed / 0 failed / 9 ignored**，比上一笔各多 3 条 = `src/cli`
+    那条回归单测 + `tests/batch.rs` 那两条并发对抗；`cargo clippy --release --all-targets` 在本轮
+    改过的四个文件上零新增警告（仓里既有 `tests/*.rs` 的警告与这一笔无关，`src/bin/server.rs:84`
+    那条 manual checked division 在 `v0.9.0` 上就在）。协议与盘上格式零改动：没有新 op、新 reply、
+    新 `Log` 变体，`PROTOCOL_VERSION` 8 / `SNAP_VERSION` 4 / dump 容器 2 全部不变，旧目录零迁移 ——
+    定版 `v0.9.1`。
+
+    **没做与下一步**：引擎侧不给 `cond_col` 增加第三档保留值（第 20 条那句限制就留着，靠 CLI
+    与文档兜）；没有把 `always` 这个名字改掉（改名等于给既有启动参数与测试一次破坏性变更，
+    收益只是少一句横幅）；并发对抗只压了「同批行 CAS」与「同键 `PUT_IF_ABSENT`」两个形状，跨
+    表的批、批与 `TableAddColumn`/`TableRename` 交错那些形状还没有对抗证据 —— 要补就在同一条
+    骨架上加负载形状，不必再搭一遍脚手架。评估本身列出的三条产品级 blocker（授权矩阵、传输
+    加密、同步复制与自动 failover）不在这一格，各自都要动协议，属于 §10 之后的阶段。

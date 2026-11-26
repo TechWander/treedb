@@ -18,8 +18,8 @@ cargo build --release                                   # 默认档：依赖只�
 ./target/release/treedb-cli  --addr 127.0.0.1:7777 table list          # 手活：非交互子命令
 ./target/release/treedb-cli  --addr 127.0.0.1:7777 shell                # 或者进 REPL，连接只给一次
 
-cargo test --release                                    # 默认档 285 passed / 0 failed / 3 ignored（引擎本体）
-cargo test --release --features postgres-compat        # 316 passed / 0 failed / 9 ignored（含 PG 过渡档）
+cargo test --release                                    # 默认档 288 passed / 0 failed / 3 ignored（引擎本体）
+cargo test --release --features postgres-compat        # 319 passed / 0 failed / 9 ignored（含 PG 过渡档）
 bash benches/throughput_matrix.sh 3 1 2 3 4 5           # 五轴复现，输出进 benches/results/
 bash benches/sync_ratio.sh 3                           # 写路径机制：一次 fsync 摊了多少写
 bash benches/single_conn.sh 3                          # 单连接对标 PG（$PIPE=32 走批量档、$CONNS/$WORKERS 走并发档）
@@ -292,7 +292,7 @@ head -c 32 /dev/urandom > /etc/treedb/auth.key && chmod 0600 /etc/treedb/auth.ke
 | 只给一个核（`workers=1`，且 PG 钉在**同一个**核上） | 同核、同并发 64/1：`ping` **153 329 vs 17 035**（**9.0×**）、`lookup` **119 001 vs 6 501**（**18.3×**）、`readdir` **87 075 vs 4 486**（**19.4×**）、`create` **65 122 vs 1 583**（**41.1×**）、`write` **71 213 vs 828**（**86.0×**）。旧版这一行写的「输给 PG 0.26–0.48×」**已作废**：那是拿一个核去比 PG 不限亲和性的 46–52 个核。同一张四臂表里还钉了另两件事：单核 `ping` 153 329 已是**同核裸 epoll echo 服务端（中位 167 999 ops/s，`benches/results/lb_floor.log`）的 91.3 %**，而这一核 90 % 的时间在系统时间里（`benches/results/split_attr.log`）—— 这一列到顶了。详见 [DESIGN.md](DESIGN.md) §7.5 末、`benches/sc_ops.sh` |
 | 零旗标默认档（照上面两行命令起服务，同格跑 5 次取中位） | 服务端 banner 就是 `workers=8`：`readdir` **654 983**（= PG 4.5×）、`lookup` **1 062 564**（**5.0×**）、`ping` **1 016 868**（1.9×）—— 领先不靠调用方传 `--workers`；矩阵连跑的那两行是**下界**（`benches/default_check.sh`） |
 | 为什么快（引擎自己的计数器） | 两个「会 fsync」的档位现在共用同一个提交点：64 并发下一轮只付 1 次 fsync。`benches/sync_ratio.sh` 的实测范围是 **58.9–62.6 次写/fsync**（机械盘 58.9–61.9、根盘 61.5–62.6，逐次读数见 `benches/results/sync_ratio.log`）；而 `benches/ab_durability.sh` 那一轮同格只抖在 **53.9–57.7** —— 两批不是同一次采集，不要合并成一个「≈ 55」 |
-| 每 op 一次 fsync（`dur=always` vs PG `synchronous_commit=on`，WAL 同盘） | 改前 1 891 vs 1 469 ops/s（p99 81.5 ms vs 157 ms）；**改后 10 913 vs 1 469 = 7.4×**，p50 优 17×、p99 优 5×（受控 A/B：`benches/ab_durability.sh v0.3.1`）。旧版这句「刨掉合并 fsync，treedb 对 PG 就没有结构性优势」是当时那个**按连接串 fsync** 的实现留下的错判，已作废：两家都是靠一次 fsync 摊多次写，treedb 在这一格摊得动（`always` 改后三次 53.9 / 54.8 / 57.7）而 `always` 档以前自己把它抵消掉了 |
+| 每 op 一次 fsync（`dur=always` vs PG `synchronous_commit=on`，WAL 同盘） | 改前 1 891 vs 1 469 ops/s（p99 81.5 ms vs 157 ms）；**改后 10 913 vs 1 469 = 7.4×**，p50 优 17×、p99 优 5×（受控 A/B：`benches/ab_durability.sh v0.3.1`）。旧版这句「刨掉合并 fsync，treedb 对 PG 就没有结构性优势」是当时那个**按连接串 fsync** 的实现留下的错判，已作废：两家都是靠一次 fsync 摊多次写，treedb 在这一格摊得动（`always` 改后三次 53.9 / 54.8 / 57.7）而 `always` 档以前自己把它抵消掉了。**这一格的名字指客户端要求**（每条写都要 durable），不是服务端每次都 fsync：`always` 与 `group` 现在共用同一个提交点（§7.9），启动横幅把这句直接跟在名字后面印出来 |
 | 持久性 | `kill -9` 六个崩溃用例零丢失（含 checkpoint 瞬间崩、连崩 3 轮）；并另有 `workers=8` 下同语义的一条，目录写与表写逐条交错 |
 | 接入认证（可选、默认关；v0.7.0 历史读数） | 20 000 条连接、两臂同轮 A/B × 3：**RSS +93 ~ 96 B/conn**（439 → 532/535 B，极可复现）、建连中位 **+90.9 µs/conn**（+232 / +1 818 / +1 885 ms —— 噪声比效应大，`off` 臂自己就摆 27 %）、稳态 `ping` 中位 1 147 239 → 1 148 689 ops/s、`create` 67 414 → 64 122（−4.9 %，**落在同臂自身 2.8 ~ 4.5 % 的散布里，既不报回归也不报变快**）。未开认证的数据面另用两臂都不带密钥的 `ab_layout.sh v0.3.5` 证零回归（八格最差 −0.90 %）。逐格原始输出 `benches/results/handshake_cost.log` 与 `ab_layout_v0.3.6.log`，读法见 §4.4 |
 | **批量形状**（`v0.7.0`，100 万行表、`dur=group`、2026-11-23） | 同样删完一百万行：逐行 `RowDelete` **16 064 ms / 1 000 000 条 WAL 记录 / 2 075 次 fsync / 38 MB**；`RowRangeDelete`（batch 2000）**1 017 ms / 500 条 / 2 次 / 29.5 KB**；`TableClear` **924 ms / 1 条 / 1 次 / 25 字节**。同值重写 100 万次：`RowPut` 同值 **970 ms / 0 条记录 / 0 次 fsync**，真改值 **21 126 ms / 1 000 000 条 / 2 046 次**。逐格 `benches/results/bench_bulk.log`，读法与「为什么时间不随记录数同比例下降」见 §7.16 |

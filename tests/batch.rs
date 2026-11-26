@@ -1,6 +1,6 @@
 //! `Op::Batch` 原子批验收（DESIGN §5.1）。
 //!
-//! 四条主张，一条一个用例组：
+//! 五条主张，一条一个用例组：
 //!
 //! 1. **顺序可见**：批内后一条看得到前一条的写（`create` 完直接 `setattr` 那个新 ino）。
 //! 2. **失败整批不落**：任何一条回 errno，真状态一个字段都不变（连父目录的
@@ -9,16 +9,26 @@
 //!    整批一条不剩，而不是「前几条还在」。这一条是「崩溃原子」的可执行定义。
 //! 4. **拒绝面**：空批、超 `MAX_BATCH_OPS`、嵌套、控制面 op —— 结构化构造走
 //!    `translate` 回 `EINVAL`，字节层面的越界/嵌套在解码就断连。
+//! 5. **并发对抗**：上面四条都在单线程里跑，而批的原子性真正要防的是「多个连接同时
+//!    在同一批行上做乐观锁」。这两条用真服务端、真 TCP、真 `fsync` 跑（见
+//!    [`contended_cas_batches_never_lose_a_transfer`]），并且在 `workers=1` 与
+//!    `workers=8` 两种前端形状上各跑一遍 —— 只测一种等于另一种裸奔（§11 第 7 条）。
 //!
 //! 跑法：`cargo test --test batch`
 
+mod common;
+
+use common::Server;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use tempfile::TempDir;
 use treedb::engine::core::WAL_FILE;
 use treedb::engine::model::{
-    errno, ColumnDef, Op, Reply, TableDef, COL_UNIQUE, MAX_BATCH_OPS, ROW_PK, SA_MODE, SA_UID,
+    errno, ColumnDef, Op, Reply, TableDef, COL_UNIQUE, COND_NONE, MAX_BATCH_OPS, PUT_IF_ABSENT,
+    ROW_PK, SA_MODE, SA_UID,
 };
 use treedb::engine::{Durability, Engine, Rd, W};
+use treedb::net::client::Client;
 
 // ---------------------------------------------------------------- 驱动脚手架
 
@@ -439,4 +449,314 @@ fn batch_refuses_empty_oversize_nested_and_control_ops() {
     let bytes = w.finish();
     let err = Op::decode(&mut Rd::new(&bytes)).expect_err("嵌套批要在解码里拒");
     assert!(format!("{err}").contains("nested batch"), "{err}");
+}
+
+// ---------------------------------------------------------------- 并发对抗
+
+/// 余额的字节形状：十进制 ASCII。CAS 只比字节相等，不需要可排序。
+fn amt(n: u32) -> Vec<u8> {
+    n.to_string().into_bytes()
+}
+
+/// 无条件写 —— 建数据用（带条件的写对不存在的行必然 `EAGAIN`）。
+fn set_raw(key: &str, n: u32) -> Op {
+    Op::RowPut {
+        table: b"bal".to_vec(),
+        key: key.as_bytes().to_vec(),
+        cols: vec![amt(n)],
+        flags: 0,
+        cond_col: COND_NONE,
+        cond_val: Vec::new(),
+    }
+}
+
+/// 带 CAS 的写：要求这一列当前恰好是 `expect`。
+fn set_cas(key: &str, n: u32, expect: u32) -> Op {
+    Op::RowPut {
+        table: b"bal".to_vec(),
+        key: key.as_bytes().to_vec(),
+        cols: vec![amt(n)],
+        flags: 0,
+        cond_col: 0,
+        cond_val: amt(expect),
+    }
+}
+
+fn row_get(key: &str) -> Op {
+    Op::RowGet {
+        table: b"bal".to_vec(),
+        key: key.as_bytes().to_vec(),
+    }
+}
+
+/// 期望成功的那类调用（建表、初始化）。失败时把 op 与 errno 一起打出来。
+fn must(c: &mut Client, op: &Op) -> Reply {
+    match c.call(op) {
+        Ok(Reply::Err { code, msg }) => panic!(
+            "{op:?} → errno {code} ({})",
+            String::from_utf8_lossy(&msg)
+        ),
+        Ok(r) => r,
+        Err(e) => panic!("{op:?} → transport error: {e}"),
+    }
+}
+
+fn one_row(r: &Reply) -> u32 {
+    match r {
+        Reply::Row(Some(rec)) => String::from_utf8_lossy(&rec.cols[0])
+            .parse()
+            .unwrap_or_else(|e| panic!("余额不是十进制: {e}")),
+        other => panic!("RowGet → {other:?}"),
+    }
+}
+
+/// 用**一条只读批**读回一对余额。
+///
+/// 「没有半批可见」的可执行定义就是：任何一次采样都满足 `a + b == total`。
+/// 只读批在同一次锁持有期内翻译两条 `RowGet`（apply.rs 的纯读批分支），所以
+/// 它拿到的是一个切面，而不是两个各取各的时刻。
+fn read_pair(c: &mut Client) -> (u32, u32) {
+    match must(c, &batch(vec![row_get("A"), row_get("B")])) {
+        Reply::Batch { replies } => {
+            assert_eq!(replies.len(), 2);
+            (one_row(&replies[0]), one_row(&replies[1]))
+        }
+        other => panic!("只读批 → {other:?}"),
+    }
+}
+
+/// 原子性的两本账：`(seq, writes_total)`。
+fn seq_writes(c: &mut Client) -> (u64, u64) {
+    match must(c, &Op::Stats) {
+        Reply::Stats(s) => (s.seq, s.writes_total),
+        other => panic!("Stats → {other:?}"),
+    }
+}
+
+/// 建 `bal(amt)`，把 `total` 全压在 A 上，返回落盘后的账本基准。
+fn setup_bal(srv: &Server, total: u32) -> (u64, u64) {
+    let mut c = srv.client();
+    must(
+        &mut c,
+        &Op::TableCreate {
+            def: TableDef {
+                name: b"bal".to_vec(),
+                columns: vec![ColumnDef {
+                    name: b"amt".to_vec(),
+                    flags: 0,
+                }],
+            },
+        },
+    );
+    must(&mut c, &set_raw("A", total));
+    must(&mut c, &set_raw("B", 0));
+    seq_writes(&mut c)
+}
+
+/// 一笔转账 = 一条批 = 两个 CAS。`EAGAIN` 是乐观锁的正常代价，不是错误。
+fn send_one(c: &mut Client, retries: &AtomicUsize) -> bool {
+    let (a, b) = read_pair(c);
+    assert!(a > 0, "本线程还有该转的额度，A 却已空 —— 钱被凭空造出来了");
+    match c
+        .call(&batch(vec![set_cas("A", a - 1, a), set_cas("B", b + 1, b)]))
+        .expect("transport")
+    {
+        Reply::Batch { replies } => {
+            assert_eq!(replies.len(), 2);
+            assert!(
+                replies.iter().all(|x| matches!(x, Reply::Row(Some(_)))),
+                "批成功却有条目失败：{replies:?}"
+            );
+            true
+        }
+        Reply::Err { code, .. } if code == errno::EAGAIN => {
+            retries.fetch_add(1, Ordering::Relaxed);
+            false
+        }
+        other => panic!("转账批 → {other:?}"),
+    }
+}
+
+/// N 个连接在同一对行上做乐观锁转账：钱不许多不许少，旁观者不许看到半批，
+/// 账本上必须恰好「一笔转账 = 一条 WAL 记录」。
+///
+/// 前面四节都在线程 0 里跑，加在一起也证明不了一件事：**批与批之间的互斥靠
+/// 的是那把写锁，不是运气**。若 `translate` 与 `apply` 之间让出过锁，两个转账
+/// 批会各自基于同一份旧余额做预演，后落地的那笔把前一笔覆盖掉 —— 经典的丢失
+/// 更新。它从统计上看不出来（`seq` 照样 +2、`writes_total` 照样 +2），只有
+/// `(a, b)` 的和会少一块，所以断言必须落在钱上、并且要有独立采样者。
+#[test]
+fn contended_cas_batches_never_lose_a_transfer() {
+    const THREADS: usize = 4;
+    const PER: usize = 40;
+    const TOTAL: u32 = (THREADS * PER) as u32;
+    /// 单笔转账的重试上限：撞满说明活锁，而不是慢。
+    const ATTEMPTS: usize = 50_000;
+
+    // 两种前端形状各跑一遍：`workers=1` 时读写都排在主线程的事件循环里，
+    // `workers=8` 时只读批被派到 worker 线程、与提交线程并行。只测一种，
+    // 另一种就是裸奔（§11 第 7 条）。
+    for workers in [1usize, 8] {
+        let srv = Server::start_workers("group", workers);
+        let (seq0, writes0) = setup_bal(&srv, TOTAL);
+        let done = AtomicBool::new(false);
+        let torn = AtomicUsize::new(0);
+        let retries = AtomicUsize::new(0);
+
+        std::thread::scope(|sc| {
+            let watch = sc.spawn(|| {
+                let mut c = srv.client();
+                while !done.load(Ordering::Relaxed) {
+                    let (a, b) = read_pair(&mut c);
+                    if a + b != TOTAL {
+                        torn.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            });
+            let sends: Vec<_> = (0..THREADS)
+                .map(|_| {
+                    sc.spawn(|| {
+                        let mut c = srv.client();
+                        for _ in 0..PER {
+                            let mut moved = false;
+                            for _ in 0..ATTEMPTS {
+                                if send_one(&mut c, &retries) {
+                                    moved = true;
+                                    break;
+                                }
+                            }
+                            assert!(moved, "workers={workers}：重试 {ATTEMPTS} 次仍转不出去，活锁");
+                        }
+                    })
+                })
+                .collect();
+            for h in sends {
+                h.join().unwrap();
+            }
+            done.store(true, Ordering::Relaxed);
+            watch.join().unwrap();
+        });
+
+        let mut c = srv.client();
+        let (a, b) = read_pair(&mut c);
+        assert_eq!(
+            (a, b),
+            (0, TOTAL),
+            "workers={workers}：转账数恰好等于总额度，A 必须清零、B 必须收满"
+        );
+        let (seq1, writes1) = seq_writes(&mut c);
+        assert_eq!(
+            seq1 - seq0,
+            TOTAL as u64,
+            "workers={workers}：{TOTAL} 笔转账必须恰好 {TOTAL} 条 WAL 记录，一条不多一条不少"
+        );
+        assert_eq!(
+            writes1 - writes0,
+            TOTAL as u64,
+            "workers={workers}：被 `EAGAIN` 拒掉的批一个字段都不许改，也就一进不了写账"
+        );
+        assert_eq!(torn.load(Ordering::Relaxed), 0, "workers={workers}：旁观者看到过半批");
+        // 一次冲突都没有，说明这压根不是竞争负载，前面那几条断言就只是重言式。
+        assert!(
+            retries.load(Ordering::Relaxed) > 0,
+            "workers={workers}：没有一次 CAS 冲突，用例退化成了串行跑"
+        );
+    }
+}
+
+/// 8 个连接对同一个不存在的键抢 `PUT_IF_ABSENT`：恰好一个成功，其余 `EEXIST`，
+/// 落盘的是赢家那一份。
+///
+/// 这条要防的是「存在性检查与写入之间让出了锁」：那样会有两个连接都看到键
+/// 不在、都产出一条 `PutRow`，后写的静默覆盖先写的 —— 而 `PUT_IF_ABSENT` 的全部
+/// 承诺就是「创建者唯一」。和丢失更新一样，`seq` 与 `writes_total` 都会 +2，
+/// 只有值本身与创建者计数能揭穿它。
+#[test]
+fn contended_put_if_absent_elects_exactly_one_winner() {
+    const RACERS: usize = 8;
+    let srv = Server::start_workers("group", 4);
+    let mut c = srv.client();
+    must(
+        &mut c,
+        &Op::TableCreate {
+            def: TableDef {
+                name: b"bal".to_vec(),
+                columns: vec![ColumnDef {
+                    name: b"amt".to_vec(),
+                    flags: 0,
+                }],
+            },
+        },
+    );
+    let (seq0, writes0) = seq_writes(&mut c);
+
+    let winner = AtomicUsize::new(usize::MAX);
+    let created = AtomicUsize::new(0);
+    let clashed = AtomicUsize::new(0);
+    let go = AtomicBool::new(false);
+
+    std::thread::scope(|sc| {
+        // 线程要按值搬走 `i`，共享的那几个就得先借出来再 `move`，否则 `move`
+        // 会试图把 `Server` 与几个原子量整个搬进每一个闭包。
+        let (srv, go, winner, created, clashed) = (&srv, &go, &winner, &created, &clashed);
+        let racer: Vec<_> = (0..RACERS)
+            .map(|i| {
+                sc.spawn(move || {
+                    let mut c = srv.client();
+                    // 都连上再同时发车：一边连一边写的话，先连的那个早就写完了。
+                    while !go.load(Ordering::Acquire) {
+                        std::hint::spin_loop();
+                    }
+                    match c
+                        .call(&Op::RowPut {
+                            table: b"bal".to_vec(),
+                            key: b"k".to_vec(),
+                            cols: vec![amt(i as u32)],
+                            flags: PUT_IF_ABSENT,
+                            cond_col: COND_NONE,
+                            cond_val: Vec::new(),
+                        })
+                        .expect("transport")
+                    {
+                        Reply::Row(Some(_)) => {
+                            assert_eq!(
+                                winner.swap(i, Ordering::SeqCst),
+                                usize::MAX,
+                                "两个连接都声称自己是创建者"
+                            );
+                            created.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Reply::Err { code, .. } if code == errno::EEXIST => {
+                            clashed.fetch_add(1, Ordering::Relaxed);
+                        }
+                        other => panic!("PUT_IF_ABSENT → {other:?}"),
+                    }
+                })
+            })
+            .collect();
+        go.store(true, Ordering::Release);
+        for h in racer {
+            h.join().unwrap();
+        }
+    });
+
+    let mut c = srv.client();
+    let won = winner.load(Ordering::SeqCst);
+    assert_eq!(created.load(Ordering::Relaxed), 1, "{RACERS} 个抢同一个键，赢家必须恰好一个");
+    assert_eq!(
+        clashed.load(Ordering::Relaxed),
+        RACERS - 1,
+        "其余都要按 `EEXIST` 被拒，不能静默成功"
+    );
+    match must(&mut c, &row_get("k")) {
+        Reply::Row(Some(rec)) => assert_eq!(
+            rec.cols[0],
+            amt(won as u32),
+            "落盘的值必须是赢家那一份，不能是被后来者覆盖后的任意一份"
+        ),
+        other => panic!("RowGet → {other:?}"),
+    }
+    let (seq1, writes1) = seq_writes(&mut c);
+    assert_eq!(seq1 - seq0, 1, "{RACERS} 个请求只该有一条记录落地");
+    assert_eq!(writes1 - writes0, 1, "被拒的那一些不许进 writes_total");
 }

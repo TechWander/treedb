@@ -65,7 +65,7 @@ treedb-cli — 通用表与引擎状态的人工操作入口（非交互子命�
 行：
   row get <t> <key>                                       RowGet
   row put <t> <key> <c0> <c1>… [--if-absent|--if-exists]
-          [--cond-col C --cond-val V]                     RowPut；C 写 pk / 0 基序号 / 列名
+          [--cond-col C --cond-val V]                     RowPut；C 是 0 基序号 / 列名（不能 pk）
   row del <t> <key> [--if-exists] [--cond-col C --cond-val V]  RowDelete
   row del-range <t> [--col C] [--lo A] [--hi B] [--max N]  RowRangeDelete → 报实际删除数
   row list <t> [--col C] [--eq V] [--after K] [--limit N]  RowList（limit 0 = 引擎默认页宽 1000）

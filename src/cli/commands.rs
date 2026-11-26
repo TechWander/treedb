@@ -372,6 +372,13 @@ fn get_num<T: std::str::FromStr>(
 }
 
 /// 条件对：`--cond-col` 可以给列名，此时要先查表形。
+///
+/// `pk` 这一档必须在这里当场拒掉，不能递给引擎去决定：编码层里 [`ROW_PK`] 与
+/// [`COND_NONE`] 是同一个数（`u32::MAX`），而引擎的条件闸门写的是
+/// `if cond_col != COND_NONE` —— 递过去的 `pk` 走的是「没有条件」那一条分支，
+/// `--cond-val` 整个被忽略，一句本该 CAS 的覆盖写就静默成了裸写。主键 CAS 本身
+/// 也是空命题（行就是按主键寻址的，比较 `key == key` 恒真），所以正确出口只有报错：
+/// 存在性用 `--if-exists`/`--if-absent`，值用列序号或列名。
 fn read_cond(
     ctx: &mut Ctx,
     table: &[u8],
@@ -387,6 +394,14 @@ fn read_cond(
         return Err(usage(ctx, "--cond-val needs a value"));
     }
     let spec = parse_col_spec(&spec).map_err(|e| usage(ctx, &e))?;
+    if matches!(spec, ColSpec::Pk) {
+        return Err(usage(
+            ctx,
+            "--cond-col cannot be pk: ROW_PK and COND_NONE are the same value, so the \
+             engine reads it as \"no condition\" and writes unconditionally. Name a column \
+             (index or name) for CAS, or use --if-exists / --if-absent for existence",
+        ));
+    }
     let col = resolve_col(ctx, table, &spec)?;
     let val = match get_val(flags, "cond-val") {
         Some(v) => value::parse_value(&v).map_err(|e| usage(ctx, &e))?,
@@ -610,7 +625,7 @@ fn table_desc(ctx: &mut Ctx, args: &[String]) -> i32 {
     }
     let _ = writeln!(
         ctx.out,
-        "  pk  {:<20} ROW_PK = 主键本身（按字节序），与任何列无关",
+        "  pk  {:<20} ROW_PK = 主键本身（按字节序）；--col 可用，--cond-col 不可（与 COND_NONE 同值）",
         "(key)"
     );
     EX_OK
@@ -2324,6 +2339,42 @@ mod tests {
         // 没建索引的列也一样要拒 —— 退化成全表扫是把成本藏起来。
         assert_eq!(h.run(&["row", "count", "people", "--col", "0", "--eq", "alice"]), EX_ENGINE);
         assert!(h.err().contains("not indexed"), "{}", h.err());
+    }
+
+    /// 第四条同形坑：`--col pk` 合法，`--cond-col pk` 必须报错。两者差一个词，而后者
+    /// 在编码层里与「不带条件」是同一个数（`ROW_PK == COND_NONE == u32::MAX`），递进引擎
+    /// 会绕过条件闸门 —— 一句本该 CAS 的覆盖写会静默真的写下去，一句本该 CAS 的删除会
+    /// 静默删掉一个不相干的行。这里同时钉住「报错」与「一个字节没动」，只钉前者
+    /// 不够：退回到「递 COND_NONE」也能拿到用法错以外的任意形状。
+    #[test]
+    fn a_pk_cond_col_is_rejected_not_silently_unconditional() {
+        let mut h = H::open();
+        h.seed();
+        // 对照组：不带条件的写法确实会写（否则下面的「没动」是假的）。
+        assert_eq!(h.run(&["row", "put", "people", "alice", "alice", "77"]), EX_OK);
+        h.drain();
+        for argv in [
+            // `pk` 与 `-1` 在 `parse_col_spec` 里是同一档。
+            vec!["row", "put", "people", "alice", "alice", "99", "--cond-col", "pk", "--cond-val", "alice"],
+            vec!["row", "put", "people", "alice", "alice", "99", "--cond-col", "-1", "--cond-val", "alice"],
+            // 删除也一样：这一句如果递出去，alice 会被真的删掉。
+            vec!["row", "del", "people", "alice", "--cond-col", "pk", "--cond-val", "alice"],
+            // 批里的子 op 走同一个 `read_cond`，不能绕过这道闸门。
+            vec!["batch", "row put people alice alice 99 --cond-col pk --cond-val alice"],
+        ] {
+            assert_eq!(h.run(&argv), EX_USAGE, "{argv:?} -> {}", h.err());
+            let (_, e) = h.drain();
+            assert!(e.contains("cannot be pk"), "{argv:?} -> {e}");
+        }
+        // 一个字节都没动：那一句 77 还在，且 alice 还活着。
+        let o = h.ok(&["row", "get", "people", "alice"]);
+        assert!(o.contains("77"), "{o}");
+        // 列序号与列名依旧可用 —— 这一条拒的是 `pk`，不是整个条件位。
+        assert_eq!(
+            h.run(&["row", "put", "people", "alice", "alice", "99", "--cond-col", "1", "--cond-val", "30"]),
+            EX_ENGINE
+        );
+        assert!(h.err().contains("EAGAIN"), "{}", h.err());
     }
 
     /// 默认表只吃掉「真的是表名」的那个参数（`split_table` 由引擎裁定）。

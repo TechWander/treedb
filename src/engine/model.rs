@@ -295,9 +295,18 @@ pub const MAX_TABLE_ITEMS: usize = 1_000_000;
 /// `Batch` 多出来的是跨 op 的可见性与原子性，不是吞吐。
 pub const MAX_BATCH_OPS: usize = 64;
 
-/// `RowList` / `RowCount` 的 `column` 保留值：按主键序遍历全表，`value` 忽略。
+/// `RowList` / `RowCount` / `RowRange` / `RowRangeDelete` 的 `column` 保留值：按主键序
+/// 遍历全表，`value` 忽略。
+///
+/// **它和 [`COND_NONE`] 是同一个数**，这不是疏忽，而是 `cond_col` 那一档根本不该写它：
+/// 引擎的条件闸门是 `if cond_col != COND_NONE`（`apply.rs`），所以把 `ROW_PK` 当条件列
+/// 递进来会走「无条件」那一条分支，`cond_val` 整个被忽略 —— 一句本该 CAS 的写会静默
+/// 变成裸写。主键 CAS 本身也是空命题（行就是按主键寻址的，比较 `key == key` 恒真），
+/// 因此这条不打算修成一种新语义，而是在 [`crate::cli`] 那一侧直接拒掉（DESIGN §5.4）。
 pub const ROW_PK: u32 = u32::MAX;
 /// `RowPut` / `RowDelete` 的 `cond_col` 保留值：不带条件。
+///
+/// 只能取这一个值 —— 见 [`ROW_PK`] 末段那条同值警告。
 pub const COND_NONE: u32 = u32::MAX;
 
 /// `RowPut` 的 flags。两者同时给是客户端的错，按 `EINVAL` 拒。

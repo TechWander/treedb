@@ -244,6 +244,16 @@ fn main() {
         let _ = std::fs::write(p, std::process::id().to_string());
     }
 
+    // banner 里的落盘档得自己多说一句。`always` 读起来像「每个 op 一次 fsync」，而实现
+    // 与 `group` 共用同一个落盘点（§7.9：按连接串 fsync 不给已 ack 的写增加任何持久性），
+    // 只打一个档名会让运维以为拿到了比默认更强的保证；`never` 反过来容易被当成一种
+    // 普通的生产选项，而它是测试/基准专用。拼错的档名在 `parse_durability` 里已经 die。
+    let dur_banner = match durability.as_str() {
+        "always" => "always (same fsync point as group; acked writes are durable)",
+        "never" => "never (NO fsync on the commit path; acked writes can be lost; test/bench only)",
+        other => other,
+    }
+    .to_string();
     let cfg = ServerConfig {
         listen: addr,
         dir: dir.clone(),
@@ -270,7 +280,7 @@ fn main() {
         addr,
         dir.display(),
         PROTOCOL_VERSION,
-        durability,
+        dur_banner,
         backlog,
         if max_conn == 0 { "unlimited".to_string() } else { max_conn.to_string() },
         workers,
