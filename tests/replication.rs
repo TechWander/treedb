@@ -291,6 +291,11 @@ fn a_replica_hands_shakes_with_an_authenticated_primary() {
     assert_eq!(p.lag, 0);
     assert!(p.connected, "握过手的副本才算连上");
     assert_eq!(p.errors, 0, "对密钥不该抬 errors：{p:?}");
+    // 不只是「认证过了」：这一条线传的是主的全量状态（SnapFetch/WalFetch），
+    // 明文等于把整棵树挂在网络上。`connected` 与 `secure` 分开计数，就是为了让
+    // 「连上了但没加密」能被抓出来，而不是被当成同一个意思。
+    assert!(p.secure, "带密钥的副本线必须已切到记录层：{p:?}");
+    assert!(p.secure_records > 0, "一条记录都没发出 = 它其实没在加密跑：{p:?}");
     // 内容与非认证副本同构：握手只建立身份，不改传送的任何字节。
     assert_eq!(lookup(&mut eng, vid, "f0").uid, 1000);
     assert_eq!(lookup(&mut eng, vid, "f19").uid, 1019);
@@ -315,6 +320,31 @@ fn a_replica_hands_shakes_with_an_authenticated_primary() {
         Reply::Views(_) => {}
         other => panic!("副本仍该答读：{other:?}"),
     }
+}
+
+/// 副本线故意不走记录层（`ReplicaCfg::secure = false`）：认证仍然成立，但字节
+/// 是明文。这一条是给 `benches/secure_cost.sh` 的对照臂兜底的 —— 那个脚本要量
+/// 「加密开着与没开」的代价差，如果这个开关其实不生效（照发 `SecureBegin`），
+/// 两臂量的是同一个东西，差值恒等于 0 并会被读成「加密几乎不要钱」。
+#[test]
+fn a_replica_can_keep_the_line_plaintext_on_purpose() {
+    let srv = Server::start_auth("group", 4);
+    let vid = seed_primary(&srv, "rplain", 20);
+
+    let (_tmp, dir) = read_only_dir("rep-auth-plain");
+    let mut eng = replica(&dir);
+    let mut cfg = fcfg(&srv.addr, 1, 1 << 20);
+    cfg.auth = Some(Arc::new(test_key()));
+    cfg.secure = false;
+    let mut f = Follower::new(cfg);
+    let p = converge(&mut f, &mut eng, &srv.log_text());
+    assert_eq!(p.lag, 0);
+    assert!(p.connected, "不加密也算连上：那道闸门只问密钥");
+    assert!(!p.secure, "显式 secure = false 却切到了记录层：{p:?}");
+    assert_eq!(p.secure_records, 0, "一个记录都不该发出去：{p:?}");
+    // 内容与加密那一臂逐字段相同：这个开关只改字节形状，不改任何语义。
+    assert_eq!(lookup(&mut eng, vid, "f0").uid, 1000);
+    assert_eq!(lookup(&mut eng, vid, "f19").uid, 1019);
 }
 
 /// 主被 kill -9 之后，副本不退出、不报错，且继续用已有状态答读。

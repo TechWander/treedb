@@ -134,6 +134,29 @@ impl Server {
         s
     }
 
+    /// 认证服务端 + 额外 flag（`--require-secure` 这类）。
+    ///
+    /// 不能只走 [`Server::start_extra`]：那个入口 `auth = None`，而
+    /// `--require-secure` 在参数阶段就要求有密钥（记录密钥从握手派生），
+    /// 报出来的是用法错误而不是被测行为。
+    pub fn start_auth_extra(durability: &str, workers: usize, extra: &[&str]) -> Server {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("data");
+        let key = test_key();
+        let s = Server::spawn_extra(
+            tmp,
+            dir,
+            free_addr(),
+            durability,
+            4096,
+            workers,
+            Some(key),
+            extra,
+        );
+        s.wait_ready();
+        s
+    }
+
     /// 同上，但显式指定 `--backlog`：万级连接风暴用例需要把它拉大。
     pub fn start_backlog(durability: &str, backlog: i32) -> Server {
         let tmp = tempfile::tempdir().expect("tempdir");

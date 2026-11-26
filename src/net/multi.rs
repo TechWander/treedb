@@ -121,6 +121,10 @@ struct WorkerCfg {
     max_conn: usize,
     /// 接入认证密钥（§4.4）。`None` = 不认证，与 `ServerConfig::auth` 同语义。
     auth: Option<Arc<crate::net::auth::Key>>,
+    /// 要求记录层（§4.5），与 `ServerConfig::require_secure` 同语义。
+    ///
+    /// worker 必须拿到它：闸门在 worker 手里，`allows_data()` 的判据也在它手里。
+    require_secure: bool,
 }
 
 /// 起 `cfg.workers` 条前端线程，当前线程当 committer。
@@ -162,6 +166,7 @@ pub(crate) fn serve(
             sync_ms: cfg.sync_ms,
             max_conn: cfg.max_conn,
             auth: cfg.auth.clone(),
+            require_secure: cfg.require_secure,
         };
         let (st, oc, fl, ct, er, mi, mo, dd) = (
             state.clone(),
@@ -352,7 +357,7 @@ fn worker_loop(
                             }
                             let id = next_id;
                             next_id += 1;
-                            let c = Conn::new(stream, id);
+                            let c = Conn::new(stream, id, w.require_secure);
                             let nfd = c.fd;
                             epoll_set(ep, nfd, false)?;
                             by_id.insert(id, nfd);
@@ -397,7 +402,13 @@ fn worker_loop(
                             // 只能拿 EAGAIN 的 recvfrom（电平触发不会丢数据）。
                             Ok(m) => {
                                 let full = m == buf.len();
-                                c.rx.extend(&buf[..m]);
+                                // 同 serve_single：记录层开着时先过会话再进 `rx`。
+                                // 切点、停放、验不过就关连接，三件都在 `Conn::absorb` 里，
+                                // 两条循环共用同一份判据。
+                                if !c.absorb(&buf[..m]) {
+                                    eof = true;
+                                    break;
+                                }
                                 if !full {
                                     break;
                                 }
@@ -538,6 +549,10 @@ fn worker_loop(
                                 c.out.push_back(Slot::Filled(reply_frame(r)));
                             }
                         }
+                        // 刚答完的如果是 `SecureOk`，把记录层切点排到它后面。
+                        // 这一档比单线程更要紧：这里的 `out` 经常含 `Await`
+                        // （已转发、committer 未回话），切点只能按队列位置算。
+                        c.queue_secure_cut();
                     }
                 }
             }

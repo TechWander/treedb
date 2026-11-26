@@ -24,6 +24,29 @@ use treedb::net::client::Client;
 
 static ERRORS: AtomicU64 = AtomicU64::new(0);
 
+/// `--no-secure` 的落点：认证照跑，但不进记录层。
+///
+/// 放进程级而不是 `Args` 里：建连入口有十六处，其中 `setup_row_table` 与各工作
+/// 线程闭包只拿得到 `(addr, auth)`，为这一个开关把 bool 透传到每一处会让每个
+/// 辅助签名都变脏（本二进制已有同样的先例：`ERRORS`）。
+static NO_SECURE: AtomicBool = AtomicBool::new(false);
+
+/// 建连的唯一入口 —— A/B 只需要翻 `NO_SECURE` 一个位，两边跑的是同一份代码。
+///
+/// 不加密那一臂走 [`Client::connect_auth_plain`]：服务端没开 `--require-secure`
+/// 时它是一条止于握手的明文认证连接，正是 §4.5 记录层代价实测要的对照臂。
+fn conn(
+    addr: &str,
+    timeout_ms: u64,
+    auth: Option<&treedb::net::auth::Key>,
+) -> treedb::error::Result<Client> {
+    if NO_SECURE.load(Ordering::Relaxed) {
+        Client::connect_auth_plain(addr, timeout_ms, auth)
+    } else {
+        Client::connect_auth(addr, timeout_ms, auth)
+    }
+}
+
 struct Args {
     addr: String,
     op: String,
@@ -105,6 +128,7 @@ fn parse() -> Args {
             "--cycles" => args.cycles = next(&mut i).parse().unwrap_or(3),
             "--sample-ms" => args.sample_ms = next(&mut i).parse().unwrap_or(0),
             "--hold" => args.hold = true,
+            "--no-secure" => NO_SECURE.store(true, Ordering::Relaxed),
             "--auth-key-file" => {
                 let p = next(&mut i);
                 match treedb::net::auth::Key::load(std::path::Path::new(&p)) {
@@ -196,7 +220,7 @@ fn row_table_def() -> TableDef {
 /// `EINVAL`，而那时报出来的错在压测输出里只是一行 `errors=NNN`，查起来要绕
 /// 一大圈。形状不同就在建连阶段直接退出并说清差异。
 fn setup_row_table(addr: &str, auth: Option<&treedb::net::auth::Key>) {
-    let mut c = Client::connect_auth(addr, 3000, auth).expect("connect for table setup");
+    let mut c = conn(addr, 3000, auth).expect("connect for table setup");
     match c.call(&Op::TableCreate { def: row_table_def() }) {
         Ok(Reply::Table(Some(_))) => {}
         Ok(Reply::Err { code, .. }) if code == errno::EEXIST => {
@@ -374,7 +398,7 @@ fn start_bulk_sampler(args: &Args) -> Option<BulkSampler> {
     if args.sample_ms == 0 {
         return None;
     }
-    let mut c = Client::connect_auth(&args.addr, 3000, args.auth.as_deref())
+    let mut c = conn(&args.addr, 3000, args.auth.as_deref())
         .expect("bulk sampler conn");
     let interval = Duration::from_millis(args.sample_ms);
     let stop = std::sync::Arc::new(AtomicBool::new(false));
@@ -415,7 +439,7 @@ fn run_churn_phases(
     let active = conns.min(widest.max(1));
     let mut clients: Vec<Client> = (0..active)
         .map(|_| {
-            Client::connect_auth(&args.addr, 3000, args.auth.as_deref()).expect("churn conn")
+            conn(&args.addr, 3000, args.auth.as_deref()).expect("churn conn")
         })
         .collect();
     let barrier = std::sync::Barrier::new(active);
@@ -504,7 +528,7 @@ fn rows_of(c: &mut Client) -> u64 {
 /// 终态与调用前逐字段相同，但 WAL 多两条记录；联合量具随后直接 SIGKILL，
 /// 用来证明「快照 + 已 ack 尾巴」确实走完了恢复，而不是靠优雅停服替它收口。
 fn run_tail(args: &Args) {
-    let mut c = Client::connect_auth(&args.addr, 3000, args.auth.as_deref())
+    let mut c = conn(&args.addr, 3000, args.auth.as_deref())
         .expect("tail control conn");
     let rows_before = rows_of(&mut c);
     let s0 = stats_of(&mut c);
@@ -665,7 +689,7 @@ fn run_posix_seed(args: &Args) {
         eprintln!("posixseed 需要 --rows >= 1");
         std::process::exit(2);
     }
-    let mut c = Client::connect_auth(&args.addr, 3000, args.auth.as_deref())
+    let mut c = conn(&args.addr, 3000, args.auth.as_deref())
         .expect("posixseed control conn");
     match c.call(&Op::CreateView { name: POSIX_VIEW.to_vec() }).expect("CreateView") {
         Reply::View { id: view, root: 1 } => {
@@ -745,7 +769,7 @@ fn run_posix_seed(args: &Args) {
 
 fn run_posix_verify(args: &Args) {
     let n = args.rows;
-    let mut c = Client::connect_auth(&args.addr, 3000, args.auth.as_deref())
+    let mut c = conn(&args.addr, 3000, args.auth.as_deref())
         .expect("posixverify control conn");
     let (view, _) = posix_view(&mut c);
     let s = stats_of(&mut c);
@@ -851,7 +875,7 @@ fn run_mv_seed(args: &Args) {
         std::process::exit(2);
     }
     let mut c =
-        Client::connect_auth(&args.addr, 3000, args.auth.as_deref()).expect("mvseed control conn");
+        conn(&args.addr, 3000, args.auth.as_deref()).expect("mvseed control conn");
     let s0 = stats_of(&mut c);
     if (s0.views, s0.nodes, s0.dentries, s0.locks, s0.refs, s0.tables, s0.rows)
         != (0, 0, 0, 0, 0, 0, 0)
@@ -1050,7 +1074,7 @@ fn run_mixed_views(args: &Args) {
     let conns = args.conns.max(1);
     let gpb = pipe / MIX_GROUP_OPS;
     let mut ctrl =
-        Client::connect_auth(&args.addr, 3000, args.auth.as_deref()).expect("mvmix control conn");
+        conn(&args.addr, 3000, args.auth.as_deref()).expect("mvmix control conn");
     let vids = mv_views(&mut ctrl, nviews as u64);
     let s0 = stats_of(&mut ctrl);
     if (s0.views, s0.nodes, s0.dentries, s0.locks, s0.refs, s0.tables, s0.rows)
@@ -1078,7 +1102,7 @@ fn run_mixed_views(args: &Args) {
         let touched = touched.clone();
         let vids = vids.clone();
         handles.push(std::thread::spawn(move || {
-            let mut c = Client::connect_auth(&a, 3000, auth.as_deref()).expect("mvmix conn");
+            let mut c = conn(&a, 3000, auth.as_deref()).expect("mvmix conn");
             let (mut groups, mut errs) = (0u64, 0u64);
             let (mut lookups, mut dirs, mut creates, mut unlinks) = (0u64, 0u64, 0u64, 0u64);
             let mut lat = Vec::new();
@@ -1301,7 +1325,7 @@ fn run_posix_delete(args: &Args) {
         eprintln!("posixdelete 需要 --rows >= 1");
         std::process::exit(2);
     }
-    let mut ctrl = Client::connect_auth(&args.addr, 3000, args.auth.as_deref())
+    let mut ctrl = conn(&args.addr, 3000, args.auth.as_deref())
         .expect("posixdelete control conn");
     let (view, _) = posix_view(&mut ctrl);
     let s0 = stats_of(&mut ctrl);
@@ -1331,7 +1355,7 @@ fn run_posix_delete(args: &Args) {
         let lo = k * per;
         let hi = (lo + per).min(total as usize);
         handles.push(std::thread::spawn(move || {
-            let mut c = Client::connect_auth(&a, 3000, auth.as_deref()).expect("posix conn");
+            let mut c = conn(&a, 3000, auth.as_deref()).expect("posix conn");
             let (mut done, mut freed, mut errs) = (0u64, 0u64, 0u64);
             let mut lat = Vec::new();
             let mut i = lo;
@@ -1498,7 +1522,7 @@ fn run_bulk(args: &Args) {
     let n = args.rows;
     let bat = if args.batch == 0 { 1000 } else { args.batch };
     let mut ctrl =
-        Client::connect_auth(&args.addr, 3000, args.auth.as_deref()).expect("bulk control conn");
+        conn(&args.addr, 3000, args.auth.as_deref()).expect("bulk control conn");
 
     if args.bulk == "tail" {
         run_tail(args);
@@ -1665,7 +1689,7 @@ fn run_bulk(args: &Args) {
             let lo = k * per;
             let hi = (lo + per).min(total);
             handles.push(std::thread::spawn(move || {
-                let mut c = Client::connect_auth(&a, 3000, auth.as_deref()).expect("bulk conn");
+                let mut c = conn(&a, 3000, auth.as_deref()).expect("bulk conn");
                 let (mut done, mut reported, mut errs) = (0u64, 0u64, 0u64);
                 let mut i = lo;
                 while i < hi {
@@ -1842,7 +1866,7 @@ fn main() {
     // 探活不走 `Client::ping_auth`：它只回 `bool`，能把“对端拒绝降级”与
     // “MAC 不对”与“端口没人听”归成同一个结果，而这三件事的下一步运维动作
     // 完全不同。这里自己跑一次握手 + Ping，把真实错误带进文案。
-    match Client::connect_auth(&args.addr, 3000, args.auth.as_deref())
+    match conn(&args.addr, 3000, args.auth.as_deref())
         .and_then(|mut c| c.call(&Op::Ping))
     {
         Ok(Reply::Pong) => {}
@@ -1871,7 +1895,7 @@ fn main() {
         let t_conn = Instant::now();
         let mut cs: Vec<Client> = Vec::with_capacity(args.conns);
         for _ in 0..args.conns {
-            match Client::connect_auth(&args.addr, 0, args.auth.as_deref()) {
+            match conn(&args.addr, 0, args.auth.as_deref()) {
                 Ok(c) => cs.push(c),
                 Err(e) => {
                     eprintln!("opened {} of {} before failure: {e}", cs.len(), args.conns);
@@ -1929,7 +1953,7 @@ fn main() {
         handles.push(std::thread::spawn(move || {
             let mut cs: Vec<Client> = Vec::with_capacity(per_conn);
             for _ in 0..per_conn {
-                cs.push(Client::connect_auth(&a, 0, auth.as_deref()).expect("connect"));
+                cs.push(conn(&a, 0, auth.as_deref()).expect("connect"));
             }
             // 每线程独占一批视图，避免跨线程名字冲突污染语义。
             //
@@ -2442,6 +2466,10 @@ treedb-bench — 对 treedb-server 打负载
                      服务端必须开着同一把密钥，否则报错退出（客户端
                      fail-closed，不会静默降级成不认证）。与 --hold 合用
                      就是「建连风暴里握手占多少」的口径
+  --no-secure        只在做 A/B 时用：握手照跑，但不进记录层（§4.5 的
+                     `SecureBegin` 那一步不发了）。服务端未开
+                     --require-secure 时才连得上，用途是把「加密开着与
+                     没开」的代价差从同一份代码里量出来
 
 环境变量（只影响基准形状，不动线协议）：
   TREEDB_BENCH_WARM  预热条数 = 被测目录 / 表的规模（默认 500，最小 100）

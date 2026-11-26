@@ -1610,5 +1610,11 @@ pub fn translate(s: &State, now: i64, op: &Op) -> (Vec<Log>, Reply) {
             vec![],
             Reply::err(errno::EINVAL, "handshake op reached the engine (§4.4)"),
         ),
+        // 同上，但文案单独一条：它漏进引擎意味着「闸门已经 Ready 但还没装填
+        // 会话」这一步走飘了，那是记录层的问题，与身份握手不是同一件事。
+        Op::SecureBegin { .. } => (
+            vec![],
+            Reply::err(errno::EINVAL, "secure negotiation op reached the engine (§4.5)"),
+        ),
     }
 }

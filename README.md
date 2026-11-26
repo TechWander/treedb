@@ -18,8 +18,8 @@ cargo build --release                                   # 默认档：依赖只�
 ./target/release/treedb-cli  --addr 127.0.0.1:7777 table list          # 手活：非交互子命令
 ./target/release/treedb-cli  --addr 127.0.0.1:7777 shell                # 或者进 REPL，连接只给一次
 
-cargo test --release                                    # 默认档 288 passed / 0 failed / 3 ignored（引擎本体）
-cargo test --release --features postgres-compat        # 319 passed / 0 failed / 9 ignored（含 PG 过渡档）
+cargo test --release                                    # 默认档 327 passed / 0 failed / 4 ignored（引擎本体）
+cargo test --release --features postgres-compat        # 358 passed / 0 failed / 10 ignored（含 PG 过渡档）
 bash benches/throughput_matrix.sh 3 1 2 3 4 5           # 五轴复现，输出进 benches/results/
 bash benches/sync_ratio.sh 3                           # 写路径机制：一次 fsync 摊了多少写
 bash benches/single_conn.sh 3                          # 单连接对标 PG（$PIPE=32 走批量档、$CONNS/$WORKERS 走并发档）
@@ -265,10 +265,16 @@ head -c 32 /dev/urandom > /etc/treedb/auth.key && chmod 0600 /etc/treedb/auth.ke
 ```
 
 它是共享密钥的双向挑战握手（两次往返，密钥从不上线），**不是 TLS**：只建立身份，
-不建立机密性，也不做授权。带密钥的客户端遇到没开认证的服务端会直接报错退出，
+不做授权。带密钥的客户端遇到没开认证的服务端会直接报错退出，
 不静默降级；反过来不带密钥的客户端面对开了认证的端口，每个数据 op 拿 `EADV`。
 **v8 起版本协商独立于认证且必须成功**：所有正常连接先交换 `VersionBegin` /
 `VersionOk`，旧服务端不认 `0x0092` 时建连直接失败；不认证只省掉后续 CHAP，不省版本闸门。
+**v9 起带密钥的连接默认再切一次加密面**（§4.5）：`SecureBegin`/`SecureOk` 在认证之后
+协商出记录层 —— 自写 ChaCha20-Poly1305，`SecureOk` 之后的每个字节都是 AEAD 记录，
+不再是裸 TCP + 长度前缀。带密钥的正常客户端把降级当建连失败；服务端
+`--require-secure` 把「可选」翻成「必须」，认证过但未加密的连接数据 op 一律
+`EADV`。副本线（`treedb-standby` 对主的 `SnapFetch`/`WalFetch`）有密钥就自动走
+记录层，跨机拉全量状态不再明文。
 
 代价量过了（**v0.7.0 历史读数**，`bash benches/handshake_cost.sh 20000`，20 000 条连接、两臂同轮 A/B
 独立跑 3 次，逐格原始输出 `benches/results/handshake_cost.log`）：常驻内存
@@ -353,10 +359,11 @@ DESIGN.md §7（含 §7.8 那次全五轴复跑）。
 
 ## 接入前必读：没做的（和只做了一半的）五件事
 
-- **认证只管身份，授权与传输加密仍然没有**（§4.4、§8 第 13 条）。v5 起可以
-  `--auth-key-file` 打开一次共享密钥的双向握手，但它默认关、而且过了握手的连接与
-  不开时一样拥有全部 45 个 op 的权限，包括 `Shutdown` 与 `Checkpoint`；握手之后仍是
-  裸 TCP + 长度前缀 + CRC32，而 CRC32 只判损坏。所以「谁能连上 + 谁持有这把密钥」
+- **认证与加密只管「谁连上、线是否被听」，授权矩阵仍然没有**（§4.4、§4.5、§8 第
+  13 条）。v5 起可以 `--auth-key-file` 打开一次共享密钥的双向握手，v9 起带密钥的
+  连接默认把线上字节搬进 AEAD 记录层（`--require-secure` 可强制）；但过了握手的
+  连接（加密与否）与不开时一样拥有全部 46 个 op 的权限，包括 `Shutdown` 与
+  `Checkpoint`，也没有按 op/按视图的权限位。所以「谁能连上 + 谁持有这把密钥」
   = 「谁能改整个状态」，多租户、配额、审计归属必须在引擎之外做（grovefs 的
   apikey + 网关白名单就是这一层），或者把端口锁在回环/私有网段。副本对主那一侧
   能证明「持有密钥」了，`v0.4.0` 起也能认出被提掉权的旧主（`fence`，§6.6）；但
@@ -400,11 +407,11 @@ DESIGN.md §7（含 §7.8 那次全五轴复跑）。
 
 | 路径 | 内容 |
 |------|------|
-| `src/engine/` | 线协议类型（`model.rs`，45 个 op / 24 个 Reply）、帧编码（`codec.rs`）、状态机（`mem.rs`）、应用与定序（`apply.rs`）、WAL/快照（`wal.rs`）、核心（`core.rs`）、WAL 归档与 PITR（`archive.rs`，§6.11）、离线 dump 容器（`dump.rs`，§6.9）、自写的 SHA-256/HMAC（`sha256.rs`，§4.4） |
-| `src/net/` | 单线程事件循环（`server.rs`）、多前端 worker + 唯一提交线程（`multi.rs`）、跨线程信箱（`mail.rs`）、接入认证闸门（`auth.rs`，§4.4）、副本跟踪器（`replicate.rs`）、阻塞客户端（`client.rs`） |
+| `src/engine/` | 线协议类型（`model.rs`，46 个 op / 25 个 Reply）、帧编码（`codec.rs`）、状态机（`mem.rs`）、应用与定序（`apply.rs`）、WAL/快照（`wal.rs`）、核心（`core.rs`）、WAL 归档与 PITR（`archive.rs`，§6.11）、离线 dump 容器（`dump.rs`，§6.9）、自写的 SHA-256/HMAC（`sha256.rs`，§4.4） |
+| `src/net/` | 单线程事件循环（`server.rs`）、多前端 worker + 唯一提交线程（`multi.rs`）、跨线程信箱（`mail.rs`）、接入认证闸门（`auth.rs`，§4.4）、记录层与自写 AEAD 原语（`record.rs` / `chacha20poly1305.rs`，§4.5）、副本跟踪器（`replicate.rs`）、阻塞客户端（`client.rs`） |
 | `src/{pool,store,persist,schema,probe}.rs` | `postgres-compat` 过渡档 |
 | `src/bin/` | `treedb-server` / `treedb-bench` / `treedb-pgbench`（对照工具）/ `treedb-micro`（纯计算 + 分配计数）/ `treedb-migrate`（快照升级）/ `treedb-standby`（只读副本 + `--promote`）/ `treedb-dump` + `treedb-load`（离线逻辑导出与重建）/ `treedb-backup`（在线一致快照）/ `treedb-pitr`（按 seq 恢复到新目录）/ `treedb-cli`（人工操作：子命令 + REPL，实现在 `src/cli/`）/ `treedb-demo` |
-| `tests/` | `engine_crud` `net_protocol` `read_scaling` `replication` `auth` `crash_recovery` `migrate` `dump_restore` `backup_online` `pitr` `batch` `table_alter` `table_bulk` `scale_connections` `independence` `cli`（默认档全部要跑）；`concurrency` 属过渡档 |
+| `tests/` | `engine_crud` `net_protocol` `read_scaling` `replication` `auth` `record` `secure_channel` `crash_recovery` `migrate` `dump_restore` `backup_online` `pitr` `batch` `table_alter` `table_bulk` `scale_connections` `independence` `cli`（默认档全部要跑）；`concurrency` 属过渡档 |
 | `benches/` | 五轴矩阵脚本与历史/复跑原始输出；通用表的九条 `row*` 路径基准在 `bench_rows.sh`（§7.15）、批量形状与同值消除在 `bench_bulk.sh`（§7.16）、多实例写扩展在 `shard_write.sh`（§7.17） |
 | `DESIGN.md` | 选型判据、协议字节布局、语义边界、五轴实测、已知限制、接入路径与下一步 |
 

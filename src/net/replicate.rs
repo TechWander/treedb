@@ -46,6 +46,14 @@ pub struct ReplicaCfg {
     /// 「对端持有这把密钥」：脑裂后的旧主同样持有，照样能应答握手 ——
     /// fencing token 仍然欠着（§11 第 4 条②③）。
     pub auth: Option<Arc<Key>>,
+    /// 有密钥时要不要顺手把记录层也协商上（§4.5）。默认 `true`，
+    /// 也就是“副本线上传真字节时不走明文”。
+    ///
+    /// 只有一个正当用途：与 `auth` 合用把「加密开着与没开」的代价差从
+    /// 同一条 `SnapFetch` 路径上量出来（`benches/secure_cost.sh`）。开着认证的
+    /// 主不拒绝它（那是 `require_secure` 的活），但调用方需知道自己正在
+    /// 把快照字节放到明文线上。
+    pub secure: bool,
 }
 
 impl ReplicaCfg {
@@ -61,6 +69,7 @@ impl ReplicaCfg {
             max_bytes: 1 << 20,
             timeout_ms: 5_000,
             auth: None,
+            secure: true,
         }
     }
 }
@@ -216,7 +225,14 @@ impl Follower {
                 let _ = s.set_nodelay(true);
                 let _ = s.set_read_timeout(Some(dur));
                 let _ = s.set_write_timeout(Some(dur));
-                Client::from_stream_auth(s, self.cfg.auth.as_deref()).map_err(|e| e.to_string())
+                // `secure = false` 只给 A/B 用（字段注释），它走的是同一个
+                // 握手，只是不发 `SecureBegin`。
+                let r = if self.cfg.secure {
+                    Client::from_stream_auth(s, self.cfg.auth.as_deref())
+                } else {
+                    Client::from_stream_auth_plain(s, self.cfg.auth.as_deref())
+                };
+                r.map_err(|e| e.to_string())
             }
         };
         match built {
@@ -619,6 +635,12 @@ impl Follower {
             snap_reused: self.snap_reused,
             snap_restarts: self.snap_restarts,
             snap_probes: self.snap_probes,
+            secure: self.client.as_ref().map(|c| c.is_secure()).unwrap_or(false),
+            secure_records: self
+                .client
+                .as_ref()
+                .map(|c| c.secure_records_sent())
+                .unwrap_or(0),
         }
     }
 
@@ -656,6 +678,13 @@ pub struct FollowerProgress {
     pub snap_reused: u64,
     pub snap_restarts: u64,
     pub snap_probes: u64,
+    /// 副本线现在是不是密文，以及本端已发出去几条记录。
+    ///
+    /// 它们是为了让「副本线也加密了」这句话能被断言而不是被相信：主启用了认证
+    /// 且副本没显式 `secure = false` 时，握手必然带记录层；`secure = false` 就
+    /// 意味着这一条线在明文跑。跟 `snap_*` 一样不进 `Stats`：那会改线协议。
+    pub secure: bool,
+    pub secure_records: u64,
 }
 
 #[cfg(test)]

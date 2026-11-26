@@ -9,6 +9,7 @@ use crate::engine::codec::Rd;
 use crate::engine::{encode_frame, Op, Reply, RxBuf, FRAME_HDR, MAX_FRAME};
 use crate::error::{Error, Result};
 use crate::net::auth::{self, Key};
+use crate::net::record::Session;
 use std::io::{ErrorKind, Read, Write};
 use std::net::TcpStream;
 use std::time::Duration;
@@ -16,6 +17,9 @@ use std::time::Duration;
 pub struct Client {
     stream: TcpStream,
     rx: RxBuf,
+    /// 记录层（§4.5）。`None` = 这条线还是明文，
+    /// 而 `send`/`recv` 的判据也只有这一个 `is_some`。
+    secure: Option<Session>,
 }
 
 impl Client {
@@ -34,6 +38,7 @@ impl Client {
         Ok(Client {
             stream,
             rx: RxBuf::with_capacity(4096),
+            secure: None,
         })
     }
 
@@ -57,6 +62,7 @@ impl Client {
         Client {
             stream,
             rx: RxBuf::with_capacity(4096),
+            secure: None,
         }
     }
 
@@ -70,6 +76,18 @@ impl Client {
         Ok(c)
     }
 
+    /// [`Client::connect_auth`] 的不加密版：认证照跑，但不进记录层。
+    ///
+    /// 同样是逃生口而不是默认路径（理由见 [`Client::from_stream_auth_plain`]）：
+    /// 代价实测需要「同一台服务端、同一份调用代码，只有加密开关不同」的 A/B，
+    /// 而 `from_stream_*` 要调用方自备 socket（压测不会为了一个 flag 去接管
+    /// socket 的调优）。服务端不 `--require-secure` 时这条线能正常拉起来。
+    pub fn connect_auth_plain(addr: &str, timeout_ms: u64, key: Option<&Key>) -> Result<Client> {
+        let mut c = Client::connect_raw(addr, timeout_ms)?;
+        auth::handshake_plain(&mut c, key)?;
+        Ok(c)
+    }
+
     /// [`Client::from_stream`] 的握手版：自己调好 socket 之后也能协商版本并按需认证。
     ///
     /// `key = None` 也会完成版本协商；背压类用例因此既能调小缓冲区，又不会
@@ -77,6 +95,17 @@ impl Client {
     pub fn from_stream_auth(stream: TcpStream, key: Option<&Key>) -> Result<Client> {
         let mut c = Client::from_stream(stream);
         auth::handshake(&mut c, key)?;
+        Ok(c)
+    }
+
+    /// 只跑认证握手、**不**协商记录层（保持明文）。
+    ///
+    /// 这是一个有意保留的逃生口，不是默认路径：它存在的意义是让「加密开着
+    /// 与没开」能在同一份代码上 A/B（`benches/` 的代价实测就要这个对比），
+    /// 以及让跨版本探针能拿明文看线。正常调用方用 [`Client::connect_auth`]。
+    pub fn from_stream_auth_plain(stream: TcpStream, key: Option<&Key>) -> Result<Client> {
+        let mut c = Client::from_stream(stream);
+        auth::handshake_plain(&mut c, key)?;
         Ok(c)
     }
 
@@ -90,9 +119,61 @@ impl Client {
     pub fn send(&mut self, op: &Op) -> Result<()> {
         let mut w = crate::engine::W::new();
         op.encode(&mut w);
+        self.put(&encode_frame(&w.finish()))
+    }
+
+    /// 把一段已经成形的帧字节送上连接。
+    ///
+    /// 切点就是 `self.secure`：它只能由 [`Client::arm_secure`] 在解码完
+    /// `SecureOk` 之后置位，而服务端那侧的切点是「`SecureOk` 排进发送队列之后」。
+    /// 两侧各自看得到同一个位置（都是那一帧的帧尾），所以不会出现一侧已封、
+    /// 另一侧还按明文解。
+    fn put(&mut self, blob: &[u8]) -> Result<()> {
+        if self.secure.is_none() {
+            return self
+                .stream
+                .write_all(blob)
+                .map_err(|e| Error::Io(format!("send: {e}")));
+        }
+        // 密文要多一个局部缓冲：`seal` 得先算完整段才能发（标签在尾部），
+        // 而 `write_all` 需要 `&self.stream`。明文热路径不付这笔钱。
+        let mut sealed = Vec::with_capacity(blob.len() + 32);
+        if !self
+            .secure
+            .as_mut()
+            .expect("secure was just checked")
+            .seal(blob, &mut sealed)
+        {
+            return Err(Error::Io(
+                "record counters exhausted on this connection: reconnect (§4.5)".into(),
+            ));
+        }
         self.stream
-            .write_all(&encode_frame(&w.finish()))
+            .write_all(&sealed)
             .map_err(|e| Error::Io(format!("send: {e}")))
+    }
+
+    /// 启客户端一侧的记录层，并把已经读进来的尾巴（那是记录）交给它。
+    ///
+    /// `recv` 一次能读 8 KiB，所解码完 `SecureOk` 时缓冲里很可能已经多了一段
+    /// 字节。不把它们转给会话，下一轮就会拿密文去当明文帧头。
+    pub(crate) fn arm_secure(&mut self, s: Session) -> Result<()> {
+        let rest = self.rx.take_rest();
+        self.secure = Some(s);
+        if !rest.is_empty() {
+            self.absorb(&rest)?;
+        }
+        Ok(())
+    }
+
+    /// 这条连接现在是不是密文。
+    pub fn is_secure(&self) -> bool {
+        self.secure.is_some()
+    }
+
+    /// 本端已发记录数（代价实测要拿它区分「真加密跑过」与「只是连上了」）。
+    pub fn secure_records_sent(&self) -> u64 {
+        self.secure.as_ref().map(|s| s.sent_records()).unwrap_or(0)
     }
 
     /// 收一个应答帧。内部缓冲里已有的帧优先，避免每次都 read。
@@ -104,9 +185,29 @@ impl Client {
             let mut buf = [0u8; 8192];
             match self.stream.read(&mut buf) {
                 Ok(0) => return Err(Error::Io("server closed".into())),
-                Ok(n) => self.rx.extend(&buf[..n]),
+                Ok(n) => self.absorb(&buf[..n])?,
                 Err(e) if e.kind() == ErrorKind::Interrupted => {}
                 Err(e) => return Err(Error::Io(format!("recv: {e}"))),
+            }
+        }
+    }
+
+    /// 线上字节 → 明文帧：没加密就直接进 `rx`，加密就先验签解密。
+    ///
+    /// 返 `Err` 就是这条连接该丢了：标签验不过意味着两侧已经不在同一个
+    /// 计数器上，继续读只会把乱字节当合法帧解下去（`record` 模块头第 2 条）。
+    fn absorb(&mut self, more: &[u8]) -> Result<()> {
+        match &mut self.secure {
+            None => {
+                self.rx.extend(more);
+                Ok(())
+            }
+            Some(s) => {
+                let mut plain = Vec::with_capacity(more.len());
+                s.feed(more, &mut plain)
+                    .map_err(|e| Error::Denied(format!("{e} (record layer, §4.5)")))?;
+                self.rx.extend(&plain);
+                Ok(())
             }
         }
     }
@@ -119,8 +220,7 @@ impl Client {
             op.encode(&mut w);
             blob.extend_from_slice(&encode_frame(&w.finish()));
         }
-        self.stream
-            .write_all(&blob)
+        self.put(&blob)
             .map_err(|e| Error::Io(format!("pipeline send: {e}")))?;
         let mut out = Vec::with_capacity(ops.len());
         for _ in 0..ops.len() {

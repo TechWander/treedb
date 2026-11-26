@@ -1618,6 +1618,7 @@ fn op_is_control(op: &Op) -> bool {
             | Op::VersionBegin { .. }
             | Op::AuthBegin { .. }
             | Op::AuthFinish { .. }
+            | Op::SecureBegin { .. }
     )
 }
 

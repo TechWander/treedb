@@ -9,11 +9,16 @@
 自己的仓里；本仓唯一与 PostgreSQL 有关的东西是默认关掉的 `postgres-compat` 脚手架，
 而这条约束有测试守着（`tests/independence.rs`，详见 §11 第 7 条）。
 
-**状态**：v0.9.0（2026-11-25）。`v0.9.0` 只长**人工操作面**：一个 `treedb-cli` 二进制加
-一个 `pub mod cli`（非交互子命令 + 自写 REPL，§5.4）。**不新加 op / reply / `Log` 变体，
-`PROTOCOL_VERSION` 仍 8、`SNAP_VERSION` 仍 4、`DUMP_VERSION` 仍 2**，旧数据目录零迁移，
-与 `v0.8.1` 同代；升 minor 而不是补丁号的唯一理由，是库面多了一个公开模块（依赖它的下游
-能看到新符号，看不到任何行为变化）。上一笔 `v0.8.1` 是维护号：它把 `v0.8.0` 之后的三笔（切主
+**状态**：v0.10.0（2026-11-26）。`v0.10.0` 把传输加密——评估列出的三条产品级 blocker 里的
+第二条（§11 第 23 条）——接进线协议：`SecureBegin`/`SecureOk` 两拍在认证之后协商出
+**记录层**（自写 ChaCha20-Poly1305 AEAD，握手后的可选阶段，§4.5），`PROTOCOL_VERSION`
+8→9、op/reply 45/24→46/25，包版本随协议抬到 `0.10.0`。阶段可选，所以降级方向可用
+（不发 `SecureBegin` 的旧客户端对不开 `--require-secure` 的 v9 服务端逐字照旧）；但带密钥的
+正常客户端把降级当建连失败，真正的明文逃生口是显式的 `connect_auth_plain`。
+上一笔 `v0.9.1` 是维护号：`--cond-col pk` 不再静默退化成裸写（§11 第 23 条第 1 项）加两条
+批并发对抗证据，协议与盘上格式零改动；再往前 `v0.9.0` 只长**人工操作面**：一个
+`treedb-cli` 二进制加一个 `pub mod cli`（非交互子命令 + 自写 REPL，§5.4），同样
+**不新加 op / reply / `Log` 变体**（§11 第 22 条）。更早的 `v0.8.1` 是维护号：它把 `v0.8.0` 之后的三笔（切主
 回归、POSIX 级联清锁、万级视图量具）圈进一个钉得住的 tag，**不新加 op / reply /
 `Log` 变体，`PROTOCOL_VERSION` 仍 8**，与 `v0.8.0` 同代（理由见 §11 第 21 条）。
 引擎本体已落地并跑完五轴验收（§7.8 是 2026-11-19 的全轴复跑）；
@@ -184,18 +189,19 @@ op / reply / `Log` 变体，`PROTOCOL_VERSION` 仍 8、`SNAP_VERSION` 仍 4，�
 按「不改写已推引用」的纪律保留现状：Cargo 解析 git 依赖只看 tag/rev 与 lock 里的
 hash，不看这个字段，所以不影响任何构建；`v0.6.0` 是下一次带 API 变更的发版，
 `Cargo.toml` 的 `version` 随它回到 `0.6.0`，两者重新对齐，此后逐版跟齐（`v0.8.0` =
-`0.8.0`、`v0.8.1` = `0.8.1`、`v0.9.0` = `0.9.0`、`v0.9.1` = `0.9.1`）。
+`0.8.0`、`v0.8.1` = `0.8.1`、`v0.9.0` = `0.9.0`、`v0.9.1` = `0.9.1`、`v0.10.0` = `0.10.0`）。
 
-test 现在分两档报（2026-11-26 在本轮交付的树上实跑，含 §5.4 那处 `--cond-col pk` 修复与
-§5.1 那两条并发对抗用例）：默认档（纯引擎）`cargo test --release` = **288 passed / 0 failed / 3 ignored**（107 lib（其中 36 条是 `src/cli`
-自己的单测，§5.4）+ 8 cli +
-36 engine_crud + 14 migrate + 21 replication + 12 net_protocol + 11 pitr + 8 read_scaling
+test 现在分两档报（2026-11-26 在 v0.10.0 交付的树上实跑，含 §4.5 那批记录层套件）：默认档（纯引擎）
+`cargo test --release` = **327 passed / 0 failed / 4 ignored**（131 lib（其中 36 条是 `src/cli`
+自己的单测，§5.4；本轮 lib 新增 24 条 = `record.rs` 12 + `chacha20poly1305.rs` 12）+ 8 cli +
+36 engine_crud + 14 migrate + 22 replication + 12 net_protocol + 11 pitr + 8 read_scaling
 + 7 crash_recovery + 7 delete_storm + 5 mixed_views + 8 batch + 12 table_bulk + 8 auth
 + 5 observe
 + 5 table_alter + 4 dump_restore +
 3 backup_online + 3 independence + 1 large_reply + 1 checkpoint_tail + 1 scale_connections
-+ 1 scale_restore；另 3 条带 `#[ignore]` —— 万级连接、百万节点、64 MiB 快照收尾 ——
-只手动跑，不计入 passed）；`--features postgres-compat` = **319 passed / 0 failed / 9 ignored**，多出的 31 条 = 过渡档自己的 30 条单测 +
++ 1 scale_restore + 8 record + 6 secure_channel；另 4 条带 `#[ignore]` —— 万级连接、
+百万节点、64 MiB 快照收尾、记录层每字节测量 ——
+只手动跑，不计入 passed）；`--features postgres-compat` = **358 passed / 0 failed / 10 ignored**，多出的 31 条 = 过渡档自己的 30 条单测 +
 `concurrency.rs` 里那条
 不需要 PG 的拨号用例（剩下 6 条要真 PG，默认 `#[ignore]`，不计入 passed）。即 PG 只出现在
 `postgres-compat` 后面的 `src/pool`、`src/store`、
@@ -325,7 +331,7 @@ test 现在分两档报（2026-11-26 在本轮交付的树上实跑，含 §5.4 
                                   │            src/net/mail.rs     纯读批次就地算完直接回；
                                   │           （eventfd 信箱）     含写批次整批 ──► 唯一提交线程
                                   │                                 （只有它持 Engine/WAL/stats）
-                                  │  Op/Reply（src/engine/model.rs，45 op / 24 reply）
+                                  │  Op/Reply（src/engine/model.rs，46 op / 25 reply）
                                   ▼
                                   src/engine/core.rs   Engine：apply → WAL → 持久化 → 回包
                                   │  src/engine/apply.rs  语义实现（rename/锁/账本/分页/表约束）
@@ -360,22 +366,26 @@ test 现在分两档报（2026-11-26 在本轮交付的树上实跑，含 §5.4 
 | `src/engine/archive.rs` | 442 | WAL 归档目录（`Archive`：段/快照的自描述命名、`record` 的顺序与 fail-closed 校验）与时间点恢复（`plan_pitr` 选锚点/拼段/查缺口、`pitr_restore` 落成新目录，§6.11） |
 | `src/engine/dump.rs` | 466 | 逻辑 dump 容器：`Dump`/`DumpCounts`、`encode`/`decode`（魔数 + 版本 + 两个 `next_*` + 条数 + 尾部 CRC32）、终态→重建序列的 `state_to_logs`（视图→节点→目录项→…→表→行的三条硬顺序）与文件读写；导出确定性由 `dump → restore → dump` 的字节相等钉住（§6.9） |
 | `src/engine/mem.rs` | 1998 | `State`（views/nodes/dentries/locks/refs/tables/rows/row_index）+ `Log`；快照的版本闸门与两代读入口（`load` / `load_for_migration`），以及 v3 → v4 的代际差异（抽掉四张专用控制面表的计数段） |
-| `src/engine/apply.rs` | 1594 | 45 个 op 里那 42 个的具体语义：环检测、硬链接引用计数、租约过滤、分页游标、表形状校验与约束、原子批的顺序预演、追加列的补行补索引、批量删的区间展开与整表清空、影子表顶替、同值消除、副本拒写（三条握手 op 不进引擎，§4.4；这里只留一道 `EINVAL` 兜底） |
+| `src/engine/apply.rs` | 1594 | 46 个 op 里那 42 个的具体语义：环检测、硬链接引用计数、租约过滤、分页游标、表形状校验与约束、原子批的顺序预演、追加列的补行补索引、批量删的区间展开与整表清空、影子表顶替、同值消除、副本拒写（四条握手 op 不进引擎，§4.4/§4.5；这里只留一道 `EINVAL` 兜底） |
 | `src/engine/model.rs` | 2727 | `Op`/`Reply` 定义与 codec 实现（含 `WalBatch`/`SnapChunk` 尾部的 `epoch`、目录树的 `Link`、通用表的 `RowRange`、`TableAddColumn`、原子批 `Batch`/`Reply::Batch` 及其解码层深度/条数闸门、批量形状的 `TableClear`/`RowRangeDelete`/`TableRename`） |
 | `src/engine/sha256.rs` | 365 | 自写的 SHA-256 / HMAC-SHA256 / 常数时间比对 —— 依赖门逼出来的（§11 第 7 条），正确性钉在 FIPS 180-4 与 RFC 4231 的已知向量上（§4.4） |
-| `src/net/server.rs` | 986 | `workers=1` 的 epoll 循环、连接生命周期、写回背压、周期任务（含追平 tick、旁路快照的 poll/派工、过期租约清扫）；兼作两条路径共用的 `Conn`/`Slot` 构件 |
-| `src/net/multi.rs` | 1386 | `workers>1`：N 条前端 worker + 唯一提交线程（路由闸门、按连接号回程、停机收尾），自动档快照同样只 poll/派工，周期任务里还有过期租约清扫 |
-| `src/net/auth.rs` | 623 | 接入认证：`Key`（读密钥 + MAC 派生）与 `Gate`（每连接一份的握手闸门），两条事件循环共用（§4.4） |
-| `src/net/replicate.rs` | 729 | 副本侧跟踪器 `Follower`：拉快照 → 追 WAL → gap 重装，连不上主退避重连；拒收被提掉权的旧主（`Error::Fence`）不退出、只抬计数（§6.6） |
+| `src/net/server.rs` | 1148 | `workers=1` 的 epoll 循环、连接生命周期、写回背压、周期任务（含追平 tick、旁路快照的 poll/派工、过期租约清扫）；兼作两条路径共用的 `Conn`/`Slot` 构件与记录层切点（`Slot::Arm`/`parked`，§4.5） |
+| `src/net/multi.rs` | 1401 | `workers>1`：N 条前端 worker + 唯一提交线程（路由闸门、按连接号回程、停机收尾），自动档快照同样只 poll/派工，周期任务里还有过期租约清扫 |
+| `src/net/auth.rs` | 806 | 接入认证与记录层协商：`Key`（读密钥 + MAC 派生）与 `Gate`（每连接一份的握手闸门，`SecureBegin` 的派生与装填闸也在这里），两条事件循环共用（§4.4/§4.5） |
+| `src/net/record.rs` | 438 | 记录层：两步 HKDF 从握手 nonce 派生双向密钥、`seal`/`feed` 的记录收发与攒包缓冲、切点前后的会话形状（§4.5）；单测钉分段无关/逐位篡改/重放/方向分域 |
+| `src/net/chacha20poly1305.rs` | 870 | 自写的 ChaCha20 / Poly1305 / HKDF-SHA256 —— RFC 8439 官方向量钉住，与 `sha256.rs` 同一条依赖门纪律（§11 第 7 条；§4.5） |
+| `src/net/replicate.rs` | 758 | 副本侧跟踪器 `Follower`：拉快照 → 追 WAL → gap 重装，连不上主退避重连；拒收被提掉权的旧主（`Error::Fence`）不退出、只抬计数（§6.6）；有密钥时默认把副本线也搬进记录层（`ReplicaCfg.secure`，§4.5） |
 | `src/net/mail.rs` | 114 | 两者之间那条能被 `epoll` 唤醒的信箱（`Mutex<VecDeque>` + eventfd） |
-| `src/net/client.rs` | 158 | 同步客户端 + pipeline；`connect` / `connect_auth` 先强制协商版本，再按需认证；`connect_raw` / `from_stream` 是只建 TCP 的显式逃生口（§4.4） |
-| `src/bin/{cli,server,bench,pgbench,sqlitebench,micro,migrate,standby,demo,dump,load,backup,pitr}.rs` | 5491 | 可执行入口；`pgbench` 是 PG 对照器，`migrate` 是快照升级 工具（§6.5），`standby` 是只读副本兼 `--promote`（§6.6），`dump`/`load` 是离线逻辑导出与重建（§6.9），`backup` 是在线一致快照导出（§6.10），`pitr` 是按 seq 恢复到新目录（§6.11）；面向网络的那几个入口共用 `--auth-key-file`（`server`/`bench`/`standby`/`backup`，加上 `cli` 的 `--addr` 模式），`cli` 是面向人工的通用表与引擎状态入口（§5.4，14 个表 op + `Batch` + 4 个运维 op 全有对应子命令） |
+| `src/net/client.rs` | 258 | 同步客户端 + pipeline；`connect` / `connect_auth` 先强制协商版本，再按需认证并切记录层（§4.5）；`connect_auth_plain` / `from_stream_auth_plain` 是 A/B 用的显式明文逃生口，`connect_raw` / `from_stream` 是只建 TCP 的显式逃生口（§4.4） |
+| `src/bin/{cli,server,bench,pgbench,sqlitebench,micro,migrate,standby,demo,dump,load,backup,pitr}.rs` | 5595 | 可执行入口；`pgbench` 是 PG 对照器，`migrate` 是快照升级工具（§6.5），`standby` 是只读副本兼 `--promote`（§6.6），`dump`/`load` 是离线逻辑导出与重建（§6.9），`backup` 是在线一致快照导出（§6.10），`pitr` 是按 seq 恢复到新目录（§6.11）；面向网络的那几个入口共用 `--auth-key-file`（`server`/`bench`/`standby`/`backup`，加上 `cli` 的 `--addr` 模式），`server`/`standby` 另接 `--require-secure`、`bench`/`standby` 另接 A/B 用的 `--no-secure`（§4.5），`cli` 是面向人工的通用表与引擎状态入口（§5.4，14 个表 op + `Batch` + 4 个运维 op 全有对应子命令） |
 | `benches/throughput_matrix.sh` | 188 | 五轴吞吐矩阵（§7 的数据来源） |
 | `benches/rehearse_migrate.sh` | 159 | 快照升级的真机彩排：旧 tag → 当前树，逐格核四条承诺与回滚窗口（§6.5 的外部效度） |
 | `benches/xgen_probe.sh` | 151 | 跨代混跑探针（§4.4 末）：`git archive` 取真 tag 编旧服务端，五臂分别钉 banner、跨代认证 / 非认证拒绝与同代认证 / 非认证放行 |
 | `benches/single_conn.sh` | 99 | 单连接与并发档对标（§7.11）：treedb 默认档 vs 私有 PG 集群，`$PIPE` 选一问一答还是批量、`$CONNS`/`$WORKERS` 选形状，逐格附带引擎自计的 fsync 计数 |
 | `benches/backup_probe.sh` | 133 | 备份/还原三形状实测（§6.7）：冷拷贝、写入进行中的热拷贝、副本目录当还原点，逐档拿 `--stats` 的数据面四行对拍 |
 | `benches/handshake_cost.sh` | 126 | 接入握手的代价（§4.4 末表）：同一轮里 off/on 两臂交替跑 N 条建连，取 bench 自报的 `connected` 时间 + 那一刻的服务端 RSS + 稳态 `ping`/`create`，并校验两臂实际连上的条数一致 |
+| `benches/secure_cost.sh` | 254 | 记录层代价（§4.5 末表）：[1] 接入面 off/auth/sec 三臂交替 2 轮（建连 + RSS + 稳态两问，对照 handshake_cost.sh 规格），[2] 副本线明文/加密两臂交替 3 轮（热身轮不进中位、`uplink=` 反空跑断言、传输段速率扣最坏轮）；`SKIP1=1` 只补 [2] |
+| `benches/ximpl_chachapoly.py` | 184 | 用 `cryptography`（独立实现）按 §4.5 的派生链与记录形状重算线上字节，产出可冻进 `tests/secure_channel.rs` 的常量表；改派生链/记录形状必须重跑并同步；`--selftest` 自检 |
 | `benches/three_way.sh` | 170 | 三臂同口径对照（§7.13）：treedb / PG 12 / SQLite3，24 格；头部七条口径与「不按 pipeline 乘」的计数判据都写在脚本里 |
 | `benches/three_way_table.py` | 118 | 由两份原始采集重算 §7.13 引用的 `final.tsv`；`--check` 对账、`--selftest` 自带三处注入错（上一版表是手搓 one-liner，把 p50/p99 拼成了一列） |
 | `benches/doc_table_check.py` | 1060 | 把 §7.13 的 markdown 表与 `final.tsv` 逐格对账（24×14），再把 §7.18 的七张表（3 张通用表 + 4 张 POSIX）与 `delete_storm.tsv` / `posix_delete_storm.tsv`、§7.19 的四张矩阵表 + 一张驻留探针表与 `many_views_mix.tsv` / `mix_isolate_auto{0,1}.tsv`、§7.9 的两张持久化表与 `sync_ratio.log` 的两个锚定块、§10 阶段 C 4 补段的 ref 表与套件表与 `grovefs_pin_ab.log` 逐格对账（§7.19 的格子按 `(auto_mb, views, conns)` 三键定位、§7.9 的按块时间戳定位、§10 补段的按 ref 名与「套件名 × 臂」定位，都不按行序），并校固定工作量、WAL/快照水位、账本收敛、RSS 样本、`worst_round_us`、合批比与「改后两档同一提交点」等不变量，再校 §10 补段的六条套件两臂齐备、三元组逐行相等、混代闸门点名行在日志里，列头的臂号与臂上 pin 也照日志的臂头校准而不写死；`--selftest` 用 24 处注入错验证它真的会红 |
@@ -410,7 +420,8 @@ payload = tag: u16 | 字段…            （Op / Reply 各自的 tag 空间，R
 - 错误：`Reply::Err { code: u16, msg }`，`code` 就是 POSIX `errno`。
 - **帧里没有版本位**（v1 定形时就没给，现在也不能塞 —— 塞进去就把旧客户端的
   整个 payload 偏移挪了两位）。v8 起版本靠每条连接建立时的 `VersionBegin` /
-  `VersionOk` 交换，当前 `PROTOCOL_VERSION = 8`；`Stats.proto_version` 只是协商后的
+  `VersionOk` 交换，当前 `PROTOCOL_VERSION = 9`；v9 又把「握手之后可选地进加密
+  阶段」接进连接建立语义（§4.5）。`Stats.proto_version` 只是协商后的
   交叉核对，不是闸门。升级顺序仍是**先升服务端，后升客户端**：窗口期旧客户端主动
   连新服务端会在首个数据 op 上拿到 `EADV`；新客户端连旧服务端时，旧服务端不认
   `0x0092` 后直接关连接，客户端实际看到 `server closed`（§4.4 五臂实测），两边都
@@ -480,8 +491,14 @@ payload = tag: u16 | 字段…            （Op / Reply 各自的 tag 空间，R
   `EngineStats` 都没变，但旧客户端不会协商、新服务端若放行它就会重新打开跨代静默
   错读；新客户端连旧服务端也会在未知 tag 上失败。连接建立语义本身就是升级判据，
   因此协议与包版本一起抬到 8 / `v0.8.0`。
+  `8 → 9`（§4.5）**不兼容**：新增 `SecureBegin` 0x0093 / `SecureOk` 0x0193，在认证
+  之后加一个**可选**的加密阶段。阶段可选，所以降级方向可用（不发
+  `SecureBegin` 的旧客户端对新服务端逐字照旧）；但协商成功的两侧对「`SecureOk`
+  之后那段字节」的解释不再相同（一边是明文帧，一边是记录），且帧头里没有版本位
+  能救 —— 与 `7 → 8` 同一条判据，只是这次交换的是加密状态而不是版本号。op /
+  reply 计数 45 / 24 → 46 / 25，包版本定 `0.10.0`。
 
-### 4.2 op 分组（45 个）
+### 4.2 op 分组（46 个）
 
 | 组 | op |
 |----|----|
@@ -489,6 +506,7 @@ payload = tag: u16 | 字段…            （Op / Reply 各自的 tag 空间，R
 | 日志传送 | `WalFetch` `SnapFetch` |
 | 版本协商 | `VersionBegin` |
 | 接入认证 | `AuthBegin` `AuthFinish` |
+| 记录层协商 | `SecureBegin` |
 | 视图 | `CreateView` `DropView` `ListViews` |
 | 名字/属性 | `Lookup` `Getattr` `Setattr` `ReadDir` `ReadDirPlus` |
 | 增删 | `Create` `Mkdir` `Symlink` `Link` `Readlink` `Unlink` `Rmdir` `Rename` |
@@ -497,7 +515,7 @@ payload = tag: u16 | 字段…            （Op / Reply 各自的 tag 空间，R
 | 通用表 | `TableCreate` `TableDrop` `TableGet` `TableList` `TableAddColumn` `TableClear` `TableRename` `RowPut` `RowGet` `RowList` `RowRange` `RowDelete` `RowRangeDelete` `RowCount` |
 | 原子批 | `Batch` |
 
-45 个 op 分**三档**，两个布尔判据（`is_readonly` / `is_control`）恰好切出三块，
+46 个 op 分**三档**，两个布尔判据（`is_readonly` / `is_control`）恰好切出三块，
 两两不交、并起来是全集：
 
 - **只读 15 个 = worker 可就地执行集**：`Ping` `ListViews` `Lookup` `Getattr`
@@ -561,7 +579,7 @@ worker 就空转了。现在的做法是**摘掉 `EPOLLIN`**（`Conn::hold_read`
 压在接收队列里，然后采样 0.6 s 墙钟烧掉多少 CPU —— 摘掩码之前是 0.600 s，之后只剩
 epoll 定时唤醒的零头（门限 0.2 s）。
 
-### 4.4 协议版本闸门与接入认证（v5 起认证，v8 起版本必协商）
+### 4.4 协议版本闸门与接入认证（v5 起认证，v8 起版本必协商；握手后的可选加密见 §4.5）
 
 **版本协商先于认证且不依赖认证**。`Client::connect` / `connect_auth` 与
 `from_stream_auth` 都先发 `VersionBegin`；错版本或旧服务端不认 `0x0092` 都直接让
@@ -570,8 +588,8 @@ epoll 定时唤醒的零头（门限 0.2 s）。
 `from_stream` 是给反例测试与跨代探针的显式未协商入口，不作为正常客户端 API。
 
 下面的一次共享密钥双向挑战握手（CHAP）跑在版本协商之后。**它不是 TLS 的
-简化版**，它只建立身份，不建立机密性（下面「防不住什么」四条是这个节的全部
-边界）。实现一侧在 `src/net/auth.rs`，原语（自写的 SHA-256 / HMAC-SHA256）在
+简化版**，它只建立身份；机密性是 v9 加在它之后的另一个可选阶段（§4.5），
+不属于本节。下面「防不住什么」四条是认证握手自己的全部边界。实现一侧在 `src/net/auth.rs`，原语（自写的 SHA-256 / HMAC-SHA256）在
 `src/engine/sha256.rs` —— 自写不是选择，是依赖门逼出来的：`[dependencies]` 非 optional
 项只允许 `libc` + `thiserror`（§11 第 7 条），所以 `ring`/`rustls` 这类东西进不来，
 于是正确性只能拿 FIPS 180-4 / RFC 4231 的已知向量钉住。
@@ -693,9 +711,13 @@ release，loopback，同轮两臂 A/B、独立跑 3 次，逐格原始输出
 
 **它防不住什么**（写清楚而不是等使用者自己发现；与 `src/net/auth.rs` 模块头同源）：
 
-1. **不防窃听**。握手之后的每一个字节仍是明文，CRC32 只判损坏。抓包的人拿不到
-   密钥，但拿得到全部数据，也随时能 RST 掉这条连接。
-2. **不做授权**。过了握手的连接与今天一样拥有全部 45 个 op，包括 `Shutdown`。
+1. **不防窃听（这一条 v9 之后由 §4.5 接手，但有两个口子）**。认证握手自己不
+   建立机密性：没协商记录层的连接，握手之后的每一个字节仍是明文（v5–v8 全程
+   如此；v9 默认也仍然收明文客户端，那是升级窗口的刻意保留）。v9 起带密钥的
+   正常客户端会在 `AuthOk` 之后多发一拍 `SecureBegin`，从那一拍起整条帧流走
+   ChaCha20-Poly1305 记录（§4.5）—— 抓包的人拿不到内容了，但**记录长度仍然
+   可见**（记录长 = 明文帧长 + 16），也随时能 RST 掉这条连接。
+2. **不做授权**。过了握手的连接与今天一样拥有全部 46 个 op，包括 `Shutdown`。
    它是「一把钥匙开整扇门」，不是租户模型 —— 多租户、配额、审计归属仍在引擎
    之外（§8 第 13 条）。
 3. **不防字典攻击**。密钥必须是 32 字节随机值；从口令派生的话，抓一次握手就能
@@ -704,6 +726,171 @@ release，loopback，同轮两臂 A/B、独立跑 3 次，逐格原始输出
    照样能应答握手。把两者分开看：**副本侧**现在有了 fencing token（§6.6「切
    主」），令牌更小的对端一律拒收；**客户端侧**没有 —— 客户端不会去问“你是第几
    任主”，一个已被换掉的旧主照旧服务它自己的读者/写者。所以切主仍然必须真停旧主。
+
+### 4.5 记录层：握手之后的可选加密（v9）
+
+它补的是 §4.4 边界清单的第 1 条，且**只**补那一条：认证只建立身份，记录层把
+「握手之后的每一个字节都是明文」关掉。实现一侧在 `src/net/record.rs`（派生、
+协商、记录收发），原语在 `src/net/chacha20poly1305.rs`（自写的 ChaCha20 +
+Poly1305 + HKDF-SHA256，RFC 8439 官方向量钉住）—— 自写的理由与 §4.4 的
+`sha256.rs` 相同：依赖门（§11 第 7 条）不放带 C/汇编的密码学库进来，这一层的
+回应是「无查表 ⇒ 没有 cache-timing 侧信道」的纯软件实现。
+
+线上形状（协商两拍仍是明文，其后整条帧流是记录）：
+
+```
+… AuthFinish { mac }  ──►  AuthOk { server_mac, authed: true }
+SecureBegin { want: 1 }  ──►  SecureOk { suite: 1 }        ← 最后两拍明文
+─── 此线以下全部是记录，不再有任何明文帧 ───
+rec(len: u32 LE ‖ 密文 ‖ Poly1305 标签)   ◄──►  一个或多个明文帧拼成的字节流
+```
+
+- **协商是可选的，要求是显式的**。`SecureBegin { want }` 报客户端想要的套件
+  （0 = 不加密，1 = `AEAD_CHACHA20_POLY1305` + 每方向递增计数器 nonce），三种
+  结局都合法：`SecureOk { suite: 1 }`（接受）、`SecureOk { suite: 0 }`（**明确的
+  拒绝**，两侧继续明文 —— 所以 0 必须是拒绝而不是「缺字段」），或者旧服务端
+  根本不认识 `0x0093`，在 `decode` 的兜底那里回 `EINVAL`。但「可选」指的是
+  协商这一拍本身；**带密钥的正常客户端把降级当建连失败**（`auth::handshake`
+  给 `secure_handshake` 传 `require = true`，与认证那一拍「`authed: false` 不
+  静默接受」同构 —— 降级不能是静默的，
+  `a_downgraded_secureok_is_not_silently_accepted`）。真正的明文逃生口是显式的
+  `connect_auth_plain` / `from_stream_auth_plain`（握手照跑、不发 `SecureBegin`），
+  它们是 A/B 代价实测与跨代探针的专用入口，不是默认路径。
+- **会话密钥从不上线**，两步 HKDF-SHA256：第一步（extract salt =
+  `"treedb-record-v1"`，ikm = `"treedb-secure-v1" ‖ cn ‖ sn`，info =
+  `INFO_SALT`）把握手那对随机数磨成一个 32 字节中间值；第二步（salt = 中间值，
+  ikm = 集群密钥）expand 出两条方向密钥（`INFO_CLI` / `INFO_SRV` 两条域分隔）。
+  集群密钥只在第二步出现，上线的是它的 HMAC 证明；两条 info 与握手 MAC 的
+  `treedb-auth-v1-*` 刻意不同 —— 同一份输入里同时混进了「证明」与「密钥流」
+  两种用途，不能算成同一种东西。绑随机数而不是绑密钥字节的收益：每条连接的
+  `server_nonce` 都是新的 `getrandom` 值，两条密钥流在一次集群密钥的生命周期内
+  不会撞上另一个会话 —— 这正是敢拿递增计数器当 nonce 的前提
+  （`a_different_handshake_yields_a_different_session`）。
+- **记录 nonce 是同方向递增的序号**：8 字节大端记录序号 ‖ 4 字节零，从 0 起
+  每记录 +1。重用即全崩（明文异或泄露 + Poly1305 一次性密钥重用），所以这里
+  **没有**「重用就退回去」的分支：计数器耗尽时 `seal` 报错，调用方必须断连。
+  长于 `MAX_PLAINTEXT`（64 KiB）的载荷切成整数个记录，每条推一格；
+  `sent_records()` 是这个推进行为的唯一读数
+  （`long_payload_becomes_whole_records`、`the_send_counter_advances_per_record`）。
+- **记录头是闸门**：`len` 越界（> 64 KiB + 16，或 < 16）按协议违规直接断连，
+  接收方不去攒声明的 4 GiB；长度头本身进 AAD —— 改它同样过不了验。
+  分段无关由 `roundtrip_is_independent_of_the_tcp_fragmentation` 钉住
+  （7 种长度 × 4 种切段）。
+- **验不过 = 断连，没有可恢复分支**。握手 MAC 错可以回 `EADV` 重来，因为那一拍
+  没有任何状态被猜透过；记录验不过意味着密钥流、计数器、构造三者之一已经与
+  对面不一致，继续读写只会把错乱字节当合法帧解下去。改密文 / 改标签 / 改长度头 /
+  两条记录掉头 / 整段重放（同连接落在下一格序号上、跨连接换了会话密钥）——
+  全部断连：`a_tampered_record_kills_the_session`、`a_tampered_tag_is_rejected`、
+  `reordered_records_are_rejected`、`replayed_records_are_rejected`。
+- **切点是全协议最容易写错的一拍**。判据是「`SecureOk` 这条应答本身发出去
+  之后」，不是「收到 `SecureBegin` 之后」：`SecureOk` 前面可能还排着等 fsync 的
+  应答（客户端完全可以把一个写 op 与 `SecureBegin` 挤进同一批），提前装填会把
+  更早的应答加密掉，而对侧还没看到 `SecureOk`，它会拿明文帧头去解密文。服务端
+  因此三段式：`Gate::secure_begin` 派生好会话放进 `pending`；
+  `Conn::queue_secure_cut` 在 `SecureOk` push 之后往发送队列插一个 `Slot::Arm`
+  （切点不是一个帧，是队列里的一个语义位）；`pump` 走到 `Arm` 才真装填，并把
+  切点前已经摸进 `rx` 的尾巴（那是记录）从 `parked` 停放处解回明文帧。客户端
+  对称：`arm_secure` 在解码完 `SecureOk` 后置位，把缓冲里多读出来的尾巴交给
+  会话。两侧各自看得到同一个线上位置（`SecureOk` 的帧尾），不需要任何序号
+  对齐。会话放在 `Gate` 而不是 `Conn`：`allows_data()`（数据面闸门）与写侧
+  「要不要封存」判的是同一个 `Option` —— 两处各存一份就可能一侧发密文、
+  另一侧按明文解。
+- **`--require-secure`：把「可选」翻成「必须」的服务端开关**
+  （`ServerConfig::require_secure`）。开了之后 `allows_data()` 多一格判据：
+  认证过了但记录层还没装的连接，数据 op 一律 `EADV "transport encryption
+  required: send SecureBegin before any data op (§4.5)"` —— 这第三档文案单独给，
+  运维才能区分「客户端忘了握手」与「服务端强制加密而客户端不支持」（用例钉的
+  就是文案指得准：`require_secure_refuses_an_authenticated_plaintext_connection`）。
+  它离不开 `--auth-key-file`（记录密钥从握手 nonce 派生，没密钥就无从派生），
+  两个二进制都在参数阶段拒绝这种组合（exit 2：
+  `require_secure_without_a_key_is_refused_at_startup`）。副本侧 `--require-secure`
+  一个 flag 管两头：对主的连接本来就会带 `SecureBegin`（`ReplicaCfg.secure`
+  默认 true），差别只在它也拒绝明文读者；banner 的 `uplink=` 行印实际线形状
+  （`plaintext:no-key` / `plaintext:forced` / `encrypted`），`plaintext:forced`
+  是 `--no-secure` 的 A/B 专用档。
+- **多 worker 的次序规矩与 §4.4 那刀共用**：`SecureBegin` 也是握手 op
+  （`auth::is_handshake`），夹在批次里必须就地答、不能进引擎 —— 进引擎拿不到
+  那对 nonce，还会把「`SecureOk` 在发送队列里的位置」这个切点信息丢掉。
+  `apply.rs` 只留一道大声的 `EINVAL "secure negotiation op reached the engine"`
+  兜底报警。两种 worker 形状由
+  `an_encrypted_connection_round_trips_big_values_on_both_worker_shapes` 钉住。
+- **副本线是最大受益者**：`Follower::connect` 有密钥就自动进记录层，跨机线上
+  的 `SnapFetch` / `WalFetch` 字节全部是密文。`FollowerProgress.secure` /
+  `secure_records` 记录这条线是否真加密（本地进度读数，不进线协议）；
+  `a_replica_can_keep_the_line_plaintext_on_purpose` 反向钉住 A/B 开关真的生效
+  —— 否则对照臂量的是同一个东西，「加密几乎不要钱」就是假结论。
+
+**验收分两层**。**接线**（`tests/record.rs`，8 条 + 1 条测量）：真实 TCP 上
+切点位置正确、线上取不到明文 —— 夹在中间的代理看得见握手帧，却看不见切点
+之后的 canary；同一代理对明文客户端看得见它（对照组缺了「看不见」就等于
+「没采到」，`the_wire_hides_payloads_after_the_cut_but_shows_them_before_it`）；
+翻转一个 bit ⇒ 断连，且那条写**没有落库**（不是落了一个错值）；
+`--require-secure` 三档语义；没开它的 v9 服务端仍服务明文客户端（升级窗口）。
+**装配**（`tests/secure_channel.rs`，6 条）：`benches/ximpl_chachapoly.py` 用
+`cryptography`（独立实现）按同一份派生链重算线上字节，常量冻结进仓库 ——
+密钥编排逐字节相等、封出的记录逐字节相等、客户端方向用另一把、参照流整条
+可开、超长分块一致、改坏参照记录必须被拒。拒收判据是「只交付坏记录之前的
+前缀」，不是「全空」—— 流式语义下坏记录之前的记录本来就合法。装配错
+（AAD 漏了长度头、nonce 字节序反了、salt 用错层）只会让本实现自己封自己解
+完全自洽，却与世界上任何其他实现不互通 —— 那正是「升级窗口里旧客户端连不上
+新服务端」的形状，只在跨实现对照里暴露。改派生链或记录形状必须重跑脚本并
+同步常量；冻结而不现算，是因为本仓库的测试不许依赖解释器与第三方包。
+
+**代价实测**（2026-11-26，release，本机回环；逐轮原始输出
+`benches/results/secure_cost.log`，脚本 `benches/secure_cost.sh`，规格对照 §4.4
+末的 `handshake_cost.sh`；单轮读数一律不进结论 —— [1] 三臂交替 2 轮、[2] 两臂
+交替 3 轮，热身轮不进中位）：
+
+| 量 | 明文（无握手） | 明文（握手、无记录层） | 加密（握手 + 记录层） |
+|----|------|------|------|
+| 建 2 000 条连接 | 281 / 289 ms | 429 / 425 ms | 558 / 540 ms |
+| 服务端 RSS/conn | 2177 B | 2177 B | 2177 B |
+| 稳态 `ping` ops/s | 1 142 738 / 1 147 743 | 1 158 792 / 1 153 806 | 998 437 / 968 927 |
+| 稳态 `create` ops/s | 72 000 / 72 055 | 71 969 / 68 300 | 63 276 / 62 994 |
+
+三句话读这张表：
+
+- **sec − auth 才是记录层的增量**：建连 +129 / +115 ms ÷ 2 000 ≈
+  **+58~64 µs/conn**（HKDF 一次 + 一拍额外往返）；auth − off ≈
+  +68~74 µs/conn，与 §4.4 末表的历史读数（+90.9 µs/conn）同量级。RSS 三臂
+  全部 2177 B/conn —— 记录层每连接两个方向密钥加一个空攒包缓冲，2 000 条的
+  分辨率下量不出来（认证那 +93 B 都是靠 20 000 条放大才看得见的）。
+- **稳态**：ping −14~−16%（每 op 一次 seal/open，小帧上 AEAD 的固定成本占比
+  高）；create −8~−12%（group commit 合并度不变 —— 握手与记录层都不进提交
+  线程，摊到批次之后税感更低）。两个差值都大于臂内散布，方向明确；但绝对值
+  与 §4.4 的判据同构：不构成改架构的理由。
+- **副本线（下载 127 MiB 快照 + WAL，`--fetch-bytes 4194304`）**：传输段中位
+  明文 161 MiB/s → 加密 70.1 MiB/s，加密墙钟 1.51×。两臂各付一次「装快照最坏
+  轮」（1.2–1.4 s）的固定成本，所以判「加密贵不贵」看传输段，不看墙钟。
+  70 MiB/s 高于 §11 第 4 条那个 1 MiB × 20 ms 的算术上界（≈ 50 MiB/s）、低于
+  同参数（4 MiB × 20 ms）的 200 MiB/s 算术上界与 §6.6 跨机 4 MiB 档的实测
+  199–351 MiB/s —— 快照线的瓶颈从链路挪到了 crypto，但没有挪出「可用」的
+  区间。
+- **每字节分辨率**（`cargo test --release --test record -- --ignored
+  --nocapture`，64 MiB/档，单线程）：`memcpy` 基线 31 505–67 999 MiB/s；
+  seal 267–277 MiB/s；seal + open 137–138 MiB/s。同机 OpenSSL
+  （`cryptography`，SIMD）1484 MiB/s —— 自写标量约其 19%。这是依赖门下的
+  已知取舍（无查表 ⇒ 无 cache-timing 侧信道），不是实现 bug；要 SIMD 就得
+  引入带汇编的依赖，那是另一个依赖问题（§11 第 7 条）。
+
+**它防不住什么**（与 `record.rs` / `chacha20poly1305.rs` 模块头同源）：
+
+1. **无前向保密**。会话密钥是握手两个随机数的派生物；集群密钥泄露 = 抓来的
+   历史包全部可解。要前向保密得加临时 DH（X25519），那是另一件事。
+2. **不防流量分析**。记录长度就是明文帧长 + 16。谁在什么时候发了多大一帧，
+   仍然可见。
+3. **重放防护只在一条连接内成立**。序号不跨连接：抓整段记录发到另一条连接上，
+   会因会话密钥不同而验不过断连 —— 靠的是每连接新 nonce，不是序号窗口。
+4. **不改变授权面**。加密不缩小 op 集合：过了握手的连接（加密与否）仍然拥有
+   全部 46 个 op，包括 `Shutdown`（§4.4 第 2 条照旧）。
+
+版本判据为什么这次抬（§4.1）：`SecureBegin` / `SecureOk` 本身是纯追加的两个
+花 tag，但「服务端会在 `AuthOk` 之后再切一次加密面」踩中了「连接建立/握手的
+前置语义变了」那条 —— 协商成功的两侧对 `SecureOk` 之后那段字节的解释不再相同
+（一边是明文帧，一边是记录），而帧头里没有版本位可以救它。两个方向都
+fail-closed：v9 客户端连 v8 服务端在 `0x0093` 上拿到 `EINVAL`（带密钥的把它
+当建连失败）；v8 客户端不发 `SecureBegin`，v9 服务端对它逐字照旧（不开
+`--require-secure` 时）。包版本定 `0.10.0`。
 
 ---
 
@@ -5584,3 +5771,40 @@ spike 明确**没**做、也不在接入面上假装做的事 —— 一律返�
     表的批、批与 `TableAddColumn`/`TableRename` 交错那些形状还没有对抗证据 —— 要补就在同一条
     骨架上加负载形状，不必再搭一遍脚手架。评估本身列出的三条产品级 blocker（授权矩阵、传输
     加密、同步复制与自动 failover）不在这一格，各自都要动协议，属于 §10 之后的阶段。
+
+24. **传输加密：评估 blocker 的第二条在引擎里还掉**（§4.5，2026-11-26，**已做完**）。
+    第 23 条列的三条产品级 blocker，第二条就是传输加密。这一笔把它做进线协议本体：
+    `SecureBegin`/`SecureOk` 两拍在认证之后协商出**记录层** —— 自写的 ChaCha20-Poly1305
+    AEAD（RFC 8439 官方向量钉住）+ 两步 HKDF-SHA256 从握手 nonce 派生双向密钥，
+    `SecureOk` 之后的每一个字节都是记录（`len ‖ 密文 ‖ 标签`），不再有明文帧。
+    形状、派生链、切点三段式与防不住什么都在 §4.5，这里只记定版取舍：
+    1. **协议与包版本**：`PROTOCOL_VERSION` 8 → 9、op/reply 45/24 → 46/25（`SecureBegin`
+       0x0093 / `SecureOk` 0x0193），`SNAP_VERSION`/`DUMP_VERSION` 不动，旧数据目录
+       零迁移；`Cargo.toml` 抬到 `0.10.0`，tag↔包版本照旧逐版对齐。抬版本的判据与
+       `7 → 8` 同一条（§4.1）：协商成功的两侧对 `SecureOk` 之后那段字节的解释不再
+       相同，帧头里没有版本位能救。
+    2. **可选协商、显式强制、降级必须响**：套件 0 是明确拒绝（两侧继续明文），带密钥的
+       正常客户端把降级当建连失败（`auth::handshake` 给 `secure_handshake` 传
+       `require = true`）；A/B 的明文逃生口是显式的 `connect_auth_plain` /
+       `from_stream_auth_plain`。服务端 `--require-secure` 把「可选」翻成「必须」，
+       认证过但未加密的连接回第三档 `EADV` 文案（运维分得清「客户端忘了协商」与
+       「服务端强制而客户端不支持」）；`server`/`standby` 都在参数阶段拒绝
+       「require-secure 无密钥」（exit 2）。
+    3. **副本线自动受益**：`ReplicaCfg.secure` 默认 true，跨机 `SnapFetch`/`WalFetch`
+       全部进记录层；`--no-secure` 是 A/B 专用降级档，banner 的 `uplink=` 行印实际
+       线形状。
+    4. **自写原语的纪律不变**：依赖门（第 7 条）不放带 C/汇编的密码学库进来，
+       `chacha20poly1305.rs` 870 行与 `sha256.rs` 同一条路 —— RFC 8439 向量 +
+       `benches/ximpl_chachapoly.py`（独立实现）的常量冻结交叉验证；代价是标量
+       速度约为 OpenSSL 的 19%（§4.5 末表），接受。
+    验证（当轮实跑）：默认档 `cargo test --release` **327 passed / 0 failed / 4 ignored**、
+    `--features postgres-compat` **358 passed / 0 failed / 10 ignored**（两档各比上一笔多
+    39 条 = `tests/record.rs` 8 + `tests/secure_channel.rs` 6 + `tests/replication.rs` +1
+    + lib 24 = `record.rs` 12 + `chacha20poly1305.rs` 12）；`cargo clippy --release
+    --all-targets` 在本轮新增/改动的文件上零警告（仓里既有的警告都在
+    `sha256.rs`/`multi.rs`/旧 tests 那批上，与本笔无关）。代价实测三口径入册 §4.5
+    （接入面 sec−auth ≈ +58~64 µs/conn、稳态 ping −14~−16% / create −8~−12%、
+    副本线传输段 161 → 70.1 MiB/s 1.51×）。
+    **没做与下一步**：无前向保密（要它得加临时 DH，X25519，那是另一件事）；不防
+    流量分析（记录长度可见）；重放防护只在单连接内成立 —— 三条都写在 §4.5 末。
+    第三条 blocker（同步复制与自动 failover）不在这一格。定版 `v0.10.0`。

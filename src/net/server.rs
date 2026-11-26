@@ -125,6 +125,16 @@ pub struct ServerConfig {
     /// 开启后**只影响握手**：数据面每 op 多一次 `Gate::allows_data()` 判等，
     /// 握手本身不占提交线程。代价由 `benches/handshake_cost.sh` 实测。
     pub auth: Option<Arc<crate::net::auth::Key>>,
+    /// 要求记录层（§4.5）：认证过了但没启用加密的连接也不许走数据面。
+    ///
+    /// 默认关，与 `auth` 之前的行为逐字一致：开着认证但不强制加密 = 只防
+    /// 「没密钥的人连上来」，不防「有密钥的人在明文跑」（前者是接入控制，
+    /// 后者是机密性，两件事不必捆在一起卖）。
+    ///
+    /// 它不能离开 `auth` 单独开：记录密钥是从握手那对 nonce 派生的，没密钥
+    /// 就没什么可派。`bin/server.rs` 在参数阶段拦住这种组合，而不是到这里
+    /// 才变成「所有连接都上不来」。
+    pub require_secure: bool,
     /// 同时在册的连接数上限；`0` = 不限（默认，与历史行为逐字一致）。
     ///
     /// 为什么需要它：§7 的连接轴实测到 25 000 条连接、0.31 KiB/conn，也就是说
@@ -180,6 +190,8 @@ impl ServerConfig {
             flush_pipeline: false,
             replication: None,
             auth: None,
+            // 默认不要求加密：它是 `auth` 之上的一个选择，不是一个新默认。
+            require_secure: false,
             // 默认不限：v0.5 之前的实例没有这个概念，默认值一变就是行为变更。
             max_conn: 0,
             // 默认不归档：额外一次字节搬运与一份磁盘占用，不该默认替用户决定。
@@ -251,6 +263,15 @@ pub(crate) enum Slot {
     /// 等提交线程回话的 op（只在多 worker 模式）：答案按同连接的提交
     /// 顺序送回来，所以不需要 id，填到第一个 `Await` 槽就是它。
     Await,
+    /// 记录层的切点（§4.5）。它不是一个帧，而是插在 `SecureOk` 之后的一个
+    /// 语义位：`pump` 走到这里才把 [`Gate`] 里等着的会话启用。
+    ///
+    /// 为什么需要它而不直接在答完 `SecureBegin` 时装填：`out` 是严格 FIFO，
+    /// 客户端可以把一个写 op 与 `SecureBegin` 挤进同一批帧 —— 那时有可能是
+    /// `Slot::Pending`/`Slot::Await` 排在 `SecureOk` 前面。提前装填会把那条
+    /// 更早的应答加密掉，而对侧还没看到 `SecureOk`，它会拿明文帧头去解密文。
+    /// 切点必须是「线上的位置」，而不是「处理到的时刻」。
+    Arm,
 }
 
 pub(crate) struct Conn {
@@ -276,8 +297,22 @@ pub(crate) struct Conn {
     /// 从 2 次降到 0 次。
     pub(crate) ep_out: bool,
     /// 这条连接的握手进度（§4.4）。`Stage::Off` 时所有数据 op 直通，
-    /// 判据只有一次 `matches!`。
+    /// 判据只有一次 `matches!`。记录层会话也在它里面（`auth.secure`），
+    /// 于是「能不能走数据」与「要不要封存」共用同一个真值来源。
     pub(crate) auth: Gate,
+    /// 同批读进来、排在 `SecureBegin` 之后的字节（那是记录）。
+    ///
+    /// 为什么要另存：切点要等 `pump` 走到 `Slot::Arm` 才落地，而读侧已经先
+    /// 把它们摸进了 `rx`。留在 `rx` 里会被 `take_frame` 拿密文当明文帧头，
+    /// 所以先停在这里，到切点一次性喂给会话。
+    pub(crate) parked: Vec<u8>,
+    /// 记录层已经不可恢复（验签不过或计数器耗尽）。
+    ///
+    /// 形状选「一个位 + `flush` 报 Err」而不是让 `push` 返回 Result：帧能完成的
+    /// 地方比能报错的地方多得多（主循环、`drain_round`、committer 回话、轮末
+    /// 统一写出），逐个把 `Result` 透上去会把两条事件循环都改脏。而所有出口
+    /// 本来就已经在处理 `flush` 的错误 -> 关连接，语义刚好一致。
+    pub(crate) secure_dead: bool,
     /// 背压把读端从 epoll 掩码里摘下来时置位。
     ///
     /// 为什么必须摘：epoll 是**电平触发**的，而背压时我们主动不读 socket ——
@@ -292,8 +327,8 @@ pub(crate) struct Conn {
 }
 
 impl Conn {
-    /// 每条连接都从 `VersionNeeded` 开局；认证开关只决定协商后的下一档。
-    pub(crate) fn new(stream: TcpStream, id: u64) -> Self {
+    /// 每条连接都从 `VersionNeeded` 开局；认证与加密开关只决定协商后的下一档。
+    pub(crate) fn new(stream: TcpStream, id: u64, require_secure: bool) -> Self {
         let fd = stream.as_raw_fd();
         Conn {
             fd,
@@ -309,7 +344,35 @@ impl Conn {
             ep_out: false,
             read_hold: false,
             ep_hold: false,
-            auth: Gate::new(),
+            auth: Gate::new(require_secure),
+            parked: Vec::new(),
+            secure_dead: false,
+        }
+    }
+
+    /// 线上字节 → `rx` 里的明文帧（与 `Client::absorb` 同一形状）。
+    ///
+    /// 返 `false` = 记录验不过，调用方必须关这条连接（`record` 模块头第 2 条）。
+    /// 切点已经协商但还没轮到落地时（`auth.pending` 非空），后面的字节也是
+    /// 记录，得先停放 —— 否则它会绕过会话直接变成 `rx` 里的「假帧」。
+    pub(crate) fn absorb(&mut self, more: &[u8]) -> bool {
+        if self.auth.pending.is_some() && self.auth.secure.is_none() {
+            self.parked.extend_from_slice(more);
+            return true;
+        }
+        match &mut self.auth.secure {
+            None => {
+                self.rx.extend(more);
+                true
+            }
+            Some(s) => {
+                let mut plain = Vec::with_capacity(more.len());
+                if s.feed(more, &mut plain).is_err() {
+                    return false;
+                }
+                self.rx.extend(&plain);
+                true
+            }
         }
     }
 
@@ -344,6 +407,7 @@ impl Conn {
     /// 未发送字节（含已回填但未弹出的帧）——背压判据。
     pub(crate) fn backlog(&self) -> usize {
         self.tx.len() - self.tx_pos
+            + self.parked.len()
             + self
                 .out
                 .iter()
@@ -351,9 +415,71 @@ impl Conn {
                     Slot::Filled(f) => f.len(),
                     // 待回填的槽不知道成品帧多大（写等 fsync、转发等提交线程），
                     // 按 0 计：背压只需要拦住那些真把内存堆起来的情况。
-                    Slot::Pending(_) | Slot::Await => 0,
+                    Slot::Pending(_) | Slot::Await | Slot::Arm => 0,
                 })
                 .sum::<usize>()
+    }
+
+    /// 把一条成品明文帧放到发送流的尾部（没加密时就是它自己）。
+    ///
+    /// 全文件只有这一处判断「该不该封存」，所以 `push_frame` 的直写快路、
+    /// `pump` 的队列排空、错误应答的插队，三者不会各自长出一个判据。
+    ///
+    /// 加密时多一次拷贝（帧先成形、再整段封）：AEAD 的标签在尾部，不先拿到
+    /// 整段明文就算不出它。代价实测见 `benches/`，模块注释写明它不是白接的。
+    fn put_frame(&mut self, frame: &[u8]) {
+        match &mut self.auth.secure {
+            Some(s) => {
+                if !s.seal(frame, &mut self.tx) {
+                    self.secure_dead = true;
+                }
+            }
+            None => self.tx.extend_from_slice(frame),
+        }
+    }
+
+    /// 闸门刚就地答完一条 op：如果那是 `SecureOk`，把切点登记进发送队列。
+    ///
+    /// 调用位置必须在 `SecureOk` 已经 `push` 之后 —— 那一帧本身是最后一帧明文。
+    /// 没有待装填的会话时这里是空操作，所以热路径只多一次 `is_none` 判断。
+    pub(crate) fn queue_secure_cut(&mut self) {
+        if self.auth.pending.is_none() {
+            return;
+        }
+        // 同批已经读进来的尾巴是记录，先停放到 `parked`。
+        let rest = self.rx.take_rest();
+        if !rest.is_empty() {
+            self.parked.extend_from_slice(&rest);
+        }
+        self.out.push_back(Slot::Arm);
+    }
+
+    /// 走到切点：启用会话，并把停放着的记录解成明文帧送回 `rx`。
+    ///
+    /// 返 `false` = 那堆字节验不过（两侧已经不同步），调用方必须丢这条连接。
+    fn arm_secure(&mut self) -> bool {
+        let Some(s) = self.auth.pending.take() else {
+            return true;
+        };
+        self.auth.secure = Some(s);
+        let parked = std::mem::take(&mut self.parked);
+        if parked.is_empty() {
+            return true;
+        }
+        let mut plain = Vec::with_capacity(parked.len());
+        let r = self
+            .auth
+            .secure
+            .as_mut()
+            .expect("session was just installed")
+            .feed(&parked, &mut plain);
+        match r {
+            Ok(()) => {
+                self.rx.extend(&plain);
+                true
+            }
+            Err(_) => false,
+        }
     }
 
     /// 把一条应答**直接编进 `tx`**，帧长回填在最后一步。
@@ -368,6 +494,14 @@ impl Conn {
     pub(crate) fn push_frame(&mut self, reply: &Reply) -> bool {
         if !self.out.is_empty() {
             return false;
+        }
+        if self.auth.secure.is_some() {
+            // 加密档走不了「直接编进 `tx`」那条快路：Poly1305 的标签要拿整段
+            // 明文才能算，所以帧得先自己成形再交给 `put_frame`。密文路径多一次
+            // 拷贝，明文路径逐字照旧 —— 性能对比时记得这一条。
+            let f = reply_frame(reply);
+            self.put_frame(&f);
+            return true;
         }
         let at = self.tx.len();
         let mut buf = std::mem::take(&mut self.tx);
@@ -384,12 +518,21 @@ impl Conn {
         true
     }
 
-    /// 把队头连续的 `Filled` 帧搬进 `tx`。
+    /// 把队头连续的 `Filled` 帧搬进 `tx`，途中遇到 `Arm` 就落地记录层切点。
     fn pump(&mut self) {
-        while let Some(Slot::Filled(_)) = self.out.front() {
-            match self.out.pop_front() {
-                Some(Slot::Filled(f)) => self.tx.extend_from_slice(&f),
-                _ => break,
+        while let Some(front) = self.out.pop_front() {
+            match front {
+                Slot::Filled(f) => self.put_frame(&f),
+                Slot::Arm => {
+                    if !self.arm_secure() {
+                        self.secure_dead = true;
+                        return;
+                    }
+                }
+                other => {
+                    self.out.push_front(other);
+                    break;
+                }
             }
         }
     }
@@ -397,6 +540,15 @@ impl Conn {
     /// 尽力写出；`WouldBlock` 时保留剩余字节并置 `want_write`。
     pub(crate) fn flush(&mut self) -> std::io::Result<()> {
         self.pump();
+        // 记录层不可恢复：当成写错误同样处理（调用方的唯一反正是关连接），
+        // 而且必须赶在任何字节上 socket 之前报 —— 继续排队只会多送乱字节。
+        if self.secure_dead {
+            self.want_write = false;
+            return Err(std::io::Error::new(
+                ErrorKind::InvalidInput,
+                "record layer failed: authentication error or counter exhaustion (§4.5)",
+            ));
+        }
         while self.tx_pos < self.tx.len() {
             match self.stream.write(&self.tx[self.tx_pos..]) {
                 Ok(0) => {
@@ -632,7 +784,7 @@ pub(crate) fn serve_single(cfg: &ServerConfig, stop: &AtomicBool, live: &AtomicU
                             }
                             // id 在多 worker 模式才用得到；单线程按 fd 索引，
                             // 永远不路由应答，故统一填 0。
-                            let c = Conn::new(stream, 0);
+                            let c = Conn::new(stream, 0, cfg.require_secure);
                             let nfd = c.fd;
                             epoll_set(ep, nfd, false)?;
                             conns.insert(nfd, c);
@@ -686,7 +838,12 @@ pub(crate) fn serve_single(cfg: &ServerConfig, stop: &AtomicBool, live: &AtomicU
                             // 2 次 recvfrom，其中恰好 1 次报错）。
                             Ok(m) => {
                                 let full = m == buf.len();
-                                c.rx.extend(&buf[..m]);
+                                // 记录层开着时这段字节是密文，先进会话再进 `rx`
+                                // （否则 `take_frame` 会把密文头当帧长读）。
+                                if !c.absorb(&buf[..m]) {
+                                    eof = true;
+                                    break;
+                                }
                                 if !full {
                                     break;
                                 }
@@ -764,6 +921,11 @@ pub(crate) fn serve_single(cfg: &ServerConfig, stop: &AtomicBool, live: &AtomicU
                 };
                 if let Some(reply) = gated {
                     push(&mut conns, fd, &reply);
+                    // 闸门刚答完的如果是 `SecureOk`，把记录层切点排到它后面。
+                    // 顺序不能反：那一帧本身必须是最后一帧明文。
+                    if let Some(c) = conns.get_mut(&fd) {
+                        c.queue_secure_cut();
+                    }
                     continue;
                 }
                 // checkpoint / shutdown 会动 WAL，必须先把本轮已 stage 的写

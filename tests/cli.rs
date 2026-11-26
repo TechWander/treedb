@@ -17,6 +17,7 @@ use common::Server;
 use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
+use treedb::engine::PROTOCOL_VERSION;
 
 /// 跑一次 `treedb-cli`。`conn` 是连接参数（`--addr`/`--dir` 那一组），`args` 是命令本身。
 fn cli(conn: &[&str], args: &[&str]) -> Output {
@@ -219,10 +220,17 @@ fn json_mode_keeps_stdout_machine_only() {
     assert_eq!(code(&o), 1);
     assert!(so(&o).contains("\"errno_name\":\"EEXIST\""), "{}", so(&o));
     // stats 的协议版本与 `--version` 说的那个是同一个数。
+    //
+    // 这里故意不写字面量：把版本钉进断言的用例会在每次 `PROTOCOL_VERSION` 抬升时
+    // 红一次，而它真正要保的是「两条出口给的是同一个数」与「服务端真上报了它」，
+    // 那两件事与具体是几无关。
     let out = ok(&j(&["stats"]), "json stats");
-    assert!(out.contains("\"proto_version\":8"), "{out}");
+    assert!(
+        out.contains(&format!("\"proto_version\":{PROTOCOL_VERSION}")),
+        "{out}"
+    );
     let v = ok(&cli(&[], &["version"]), "version");
-    assert!(v.contains("protocol 8"), "{v}");
+    assert!(v.contains(&format!("protocol {PROTOCOL_VERSION}")), "{v}");
 }
 
 /// 交互/脚本模式：连接参数只给一次，`use` 之后可省表名，多条语句共享上下文。

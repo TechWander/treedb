@@ -84,7 +84,15 @@ pub const MAX_FRAME: u32 = 8 * 1024 * 1024;
 /// 协商设为每条连接的强制第一步。既有帧的字段布局没变，但连接建立语义变了：
 /// 旧客户端不协商，新服务端必须拒；新客户端连旧服务端会在 `0x0092` 上大声失败。
 /// 这是一次不兼容升级，因此协议与包版本一起从 v0.7.0 抬到 v0.8.0。
-pub const PROTOCOL_VERSION: u16 = 8;
+/// v9（2026-11-26）在握手完成后追加一个**可选**阶段：`SecureBegin` 0x0093 /
+/// `SecureOk` 0x0193，其后整条帧流改走 ChaCha20-Poly1305 记录（§4.5；§4.4
+/// 边界清单的第 1 条正是它要补的那一条）。帧的字段布局仍然一字未动，但抬版本的
+/// 理由与 v8 同一条判据：**连接建立的语义变了** —— 协商成功的两侧对「`SecureOk`
+/// 之后那段字节」的解释不再相同（一边是明文帧，一边是记录），而帧头里没有
+/// 版本位可以救它。旧客户端不发 `SecureBegin`，新服务端对它逐字照旧（阶段是
+/// 可选的），所以降级方向可用；但运维必须能从 `proto_version` 看出加密是否
+/// 真的生效，不能把「能连上」当成「已加密」。
+pub const PROTOCOL_VERSION: u16 = 9;
 /// 帧头长度：payload 字节数（u32 小端，不含头）。
 pub const FRAME_HDR: usize = 4;
 
@@ -158,6 +166,18 @@ impl RxBuf {
         let out = self.data[s..s + len as usize].to_vec();
         self.start = s + len as usize;
         Ok(Some(out))
+    }
+
+    /// 取走全部未消费的字节并清空缓冲。
+    ///
+    /// 只有一处会用它：[`crate::net::record`] 的切点。那一刻「还剩多少没解完」
+    /// 的含义已经从「半个明文帧」变成「若干条记录」，继续让 `take_frame` 按明文
+    /// 帧头去读这段字节会把密文当长度字段。所以整段摘走，交给记录层。
+    pub fn take_rest(&mut self) -> Vec<u8> {
+        let out = self.data[self.start..].to_vec();
+        self.data.clear();
+        self.start = 0;
+        out
     }
 
     /// peek 帧头声明的长度；不足一个头返回 None。客户端用它判断“下一帧齐了没”。

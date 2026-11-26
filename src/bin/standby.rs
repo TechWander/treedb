@@ -56,6 +56,8 @@ fn main() {
     let mut workers: usize = 0;
     let mut pid_file: Option<PathBuf> = None;
     let mut auth_key_file: Option<PathBuf> = None;
+    let mut require_secure = false;
+    let mut no_secure = false;
     let mut promote = false;
 
     let mut i = 1;
@@ -81,6 +83,8 @@ fn main() {
             "--workers" => workers = num("--workers", &next(&mut i), workers),
             "--pid-file" => pid_file = Some(PathBuf::from(next(&mut i))),
             "--auth-key-file" => auth_key_file = Some(PathBuf::from(next(&mut i))),
+            "--require-secure" => require_secure = true,
+            "--no-secure" => no_secure = true,
             "--promote" => promote = true,
             "-h" | "--help" => {
                 println!("{}", HELP);
@@ -181,12 +185,26 @@ fn main() {
         None => None,
     };
     let auth_on = auth.is_some();
+    // 与 `treedb-server` 同一条门禁：记录密钥是从握手那对随机数派生的，没密钥
+    // 就谈不上「必须加密」，与其起一个永远拒读者的服务端不如在参数阶段就说清。
+    if require_secure && !auth_on {
+        eprintln!("--require-secure needs --auth-key-file: record keys are derived from the handshake (§4.5)");
+        std::process::exit(2);
+    }
+    // 两个开关合用等于「只许读者加密、自己往主那边发明文快照」，运维面不会有人
+    // 真想这么配；写错时直接拒比默默拿一个拧巴的形状跑起来好查。
+    if no_secure && require_secure {
+        eprintln!("--no-secure contradicts --require-secure: the first keeps the replica line plaintext, the second demands encryption (§4.5)");
+        std::process::exit(2);
+    }
 
     let mut rcfg = ReplicaCfg::new(primary);
     rcfg.interval_ms = interval_ms;
     rcfg.max_bytes = fetch_bytes;
     rcfg.timeout_ms = timeout_ms;
     rcfg.auth = auth.clone();
+    // 只影响这一条上行线（副本 → 主），不碰本地读者那批连接。
+    rcfg.secure = !no_secure;
     if let Err(e) = Follower::check_cfg(&rcfg) {
         eprintln!("{e}");
         std::process::exit(2);
@@ -214,6 +232,7 @@ fn main() {
     cfg.workers = workers;
     cfg.replication = Some(rcfg.clone());
     cfg.auth = auth;
+    cfg.require_secure = require_secure;
 
     // 令牌要进 banner，但引擎在 `serve` 里才打开（`open` 会抢目录锁）。
     // 直接读那个小文件：它和引擎启动时读的是同一个函数，所以 banner 上
@@ -228,7 +247,7 @@ fn main() {
         }
     };
     eprintln!(
-        "treedb-standby pid={} listen={} dir={} primary={} protocol={} interval={} ms fetch={} B workers={} auth={} fence={}",
+        "treedb-standby pid={} listen={} dir={} primary={} protocol={} interval={} ms fetch={} B workers={} auth={} secure={} fence={} uplink={}",
         std::process::id(),
         addr,
         dir.display(),
@@ -238,7 +257,17 @@ fn main() {
         fetch_bytes,
         workers,
         if auth_on { "on" } else { "off" },
-        fence
+        if require_secure { "required" } else { "optional" },
+        fence,
+        // 副本线的实际形状：没密钥时无从加密，有密钥时默认必加密，
+        // `--no-secure` 是 A/B 专用的降级档（`benches/secure_cost.sh`）。
+        if !auth_on {
+            "plaintext:no-key"
+        } else if no_secure {
+            "plaintext:forced"
+        } else {
+            "encrypted"
+        }
     );
     match serve(&cfg, &STOP, &LIVE) {
         Ok(rep) => {
@@ -345,6 +374,18 @@ treedb-standby — 只读副本（pull 式日志传送，DESIGN.md §6.6）
                              密钥必须与主的 `--auth-key-file` 是同一把，否则表
                              现是 lag 永远追不上（副本会指数退避重试并在日志里
                              报 unusable，不会默默降级）。
+                             有密钥时副本线（SnapFetch/WalFetch）自动走记录层，
+                             不需要额外 flag：这条线上传的就是主的全量状态。
+  --require-secure           握手之后还必须协商出记录层（§4.5），否则数据
+                             op 一律 EADV。需要 `--auth-key-file`。作用两头：
+                             本副本要求读者加密，而对主的连接本来就会带
+                             SecureBegin（差别只在 `--require-secure` 让本副本
+                             这边也拒绝明文读者）。
+  --no-secure                与 `--auth-key-file` 合用：对主握手，但不发
+                             SecureBegin，也就是把快照与 WAL 放在明文线上拉。
+                             仅属 A/B 工具（`benches/secure_cost.sh` 用它量记录
+                             层的真实字节代价），与 --require-secure 互斥，
+                             生产环境里不该出现。
 
 监控：treedb-server --listen <本副本地址> --stats，副本会多一行
   replica = yes (primary seq .. lag .. applied .. resyncs .. errors ..)

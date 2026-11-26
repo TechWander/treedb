@@ -854,6 +854,20 @@ pub enum Op {
     AuthFinish {
         mac: [u8; DIGEST_LEN],
     },
+    /// 握手的**可选**后续阶段：把这条连接之后的帧流整体加密（wire tag `0x0093`）。
+    ///
+    /// `want` 是客户端能接受的记录保护套件（见
+    /// [`SECURE_SUITE_NONE`](crate::net::record::SECURE_SUITE_NONE) 与
+    /// [`SECURE_SUITE_CHACHAPOLY1305`](crate::net::record::SECURE_SUITE_CHACHAPOLY1305)）。
+    /// 服务端要么回 [`Reply::SecureOk`] 里同一个套件（接受），要么回
+    /// `suite = 0`（拒绝，两侧继续走明文），要么完全不认识（旧服务端在
+    /// `decode` 的兜底那里回 `EINVAL`）—— 三种都是合法结局，所以这一拍是可选的。
+    ///
+    /// 它只在认证已完成（`Stage::Ready`）之后才有意义：会话密钥从握手的两个
+    /// 随机数派生，未握手的连接根本没有可派生的东西。它同样不进引擎。
+    SecureBegin {
+        want: u8,
+    },
 }
 
 impl Op {
@@ -911,6 +925,11 @@ impl Op {
             Op::AuthBegin { .. } => 0x0090,
             Op::AuthFinish { .. } => 0x0091,
             Op::VersionBegin { .. } => 0x0092,
+            // 0x0093 是握手阶段的下一个空位：只追加，不动既有帧的形状。
+            // 但 `PROTOCOL_VERSION` 仍必须 +1 —— §4.1 的判据里「连接建立/握手的
+            // 语义变了」这一条被踩中了：服务端现在会在 `AuthOk` 之后再切一次
+            // 加密面，旧客户端不知道这一刀，两边会在同一段字节上得到不同的解释。
+            Op::SecureBegin { .. } => 0x0093,
         }
     }
 
@@ -932,6 +951,7 @@ impl Op {
                 | Op::VersionBegin { .. }
                 | Op::AuthBegin { .. }
                 | Op::AuthFinish { .. }
+                | Op::SecureBegin { .. }
         )
     }
 
@@ -998,7 +1018,8 @@ impl Op {
             | Op::SnapFetch { .. }
             | Op::VersionBegin { .. }
             | Op::AuthBegin { .. }
-            | Op::AuthFinish { .. } => false,
+            | Op::AuthFinish { .. }
+            | Op::SecureBegin { .. } => false,
         }
     }
 
@@ -1274,6 +1295,7 @@ impl Op {
             Op::VersionBegin { client_proto } => w.u16(*client_proto),
             Op::AuthBegin { client_nonce } => w.bytes(client_nonce),
             Op::AuthFinish { mac } => w.bytes(mac),
+            Op::SecureBegin { want } => w.u8(*want),
         }
     }
 
@@ -1523,6 +1545,7 @@ impl Op {
             0x0092 => Op::VersionBegin {
                 client_proto: r.u16()?,
             },
+            0x0093 => Op::SecureBegin { want: r.u8()? },
             x => return Err(Error::Codec(format!("unknown op tag 0x{x:04x}"))),
         };
         Ok(op)
@@ -1782,6 +1805,18 @@ pub enum Reply {
         server_mac: [u8; DIGEST_LEN],
         authed: bool,
     },
+    /// [`Op::SecureBegin`] 的应答：实际达成的记录保护套件（wire tag `0x0193`）。
+    ///
+    /// `suite = 0` 是**明确的拒绝**而不是错误：服务端可以同意不加密，两侧继续
+    /// 走明文，调用方要不要把降级当成失败是它自己的事（见
+    /// [`crate::net::record`] 模块头第 3 条）。非零值必须等于请求的 `want`，
+    /// 否则就是服务端在乱说话。
+    ///
+    /// 收到这一条之后（且 suite 非零），**两侧同时切到记录层**：从这里开始
+    /// 线上不再有明文帧，包括这条应答自己的后续字节。
+    SecureOk {
+        suite: u8,
+    },
 }
 
 impl Reply {
@@ -1983,6 +2018,10 @@ impl Reply {
                 w.bytes(server_mac);
                 w.bool(*authed);
             }
+            Reply::SecureOk { suite } => {
+                w.u16(0x0193);
+                w.u8(*suite);
+            }
         }
     }
 
@@ -2174,6 +2213,7 @@ impl Reply {
                 server_mac: fixed_bytes(r)?,
                 authed: r.bool()?,
             },
+            0x0193 => Reply::SecureOk { suite: r.u8()? },
             x => return Err(Error::Codec(format!("unknown reply tag 0x{x:04x}"))),
         };
         Ok(rep)
@@ -2456,6 +2496,11 @@ mod tests {
             Op::AuthFinish {
                 mac: [0x5a; DIGEST_LEN],
             },
+            Op::SecureBegin {
+                want: crate::net::record::SECURE_SUITE_CHACHAPOLY1305,
+            },
+            // 套件的「拒绝」那一支：0 = 不加密，形状上也是一条合法帧。
+            Op::SecureBegin { want: 0 },
         ];
         for op in ops {
             let mut w = W::new();
@@ -2521,6 +2566,16 @@ mod tests {
         let mut w = W::new();
         w.u16(0x0192);
         w.u8(crate::engine::PROTOCOL_VERSION as u8);
+        assert!(Reply::decode(&mut Rd::new(&w.finish())).is_err());
+
+        // `SecureBegin` 的套件字段是定长一字节：少了就是「不知道要哪个套件」，
+        // 不能当 0（= 不加密）默认掉 —— 那会把一条协商帧悄悄变成降级。
+        let mut w = W::new();
+        w.u16(0x0093);
+        assert!(Op::decode(&mut Rd::new(&w.finish())).is_err());
+
+        let mut w = W::new();
+        w.u16(0x0193);
         assert!(Reply::decode(&mut Rd::new(&w.finish())).is_err());
     }
 
@@ -2675,6 +2730,11 @@ mod tests {
                 server_mac: [0u8; DIGEST_LEN],
                 authed: false,
             },
+            Reply::SecureOk {
+                suite: crate::net::record::SECURE_SUITE_CHACHAPOLY1305,
+            },
+            // 服务端明确拒绝加密那一支。
+            Reply::SecureOk { suite: 0 },
         ];
         for rep in replies {
             let mut w = W::new();

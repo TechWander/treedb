@@ -116,6 +116,7 @@ fn main() {
     let mut shutdown_only = false;
     let mut pid_file: Option<PathBuf> = None;
     let mut auth_key_file: Option<PathBuf> = None;
+    let mut require_secure = false;
     let mut archive: Option<PathBuf> = None;
     let mut format = "text".to_string();
     let mut format_given = false;
@@ -143,6 +144,7 @@ fn main() {
             "--flush-pipeline" => flush_pipeline = true,
             "--pid-file" => pid_file = Some(PathBuf::from(next(&mut i))),
             "--auth-key-file" => auth_key_file = Some(PathBuf::from(next(&mut i))),
+            "--require-secure" => require_secure = true,
             "--archive-dir" => archive = Some(PathBuf::from(next(&mut i))),
             "--stats" => stats_only = true,
             "--format" => {
@@ -188,6 +190,13 @@ fn main() {
         None => None,
     };
     let auth_on = auth.is_some();
+
+    // `--require-secure` 离不开密钥：记录密钥是从握手那对 nonce 派生的，而 nonce
+    // 只在 CHAP 里交换过。没密钥就没人能派生出会话，这个组合的意思只能是
+    // 「所有连接都上不来」—— 那不是一个可理解的选项，参数阶段就拒。
+    if require_secure && !auth_on {
+        die("--require-secure needs --auth-key-file: record keys derive from the handshake nonces (§4.5)");
+    }
 
     // `--format` 只影响 `--stats` 的输出形状。给了它却忘了 `--stats` 的话，
     // 用户以为自己在抓指标、实际上起了一个服务端 —— 那种误会必须在参数
@@ -269,13 +278,14 @@ fn main() {
         // 副本会拿到一份没人测过的默认值。
         replication: None,
         auth,
+        require_secure,
         archive: archive.clone(),
         lock_sweep_ms,
     };
     eprintln!(
         // 帧里没有版本位（§4.1），升级顺序又是硬约束，所以 banner 一开就把它摆出来：
         // 运维在两端对不上时第一眼就该看见。
-        "treedb-server pid={} listen={} dir={} protocol={} durability={} backlog={} max_conn={} workers={} auth={} archive={}",
+        "treedb-server pid={} listen={} dir={} protocol={} durability={} backlog={} max_conn={} workers={} auth={} secure={} archive={}",
         std::process::id(),
         addr,
         dir.display(),
@@ -285,6 +295,15 @@ fn main() {
         if max_conn == 0 { "unlimited".to_string() } else { max_conn.to_string() },
         workers,
         if auth_on { "on" } else { "off" },
+        // 运维要从 banner 直接看出「这条线上的字节是不是密文」，而不是去猜
+        // 客户端会不会自己协商。`optional` = 服务端能加密但不强制。
+        if !auth_on {
+            "n/a (no key)".to_string()
+        } else if require_secure {
+            "required".to_string()
+        } else {
+            "optional".to_string()
+        },
         match &archive {
             Some(a) => a.display().to_string(),
             None => "off".to_string(),
@@ -364,7 +383,13 @@ treedb-server — 元数据引擎服务端（POSIX 元数据语义，客户端�
                              32 原始字节或 64 个十六进制字符（0/64 个零 = 没填的
                              模板，拒接）。不给这个 flag = 不认证，与 v4 逐字一致。
                              开了之后所有客户端（含 --stats / --shutdown）都得带
-                             同一把密钥跑完握手才能发数据 op。
+                             同一把密钥跑完握手才能发数据 op；而 v9 的客户端在
+                             握手之后还会自己发 `SecureBegin`，把这条线加密。
+  --require-secure           在认证之上再要求记录层（§4.5）：只跑完 CHAP、没启用
+                             加密的连接不得走数据面。必须与 `--auth-key-file` 同用
+                             （记录密钥从握手那对 nonce 派生，没密钥就无从派生）。
+                             不给 = 能加密但不强制：旧 v9 之前的客户端继续跑明文，
+                             升级窗口里两端不会断。
   --stats                    不启服务，连上去打印状态后退出（含表的行数、WAL 的
                              逻辑与磁盘两个长度、快照长度与协议版本）
   --format NAME              --stats 的输出形状：text（默认，逐行 key = value）|
